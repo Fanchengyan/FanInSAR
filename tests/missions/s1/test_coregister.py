@@ -243,7 +243,8 @@ def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
 
     module = "faninsar.missions.s1.coregister"
     monkeypatch.setattr(
-        f"{module}.open_safe_product", lambda path, **_k: products[Path(path)]
+        f"{module}.open_acquisition_products",
+        lambda paths, **_k: [products[Path(path)] for path in paths],
     )
     monkeypatch.setattr(f"{module}.load_production_scene", fake_load)
     monkeypatch.setattr(f"{module}.deramp", fake_deramp)

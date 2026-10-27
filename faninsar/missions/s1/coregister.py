@@ -41,7 +41,7 @@ from faninsar.missions.s1.processing import (
     stage_coregister,
     stage_deramp,
 )
-from faninsar.missions.s1.safe import open_safe_product
+from faninsar.missions.s1.safe import open_acquisition_products
 from faninsar.processing.coregistration.tops.deramp import deramp, reramp
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry.coordinates import RadarGrid
@@ -214,8 +214,8 @@ def prepare_s1_reference(
     if coregistration_grid == "geo" and geo_grid is None:
         reject_invalid_state("geo coregistration requires geo_grid")
     primary_paths = _as_frame_paths(reference_path, "reference_path")
-    ref_orbits = [orbit_path] * len(primary_paths)
-    primary_products = [open_safe_product(path) for path in primary_paths]
+    primary_products = open_acquisition_products(primary_paths)
+    ref_orbits = [orbit_path] * len(primary_products)
     swath_tuple, resolved = _resolve_apply_selection(
         primary_products,
         primary_products,
@@ -247,7 +247,7 @@ def prepare_s1_reference(
             for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
                 tag = f"f{frame_index}_{swath}_b{burst_index}"
                 scene = load_production_scene(
-                    primary_paths[frame_index],
+                    primary_paths[min(frame_index, len(primary_paths) - 1)],
                     swath=swath,
                     burst_index=burst_index,
                     dem=dem,
@@ -255,6 +255,7 @@ def prepare_s1_reference(
                     coregistration_grid=coregistration_grid,
                     full_range=True,
                     read_samples=not reuse,
+                    product=primary_products[frame_index],
                 )
                 if writer is None and not reuse:
                     writer = SceneWriter(
@@ -559,7 +560,7 @@ def coregister_s1_secondary(
     date_id = _scene_id(secondary_paths[0])
     if date_id == context.reference_id:
         reject_invalid_state("coregister_s1_secondary requires a non-Reference date")
-    secondary_products = [open_safe_product(path) for path in secondary_paths]
+    secondary_products = open_acquisition_products(secondary_paths)
     reference = context.product
     reference_units = reference.unit_map()
     domain = context.coregistration_grid
@@ -584,13 +585,14 @@ def coregister_s1_secondary(
                 payload, state = _coregister_unit(
                     context,
                     unit,
-                    secondary_paths[unit.frame_index],
+                    secondary_paths[min(unit.frame_index, len(secondary_paths) - 1)],
                     reference=reference,
                     misreg_az_px=float(misreg_az_px),
                     misreg_rg_px=float(misreg_rg_px),
                     secondary_orbit_path=secondary_orbit_path,
                     work_dir=work_root / tag,
                     device=device,
+                    product=secondary_products[unit.frame_index],
                 )
                 placed = reference_units[tag]
                 if payload.shape != placed.shape:
@@ -665,6 +667,7 @@ def _coregister_unit(
     secondary_orbit_path: Path | None,
     work_dir: Path,
     device: str,
+    product: S1Product | None = None,
 ) -> tuple[np.ndarray, ProductionPairState]:
     """Resample one secondary burst onto its Reference unit."""
     domain = context.coregistration_grid
@@ -676,6 +679,7 @@ def _coregister_unit(
         orbit_path=secondary_orbit_path,
         coregistration_grid=domain,
         full_range=True,
+        product=product,
     )
     state = ProductionPairState(
         pair_id=f"{context.reference_id}_{secondary.scene_id}_{unit.tag}",

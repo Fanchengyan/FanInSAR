@@ -179,6 +179,7 @@ def parse_annotation_xml(
                     if footprints is not None and index < len(footprints)
                     else None
                 ),
+                measurement_path=measurement_path,
             )
         )
     if not bursts:

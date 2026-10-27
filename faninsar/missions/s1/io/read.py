@@ -34,7 +34,13 @@ class BurstArray:
 
 
 def _burst_line_offset(swath: S1Swath, burst: S1Burst) -> int:
-    """Return starting azimuth line of a burst in the measurement raster."""
+    """Return starting azimuth line of a burst in the measurement raster.
+
+    One-burst ASF extracts store the burst at line 0 of their own TIFF.
+    A full-scene measurement still places burst ``i`` at ``i * lines_per_burst``.
+    """
+    if burst.measurement_path and burst.measurement_path != swath.measurement_path:
+        return 0
     return int(burst.index * swath.lines_per_burst)
 
 
@@ -124,12 +130,13 @@ def read_full_burst(
         if col1 <= col0:
             reject_product("range_looks_crop is empty after intersecting valid bounds")
 
-    row0 = _burst_line_offset(swath, burst) + local_row0
+    file_row0 = _burst_line_offset(swath, burst) + local_row0
+    logical_row0 = int(burst.index * swath.lines_per_burst) + local_row0
     width = col1 - col0
     if not read_samples:
         return BurstArray(
             samples=np.broadcast_to(np.complex64(0), (height, width)),
-            row0=row0,
+            row0=logical_row0,
             col0=col0,
             burst_index=burst_index,
             valid_mask=np.broadcast_to(np.True_, (height, width)),
@@ -139,15 +146,16 @@ def read_full_burst(
     logger.info(
         "Reading full burst %s: rows[%s:%s] cols[%s:%s] (%.1f MiB complex64)",
         burst_index,
-        row0,
-        row0 + height,
+        file_row0,
+        file_row0 + height,
         col0,
         col1,
         height * width * 8 / (1024**2),
     )
-    with rasterio.open(swath.measurement_path) as dataset:
+    measurement_path = burst.measurement_path or swath.measurement_path
+    with rasterio.open(measurement_path) as dataset:
         window = Window.from_slices(
-            (row0, row0 + height),
+            (file_row0, file_row0 + height),
             (col0, col0 + width),
         )
         samples = dataset.read(1, window=window)
@@ -174,7 +182,7 @@ def read_full_burst(
 
     return BurstArray(
         samples=samples,
-        row0=row0,
+        row0=logical_row0,
         col0=col0,
         burst_index=burst_index,
         valid_mask=valid_mask,

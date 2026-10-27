@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
@@ -86,7 +88,7 @@ class RangeFetcher:
             self._connector._limit = self._window
 
     async def __aenter__(self) -> Self:
-        """Open one ClientSession with identity encoding (no decompress)."""
+        """Open one ClientSession with identity encoding and closed trust_env."""
         import aiohttp
 
         self._connector = aiohttp.TCPConnector(limit=self._window)
@@ -94,6 +96,7 @@ class RangeFetcher:
             connector=self._connector,
             auto_decompress=False,
             headers={"Accept-Encoding": "identity"},
+            trust_env=False,
         )
         return self
 
@@ -189,6 +192,7 @@ async def _request_span(
         span.url,
         headers=headers,
         allow_redirects=False,
+        proxy=_proxy_for_url(span.url),
     ) as response:
         if response.status in {301, 302, 303, 307, 308}:
             logger.error(
@@ -237,3 +241,32 @@ async def _request_span(
                 "range response did not match the requested span",
             )
         return bytes(body)
+
+
+def _proxy_for_url(url: str) -> str | None:
+    """Return the system HTTP proxy for ``url``, or None when bypassed.
+
+    Uses :func:`urllib.request.getproxies` (environment and the macOS
+    system proxy) and :func:`urllib.request.proxy_bypass`. Loopback hosts
+    always bypass so local TestServers stay direct. ``trust_env`` stays
+    closed so ``.netrc`` is never mixed with a Bearer header. HTTPS proxy
+    URLs are ignored because aiohttp cannot CONNECT through them.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host or _is_loopback(host) or urllib.request.proxy_bypass(host):
+        return None
+    proxies = urllib.request.getproxies()
+    scheme = (parsed.scheme or "https").casefold()
+    candidate = proxies.get(scheme) or proxies.get("https") or proxies.get("http")
+    if not candidate:
+        return None
+    proxy_scheme = urllib.parse.urlsplit(candidate).scheme.casefold()
+    if proxy_scheme in {"https", "wss"}:
+        return None
+    return candidate
+
+
+def _is_loopback(host: str) -> bool:
+    """Return whether ``host`` is a local loopback name."""
+    return host.casefold() in {"localhost", "127.0.0.1", "::1", "[::1]"}

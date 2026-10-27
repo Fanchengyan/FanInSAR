@@ -18,7 +18,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class S1Burst:
-    """One TOPS burst within a sub-swath annotation."""
+    """One TOPS burst within a sub-swath annotation.
+
+    ``measurement_path`` is set when a merged one-burst extract keeps its
+    own TIFF instead of sharing the parent swath measurement.
+    """
 
     index: int
     azimuth_time: datetime
@@ -30,6 +34,7 @@ class S1Burst:
     first_valid_sample: tuple[int, ...]
     last_valid_sample: tuple[int, ...]
     footprint: tuple[tuple[float, float], ...] | None = None
+    measurement_path: str | None = None
 
     @property
     def valid_samples(self) -> ValidSampleMask:

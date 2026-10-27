@@ -947,7 +947,7 @@ class S1Stack(Stack):
             self._s1_roi_burst_selection = result
             return result
         from faninsar.missions.s1.processing import _select_bursts_by_roi
-        from faninsar.missions.s1.safe import open_safe_product
+        from faninsar.missions.s1.safe import open_acquisition_products
 
         logger.info("ROI provided; explicit swaths/bursts selection ignored")
         ref_paths = list(self.catalog.paths_for(self.reference))
@@ -955,10 +955,9 @@ class S1Stack(Stack):
         selected_polarizations = (
             None if polarizations == "all" else tuple(polarizations or ())
         )
-        products = [
-            open_safe_product(path, polarizations=selected_polarizations)
-            for path in ref_paths
-        ]
+        products = open_acquisition_products(
+            ref_paths, polarizations=selected_polarizations
+        )
         ordered = sorted(
             products[0].swaths,
             key=lambda item: item.slant_range_time_s,
@@ -1001,17 +1000,16 @@ class S1Stack(Stack):
         if roi is None:
             self._s1_nesd_selection = (swaths, bursts)
             return swaths, bursts
-        from faninsar.missions.s1.safe import open_safe_product
+        from faninsar.missions.s1.safe import open_acquisition_products
 
         ref_paths = list(self.catalog.paths_for(self.reference))
         polarizations = self.config.extra.get("polarizations")
         selected_polarizations = (
             None if polarizations == "all" else tuple(polarizations or ())
         )
-        products = [
-            open_safe_product(path, polarizations=selected_polarizations)
-            for path in ref_paths
-        ]
+        products = open_acquisition_products(
+            ref_paths, polarizations=selected_polarizations
+        )
         swath_tuple = swaths or tuple(
             item.swath
             for item in sorted(

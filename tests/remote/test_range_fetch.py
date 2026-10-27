@@ -418,3 +418,146 @@ def test_range_fetcher_has_no_chunk_bytes() -> None:
     assert not hasattr(fetcher, "chunk_bytes")
     if is_dataclass(RangeFetcher):
         assert all(field.name != "chunk_bytes" for field in fields(RangeFetcher))
+
+
+def test_range_get_uses_system_https_proxy_without_trust_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A system HTTPS proxy receives the range GET; trust_env stays closed."""
+    payload = b"ABCDEFGHIJ"
+    seen: dict[str, object] = {}
+
+    async def origin(request: web.Request) -> web.StreamResponse:
+        del request
+        pytest.fail("range GET bypassed the system HTTPS proxy")
+
+    async def proxy(request: web.Request) -> web.StreamResponse:
+        seen["method"] = request.method
+        seen["host"] = request.headers.get("Host")
+        seen["range"] = request.headers.get("Range")
+        seen["authorization"] = request.headers.get("Authorization")
+        body = payload[2:6]
+        return web.Response(
+            status=206,
+            body=body,
+            headers={"Content-Range": "bytes 2-5/10", "Content-Encoding": "identity"},
+        )
+
+    async def _run() -> dict[str, bytes]:
+        proxy_app = web.Application()
+        proxy_app.router.add_route("*", "/{tail:.*}", proxy)
+        origin_app = web.Application()
+        origin_app.router.add_get("/obj", origin)
+        proxy_server = TestServer(proxy_app, host="127.0.0.1")
+        origin_server = TestServer(origin_app, host="127.0.0.1")
+        await proxy_server.start_server()
+        await origin_server.start_server()
+        try:
+            from faninsar.remote.fetch import (
+                RangeFetcher,
+                RangeSpan,
+                fetch_ranges_async,
+            )
+
+            proxy_url = f"http://{proxy_server.host}:{proxy_server.port}"
+            monkeypatch.setattr(
+                "urllib.request.getproxies",
+                lambda: {"http": proxy_url, "https": proxy_url},
+            )
+            monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+            async with RangeFetcher(token="cdse-token") as fetcher:
+                seen["trust_env"] = fetcher._session.trust_env
+                return await fetch_ranges_async(
+                    (
+                        RangeSpan(
+                            url="http://zipper.example.invalid/obj",
+                            start=2,
+                            end=5,
+                            label="a",
+                        ),
+                    ),
+                    fetcher=fetcher,
+                )
+        finally:
+            await origin_server.close()
+            await proxy_server.close()
+
+    assert asyncio.run(_run()) == {"a": b"CDEF"}
+    assert seen["trust_env"] is False
+    assert seen["range"] == "bytes=2-5"
+    assert seen["authorization"] == "Bearer cdse-token"
+
+
+def test_range_get_bypasses_system_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loopback origins stay direct even when a system HTTP proxy is set."""
+    payload = b"ABCDEFGHIJ"
+
+    async def origin(request: web.Request) -> web.StreamResponse:
+        body = payload[2:6]
+        return web.Response(
+            status=206,
+            body=body,
+            headers={
+                "Content-Range": "bytes 2-5/10",
+                "Content-Encoding": "identity",
+                "Range-Echo": request.headers.get("Range", ""),
+            },
+        )
+
+    async def proxy(request: web.Request) -> web.StreamResponse:
+        del request
+        pytest.fail("loopback range GET was sent through the system proxy")
+
+    async def _run() -> dict[str, bytes]:
+        proxy_app = web.Application()
+        proxy_app.router.add_route("*", "/{tail:.*}", proxy)
+        origin_app = web.Application()
+        origin_app.router.add_get("/obj", origin)
+        proxy_server = TestServer(proxy_app, host="127.0.0.1")
+        origin_server = TestServer(origin_app, host="127.0.0.1")
+        await proxy_server.start_server()
+        await origin_server.start_server()
+        try:
+            from faninsar.remote.fetch import (
+                RangeFetcher,
+                RangeSpan,
+                fetch_ranges_async,
+            )
+
+            proxy_url = f"http://{proxy_server.host}:{proxy_server.port}"
+            monkeypatch.setattr(
+                "urllib.request.getproxies",
+                lambda: {"http": proxy_url, "https": proxy_url},
+            )
+            monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+            async with RangeFetcher(token="cdse-token") as fetcher:
+                return await fetch_ranges_async(
+                    (
+                        RangeSpan(
+                            url=f"http://{origin_server.host}:{origin_server.port}/obj",
+                            start=2,
+                            end=5,
+                            label="a",
+                        ),
+                    ),
+                    fetcher=fetcher,
+                )
+        finally:
+            await origin_server.close()
+            await proxy_server.close()
+
+    assert asyncio.run(_run()) == {"a": b"CDEF"}
+
+
+def test_https_proxy_url_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTPS proxy URLs are dropped because aiohttp cannot CONNECT through them."""
+    from faninsar.remote.fetch.ranges import _proxy_for_url
+
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"https": "https://proxy.example.invalid:8443"},
+    )
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    assert _proxy_for_url("https://zipper.example.invalid/obj") is None

@@ -30,7 +30,7 @@ from faninsar.missions.s1.io import (
 )
 from faninsar.missions.s1.orbit import read_eof_orbit
 from faninsar.missions.s1.overlap import BurstOverlapWindow, burst_overlap_windows
-from faninsar.missions.s1.safe import open_safe_product
+from faninsar.missions.s1.safe import open_safe_acquisition, open_safe_product
 from faninsar.missions.s1.search import (
     S1DualPolarization,
     S1Polarization,
@@ -114,6 +114,7 @@ __all__ = [
     "extract_remote_burst",
     "measure_s1_pair_misreg",
     "normalize_polarizations",
+    "open_safe_acquisition",
     "open_safe_product",
     "parse_annotation_xml",
     "product_filters",

@@ -24,6 +24,7 @@ from faninsar.missions.s1 import (
     read_swath_bursts,
     stitch_bursts,
 )
+from faninsar.missions.s1.safe import open_acquisition_products
 from faninsar.processing.coregistration import (
     combine_offset_fields,
     dense_geometry_offsets,
@@ -812,13 +813,19 @@ def load_production_scene(
     coregistration_grid: CoregistrationGrid = "radar",
     full_range: bool = False,
     read_samples: bool = True,
+    product: S1Product | None = None,
 ) -> ProductionScene:
     """Load a full burst or full stitched sub-swath for production processing.
 
     Parameters
     ----------
     path : path
-        SAFE ZIP or directory.
+        SAFE ZIP or directory.  Used as the scene identity even when
+        ``product`` is supplied.
+    product : S1Product, optional
+        Already-opened product, including merged one-burst ASF extracts
+        and complementary same-date sub-swath canvases.  When omitted,
+        ``path`` is opened with :func:`open_safe_product`.
     swath : str, optional
         Sub-swath name.
     scope : {"burst", "swath"}, optional
@@ -846,7 +853,7 @@ def load_production_scene(
 
     """
     _ = dem
-    product = open_safe_product(path)
+    product = open_safe_product(path) if product is None else product
     s1_swath = product.swath(swath)
     if orbit_path is not None:
         s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
@@ -3332,14 +3339,13 @@ def _select_bursts_by_roi(
     from shapely.geometry import Polygon as ShapelyPolygon
 
     from faninsar.missions.s1 import read_eof_orbit
-    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.processing.geocoding.geo_lut import burst_geo_quad_lonlat
 
     region = _roi_geometry(roi)
+    products = open_acquisition_products(frame_paths)
     resolved: dict[tuple[int, str], list[int]] = {}
     any_quad = False
-    for frame_index, path in enumerate(frame_paths):
-        product = open_safe_product(path)
+    for frame_index, product in enumerate(products):
         orbit_path = None if orbits is None else orbits[frame_index]
         for swath in swaths:
             s1_swath = product.swath(swath)
