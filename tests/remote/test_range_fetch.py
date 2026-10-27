@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Self
 
 import pytest
 from aiohttp import web
@@ -561,3 +562,89 @@ def test_https_proxy_url_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
     assert _proxy_for_url("https://zipper.example.invalid/obj") is None
+
+
+class _FakeRangeResponse:
+    """One 206 response with the exact Content-Range the span expects."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.status = 206
+        self.headers = {
+            "Content-Range": f"bytes 2-{2 + len(body) - 1}/{2 + len(body) - 1}",
+        }
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+class _FlakySession:
+    """Fake session whose first GETs drop the connector, then succeed."""
+
+    def __init__(self, failures: int, error: Exception) -> None:
+        self._failures = failures
+        self._error = error
+        self.calls = 0
+
+    def get(self, url: str, **kwargs: object) -> _FakeRangeResponse:
+        del url, kwargs
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise self._error
+        return _FakeRangeResponse(b"CDEF")
+
+
+def test_range_span_retries_transient_connector_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy CONNECT drop is retried and the span still completes."""
+    import aiohttp
+
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    monkeypatch.setattr(ranges_module, "_CONNECT_BACKOFF_S", 0)
+    error = aiohttp.ClientConnectorError(
+        connection_key=None,
+        os_error=OSError(61, "Connection refused"),
+    )
+    session = _FlakySession(failures=1, error=error)
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=2, end=5, label="a"
+    )
+
+    async def _run() -> bytes:
+        return await ranges_module._request_span(session, span)
+
+    assert asyncio.run(_run()) == b"CDEF"
+    assert session.calls == 2
+
+
+def test_range_span_connector_failures_raise_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent connection drops surface the connector error, not a hang."""
+    import aiohttp
+
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    monkeypatch.setattr(ranges_module, "_CONNECT_BACKOFF_S", 0)
+    error = aiohttp.ClientOSError("SSL: UNEXPECTED_EOF_WHILE_READING")
+    session = _FlakySession(failures=99, error=error)
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=2, end=5, label="a"
+    )
+
+    async def _run() -> bytes:
+        return await ranges_module._request_span(session, span)
+
+    with pytest.raises(aiohttp.ClientOSError):
+        asyncio.run(_run())
+    assert session.calls == ranges_module._CONNECT_ATTEMPTS

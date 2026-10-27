@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _AIMD_SEED = 20
+_CONNECT_ATTEMPTS = 3
+_CONNECT_BACKOFF_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +182,33 @@ async def _attempt_span(
 
 
 async def _request_span(
+    session: Any, span: RangeSpan, *, token: str | None = None
+) -> bytes:
+    """GET one span; transient connection drops are retried before failing.
+
+    Proxy CONNECT failures, TLS handshake EOFs, and server disconnects are
+    bounded retries of an idempotent span GET; 429/401 semantics are owned
+    by :func:`_attempt_span` above this seam.
+    """
+    import aiohttp
+
+    last_connect_error: Exception | None = None
+    for attempt in range(1, _CONNECT_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(_CONNECT_BACKOFF_S * (attempt - 1))
+        try:
+            return await _request_span_once(session, span, token=token)
+        except aiohttp.ClientConnectionError as error:
+            last_connect_error = error
+            logger.warning(
+                "range request connection failed; retrying",
+                extra={"label": span.label, "attempt": attempt},
+            )
+    assert last_connect_error is not None
+    raise last_connect_error
+
+
+async def _request_span_once(
     session: Any, span: RangeSpan, *, token: str | None = None
 ) -> bytes:
     """GET one span once; 429 is retryable, a mismatched 206 is not."""
