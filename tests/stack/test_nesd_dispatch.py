@@ -556,7 +556,12 @@ def test_reopened_stack_restores_nesd_skip_without_remeasuring(
 def test_nesd_secondary_binds_misreg_and_goes_stale_on_reinversion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A new misreg product makes NESD secondaries stale and recoregisters."""
+    """Changed misreg constants make NESD secondaries stale; identical do not.
+
+    Re-committing identical state (every process restart) keeps the write
+    id so scenes and interferograms resume; only materially new constants
+    replace the product and recoregister the secondaries.
+    """
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
     stack.date_misreg = DateMisreg(
@@ -574,6 +579,69 @@ def test_nesd_secondary_binds_misreg_and_goes_stale_on_reinversion(
     stack.coregister_scenes()
     assert len(calls) == 1
     stack._persist_misreg()
+    assert stack._misreg_write_id == first_misreg
+    stack.coregister_scenes()
+    assert len(calls) == 1
+    stack.date_misreg = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.0},
+        range_px={"20160101": 0.0, "20160113": 0.1},
+        metadata={},
+    )
+    stack._persist_misreg()
     assert stack._misreg_write_id != first_misreg
     stack.coregister_scenes()
     assert len(calls) == 2
+
+
+def test_write_misreg_keeps_write_id_for_identical_state(tmp_path: Path) -> None:
+    """Re-committing identical misreg state keeps the existing write id.
+
+    ``invert_misreg`` re-persists restored arcs and constants in every
+    process; a fresh random write id would mark every secondary scene
+    stale and cascade into stale interferograms, breaking cross-process
+    resume of coregister/interferogram stages.
+    """
+    root = tmp_path / "misreg"
+    arcs = [
+        MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=0.01,
+            range_shift_px=0.2,
+            azimuth_sigma_px=0.05,
+            range_sigma_px=0.1,
+            method="overlap",
+            n_valid=8,
+        )
+    ]
+    constants = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.01},
+        range_px={"20160101": 0.0, "20160113": 0.2},
+        metadata={"n_arcs": 1},
+    )
+
+    first = write_misreg(
+        root, arcs=arcs, date_misreg=constants, skipped_no_windows=False
+    )
+    restored = read_misreg(root)
+    assert restored is not None
+    second = write_misreg(
+        root,
+        arcs=restored.arcs,
+        date_misreg=restored.date_misreg,
+        skipped_no_windows=restored.skipped_no_windows,
+    )
+    assert second.write_id == first.write_id
+
+    changed = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.05},
+        range_px={"20160101": 0.0, "20160113": 0.2},
+        metadata={"n_arcs": 1},
+    )
+    third = write_misreg(
+        root, arcs=restored.arcs, date_misreg=changed, skipped_no_windows=False
+    )
+    assert third.write_id != first.write_id

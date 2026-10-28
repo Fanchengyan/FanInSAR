@@ -92,11 +92,17 @@ def write_misreg(
 ) -> Product:
     """Commit the misreg product, replacing any previous one.
 
+    Re-committing semantically identical state keeps the existing product
+    and its ``write_id``: ``invert_misreg`` re-persists restored arcs and
+    constants in every process, and a fresh random write id there would
+    mark every secondary scene stale and cascade into stale
+    interferograms, breaking cross-process resume.
+
     Parameters
     ----------
     root : path-like
         Product directory, ``<work_dir>/misreg``.
-    arcs : list[MisregArc]
+    arcs : list of MisregArc
         Measured pair arcs.
     date_misreg : DateMisreg or None
         Inverted per-date constants, if inverted.
@@ -117,17 +123,44 @@ def write_misreg(
             "range_px": {k: float(v) for k, v in date_misreg.range_px.items()},
             "metadata": dict(date_misreg.metadata),
         }
+    properties = {
+        "faninsar:arcs": [_arc_record(arc) for arc in arcs],
+        "faninsar:date_misreg": constants,
+        "faninsar:nesd_skipped_no_windows": bool(skipped_no_windows),
+    }
+    existing = _identical_existing_product(root, properties)
+    if existing is not None:
+        return existing
     return commit_product(
         root,
         kind=MISREG_KIND,
-        properties={
-            "faninsar:arcs": [_arc_record(arc) for arc in arcs],
-            "faninsar:date_misreg": constants,
-            "faninsar:nesd_skipped_no_windows": bool(skipped_no_windows),
-        },
+        properties=properties,
         write_payloads=lambda _staging: {},
         overwrite=True,
     )
+
+
+def _identical_existing_product(
+    root: str | Path, properties: dict[str, object]
+) -> Product | None:
+    """Return the committed misreg product when its state is identical.
+
+    An unreadable or foreign product is reported as absent so the caller
+    rewrites (repairs) it instead of reusing it.
+    """
+    from pathlib import Path
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    if not (Path(root) / "item.json").is_file():
+        return None
+    try:
+        product = open_product(root, kind=MISREG_KIND)
+    except InvalidProcessingStateError:
+        return None
+    if all(product.properties.get(key) == value for key, value in properties.items()):
+        return product
+    return None
 
 
 def read_misreg(root: str | Path) -> MisregRecord | None:
