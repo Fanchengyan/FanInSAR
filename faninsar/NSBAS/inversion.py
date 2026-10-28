@@ -1401,7 +1401,7 @@ def calculate_u(
     calculate u by loops and unwrapped interferometric phases:
 
     >>> u = np.zeros_like(unw)
-    >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used))
+    >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used, device="cpu"))
     >>> u.shape
     (6, 2)
 
@@ -1412,6 +1412,7 @@ def calculate_u(
     (6, 2)
 
     """
+    device = parse_device(device)
     unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
     C = torch.as_tensor(loops.loop_matrix(), dtype=dtype, device=device)  # noqa: N806
 
