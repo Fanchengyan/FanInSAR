@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _AIMD_SEED = 20
-_CONNECT_ATTEMPTS = 3
+_CONNECT_ATTEMPTS = 10
 _CONNECT_BACKOFF_S = 2.0
 
 
@@ -201,8 +201,12 @@ async def _request_span(
         except aiohttp.ClientConnectionError as error:
             last_connect_error = error
             logger.warning(
-                "range request connection failed; retrying",
-                extra={"label": span.label, "attempt": attempt},
+                "range request connection failed on attempt %d/%d "
+                "(label=%s): %r; retrying",
+                attempt,
+                _CONNECT_ATTEMPTS,
+                span.label,
+                error,
             )
     assert last_connect_error is not None
     raise last_connect_error
