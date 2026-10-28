@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import time
 import urllib.parse
 from collections.abc import Mapping
@@ -32,10 +31,10 @@ _ASF_ITEM = "S1D_WV_SLC__1SSV_20260903T071057_20260903T071115_004410_008296_C928
 _LPDAAC_GRANULE = "G2816843744-LPCLOUD"
 _LPDAAC_ITEM = "NASADEM_HGT_n36w121"
 _PC_ITEM = "Copernicus_DSM_COG_10_N39_00_W105_00_DEM"
-_COMMIT = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 _ROOT = Path(
     os.environ.get(
-        "FANINSAR_LIVE_REMOTE_TEST_OUTPUT_DIR", f"/private/tmp/live-remote-{_COMMIT}"
+        "FANINSAR_LIVE_REMOTE_TEST_OUTPUT_DIR",
+        str(Path(__file__).resolve().parents[2] / "tmp" / "live-remote"),
     )
 )
 _REPORT = _ROOT / "report.json"
@@ -607,7 +606,6 @@ def test_live_remote_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> No
             )
     report = {
         "test": "live-remote",
-        "commit": _COMMIT,
         "started_at": started.isoformat(),
         "finished_at": datetime.now(UTC).isoformat(),
         "lanes": lanes,
