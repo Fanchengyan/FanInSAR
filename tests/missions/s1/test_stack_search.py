@@ -120,6 +120,24 @@ def test_asf_scene_registration_uses_canonical_collection_concept() -> None:
     assert _ADAPTERS[name].query_collection == "C1214470488-ASF"
 
 
+def test_asf_burst_search_queries_burst_collection_not_s1a_slc() -> None:
+    """Burst discovery must not pin CMR to the S1A SLC concept ID."""
+    from faninsar.missions.s1.search import ensure_asf_catalog
+    from faninsar.remote.catalog import _ADAPTERS
+    from faninsar.remote.providers.asf_search import _query_parameters
+
+    ensure_asf_catalog(product_type="burst")
+    adapter = _ADAPTERS[catalog_for_product("burst")]
+    parameters = _query_parameters(
+        adapter.query_collection,
+        spatial=None,
+        datetime_range=None,
+        filters=product_filters("burst", ("VV",)),
+    )
+    assert parameters["collections"] == "C2709161906-ASF"
+    assert parameters["dataset"] == "SLC-BURST"
+
+
 def test_asf_registration_rejects_different_redirect_policy() -> None:
     """A stable catalog name cannot hide a different redirect policy."""
     from faninsar.missions.s1.search import ensure_asf_catalog
@@ -270,17 +288,20 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
         def prepare(self) -> None:
             prepared.append(True)
 
-    monkeypatch.setattr(
-        S1Stack,
-        "from_safes",
-        classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
-    )
+    captured: dict[str, object] = {}
+
+    def from_safes(_cls: object, _paths: object, **kwargs: object) -> FakeStack:
+        captured.update(kwargs)
+        return FakeStack()
+
+    monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     result = S1Stack.from_roi(
         ROI, work_dir=tmp_path, granularity="burst", provider="asf"
     )
     assert isinstance(result, FakeStack)
     assert downloaded == [tmp_path / "inputs" / "S1_TEST.zip"]
     assert prepared == [True]
+    assert captured.get("roi") == ROI
 
 
 def test_from_search_downloads_safes_concurrently_in_selection_order(

@@ -51,9 +51,13 @@ _COLLECTION_CONCEPT_IDS = {
     "sentinel-1a_slc": "C1214470488-ASF",
     "sentinel-1_slc": "C1214470488-ASF",
     "slc-burst": "C2709161906-ASF",
+    "sentinel-1c": "C3470873558-ASF",
+    "sentinel-1c_slc": "C3470873558-ASF",
     "sentinel-1d": "C4175278193-ASF",
     "sentinel-1d_slc": "C4175278193-ASF",
 }
+_BURST_COLLECTION_CONCEPT_ID = "C2709161906-ASF"
+_BURST_DATASETS = frozenset({"slc-burst", "sentinel-1_bursts"})
 _SECRET_HEADER = re.compile(
     r"(?:authorization|cookie|token|password|passwd|secret|signature|credential|api.?key)",
     re.IGNORECASE,
@@ -394,7 +398,11 @@ def _query_parameters(
             "unsupported_query_option",
             f"unsupported ASF search option(s): {sorted(unknown)!r}",
         )
-    result: dict[str, Any] = {"collections": collection, **filters}
+    query_collection = collection
+    dataset = str(filters.get("dataset", "")).casefold()
+    if dataset in _BURST_DATASETS:
+        query_collection = _BURST_COLLECTION_CONCEPT_ID
+    result: dict[str, Any] = {"collections": query_collection, **filters}
     if spatial is not None:
         result["intersectsWith"] = _geometry_wkt(spatial)
     if datetime_range is not None:

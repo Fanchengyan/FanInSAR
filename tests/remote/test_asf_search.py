@@ -352,6 +352,7 @@ def test_asf_search_translates_common_direction_and_burst_filters() -> None:
     assert module.options.values["flightDirection"] == "ASCENDING"
     assert module.options.values["dataset"] == "SLC-BURST"
     assert module.options.values["fullBurstID"] == "burst-1"
+    assert module.options.values["collections"] == "C2709161906-ASF"
 
 
 def test_asf_search_rejects_duplicate_common_filter_before_session_creation() -> None:
