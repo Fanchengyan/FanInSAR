@@ -34,12 +34,12 @@ from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
 logger = setup_logger(__name__)
 
 _EOF_NAME = re.compile(
-    r"^(?P<mission>S1[ABC])_OPER_AUX_(?P<family>POEORB|RESORB)_OPOD_"
+    r"^(?P<mission>S1[ABCD])_OPER_AUX_(?P<family>POEORB|RESORB)_OPOD_"
     r"(?P<produced>\d{8}T\d{6})_V(?P<start>\d{8}T\d{6})_"
     r"(?P<stop>\d{8}T\d{6})\.EOF$",
     re.IGNORECASE,
 )
-_MISSIONS = frozenset({"S1A", "S1B", "S1C"})
+_MISSIONS = frozenset({"S1A", "S1B", "S1C", "S1D"})
 
 
 class S1OrbitDownloadError(RuntimeError):
@@ -147,7 +147,7 @@ def select_covering_eof_keys(
     interval : tuple of datetime
         Inclusive sensing start and stop.
     mission_id : str
-        SAFE ``mission_id`` (``S1A``, ``S1B``, or ``S1C``).
+        SAFE ``mission_id`` (``S1A``, ``S1B``, ``S1C``, or ``S1D``).
 
     Returns
     -------

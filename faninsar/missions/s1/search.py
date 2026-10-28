@@ -260,8 +260,9 @@ def select_orbit_bindings(
     intervals : mapping
         Acquisition sensing intervals keyed by Stack date ID.
     mission_ids : mapping, optional
-        SAFE ``mission_id`` (``S1A``/``S1B``/``S1C``) per date ID. When
-        provided, filenames that do not start with that prefix are ignored.
+        SAFE ``mission_id`` (``S1A``/``S1B``/``S1C``/``S1D``) per date ID.
+        When provided, filenames that do not start with that prefix are
+        ignored.
     require_coverage : bool, default True
         When true, a configured candidate set must cover every interval.
         Auto-fetch uses ``False`` so uncovered dates keep SAFE-embedded
@@ -310,7 +311,9 @@ def select_orbit_bindings(
             stop = max(vector.time for vector in metadata.vectors)
             if start <= interval[0] and stop >= interval[1]:
                 name = candidate.name.upper()
-                if mission in {"S1A", "S1B", "S1C"} and not name.startswith(mission):
+                if mission in {"S1A", "S1B", "S1C", "S1D"} and not name.startswith(
+                    mission
+                ):
                     continue
                 if "POEORB" in name or "POE_ORB" in name:
                     rank = 0

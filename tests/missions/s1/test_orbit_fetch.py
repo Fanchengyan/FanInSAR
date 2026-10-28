@@ -175,6 +175,16 @@ def test_parse_eof_filename_reads_mission_family_and_validity_window() -> None:
     assert parsed.valid_stop == datetime(2016, 12, 9, 0, 59, 43, tzinfo=UTC)
 
 
+def test_parse_eof_filename_accepts_s1d_prefix() -> None:
+    """Sentinel-1D covering EOFs share the ESA AUX_*ORB grammar."""
+    parsed = parse_eof_filename(
+        "S1D_OPER_AUX_POEORB_OPOD_20240102T000000_V20231231T230000_20240101T010000.EOF"
+    )
+    assert parsed is not None
+    assert parsed.mission_id == "S1D"
+    assert parsed.family == "POEORB"
+
+
 def test_select_covering_keys_keeps_only_the_scene_interval() -> None:
     """Neighboring validity windows are not selected for download."""
     selected = select_covering_eof_keys(
