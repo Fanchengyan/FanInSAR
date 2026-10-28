@@ -483,6 +483,6 @@ def test_frame_geometry_record_matches_unit_placement_for_iw1_to_iw3(
                 (sensing - earliest).total_seconds() / first.azimuth_time_interval_s
             )
             assert row == expected
-            assert geometry.azimuth_time(row) - sensing == pytest.approx(
-                timedelta(0), abs=timedelta(seconds=first.azimuth_time_interval_s)
-            )
+            assert (
+                geometry.azimuth_time(row) - sensing
+            ).total_seconds() == pytest.approx(0.0, abs=first.azimuth_time_interval_s)
