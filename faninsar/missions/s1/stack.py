@@ -799,6 +799,7 @@ class S1Stack(Stack):
             kwargs["orbit_paths"] = orbit_paths
         if calibration_paths is not None:
             kwargs["calibration_paths"] = calibration_paths
+        kwargs.setdefault("roi", spatial)
         kwargs["extra"] = extra
         stack = cls.from_safes(
             local_paths,
