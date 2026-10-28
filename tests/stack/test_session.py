@@ -239,10 +239,18 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
     assert first == second
 
 
+def test_stack_runtime_identity_omits_git_revision() -> None:
+    """Git revision is provenance, so it is not hashed into resume identity."""
+    from faninsar.stack import session as session_module
+
+    identity = session_module._stack_runtime_identity(None)
+    assert "faninsar_git_revision" not in identity
+
+
 def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Runtime and callback identity changes cannot reuse coregistration."""
+    """Runtime image, CUDA, and callback changes cannot reuse coregistration."""
     from faninsar.stack import session as session_module
 
     stack = _stack_with_three_date_network(tmp_path)
@@ -254,18 +262,6 @@ def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
 
     monkeypatch.setattr(
         session_module,
-        "_faninsar_git_revision",
-        lambda: "different-revision",
-    )
-    changed_revision = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-    assert changed_revision != initial
-
-    monkeypatch.setattr(
-        session_module,
         "_runtime_image_identity",
         lambda: {"platform": "different-runtime-image"},
     )
@@ -274,7 +270,7 @@ def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
         misreg_az_px=0.0,
         misreg_rg_px=0.0,
     )
-    assert changed_image != changed_revision
+    assert changed_image != initial
 
     monkeypatch.setattr(
         session_module,

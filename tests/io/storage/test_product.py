@@ -53,6 +53,38 @@ def test_commit_and_open_roundtrip(tmp_path: Path) -> None:
     assert len(product.write_id) == 26
 
 
+def test_commit_records_git_revision_as_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkout SHA is recorded on the product and is not a reuse key."""
+    from faninsar.io.storage import product as product_module
+
+    monkeypatch.setattr(product_module, "faninsar_git_revision", lambda: "a" * 40)
+    product = commit_product(
+        tmp_path / "p",
+        kind="scene",
+        properties={"faninsar:date": "20240101"},
+        write_payloads=_write_arrays({"a": np.ones((1, 1), dtype=np.float32)}),
+    )
+    assert product.properties["faninsar:git_revision"] == "a" * 40
+
+
+def test_commit_omits_git_revision_when_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Installed wheels without a checkout omit the provenance field."""
+    from faninsar.io.storage import product as product_module
+
+    monkeypatch.setattr(product_module, "faninsar_git_revision", lambda: None)
+    product = commit_product(
+        tmp_path / "p",
+        kind="scene",
+        properties={},
+        write_payloads=_write_arrays({"a": np.ones((1, 1), dtype=np.float32)}),
+    )
+    assert "faninsar:git_revision" not in product.properties
+
+
 def test_every_commit_gets_a_fresh_write_id(tmp_path: Path) -> None:
     """Overwriting with identical bytes still mints a new write id."""
     target = tmp_path / "p"

@@ -17,7 +17,6 @@ import importlib.metadata
 import json
 import os
 import platform
-import re
 import sys
 import sysconfig
 from collections.abc import Iterable, Mapping
@@ -494,90 +493,6 @@ def _loaded_module_version(names: tuple[str, ...]) -> str | None:
     return None
 
 
-_GIT_REVISION_CACHE: dict[str, str | None] = {}
-_GIT_REVISION_SENTINEL: object = object()
-
-
-def _read_git_revision(repository: Path) -> str | None:
-    """Read the checked-out revision of a git repository without subprocess.
-
-    Only plain checkouts (``.git/HEAD`` pointing at a ref file, or a detached
-    ``.git/HEAD``) are resolved; anything else returns ``None``.  The result
-    is deterministic for a given checkout, unlike a ``git`` subprocess whose
-    availability depends on the calling environment.
-    """
-    git_dir = repository / ".git"
-    if git_dir.is_file():
-        text = git_dir.read_text(encoding="utf-8", errors="replace").strip()
-        marker = "gitdir: "
-        if not text.startswith(marker):
-            return None
-        git_dir = repository / text[len(marker) :].strip()
-    head = git_dir / "HEAD"
-    if not head.is_file():
-        return None
-    value = head.read_text(encoding="utf-8", errors="replace").strip()
-    if re.fullmatch(r"[0-9a-f]{40}", value):
-        return value
-    if not value.startswith("ref: "):
-        return None
-    return _read_git_ref(git_dir, value[len("ref: ") :].strip())
-
-
-def _read_git_ref(git_dir: Path, ref: str) -> str | None:
-    """Resolve one git ref name to a commit id, loose file or packed."""
-    if not re.fullmatch(r"[A-Za-z0-9/._-]+", ref):
-        return None
-    for candidate in (git_dir, _common_git_dir(git_dir)):
-        if candidate is None:
-            continue
-        ref_file = candidate / ref
-        if ref_file.is_file():
-            resolved = ref_file.read_text(encoding="utf-8", errors="replace").strip()
-            if resolved:
-                return resolved
-        packed = candidate / "packed-refs"
-        if packed.is_file():
-            for line in packed.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines():
-                if line.strip().endswith(f" {ref}"):
-                    return line.split()[0]
-    return None
-
-
-def _common_git_dir(git_dir: Path) -> Path | None:
-    """Return the common git directory of a possible worktree git dir."""
-    commondir = git_dir / "commondir"
-    if not commondir.is_file():
-        return None
-    value = commondir.read_text(encoding="utf-8", errors="replace").strip()
-    if not value:
-        return None
-    common = Path(value)
-    return common if common.is_absolute() else (git_dir / common).resolve()
-
-
-def _faninsar_git_revision() -> str | None:
-    """Return the enclosing FanInSAR Git revision, when the checkout has one.
-
-    The revision is resolved once per process: it cannot change while that
-    process runs, and resume identities must not depend on a transient
-    subprocess failure.
-    """
-    cached = _GIT_REVISION_CACHE.get("revision", _GIT_REVISION_SENTINEL)
-    if cached is not _GIT_REVISION_SENTINEL:
-        return cached  # type: ignore[return-value]
-    repository = Path(__file__).resolve().parents[2]
-    revision = None
-    try:
-        revision = _read_git_revision(repository)
-    except OSError:
-        revision = None
-    _GIT_REVISION_CACHE["revision"] = revision
-    return revision
-
-
 def _distribution_version(names: tuple[str, ...]) -> str | None:
     """Read the first installed distribution version from a name allowlist."""
     for name in names:
@@ -778,7 +693,6 @@ def _stack_runtime_identity(callback: object | None) -> dict[str, object]:
     if compiler:
         compiler_name = Path(str(compiler).split()[0]).name
     return {
-        "faninsar_git_revision": _faninsar_git_revision(),
         "versions": {
             "faninsar": _distribution_version(("FanInSAR", "faninsar")),
             "nisar": _distribution_version(("nisar", "nisar-products"))

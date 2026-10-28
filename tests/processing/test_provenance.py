@@ -7,9 +7,12 @@ import pytest
 import yaml
 
 from faninsar.io.storage.provenance import (
+    _GIT_REVISION_CACHE,
     ProcessingEvent,
     ProvenanceRecord,
     SoftwareIdentity,
+    _read_git_revision,
+    faninsar_git_revision,
 )
 from faninsar.io.storage.validation import (
     ManifestValidationError,
@@ -78,6 +81,47 @@ def test_provenance_rejects_malformed_nested_parameters() -> None:
 
     with pytest.raises(InvalidProcessingStateError, match="valid provenance JSON"):
         ProvenanceRecord.from_json(malformed)
+
+
+def test_read_git_revision_from_detached_head(tmp_path: Path) -> None:
+    """A detached checkout reports the SHA in ``.git/HEAD``."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
+    assert _read_git_revision(tmp_path) == "a" * 40
+
+
+def test_read_git_revision_from_branch_ref(tmp_path: Path) -> None:
+    """A branch checkout follows ``HEAD`` to the loose ref file."""
+    git_dir = tmp_path / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text("b" * 40 + "\n", encoding="utf-8")
+    assert _read_git_revision(tmp_path) == "b" * 40
+
+
+def test_faninsar_git_revision_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The process-wide lookup is resolved once and then reused."""
+    from faninsar.io.storage import provenance as provenance_module
+
+    calls = {"n": 0}
+
+    def fake_read(_repository: Path) -> str:
+        calls["n"] += 1
+        return "c" * 40
+
+    monkeypatch.setattr(provenance_module, "_read_git_revision", fake_read)
+    _GIT_REVISION_CACHE.clear()
+    try:
+        first = faninsar_git_revision()
+        second = faninsar_git_revision()
+    finally:
+        _GIT_REVISION_CACHE.clear()
+    assert first == "c" * 40
+    assert second == first
+    assert calls["n"] == 1
 
 
 def test_rebuild_manifest_rejects_mutated_checksum(tmp_path: Path) -> None:
