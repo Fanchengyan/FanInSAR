@@ -227,6 +227,12 @@ def burst_geo_quad_lonlat(
     if dem is not None and not bool(ok.all()):
         # Stack DEMs are ROI-bounded while the quad corners are full-burst
         # edges; corners the DEM cannot bracket fall back to the ellipsoid.
+        logger.warning(
+            "burst quad corners off the DEM footprint fall back to the "
+            "ellipsoid: %d of %d corner(s) re-solved without terrain",
+            int((~ok).sum()),
+            int(ok.size),
+        )
         fallback = run_rdr2geo(
             geometry,
             points[~ok, 0],
