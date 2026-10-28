@@ -25,7 +25,7 @@ from faninsar.missions.s1.processing import (
     _radar_model,
     _scene_id,
 )
-from faninsar.missions.s1.safe import open_safe_product
+from faninsar.missions.s1.safe import open_acquisition_products
 from faninsar.processing.coregistration.ampcor_backend import AmpcorCandidateError
 from faninsar.processing.coregistration.dense_geometry import dense_geometry_offsets
 from faninsar.processing.coregistration.esd_overlap import (
@@ -135,8 +135,8 @@ def measure_s1_pair_misreg(
         )
     primary_id = _scene_id(primary_paths[0])
     secondary_id = _scene_id(secondary_paths[0])
-    primary_products = [open_safe_product(path) for path in primary_paths]
-    secondary_products = [open_safe_product(path) for path in secondary_paths]
+    primary_products = open_acquisition_products(primary_paths)
+    secondary_products = open_acquisition_products(secondary_paths)
     swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
     resolved = _resolve_common_bursts(
         primary_products,

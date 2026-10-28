@@ -158,8 +158,8 @@ def test_measure_s1_pair_misreg_no_windows_omits_both_axes(
         secondary: _product(secondary, _burst(0, start_line=0)),
     }
     monkeypatch.setattr(
-        "faninsar.missions.s1.measure.open_safe_product",
-        lambda path, **_kwargs: products[Path(path)],
+        "faninsar.missions.s1.measure.open_acquisition_products",
+        lambda paths, **_kwargs: [products[Path(path)] for path in paths],
     )
 
     arc = measure_s1_pair_misreg(primary, secondary, dem=ConstantDEM(0.0))
@@ -192,8 +192,8 @@ def test_measure_s1_pair_misreg_empty_ampcor_omits_range_keeps_azimuth(
         ),
     }
     monkeypatch.setattr(
-        "faninsar.missions.s1.measure.open_safe_product",
-        lambda path, **_kwargs: products[Path(path)],
+        "faninsar.missions.s1.measure.open_acquisition_products",
+        lambda paths, **_kwargs: [products[Path(path)] for path in paths],
     )
 
     def fake_observe(*_args: object, **_kwargs: object) -> tuple[object, object]:
