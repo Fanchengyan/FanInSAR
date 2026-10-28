@@ -92,12 +92,18 @@ def native_spacing_deg(product: object | None) -> float:
     return _NATIVE_SPACING_DEG.get(key, _GLO30_SPACING_DEG)
 
 
-def geodetic_crop_grid(coverage: GridSpec, spacing_deg: float) -> GridSpec:
+def geodetic_crop_grid(
+    coverage: GridSpec,
+    spacing_deg: float,
+    extra_bounds: tuple[float, float, float, float] | None = None,
+) -> GridSpec:
     """Build a native-spacing EPSG:4326 grid covering ``coverage``.
 
     The lon/lat bounding box of ``coverage`` is snapped outward onto the
     source pixel lattice.  Pixel size is the native DEM spacing, not the
-    Stack product ``resolution_m``.
+    Stack product ``resolution_m``.  ``extra_bounds`` expands that box so a
+    processing-domain crop can cover a working frame larger than the public
+    product grid.
 
     Parameters
     ----------
@@ -105,6 +111,9 @@ def geodetic_crop_grid(coverage: GridSpec, spacing_deg: float) -> GridSpec:
         Public Stack grid, typically projected.
     spacing_deg : float
         Positive geographic pixel size in degrees.
+    extra_bounds : tuple of float, optional
+        Additional WGS84 ``(west, south, east, north)`` envelope unioned
+        with ``coverage`` before snapping.
 
     Returns
     -------
@@ -114,7 +123,8 @@ def geodetic_crop_grid(coverage: GridSpec, spacing_deg: float) -> GridSpec:
     Raises
     ------
     ValueError
-        If ``spacing_deg`` is not a finite positive number.
+        If ``spacing_deg`` is not a finite positive number, or
+        ``extra_bounds`` is present but not four finite ordered values.
 
     """
     spacing = float(spacing_deg)
@@ -123,6 +133,28 @@ def geodetic_crop_grid(coverage: GridSpec, spacing_deg: float) -> GridSpec:
         logger.error(message)
         raise ValueError(message)
     west, south, east, north = _geodetic_bounds(coverage)
+    if extra_bounds is not None:
+        try:
+            extra_west, extra_south, extra_east, extra_north = (
+                float(value) for value in extra_bounds
+            )
+        except (TypeError, ValueError) as error:
+            message = "extra_bounds must contain four finite WGS84 values"
+            logger.exception(message)
+            raise ValueError(message) from error
+        extra = (extra_west, extra_south, extra_east, extra_north)
+        if len(extra_bounds) != 4 or not np.all(np.isfinite(extra)):
+            message = "extra_bounds must contain four finite WGS84 values"
+            logger.error(message)
+            raise ValueError(message)
+        if extra_west >= extra_east or extra_south >= extra_north:
+            message = "extra_bounds must be ordered west, south, east, north"
+            logger.error(message)
+            raise ValueError(message)
+        west = min(west, extra_west)
+        south = min(south, extra_south)
+        east = max(east, extra_east)
+        north = max(north, extra_north)
     inverse = 1.0 / spacing
     west_s = float(np.floor(west * inverse + 1.0e-9) * spacing)
     north_s = float(np.ceil(north * inverse - 1.0e-9) * spacing)

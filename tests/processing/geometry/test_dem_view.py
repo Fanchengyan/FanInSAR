@@ -41,6 +41,26 @@ def test_geodetic_crop_snaps_utm_bounds_to_source_pixels() -> None:
     assert grid.height >= 6
 
 
+def test_geodetic_crop_unions_roi_grid_with_working_frame_bounds() -> None:
+    """A small public grid plus a larger working-frame envelope covers the frame."""
+    roi = GridSpec(
+        "EPSG:4326",
+        Affine(0.001, 0.0, 10.0, 0.0, -0.001, 40.05),
+        height=50,
+        width=50,
+    )
+    frame = (9.5, 39.5, 11.0, 41.0)
+    grid = geodetic_crop_grid(roi, 1.0 / 3600.0, frame)
+    west, south, east, north = grid.bounds
+    assert west <= 9.5
+    assert south <= 39.5
+    assert east >= 11.0
+    assert north >= 41.0
+    roi_only = geodetic_crop_grid(roi, 1.0 / 3600.0)
+    assert roi_only.bounds[0] > 9.5
+    assert roi_only.bounds[2] < 11.0
+
+
 def test_lonlat_view_keeps_geodetic_affine_in_degrees() -> None:
     """An EPSG:4326 RasterDEM is used as-is."""
     grid = GridSpec(

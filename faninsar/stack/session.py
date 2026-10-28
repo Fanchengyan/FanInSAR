@@ -2137,31 +2137,90 @@ class Stack(NetworkContract):
             self._persist_raster_dem(raster)
         return raster
 
+    def _working_frame_bounds(self) -> tuple[float, float, float, float] | None:
+        """Return WGS84 bounds of selected acquisition footprints, if any."""
+        geometry = self._selected_footprint_roi()
+        if geometry is None:
+            return None
+        bounds = getattr(geometry, "bounds", None)
+        if bounds is None:
+            return None
+        try:
+            west, south, east, north = (float(value) for value in bounds)
+        except (TypeError, ValueError):
+            return None
+        if (
+            west >= east
+            or south >= north
+            or not np.all(np.isfinite((west, south, east, north)))
+        ):
+            return None
+        return west, south, east, north
+
+    @staticmethod
+    def _geodetic_covers(
+        actual: tuple[float, float, float, float],
+        required: tuple[float, float, float, float],
+    ) -> bool:
+        """Return whether ``actual`` WGS84 bounds cover ``required``."""
+        tolerance = 1.0e-8
+        return (
+            actual[0] <= required[0] + tolerance
+            and actual[1] <= required[1] + tolerance
+            and actual[2] >= required[2] - tolerance
+            and actual[3] >= required[3] - tolerance
+        )
+
     def _ensure_wgs84_dem(self, raster: RasterDEM) -> None:
-        """Materialize a native-spacing geographic crop for rdr2geo."""
+        """Materialize a native-spacing geographic crop for rdr2geo.
+
+        The public product raster stays on the Stack grid.  The geometry crop
+        unions that grid with selected acquisition footprints so burst-corner
+        rdr2geo stays on DEM even when the user-visible extent is a smaller
+        ROI.
+        """
         from faninsar.processing.geometry.dem_view import (
             geodetic_crop_grid,
             is_geodetic_crs,
             native_spacing_deg,
         )
 
-        if is_geodetic_crs(raster.crs):
-            self._dem_wgs84 = raster
-            return
+        extra = self._working_frame_bounds()
         loaded = self._load_persisted_wgs84_dem()
-        if loaded is not None:
+        if loaded is not None and (
+            extra is None or self._geodetic_covers(loaded.grid.bounds, extra)
+        ):
             self._dem_wgs84 = loaded
             logger.info("Reusing geographic DEM %s", self._stack_wgs84_raster_path())
             return
+        if is_geodetic_crs(raster.crs) and (
+            extra is None or self._geodetic_covers(raster.grid.bounds, extra)
+        ):
+            self._dem_wgs84 = raster
+            return
         source = self._dem_source
         if source is None:
-            self._dem_wgs84 = None
+            self._dem_wgs84 = raster if is_geodetic_crs(raster.crs) else None
+            if extra is not None and not (
+                is_geodetic_crs(raster.crs)
+                and self._geodetic_covers(raster.grid.bounds, extra)
+            ):
+                logger.warning(
+                    "Working-frame DEM needs coverage %s but no source recipe "
+                    "is available; geometry uses the public raster",
+                    extra,
+                )
             return
         cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
         if source.cache_dir is None:
             source.cache_dir = cache_dir
         product = raster.provenance.get("product") or source.product
-        grid = geodetic_crop_grid(self.grid, native_spacing_deg(product))
+        coverage = raster.grid if is_geodetic_crs(raster.crs) else self.grid
+        grid = geodetic_crop_grid(
+            coverage,
+            native_spacing_deg(product),
+            extra,
+        )
         logger.info("Materializing geographic DEM from source tiles onto %s", grid.crs)
         self._dem_wgs84 = source.to_raster(
             grid,

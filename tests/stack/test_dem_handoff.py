@@ -147,3 +147,137 @@ def test_prepare_writes_native_wgs84_from_source(
     assert reopened._dem_wgs84 is not None
     assert str(reopened._dem_wgs84.crs) == "EPSG:4326"
     assert len(grids) == n_materialize
+
+
+def _fake_source_to_raster(
+    grids: list[GridSpec],
+) -> object:
+    """Record every materialization grid and return a matching raster."""
+
+    def _fake_to_raster(
+        _self: SourceDEM,
+        grid: GridSpec,
+        **_kwargs: object,
+    ) -> RasterDEM:
+        grids.append(grid)
+        return RasterDEM(
+            array=np.full(grid.shape, 100.0, dtype=np.float32),
+            grid=grid,
+            vertical_datum="ellipsoidal",
+            provenance={"product": "glo30", "provider": "pc"},
+        )
+
+    return _fake_to_raster
+
+
+def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Processing-domain DEM covers selected footprints; public DEM stays on the ROI."""
+    from faninsar.data.query.bbox import BoundingBox
+
+    roi = BoundingBox(10.0, 40.0, 10.05, 40.05, crs="EPSG:4326")
+    frame = (9.5, 39.5, 11.0, 41.0)
+    cache = tmp_path / "dem-cache"
+    cache.mkdir()
+    source = DEM.from_source("auto", cache_dir=cache)
+    grids: list[GridSpec] = []
+    monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
+
+    work = tmp_path / "work-frame"
+    stack = Stack._from_safes(
+        _dummy_safes(tmp_path),
+        work_dir=work,
+        dem=source,
+        roi=roi,
+        dem_cache_dir=cache,
+    )
+    stack.config.extra["selected_footprints"] = (frame,)
+    stack.prepare()
+
+    public = stack.dem
+    assert isinstance(public, RasterDEM)
+    public_west, public_south, public_east, public_north = public.grid.bounds
+    if str(public.grid.crs) != "EPSG:4326":
+        from pyproj import Transformer
+
+        transformer = Transformer.from_crs(public.grid.crs, "EPSG:4326", always_xy=True)
+        lons, lats = transformer.transform(
+            [public_west, public_east, public_west, public_east],
+            [public_south, public_south, public_north, public_north],
+        )
+        public_west, public_east = min(lons), max(lons)
+        public_south, public_north = min(lats), max(lats)
+    assert public_east - public_west < 0.2
+    assert public_north - public_south < 0.2
+
+    wgs84 = stack._dem_wgs84
+    assert wgs84 is not None
+    west, south, east, north = wgs84.grid.bounds
+    assert west <= 9.5
+    assert south <= 39.5
+    assert east >= 11.0
+    assert north >= 41.0
+    assert (work / "dem" / "stack.tif").is_file()
+    assert (work / "dem" / "stack_wgs84.tif").is_file()
+    assert any(str(grid.crs) == "EPSG:4326" and grid.bounds[0] <= 9.5 for grid in grids)
+
+
+def test_geographic_roi_grid_builds_larger_processing_dem(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """An EPSG:4326 ROI product grid still gets a working-frame geometry DEM."""
+    roi_grid = GridSpec(
+        crs="EPSG:4326",
+        transform=Affine(0.001, 0.0, 10.0, 0.0, -0.001, 40.05),
+        height=50,
+        width=50,
+    )
+    frame = (9.5, 39.5, 11.0, 41.0)
+    cache = tmp_path / "dem-cache"
+    cache.mkdir()
+    source = DEM.from_source("auto", cache_dir=cache)
+    grids: list[GridSpec] = []
+    monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
+
+    work = tmp_path / "work-geo-frame"
+    stack = Stack._from_safes(
+        _dummy_safes(tmp_path),
+        work_dir=work,
+        dem=source,
+        grid=roi_grid,
+        dem_cache_dir=cache,
+    )
+    stack.config.extra["selected_footprints"] = (frame,)
+    stack.prepare()
+
+    public = stack.dem
+    assert isinstance(public, RasterDEM)
+    assert public.grid == roi_grid
+    wgs84 = stack._dem_wgs84
+    assert wgs84 is not None
+    west, south, east, north = wgs84.grid.bounds
+    assert west <= 9.5
+    assert south <= 39.5
+    assert east >= 11.0
+    assert north >= 41.0
+    assert wgs84.grid != roi_grid
+    n_materialize = len(grids)
+
+    reopened = Stack._from_safes(
+        _dummy_safes(tmp_path),
+        work_dir=work,
+        dem=source,
+        grid=roi_grid,
+        dem_cache_dir=cache,
+    )
+    reopened.prepare()
+    restored = reopened._dem_wgs84
+    assert restored is not None
+    west, south, east, north = restored.grid.bounds
+    assert west <= 9.5
+    assert south <= 39.5
+    assert east >= 11.0
+    assert north >= 41.0
+    assert reopened.dem.grid == roi_grid
+    assert len(grids) == n_materialize
