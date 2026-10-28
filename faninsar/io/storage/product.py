@@ -6,8 +6,6 @@ written last, and the directory is renamed into place, so a present
 ``item.json`` is the only completion signal. Every commit stamps a fresh
 ``faninsar:write_id``; dependents record the write ids of the upstream
 products they consumed and become stale when an upstream is replaced.
-When FanInSAR is running from a Git checkout, the commit also records
-``faninsar:git_revision`` as provenance. That SHA is not a resume key.
 """
 
 from __future__ import annotations
@@ -23,7 +21,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.io.storage._zarr_stac import digest_path, read_zarr_array
-from faninsar.io.storage.provenance import faninsar_git_revision
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
@@ -257,28 +254,24 @@ class ProductWriter:
                 entry.setdefault("roles", ["data"])
                 entry["file:checksum"] = digest_path(self.staging / entry["href"])
                 assets[name] = entry
-            header: dict[str, Any] = {
-                **dict(properties),
-                "datetime": None,
-                "faninsar:kind": self.kind,
-                "faninsar:write_id": write_id,
-                "faninsar:inputs": {
-                    str(name): (
-                        value.write_id if isinstance(value, Product) else str(value)
-                    )
-                    for name, value in (inputs or {}).items()
-                },
-            }
-            revision = faninsar_git_revision()
-            if revision is not None:
-                header["faninsar:git_revision"] = revision
             item = {
                 "stac_version": "1.0.0",
                 "type": "Feature",
                 "id": f"{self.kind}-{self.target.name}",
                 "geometry": None,
                 "bbox": None,
-                "properties": header,
+                "properties": {
+                    **dict(properties),
+                    "datetime": None,
+                    "faninsar:kind": self.kind,
+                    "faninsar:write_id": write_id,
+                    "faninsar:inputs": {
+                        str(name): (
+                            value.write_id if isinstance(value, Product) else str(value)
+                        )
+                        for name, value in (inputs or {}).items()
+                    },
+                },
                 "assets": assets,
                 "links": [],
             }
