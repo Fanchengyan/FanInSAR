@@ -1412,16 +1412,15 @@ def calculate_u(
     (6, 2)
 
     """
-    C = loops.loop_matrix()  # noqa: N806
+    unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
+    C = torch.as_tensor(loops.loop_matrix(), dtype=dtype, device=device)  # noqa: N806
 
     # edge pairs are not contributing to the loop closure phase, remove them
     # from the matrix C to avoid being involved in the calculation of u
-    mask = loops.pairs.where(loops.diagonal_pairs)
+    mask = torch.as_tensor(
+        loops.pairs.where(loops.diagonal_pairs), dtype=torch.long, device=device
+    )
     Cc = C[:, mask]  # noqa: N806
-
-    C = torch.as_tensor(C, dtype=dtype, device=device)  # noqa: N806
-    unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
-    Cc = torch.as_tensor(Cc, dtype=dtype, device=device)  # noqa: N806
 
     closure_phase = torch.mm(C, unw_phases)
 
