@@ -494,7 +494,12 @@ class TripletLoops:
         """
         if target == "pairs":
             return pd.DataFrame(
-                zip(self.pairs12.values, self.pairs23.values, self.pairs13.values),
+                zip(
+                    self.pairs12.values,
+                    self.pairs23.values,
+                    self.pairs13.values,
+                    strict=False,
+                ),
                 columns=["pair12", "pair23", "pair13"],
             )
         if target == "dates":
@@ -754,7 +759,15 @@ class Loop:
 
 
 class Loops:
-    """Loops class to handle loops with multiple acquisitions."""
+    """Loops class to handle loops with multiple acquisitions.
+
+    The loops are stored as a padded date-index matrix over a shared
+    sorted date array. All metadata (loop names, pairs, edge pairs,
+    diagonal pairs, and the design-matrix entry locations) is built once
+    with vectorized operations. Individual :class:`Loop` objects are
+    only constructed when they are actually accessed through indexing,
+    iteration, or the :attr:`loops` property.
+    """
 
     def __init__(self, loops: list, sort: bool = True) -> None:
         """Initialize the loops class.
@@ -767,16 +780,104 @@ class Loops:
             Whether to sort the loops. Default is True.
 
         """
-        self._loops = np.array(loops, dtype=object)
-        self._parse_loop_meta()
+        loops = list(loops)
+        if not loops:
+            self._dates = np.array([], dtype="M8[D]")
+            self._date_idx = np.zeros((0, 3), dtype=np.int64)
+        else:
+            self._dates = np.unique(
+                np.concatenate([np.asarray(loop.values) for loop in loops])
+            )
+            max_len = max(len(loop) for loop in loops)
+            self._date_idx = np.full((len(loops), max_len), -1, dtype=np.int64)
+            for i, loop in enumerate(loops):
+                idx = np.searchsorted(self._dates, np.asarray(loop.values))
+                self._date_idx[i, : len(loop)] = idx
+        self._init_meta(sort=sort)
+
+    @classmethod
+    def from_date_indices(
+        cls,
+        date_idx: NDArray[np.int64],
+        dates: NDArray[np.datetime64],
+        sort: bool = True,
+    ) -> Loops:
+        """Build Loops from a padded date-index matrix without Loop objects.
+
+        Parameters
+        ----------
+        date_idx : np.ndarray
+            ``(n_loops, max_len)`` integer matrix of date indices into
+            ``dates``. Variable-length loops are padded at the end with
+            ``-1``.
+        dates : np.ndarray
+            Sorted date array (``datetime64``) that the indices refer to.
+        sort : bool, optional
+            Whether to sort the loops by name. Default is True.
+
+        Returns
+        -------
+        Loops
+            The Loops object.
+
+        """
+        loops = cls.__new__(cls)
+        loops._dates = np.asarray(dates, dtype="M8[D]")
+        loops._date_idx = np.asarray(date_idx, dtype=np.int64)
+        loops._init_meta(sort=sort)
+        return loops
+
+    def _init_meta(self, sort: bool = True) -> None:
+        """Compute names, pair sets, and matrix entry locations vectorized."""
+        rows = self._date_idx
+        self._length = len(rows)
+        self._loops_cache = None
+
+        if self._length == 0:
+            self._names = np.array([], dtype="<U17")
+            self._pairs = Pairs.from_names([])
+            self._edge_pairs = Pairs.from_names([])
+            self._diagonal_pairs = Pairs.from_names([])
+            self._edge_rows = np.array([], dtype=np.int64)
+            self._edge_cols = np.array([], dtype=np.int64)
+            self._diag_rows = np.array([], dtype=np.int64)
+            self._diag_cols = np.array([], dtype=np.int64)
+            return
+
+        date_str = np.char.replace(
+            np.datetime_as_string(self._dates, unit="D"), "-", ""
+        )
+        lengths = (rows >= 0).sum(axis=1)
+        self._names = np.array(
+            ["_".join(date_str[row[row >= 0]].tolist()) for row in rows]
+        )
+
+        edge_u = rows[:, :-1]
+        edge_v = rows[:, 1:]
+        edge_valid = (edge_u >= 0) & (edge_v >= 0)
+        self._edge_rows = np.repeat(np.arange(self._length), rows.shape[1] - 1)[
+            edge_valid.ravel()
+        ]
+        edge_names = np.char.add(
+            date_str[edge_u[edge_valid]],
+            np.char.add("_", date_str[edge_v[edge_valid]]),
+        )
+        last_dates = rows[np.arange(self._length), lengths - 1]
+        diag_names = np.char.add(
+            date_str[rows[:, 0]], np.char.add("_", date_str[last_dates])
+        )
+
+        pair_names = np.concatenate([edge_names, diag_names])
+        unique_pairs = np.unique(pair_names)
+        self._pairs = Pairs.from_names(unique_pairs.tolist())
+        self._edge_pairs = Pairs.from_names(np.unique(edge_names).tolist())
+        self._diagonal_pairs = Pairs.from_names(np.unique(diag_names).tolist())
+        self._edge_cols = np.searchsorted(unique_pairs, edge_names)
+        self._diag_cols = np.searchsorted(unique_pairs, diag_names)
+        self._diag_rows = np.arange(self._length)
 
         if sort:
             self.sort()
-
-    def _parse_loop_meta(self) -> None:
-        self._length = len(self._loops)
-        self._names = np.array([i.name for i in self.loops])
-        self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
 
     def __str__(self) -> str:
         """Return the string representation of the loops."""
@@ -802,42 +903,34 @@ class Loops:
         return self._length
 
     def __getitem__(self, index: int) -> Loop:
-        """Return the loop by index."""
-        return self.loops[index]
+        """Return the loop by index, constructing it on demand."""
+        return self._make_loop(index)
 
     def __iter__(self) -> iter[Loop]:
-        """Iterate the loops."""
+        """Iterate the loops, constructing each Loop on demand."""
         return iter(self.loops)
 
     def __contains__(self, item: Loop) -> bool:
-        """Check if the item is in the loops."""
-        return item in self.loops
+        """Check if the item is in the loops by name."""
+        return item.name in self._names
 
-    def _parse_pairs(self) -> tuple[Pairs, Pairs, Pairs]:
-        """Parse the pairs in the loops.
-
-        Returns
-        -------
-        (Pairs, Pairs, Pairs) : all pairs, edge pairs, and diagonal pairs
-
-        """
-        pairs = []
-        edge_pairs = []
-        diagonal_pairs = []
-        for loop in self.loops:
-            pairs.extend(loop.pairs)
-            edge_pairs.extend(loop.pairs[:-1])
-            diagonal_pairs.extend(loop.pairs[-1:])
-        return (
-            Pairs(pairs, sort=True),
-            Pairs(edge_pairs, sort=True),
-            Pairs(diagonal_pairs, sort=True),
-        )
+    def _make_loop(self, index: int) -> Loop:
+        """Build a single Loop object from one row of the date matrix."""
+        row = self._date_idx[index]
+        return Loop(self._dates[row[row >= 0]])
 
     @property
     def loops(self) -> NDArray[np.object_]:
-        """The loops in the numpy array format."""
-        return self._loops
+        """The loops in the numpy array format.
+
+        Every :class:`Loop` object is constructed here, once, and cached.
+        """
+        if self._loops_cache is None:
+            self._loops_cache = np.array(
+                [self._make_loop(i) for i in range(self._length)],
+                dtype=object,
+            )
+        return self._loops_cache
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -865,7 +958,7 @@ class Loops:
         return self._diagonal_pairs
 
     def sort(self, ascending: bool = True, inplace: bool = True) -> Loops | None:
-        """Sort the loops.
+        """Sort the loops by name.
 
         Parameters
         ----------
@@ -876,27 +969,38 @@ class Loops:
             Default is True.
 
         """
-        names = self.names
-        _, _index = np.unique(names, return_index=True)
+        if self._length == 0:
+            if inplace:
+                return None
+            return Loops.from_date_indices(self._date_idx, self._dates, sort=False)
+        _, index = np.unique(self._names, return_index=True)
         if not ascending:
-            _index = _index[::-1]
+            index = index[::-1]
         if inplace:
-            self._loops = self._loops[_index]
-            self._parse_loop_meta()
+            self._reindex(index)
             return None
-        return Loops(self._loops[_index])
+        return Loops.from_date_indices(self._date_idx[index], self._dates, sort=False)
+
+    def _reindex(self, index: NDArray[np.int64]) -> None:
+        """Reorder all array-backed metadata by the given row index."""
+        position = np.empty(self._length, dtype=np.int64)
+        position[index] = np.arange(len(index))
+        self._date_idx = self._date_idx[index]
+        self._names = self._names[index]
+        self._edge_rows = position[self._edge_rows]
+        self._diag_rows = position[self._diag_rows]
+        self._length = len(index)
+        self._loops_cache = None
 
     def loop_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
         """Return a design matrix describes the relationship between loops and pairs.
 
         The rows and columns of this matrix are loops and pairs respectively.
         The values of the matrix are 1 for the edge pairs, -1 for the diagonal
-        pairs, and 0 otherwise.
+        pairs, and 0 otherwise. The matrix is filled by a vectorized scatter
+        of the precomputed entry locations.
         """
-        loop_pairs_ls = [i.pairs.names for i in self.loops]
-        all_pairs = self.pairs.names
-        matrix = np.zeros((len(self), len(self.pairs)), dtype=dtype)
-        for i, loop_pairs in enumerate(loop_pairs_ls):
-            matrix[i][np.isin(all_pairs, loop_pairs[:-1])] = 1
-            matrix[i][np.isin(all_pairs, loop_pairs[-1])] = -1
+        matrix = np.zeros((self._length, len(self.pairs)), dtype=dtype)
+        matrix[self._edge_rows, self._edge_cols] = 1
+        matrix[self._diag_rows, self._diag_cols] = -1
         return matrix

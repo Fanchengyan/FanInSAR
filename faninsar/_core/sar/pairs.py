@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from numpy._typing import _ArrayLikeInt_co
     from numpy.typing import DTypeLike, NDArray
 
-    from faninsar import Loop, Loops, TripletLoops
+    from faninsar import Loops, TripletLoops
     from faninsar.typing import PairLike, PairsLike, PairsOrder
 
     from .baseline import BaselinePlotResult, Baselines
@@ -863,43 +863,72 @@ class Pairs:
                 This parameter will be ignored if ``edge_pairs`` is provided.
 
         """
-        # a list containing all loops
-        loops = []
         if edge_pairs is None:
             if edge_days is None:
                 msg = "Either edge_days or edge_pairs should be provided."
                 raise ValueError(msg)
-            edge_pairs = self[self.days <= edge_days]
-        # find valid diagonal pairs
-        for i in self - edge_pairs:
-            if max_days is not None and i.days > max_days:
-                continue
-            if not valid_diagonal_pair(i, self, edge_pairs):
-                continue
-            start_date, end_date = i.values[0], i.values[1]
+            edge_mask = np.asarray(self.days <= edge_days)
+        else:
+            edge_mask = self.where(edge_pairs, return_type="mask")
 
-            # find valid primary pairs
-            mask_primaries = (self.primary == start_date) & (self.secondary < end_date)
-            if not mask_primaries.any():
-                continue
-            pairs_primary = self[mask_primaries]
+        dates = np.asarray(self.dates, dtype="M8[D]")
+        u_all = np.searchsorted(dates, np.asarray(self.primary, dtype="M8[D]"))
+        v_all = np.searchsorted(dates, np.asarray(self.secondary, dtype="M8[D]"))
 
-            # initialize a loop with the primary acquisition
-            loop = [start_date]
+        diag_mask = ~edge_mask
+        if max_days is not None:
+            diag_mask &= np.asarray(self.days <= max_days)
 
-            # find all loops for all primary acquisitions
-            find_loops(
-                self,
-                loops,
-                loop,
-                pairs_primary,
-                end_date,
-                edge_pairs,
-                max_acquisition,
+        edges = np.stack([u_all[edge_mask], v_all[edge_mask]], axis=1)
+        diag = np.stack([u_all[diag_mask], v_all[diag_mask]], axis=1)
+
+        # CSR adjacency of the edge pairs sorted by (primary, secondary)
+        order = np.lexsort((edges[:, 1], edges[:, 0]))
+        edges = edges[order]
+        indptr = np.zeros(len(dates) + 1, dtype=np.int64)
+        np.add.at(indptr, edges[:, 0] + 1, 1)
+        indptr = np.cumsum(indptr)
+        neighbors = edges[:, 1]
+
+        # level-wise enumeration of all bounded-length paths from every
+        # diagonal pair's primary to its secondary date
+        closed: list[np.ndarray] = []
+        partial = diag[:, :1].copy()
+        bounds = diag[:, 1]
+        while len(partial) and partial.shape[1] < max_acquisition:
+            tails = partial[:, -1]
+            starts = indptr[tails]
+            degrees = indptr[tails + 1] - starts
+            total = int(degrees.sum())
+            if total == 0:
+                break
+            owner = np.repeat(np.arange(len(tails)), degrees)
+            offsets = np.arange(total) - np.repeat(
+                np.concatenate(([0], np.cumsum(degrees)[:-1])), degrees
             )
+            candidates = neighbors[starts[owner] + offsets]
+            within = candidates <= bounds[owner]
+            owner, candidates = owner[within], candidates[within]
+            expanded = np.concatenate([partial[owner], candidates[:, None]], axis=1)
+            new_bounds = bounds[owner]
+            closing = candidates == new_bounds
+            if closing.any():
+                closed.append(expanded[closing])
+            continuing = ~closing
+            partial, bounds = expanded[continuing], new_bounds[continuing]
+
+        max_width = max((chunk.shape[1] for chunk in closed), default=3)
+        date_idx = np.full(
+            (sum(len(chunk) for chunk in closed), max_width), -1, dtype=np.int64
+        )
+        row = 0
+        for chunk in closed:
+            date_idx[row : row + len(chunk), : chunk.shape[1]] = chunk
+            row += len(chunk)
+
         from faninsar import Loops
 
-        return Loops(loops)
+        return Loops.from_date_indices(date_idx, dates, sort=True)
 
     def sbas_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
         """Return the SBAS matrix.
@@ -1276,88 +1305,3 @@ class PairsFactory:
                         pairs.append(pair)
 
         return Pairs(pairs)
-
-
-# TODO: accelerate the process using numba or cython
-def find_loops(
-    loops_pairs: Pairs,
-    loops: list[Loop],
-    loop: Loop,
-    pairs_left: Pairs,
-    end_date: datetime,
-    edge_pairs: Pairs,
-    max_acquisition: int = 5,
-) -> None:
-    """Recursively find all available loops within pairs_left and end_date."""
-    from faninsar import Loop
-
-    for pair_left in pairs_left:
-        if pair_left not in edge_pairs:
-            continue
-        m_candidate = (
-            (loops_pairs.primary == pair_left.secondary)
-            & (loops_pairs.secondary <= end_date)
-            & (loops_pairs.where(edge_pairs, return_type="mask"))
-        )
-        if not m_candidate.any():
-            continue
-        pairs_candidate = loops_pairs[m_candidate]
-        for pair_middle in pairs_candidate:
-            loop_i = loop.copy()
-            loop_i.append(pair_middle.primary)
-            if pair_middle.secondary == end_date:
-                loop_i.append(pair_middle.secondary)
-                loops.append(Loop(loop_i))
-            elif len(loop_i) + 1 < max_acquisition:
-                find_loops(
-                    loops_pairs,
-                    loops,
-                    loop_i,
-                    pairs_candidate,
-                    end_date,
-                    edge_pairs,
-                    max_acquisition,
-                )
-
-
-def valid_diagonal_pair(
-    pair: Pair,
-    pairs: Pairs,
-    edge_pairs: int | None = None,
-) -> bool:
-    """Check if the pair is a valid diagonal pair.
-
-    A valid diagonal pair can be used to form a loop using the edge pairs. This
-    function is just a simple check to see if days of diagonal pair is less than
-    the sum of edge pairs.
-
-    Parameters
-    ----------
-    pair: Pair
-        Pair to be checked if it is a valid diagonal pair.
-    pairs: Pairs
-        All pairs of the loop.
-    edge_pairs: int, optional
-        The edge pairs to form loops.
-
-    Returns
-    -------
-    valid: bool
-        Whether the pair is a valid diagonal pair.
-
-    """
-    valid = False
-    start_date, end_date = pair.values
-    mask_edge = (
-        (pairs.primary >= start_date)
-        & (pairs.secondary <= end_date)
-        & (pairs.where(edge_pairs, return_type="mask"))
-    )
-
-    if not mask_edge.any():
-        return False
-
-    edge_pairs_ = pairs[mask_edge]
-    if edge_pairs_.days.values.sum() >= pair.days:
-        valid = True
-    return valid
