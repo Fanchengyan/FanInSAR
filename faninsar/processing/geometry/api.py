@@ -863,6 +863,7 @@ class RasterDEM(DEM):
                 dataset.write(np.asarray(self._array, dtype=np.float32), 1)
                 dataset.update_tags(dem_vertical_datum=self.vertical_datum)
             temporary.replace(destination)
+            self._path = destination.resolve()
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

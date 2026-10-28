@@ -33,6 +33,7 @@ def test_save_requires_new_geotiff(tmp_path) -> None:
     path = tmp_path / "dem.tif"
     raster.save(path)
     assert path.exists()
+    assert raster.path == path.resolve()
     with pytest.raises(FileExistsError):
         raster.save(path)
     with pytest.raises(ValueError):

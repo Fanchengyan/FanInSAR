@@ -67,6 +67,7 @@ def test_prepare_promotes_source_dem_and_reopen_reloads(
     assert isinstance(stack.dem, RasterDEM)
     assert (work / "dem" / "stack.tif").is_file()
     assert (work / "dem" / "stack.json").is_file()
+    assert stack.dem.path == work / "dem" / "stack.tif"
 
     reopened = Stack._from_safes(
         _dummy_safes(tmp_path),
