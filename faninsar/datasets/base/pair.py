@@ -80,27 +80,35 @@ class PairDataset(RasterDataset):
 
     def _manifest_extra(self, key: str) -> list | None:
         """Return the per-file manifest values for ``key``, or None."""
-        raw = self._manifest_lookup(self._files.paths.tolist())
-        if raw is None:
+        snapshot = self._manifest_snapshot(self._files.paths.tolist())
+        if snapshot is None:
             return None
-        values = [row.get(key) for row in raw]
+        values = [row.get(key) for row in snapshot["files"]]
         if any(v is None for v in values):
             return None
         return values
 
     def _manifest_write_extras(self, key: str, values: list) -> None:
         """Write ``values`` back into the manifest under ``key``."""
-        raw = self._manifest_lookup(self._files.paths.tolist())
-        if raw is None:
+        snapshot = self._manifest_snapshot(self._files.paths.tolist())
+        if snapshot is None:
             return
-        for row, value in zip(raw, values, strict=True):
+        files = snapshot["files"]
+        for row, value in zip(files, values, strict=True):
             row[key] = _manifest.encode_file_row({"v": value})["v"]
+        attrs = dict(snapshot["attrs"])
+        attrs.setdefault("crs", self.crs)
+        attrs.setdefault("res", self.res)
+        attrs.setdefault("dtype", self.dtype)
+        attrs.setdefault("nodata", self.nodata)
+        attrs.setdefault("bounds", tuple(self.bounds) if self.index.bounds else None)
         with contextlib.suppress(OSError):
             _manifest.write_entry(
                 self.root_dir,
                 self._manifest_name(),
                 self._files.paths.tolist(),
-                raw,
+                files,
+                attrs,
                 _faninsar_version,
             )
 

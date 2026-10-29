@@ -235,13 +235,6 @@ class NisarH5Mixin:
         source = parts[0] if parts is not None else str(path)
         return Path(source).name
 
-    def _manifest_comparable_path(self, path: str) -> str | list[str]:
-        """Return the backing granule path of an HDF5 subdataset URI."""
-        parts = self._split_hdf5_subdataset(path)
-        if parts is None:
-            return str(path)
-        return parts[0]
-
     @classmethod
     def _h5_files_from(cls, paths: Iterable[PathLike]) -> list[Path]:
         """Return the granule file paths of paths or HDF5 subdataset paths."""

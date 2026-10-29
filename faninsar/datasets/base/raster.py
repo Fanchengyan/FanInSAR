@@ -258,14 +258,14 @@ class RasterDataset(GeoDataset):
             paths = [str(p) for p in paths]
 
         # Scan files and extract metadata (always sequential, metadata is lightweight)
-        files_df = self._scan_files_sequential(paths, crs)
+        manifest_attrs = self._scan_files_sequential(paths, crs)
 
         # Store files information
-        self._files = files_df
+        self._files = self._last_files_df
 
         # Determine final attributes based on user parameters and file metadata
         final_crs, final_res, final_dtype, final_nodata = (
-            self._determine_final_attributes(files_df, crs, res, dtype, nodata)
+            self._determine_final_attributes(self._files, crs, res, dtype, nodata)
         )
 
         # Set final attributes
@@ -275,6 +275,14 @@ class RasterDataset(GeoDataset):
         self.nodata = final_nodata
         self.count = self._count
         self.roi = roi
+
+        if manifest_attrs is not None:
+            # Manifest hit — the attrs dict already carries the resolved
+            # crs/res/dtype/nodata/bounds, so re-emit it verbatim instead of
+            # deriving them again.
+            self._manifest_persist(paths, manifest_attrs)
+        else:
+            self._manifest_persist(paths)
 
     @staticmethod
     def _normalize_chunks(
@@ -548,48 +556,51 @@ class RasterDataset(GeoDataset):
         """Return the manifest entry name for this dataset instance."""
         return _manifest.slugify(self.ds_name or self.__class__.__name__)
 
-    def _manifest_comparable_path(self, path: str) -> str | list[str]:
-        """Return the filesystem path(s) a manifest entry should compare.
+    def _manifest_snapshot(self, paths: list[str]) -> dict[str, Any] | None:
+        """Return the manifest entry for this dataset, or None on a miss."""
+        return _manifest.read_entry(self.root_dir, self._manifest_name(), paths)
 
-        The default implementation returns ``path`` unchanged. Subclasses that
-        expose logical paths which do not exist on disk (e.g. HDF5 subdataset
-        URIs of the form ``hdf5:"file"::/group``) must override this to map
-        those URIs back to the backing granule path(s).
-        """
-        return path
-
-    def _manifest_paths_match(self, entry_paths: list[str], paths: list[str]) -> bool:
-        """Return True when the stored paths describe the current path list."""
-        expected = _manifest._normalize_paths_for_compare(
-            entry_paths, self._manifest_comparable_path
-        )
-        actual = _manifest._normalize_paths_for_compare(
-            paths, self._manifest_comparable_path
-        )
-        return expected == actual
-
-    def _manifest_restore(
-        self, paths: list[str], target_crs: CRS | None
-    ) -> list[dict[str, Any]] | None:
-        """Return manifest-restored per-file metadata, or None on a miss."""
-        raw_files = self._manifest_lookup(paths)
-        if raw_files is None:
-            return None
-        return _manifest._restore_files_rows(raw_files, paths, target_crs)
-
-    def _manifest_lookup(self, paths: list[str]) -> list[dict[str, Any]] | None:
-        """Fetch the raw ``files`` list for this dataset's manifest entry."""
-        entry = _manifest.read_raw_entry(self.root_dir, self._manifest_name())
-        if entry is None:
-            return None
-        if not self._manifest_paths_match(entry["paths"], paths):
-            return None
-        return entry["files"]
+    def _manifest_persist(
+        self, paths: list[str], attrs: dict[str, Any] | None = None
+    ) -> None:
+        """Write the current scan results (or restored ``attrs``) to the manifest."""
+        files = self._last_scan_metadata or []
+        if attrs is None:
+            attrs = {
+                "crs": self.crs,
+                "res": self.res,
+                "dtype": self.dtype,
+                "nodata": self.nodata,
+                "bounds": tuple(self.bounds) if self.index.bounds else None,
+            }
+        try:
+            _manifest.write_entry(
+                self.root_dir,
+                self._manifest_name(),
+                paths,
+                files,
+                attrs,
+                _faninsar_version,
+            )
+        except OSError as e:
+            if self.verbose:
+                logger.warning(
+                    "Unable to write manifest for %s: %s",
+                    self._manifest_name(),
+                    e,
+                )
 
     def _scan_files_sequential(
         self, paths: list[str], target_crs: CRS | None = None
-    ) -> pd.DataFrame:
-        """Scan files sequentially and extract metadata.
+    ) -> dict[str, Any] | None:
+        """Scan files and extract metadata.
+
+        On a manifest hit the snapshot's ``attrs`` is returned (the resolved
+        ``crs``/``res``/``dtype``/``nodata``/``bounds``) and the restored
+        file metadata is left in ``self._last_files_df``. On a miss the scan
+        runs and ``None`` is returned; the caller then derives the final
+        attributes from ``self._last_files_df`` and calls
+        ``_manifest_persist`` to record them.
 
         Parameters
         ----------
@@ -600,20 +611,22 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        pd.DataFrame
-            DataFrame containing file metadata
+        dict or None
+            The manifest's resolved attrs on a hit, else None.
 
         """
         if not self._reindex:
-            restored = self._manifest_restore(paths, target_crs)
-            if restored is not None:
+            snapshot = self._manifest_snapshot(paths)
+            if snapshot is not None:
                 logger.info(
                     "Restored %d file(s) for '%s' from %s",
-                    len(restored),
+                    len(snapshot["files"]),
                     self._manifest_name(),
                     _manifest.manifest_path(self.root_dir),
                 )
-                return self._process_scan_results(restored)
+                self._last_scan_metadata = snapshot["files"]
+                self._last_files_df = self._process_scan_results(snapshot["files"])
+                return snapshot["attrs"]
 
         logger.info(
             "Scanning %d file(s) for '%s' under %s",
@@ -633,26 +646,9 @@ class RasterDataset(GeoDataset):
             metadata = self._extract_single_file_metadata(path, target_crs)
             file_metadata_list.append(metadata)
 
-        # Persist the raw metadata to the manifest so subsequent
-        # instantiations can skip this scan entirely.
-        try:
-            _manifest.write_entry(
-                self.root_dir,
-                self._manifest_name(),
-                paths,
-                file_metadata_list,
-                _faninsar_version,
-            )
-        except OSError as e:
-            if self.verbose:
-                logger.warning(
-                    "Unable to write manifest for %s: %s",
-                    self._manifest_name(),
-                    e,
-                )
-
-        # Process results and return DataFrame
-        return self._process_scan_results(file_metadata_list)
+        self._last_scan_metadata = file_metadata_list
+        self._last_files_df = self._process_scan_results(file_metadata_list)
+        return None
 
     def _determine_final_attributes(
         self,
