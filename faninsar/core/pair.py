@@ -865,45 +865,72 @@ class Pairs:
                 This parameter will be ignored if ``edge_pairs`` is provided.
 
         """
-        from faninsar.core.loops import find_loops, valid_diagonal_pair
-
-        # a list containing all loops
-        loops = []
         if edge_pairs is None:
             if edge_days is None:
                 msg = "Either edge_days or edge_pairs should be provided."
                 raise ValueError(msg)
-            edge_pairs = self[self.days <= edge_days]
-        # find valid diagonal pairs
-        for i in self - edge_pairs:
-            if max_days is not None and i.days > max_days:
-                continue
-            if not valid_diagonal_pair(i, self, edge_pairs):
-                continue
-            start_date, end_date = i.values[0], i.values[1]
+            edge_mask = np.asarray(self.days <= edge_days)
+        else:
+            edge_mask = self.where(edge_pairs, return_type="mask")
 
-            # find valid primary pairs
-            mask_primaries = (self.primary == start_date) & (self.secondary < end_date)
-            if not mask_primaries.any():
-                continue
-            pairs_primary = self[mask_primaries]
+        dates = np.asarray(self.dates, dtype="M8[D]")
+        u_all = np.searchsorted(dates, np.asarray(self.primary, dtype="M8[D]"))
+        v_all = np.searchsorted(dates, np.asarray(self.secondary, dtype="M8[D]"))
 
-            # initialize a loop with the primary acquisition
-            loop = [start_date]
+        diag_mask = ~edge_mask
+        if max_days is not None:
+            diag_mask &= np.asarray(self.days <= max_days)
 
-            # find all loops for all primary acquisitions
-            find_loops(
-                self,
-                loops,
-                loop,
-                pairs_primary,
-                end_date,
-                edge_pairs,
-                max_acquisition,
+        edges = np.stack([u_all[edge_mask], v_all[edge_mask]], axis=1)
+        diag = np.stack([u_all[diag_mask], v_all[diag_mask]], axis=1)
+
+        # CSR adjacency of the edge pairs sorted by (primary, secondary)
+        order = np.lexsort((edges[:, 1], edges[:, 0]))
+        edges = edges[order]
+        indptr = np.zeros(len(dates) + 1, dtype=np.int64)
+        np.add.at(indptr, edges[:, 0] + 1, 1)
+        indptr = np.cumsum(indptr)
+        neighbors = edges[:, 1]
+
+        # level-wise enumeration of all bounded-length paths from every
+        # diagonal pair's primary to its secondary date
+        closed: list[np.ndarray] = []
+        partial = diag[:, :1].copy()
+        bounds = diag[:, 1]
+        while len(partial) and partial.shape[1] < max_acquisition:
+            tails = partial[:, -1]
+            starts = indptr[tails]
+            degrees = indptr[tails + 1] - starts
+            total = int(degrees.sum())
+            if total == 0:
+                break
+            owner = np.repeat(np.arange(len(tails)), degrees)
+            offsets = np.arange(total) - np.repeat(
+                np.concatenate(([0], np.cumsum(degrees)[:-1])), degrees
             )
-        from faninsar import Loops
+            candidates = neighbors[starts[owner] + offsets]
+            within = candidates <= bounds[owner]
+            owner, candidates = owner[within], candidates[within]
+            expanded = np.concatenate([partial[owner], candidates[:, None]], axis=1)
+            new_bounds = bounds[owner]
+            closing = candidates == new_bounds
+            if closing.any():
+                closed.append(expanded[closing])
+            continuing = ~closing
+            partial, bounds = expanded[continuing], new_bounds[continuing]
 
-        return Loops(loops)
+        max_width = max((chunk.shape[1] for chunk in closed), default=3)
+        date_idx = np.full(
+            (sum(len(chunk) for chunk in closed), max_width), -1, dtype=np.int64
+        )
+        row = 0
+        for chunk in closed:
+            date_idx[row : row + len(chunk), : chunk.shape[1]] = chunk
+            row += len(chunk)
+
+        from faninsar.core.loops import Loops
+
+        return Loops.from_date_indices(date_idx, dates, sort=True)
 
     def sbas_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
         """Return the SBAS matrix.

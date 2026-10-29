@@ -492,17 +492,22 @@ class Network(NetworkContract):
         model: TimeSeriesModels | None,
         **kwargs: Any,
     ) -> Any:
-        """Run NSBAS and adapt its legacy tuple to a ``TimeSeries``."""
+        """Run NSBAS and adapt its result to a ``TimeSeries``."""
         from faninsar.timeseries.invert import invert
+        from faninsar.timeseries.solver import NSBASResult
 
         raw = invert(stack, model=model, **kwargs)
-        if not isinstance(raw, tuple) or len(raw) != 4:
+        if isinstance(raw, NSBASResult):
+            increments = raw.increments
+            residual_pairs = raw.pair_residuals
+        elif isinstance(raw, tuple) and len(raw) == 4:
+            increments, _parameters, residual_pairs, _residual_model = raw
+        else:
             message = "NSBAS solver returned an invalid result"
             logger.error(message)
             raise NetworkAnalysisError(message)
         from faninsar.timeseries.results import TimeSeries
 
-        increments, _parameters, residual_pairs, _residual_model = raw
         increments_array = np.asarray(increments, dtype=np.float32)
         residual_array = np.asarray(residual_pairs, dtype=np.float32)
         n_pixels = int(np.asarray(stack.unwrapped_matrix()).shape[1])

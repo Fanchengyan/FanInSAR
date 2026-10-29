@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal, overload
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import psutil
@@ -13,6 +14,11 @@ from tqdm import tqdm
 from faninsar.core import Loops, Pairs
 from faninsar.logging import setup_logger
 from faninsar.processing.runtime.device import parse_device
+from faninsar.timeseries.coherence_weight import (
+    WeightFunc,
+    coherence_to_weight,
+    normalize_weight_func,
+)
 from faninsar.timeseries.models import TimeSeriesModels
 
 if TYPE_CHECKING:
@@ -22,73 +28,238 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+#: Minimum Cholesky pivot ratio accepted by the fast (SPD) solve path.
+#: Floating-point Cholesky can slip through near-zero pivots, so pixels
+#: with a smaller ratio fall back to the minimum-norm eigendecomposition.
+_PIVOT_RATIO_MIN = 1e-6
+#: Null-space column mass below which a parameter counts as constrained.
+_NULL_MASS_TOL = 1e-8
+
+
+@dataclass
+class LstsqResult:
+    """Censored least-squares result with per-pixel reliability diagnostics.
+
+    The diagnostics are by-products of the hybrid solve and always
+    filled. Iterating yields the solution, so ``x, = result`` keeps a
+    tuple-style assignment working.
+
+    Attributes
+    ----------
+    solution : Tensor
+        ``(n_param, n_pt)`` matrix that minimizes ``norm(M*(GX - d))``,
+        with minimum norm on rank-deficient pixels and NaN where a
+        pixel has no valid observation.
+    is_constrained : Tensor
+        ``(n_param, n_pt)`` bool. ``True`` where the parameter is
+        determined by the observations. ``False`` marks a local gap whose
+        value comes from the minimum-norm convention.
+    rank : Tensor
+        ``(n_pt,)`` int. Numerical rank of each pixel's system.
+    n_observations : Tensor
+        ``(n_pt,)`` int. Valid (non-NaN) observations per pixel.
+    condition_number : Tensor
+        ``(n_pt,)`` float. Ratio of the largest to the smallest retained
+        eigenvalue on the minimum-norm path; on the Cholesky fast path it
+        is the pivot-ratio proxy, a conservative estimate of the same
+        quantity.
+
+    """
+
+    solution: Tensor
+    is_constrained: Tensor
+    rank: Tensor
+    n_observations: Tensor
+    condition_number: Tensor
+
+    def __iter__(self) -> tuple:
+        """Iterate over the solution for tuple-style unpacking."""
+        return iter((self.solution,))
+
+    def cpu(self) -> LstsqResult:
+        """Return a copy with every field on the CPU."""
+        return LstsqResult(
+            solution=self.solution.cpu(),
+            is_constrained=self.is_constrained.cpu(),
+            rank=self.rank.cpu(),
+            n_observations=self.n_observations.cpu(),
+            condition_number=self.condition_number.cpu(),
+        )
+
+    def numpy(self) -> LstsqResult:
+        """Return a copy with every field as a NumPy array."""
+        return LstsqResult(
+            solution=self.solution.cpu().numpy(),
+            is_constrained=self.is_constrained.cpu().numpy(),
+            rank=self.rank.cpu().numpy(),
+            n_observations=self.n_observations.cpu().numpy(),
+            condition_number=self.condition_number.cpu().numpy(),
+        )
+
+
+@dataclass
+class NSBASResult:
+    """Inversion result with optional per-pixel reliability diagnostics.
+
+    The four core fields are always present and tuple unpacking keeps the
+    historical ``incs, params, residual_pair, residual_tsm = inverse()``
+    pattern working. The diagnostics fields are filled only when
+    :meth:`NSBASSolver.inverse` is called with ``diagnostics=True`` and
+    are ``None`` otherwise.
+
+    Attributes
+    ----------
+    increments : ndarray or Tensor
+        ``(n_date - 1, n_pt)`` incremental displacement.
+    model_parameters : ndarray or Tensor
+        ``(n_param, n_pt)`` temporal-model parameters; empty when the
+        solver has no model.
+    pair_residuals : ndarray or Tensor
+        ``(n_pair, n_pt)`` interferogram observation residuals.
+    model_residuals : ndarray or Tensor
+        ``(n_date, n_pt)`` temporal-model constraint residuals; empty
+        when the solver has no model.
+    is_constrained : ndarray, Tensor, or None
+        ``(n_date - 1, n_pt)`` bool. ``True`` where the increment is
+        determined by the interferograms alone. ``False`` marks a local
+        gap whose value comes from the minimum-norm convention (pure
+        SBAS) or from the temporal model (NSBAS). ``None`` unless
+        ``diagnostics=True``.
+    n_observations : ndarray, Tensor, or None
+        ``(n_pt,)`` int. Valid interferogram observations per pixel.
+        ``None`` unless ``diagnostics=True``.
+    rank : ndarray, Tensor, or None
+        ``(n_pt,)`` int. Rank of each pixel's data-only system. ``None``
+        unless ``diagnostics=True``.
+    condition_number : ndarray, Tensor, or None
+        ``(n_pt,)`` float. Conditioning estimate of the data-only system
+        (see :class:`LstsqResult` for the fast-path proxy). ``None``
+        unless ``diagnostics=True``.
+
+    """
+
+    increments: NDArray[np.floating] | Tensor
+    model_parameters: NDArray[np.floating] | Tensor
+    pair_residuals: NDArray[np.floating] | Tensor
+    model_residuals: NDArray[np.floating] | Tensor
+    is_constrained: NDArray[np.bool_] | Tensor | None = None
+    n_observations: NDArray[np.integer] | Tensor | None = None
+    rank: NDArray[np.integer] | Tensor | None = None
+    condition_number: NDArray[np.floating] | Tensor | None = None
+
+    def __iter__(self) -> tuple:
+        """Iterate over the four core fields for tuple unpacking."""
+        core = (
+            self.increments,
+            self.model_parameters,
+            self.pair_residuals,
+            self.model_residuals,
+        )
+        return iter(core)
+
 
 class NSBASSolver:
     """Solver class to build NSBAS matrix and perform inversion.
 
     The NSBAS inversion is expressed as: ``d = Gm``, where ``d`` is the
     unwrapped interferograms matrix, ``G`` is the NSBAS matrix, and ``m`` is
-    the model parameters, which is the combination of the displacement increment
+    the model parameters, which is the combination of the deformation increment
     and the model parameters.
     see following paper for more details: `https://ens.hal.science/hal-02185213`_ ,
     `https://www.sciencedirect.com/science/article/pii/S0924271625000772`_
 
+    Observation weights are selected only through ``weight_func``. ``None`` on
+    the constructor or on :meth:`inverse` means "do not change stored state".
+    The first fill-in is unweighted (``"no"``). A weighted choice (``"coh"``,
+    ``"fim"``, or ``"var"``) without stored coherence raises ``ValueError``.
+    Interferogram rows are scaled by ``sqrt(weight)``; NSBAS model-constraint
+    rows stay at the original ``gamma`` scale.
 
     .. note::
 
-        After initialization, the ``d`` can still be updated by assigning a new
-        unwrapped interferograms matrix to ``d``. This is useful when the
-        unwrapped interferograms is divided into multiple patches and the NSBAS
-        matrix is calculated for each patch separately.
+        After initialization, the unwrapped interferograms can still be
+        replaced with :meth:`set_d`. This is useful when they are divided
+        into multiple patches and the NSBAS matrix is calculated for each
+        patch separately. The stored coherence mask and weights are reapplied.
 
     Examples
     --------
+    Unweighted NSBAS inversion:
+
     >>> import numpy as np
     >>> import faninsar as fis
-    >>> from faninsar import NSBAS
-
-    >>> names = ['20170111_20170204',
-                '20170111_20170222',
-                '20170111_20170318',
-                '20170204_20170222',
-                '20170204_20170318',
-                '20170204_20170330',
-                '20170222_20170318',
-                '20170222_20170330',
-                '20170222_20170411',
-                '20170318_20170330']
-
+    >>> from faninsar.timeseries import NSBAS
+    >>> names = [
+    ...     "20170111_20170204",
+    ...     "20170111_20170222",
+    ...     "20170111_20170318",
+    ...     "20170204_20170222",
+    ...     "20170204_20170318",
+    ...     "20170204_20170330",
+    ...     "20170222_20170318",
+    ...     "20170222_20170330",
+    ...     "20170222_20170411",
+    ...     "20170318_20170330",
+    ... ]
     >>> pairs = fis.Pairs.from_names(names)
-    >>> unw = np.random.randint(0, 255, (len(pairs), 5))
+    >>> unw = np.random.default_rng(0).random((len(pairs), 5))
     >>> model = NSBAS.AnnualSinusoidalModel(pairs.dates)
-    >>> solver = NSBAS.NSBASSolver(unw, pairs, model)
+    >>> solver = NSBAS.NSBASSolver(unw, pairs, model, verbose=False, device="cpu")
     >>> solver
     NSBASSolver(
         pairs: Pairs(10)
         model: AnnualSinusoidalModel(dates: 6, unit: day)
         gamma: 0.0001
+        weight_func: no
+        rcond: 1e-10
         G shape: (16, 9)
         d shape: (16, 5)
     )
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse()
 
+    Replace the unwrapped interferograms for another patch with the same
+    pairs:
 
-    Now we can perform NSBAS inversion to get the incremental displacement,
-    model parameters, and residuals:
-
-    >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
-
-    reset ``d`` by assigning a new unwrapped interferograms matrix with same pairs
-
-    >>> solver.set_d(np.random.randint(0, 255, (len(pairs), 10)))
+    >>> solver.set_d(np.random.default_rng(1).random((len(pairs), 10)))
     >>> solver
     NSBASSolver(
         pairs: Pairs(10)
         model: AnnualSinusoidalModel(dates: 6, unit: day)
         gamma: 0.0001
+        weight_func: no
+        rcond: 1e-10
         G shape: (16, 9)
         d shape: (16, 10)
     )
 
+    Set Fisher-information weights at construction, then switch to DS
+    variance weights in a later :meth:`inverse` call. Omitting a kwarg
+    keeps the stored value. Weighted inversion needs coherence with the
+    same shape as ``unw``:
+
+    >>> coh = np.full(unw.shape, 0.8)
+    >>> solver = NSBAS.NSBASSolver(
+    ...     unw,
+    ...     pairs,
+    ...     model,
+    ...     coh=coh,
+    ...     weight_func="fim",
+    ...     n_looks=20,
+    ...     verbose=False,
+    ...     device="cpu",
+    ... )
+    >>> solver
+    NSBASSolver(
+        pairs: Pairs(10)
+        model: AnnualSinusoidalModel(dates: 6, unit: day)
+        gamma: 0.0001
+        weight_func: fim
+        rcond: 1e-10
+        G shape: (5, 16, 9)
+        d shape: (16, 5)
+    )
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse()
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse(weight_func="var")
 
     """
 
@@ -97,19 +268,30 @@ class NSBASSolver:
     _gamma: float
     _G: torch.Tensor
     _d: torch.Tensor
+    _unw: np.ndarray
+    _coh: np.ndarray | None
+    _coh_threshold: float
+    _weight_func: WeightFunc
+    _n_looks: int
     _device: torch.device
     _dtype: torch.dtype
     _verbose: bool
 
     __slots__ = [
         "_G",
+        "_coh",
+        "_coh_threshold",
         "_d",
         "_device",
         "_dtype",
         "_gamma",
         "_model",
+        "_n_looks",
         "_pairs",
+        "_rcond",
+        "_unw",
         "_verbose",
+        "_weight_func",
     ]
 
     def __init__(
@@ -118,8 +300,10 @@ class NSBASSolver:
         pairs: Pairs | Sequence[str] | None = None,
         model: TimeSeriesModels | None = None,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
-        coh_threshold: float = 0.4,
-        inv_alg: Literal["ls", "wls"] = "ls",
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
+        rcond: float = 1e-10,
         gamma: float = 0.0001,
         device: str | torch.device | None = None,
         dtype: torch.dtype = torch.float64,
@@ -136,8 +320,61 @@ class NSBASSolver:
         Legacy ndarray path remains for internal tests::
 
             NSBASSolver(unw, pairs, model=...)
+
+        Parameters
+        ----------
+        unw : ndarray or torch.Tensor
+            Unwrapped interferograms with shape ``(n_pair, n_pixel)``.
+        pairs : Pairs or Sequence[str]
+            Interferogram pairs corresponding to ``unw``.
+        model : TimeSeriesModels, optional
+            Parametric NSBAS model. Omit for pure SBAS.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence with the same shape as ``unw``. ``None`` means
+            no coherence is stored. Values at or below ``coh_threshold``
+            are treated as missing. When a weight function is selected,
+            ``coh`` is also converted to observation weights.
+        coh_threshold : float, optional
+            Coherence mask threshold. ``None`` keeps the internal default
+            of ``0.4``. Pixels with ``coh <= coh_threshold`` are set to NaN
+            before inversion.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Observation-weight definition. ``None`` keeps the unweighted
+            default ``"no"``. ``coh`` uses coherence, ``fim`` uses
+            ``2 L γ² / (1 - γ²)``, and ``var`` uses the inverse DS phase
+            variance. A weighted choice without ``coh`` raises
+            ``ValueError``.
+            ``sbas``/``uniform`` map to ``no``, ``lin`` to ``coh``, and
+            ``fisher``/``wls`` to ``fim``.
+        n_looks : int, optional
+            Independent looks ``L`` used by ``fim`` and ``var``. ``None``
+            keeps the internal default of ``1``.
+        rcond : float, optional
+            Relative cutoff separating determined from unconstrained
+            directions in the least-squares solve. Rank-deficient pixels
+            receive the minimum-norm solution; directions whose
+            eigenvalue falls below ``rcond`` times the largest are
+            treated as unconstrained. Must be in ``(0, 1)``. Default is
+            ``1e-10``.
+        gamma : float, optional
+            Weight of the NSBAS model-constraint rows.
+        device, dtype, verbose
+            Torch device, compute dtype, and progress-bar flag.
+        stack : InterferogramStack, optional
+            Preferred processing seam. Supplies ``unw``, ``pairs``, and
+            ``coh`` (when the stack carries coherence). Mutually exclusive
+            with the ``unw``/``pairs`` form.
+
+        Raises
+        ------
+        TypeError
+            If ``pairs`` is not a :class:`~faninsar.Pairs` or sequence of
+            pair names.
+        ValueError
+            If ``weight_func`` is weighted and ``coh`` is omitted, or if
+            ``coh`` does not match the shape of ``unw``.
+
         """
-        # Preferred seam: InterferogramStack as first positional or stack=
         from faninsar.processing.interferometry.contracts import InterferogramStack
 
         if (
@@ -180,46 +417,24 @@ class NSBASSolver:
         self._device = parse_device(device)
         self._dtype = dtype
         self._verbose = verbose
+        _check_rcond(rcond)
 
         self._model = None
         self._gamma = 0.0001
-
-        g_sbas = self._make_sbas_matrix()
-
-        # Default: use unw as-is. When coherence is provided, mask low-coherence
-        # pixels (and optionally weight) by reassigning d below.
-        d = unw
-
-        if coh is not None:
-            if isinstance(coh, np.ndarray):
-                coh_np = coh
-            elif isinstance(coh, torch.Tensor):
-                coh_np = coh.detach().cpu().numpy()
-            else:
-                msg = "coh must be a numpy array or torch tensor"
-                logger.error(msg, extra={"coh_type": type(coh).__name__})
-                raise TypeError(msg)
-
-            # mask the unwrapped values by coherence
-            d = np.where(coh_np <= coh_threshold, np.nan, unw)
-
-            # currently only support sl and wsl for SBAS matrix
-            if inv_alg == "wls":
-                coh_2 = coh_np**2
-                w = coh_2 / (1 - coh_2)
-                d = d * w
-                g_sbas = (g_sbas[:, :, None] * w[:, None, :]).transpose(2, 0, 1)
+        self._unw = _to_numpy(unw)
+        self._coh = None if coh is None else _to_numpy(coh)
+        self._coh_threshold = 0.4 if coh_threshold is None else coh_threshold
+        self._n_looks = 1 if n_looks is None else n_looks
+        self._weight_func = normalize_weight_func(weight_func)
+        self._rcond = float(rcond)
 
         if model is not None:
             _check_model(model)
             _check_gamma(gamma)
             self._model = model
             self._gamma = gamma
-            self.set_G(self._make_nsbas_matrix(model.G_br, g_sbas, gamma))
 
-        else:
-            self.set_G(self._make_sbas_matrix())
-        self.set_d(d)
+        self._rebuild_system()
 
     def __str__(self) -> str:
         """Return string representation."""
@@ -235,8 +450,10 @@ class NSBASSolver:
             f"    pairs: {self.pairs}\n"
             f"    model: {self.model!s}\n"
             f"    gamma: {self.gamma}\n"
-            f"    G shape: {self.G.shape}\n"
-            f"    d shape: {self.d.shape}\n"
+            f"    weight_func: {self._weight_func}\n"
+            f"    rcond: {self._rcond}\n"
+            f"    G shape: {tuple(self.G.shape)}\n"
+            f"    d shape: {tuple(self.d.shape)}\n"
             ")"
         )
 
@@ -271,12 +488,36 @@ class NSBASSolver:
         return self._gamma
 
     @property
+    def rcond(self) -> float:
+        """Return the relative cutoff for unconstrained directions."""
+        return self._rcond
+
+    @property
     def d(self) -> torch.Tensor:
         """Return ``d`` matrix for NSBAS ``d = Gm``."""
         return self._d
 
     def set_d(self, unw: np.ndarray | torch.Tensor) -> None:
-        """Set d by appending model matrix part to input unw matrix."""
+        """Set unwrapped interferograms and rebuild ``G`` and ``d``.
+
+        The input is the raw unwrapped phases. Any current coherence mask
+        and observation weights are reapplied. If coherence is stored, the
+        new array must have the same shape as that coherence.
+
+        Parameters
+        ----------
+        unw : ndarray or torch.Tensor
+            Unwrapped interferograms with shape ``(n_pair, n_pixel)``.
+
+        Raises
+        ------
+        TypeError
+            If ``unw`` is not a NumPy array or torch tensor.
+        ValueError
+            If ``unw`` is not 2-D, does not match the pair count, or does
+            not match the stored coherence shape.
+
+        """
         if not isinstance(unw, (np.ndarray, torch.Tensor)):
             msg = "input unw must be a numpy array or torch tensor"
             logger.error(msg, extra={"unw_type": type(unw).__name__})
@@ -293,19 +534,8 @@ class NSBASSolver:
                 extra={"rows": unw_np.shape[0], "pairs": len(self.pairs)},
             )
             raise ValueError(msg)
-
-        if self.model is None:
-            self._d: Tensor = torch.as_tensor(
-                unw_np,
-                dtype=self._dtype,
-                device=self._device,
-            )
-        else:
-            self._d = torch.as_tensor(
-                self._restructure_unw(unw_np),
-                dtype=self._dtype,
-                device=self._device,
-            )
+        self._unw = unw_np
+        self._rebuild_system()
 
     @property
     def G(self) -> torch.Tensor:  # noqa: N802
@@ -337,7 +567,7 @@ class NSBASSolver:
             time-series model in NSBAS inversion.
         G_tl : np.ndarray
             The top left part of NSBAS matrix, which is the conventional SBAS
-            matrix mapping the incremental displacement to interferograms.
+            matrix mapping the incremental deformation to interferograms.
         gamma : float
             The weight for the bottom part of NSBAS matrix, which is used to
             balance the data term and the model term in NSBAS inversion.
@@ -384,60 +614,167 @@ class NSBASSolver:
             unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
 
-    @overload
+    def _rebuild_system(self) -> None:
+        """Rebuild ``G`` and ``d`` from stored unwrap, coherence, and weights."""
+        g_sbas, observations = self._make_data_system()
+
+        if self.model is not None:
+            self.set_G(self._make_nsbas_matrix(self.model.G_br, g_sbas, self._gamma))
+        else:
+            self.set_G(g_sbas)
+
+        if self.model is None:
+            self._d: Tensor = torch.as_tensor(
+                observations,
+                dtype=self._dtype,
+                device=self._device,
+            )
+        else:
+            self._d = torch.as_tensor(
+                self._restructure_unw(observations),
+                dtype=self._dtype,
+                device=self._device,
+            )
+
+    def _make_data_system(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the SBAS design matrix and observations before model rows.
+
+        Coherence masking and weighting are applied: observations at or
+        below the coherence threshold become NaN, and weighted systems
+        scale both the design rows and the observations by
+        ``sqrt(weight)``. The SBAS part of the NSBAS matrix and ``d``
+        are built from this pair.
+        """
+        g_sbas = self._make_sbas_matrix().astype(np.float64, copy=False)
+        observations = np.array(self._unw, dtype=np.float64, copy=True)
+        if observations.shape[0] != len(self.pairs):
+            msg = "unwrapped interferograms must have the same rows as pairs"
+            logger.error(
+                msg,
+                extra={"rows": observations.shape[0], "pairs": len(self.pairs)},
+            )
+            raise ValueError(msg)
+
+        weighted = self._weight_func != "no"
+        if weighted and self._coh is None:
+            msg = "coherence is required when weight_func is not 'no'"
+            logger.error(msg, extra={"weight_func": self._weight_func})
+            raise ValueError(msg)
+
+        if self._coh is not None:
+            coh_np = np.asarray(self._coh, dtype=np.float64)
+            if coh_np.shape != observations.shape:
+                msg = "coh must have the same shape as unwrapped interferograms"
+                logger.error(
+                    msg,
+                    extra={"coh_shape": coh_np.shape, "unw_shape": observations.shape},
+                )
+                raise ValueError(msg)
+            observations = np.where(
+                coh_np <= self._coh_threshold,
+                np.nan,
+                observations,
+            )
+            if weighted:
+                weight = coherence_to_weight(
+                    coh_np,
+                    weight_func=self._weight_func,
+                    n_looks=self._n_looks,
+                )
+                weight_sqrt = np.sqrt(weight)
+                observations = observations * weight_sqrt
+                g_sbas = (g_sbas[:, :, None] * weight_sqrt[:, None, :]).transpose(
+                    2,
+                    0,
+                    1,
+                )
+        return g_sbas, observations
+
     def inverse(
-        self, return_numpy: bool = True
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-    ]: ...
-    @overload
-    def inverse(
-        self, return_numpy: bool = False
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]: ...
-    def inverse(
-        self, return_numpy: bool = True
-    ) -> (
-        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+        self,
+        return_numpy: bool = True,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
+        rcond: float | None = None,
+        diagnostics: bool = False,
+    ) -> NSBASResult:
         """Calculate increment displacement difference by NSBAS inversion.
 
         Parameters
         ----------
         return_numpy : bool, optional
             Return numpy arrays if True, otherwise torch tensors, by default True.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence used for masking and weighting. ``None`` keeps
+            the coherence stored at construction or by a previous call.
+        coh_threshold : float, optional
+            Override the coherence mask threshold. ``None`` keeps the stored
+            value.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Override the observation-weight definition. ``None`` keeps the
+            stored choice. A weighted choice without stored coherence raises
+            ``ValueError``. Aliases match the constructor
+            (``sbas``/``uniform`` → ``no``, ``lin`` → ``coh``,
+            ``fisher``/``wls`` → ``fim``).
+        n_looks : int, optional
+            Override the independent-looks value used by ``fim`` and ``var``.
+            ``None`` keeps the stored value.
+        rcond : float, optional
+            Override the relative cutoff separating determined from
+            unconstrained directions. ``None`` keeps the stored value
+            (default ``1e-10``).
+        diagnostics : bool, optional
+            If True, also fill the per-pixel reliability diagnostics of
+            the returned :class:`NSBASResult` (``is_constrained``,
+            ``n_observations``, ``rank``, ``condition_number``); they
+            stay ``None`` otherwise. The diagnostics describe the
+            data-only (SBAS) system, so with a temporal model
+            ``is_constrained`` marks increments that the interferograms
+            alone do not determine. Default is False.
 
         Returns
         -------
-        incs: np.ndarray | torch.Tensor (n_date - 1, n_pt)
-            Incremental displacement
-        params: np.ndarray | torch.Tensor (n_param, n_pt)
-            parameters of model in NSBAS inversion
-        residual_pair: np.ndarray | torch.Tensor (n_pair, n_pt)
-            residual between interferograms and model result
-        residual_tsm: np.ndarray | torch.Tensor     (n_date, n_pt)
-            residual between time-series model and model result
+        NSBASResult
+            Result object with ``increments`` ``(n_date - 1, n_pt)``,
+            ``model_parameters`` ``(n_param, n_pt)``, ``pair_residuals``
+            ``(n_pair, n_pt)``, and ``model_residuals`` ``(n_date,
+            n_pt)``. Tuple unpacking keeps the historical
+            ``incs, params, residual_pair, residual_tsm = inverse()``
+            pattern working. The diagnostics fields are present only
+            when ``diagnostics=True``.
+
+        Raises
+        ------
+        ValueError
+            If ``weight_func`` is weighted and no coherence is stored, or if
+            ``coh`` does not match the shape of the unwrapped interferograms.
 
         """
+        rebuild = False
+        if coh is not None:
+            self._coh = _to_numpy(coh)
+            rebuild = True
+        if coh_threshold is not None:
+            self._coh_threshold = coh_threshold
+            rebuild = True
+        if n_looks is not None:
+            self._n_looks = n_looks
+            rebuild = True
+        if weight_func is not None:
+            self._weight_func = normalize_weight_func(weight_func)
+            rebuild = True
+        if rcond is not None:
+            _check_rcond(rcond)
+            self._rcond = float(rcond)
+        if rebuild:
+            self._rebuild_system()
+
         n_param = len(self.model.param_names) if self.model is not None else 0
         n_pair = len(self.pairs)
-        result = batch_lstsq(
-            self.G,
-            self.d,
-            dtype=self.dtype,
-            device=self.device,
-            verbose=self.verbose,
-            tqdm_args={"desc": "  NSBAS inversion"},
-            return_numpy=False,
-        )
+        result, data_diag = self._solve(diagnostics)
         residual = _calculate_residual(
             self.G,
             self.d,
@@ -458,7 +795,57 @@ class NSBASSolver:
         residual_pair = residual[:n_pair]
         residual_tsm = residual[n_pair:]
 
-        return incs, params, residual_pair, residual_tsm
+        diag_fields: dict[str, NDArray | Tensor] = {}
+        if diagnostics:
+            if return_numpy:
+                data_diag = data_diag.numpy()
+            diag_fields = {
+                key: value
+                for key, value in vars(data_diag).items()
+                if key != "solution"
+            }
+        return NSBASResult(
+            increments=incs,
+            model_parameters=params,
+            pair_residuals=residual_pair,
+            model_residuals=residual_tsm,
+            **diag_fields,
+        )
+
+    def _solve(self, diagnostics: bool) -> tuple[Tensor, LstsqResult | None]:
+        """Solve ``d = Gm`` and optionally the data-only diagnostics.
+
+        Without a model the main solve is the data-only system, so its
+        diagnostics come for free. With a model the solved system is
+        augmented with model rows, and the diagnostics require a
+        separate solve of the SBAS block alone.
+        """
+        out = batch_lstsq(
+            self.G,
+            self.d,
+            dtype=self.dtype,
+            device=self.device,
+            verbose=self.verbose,
+            tqdm_args={"desc": "  NSBAS inversion"},
+            return_numpy=False,
+            rcond=self._rcond,
+        )
+        if not diagnostics:
+            return out.solution, None
+        if self.model is None:
+            return out.solution, out
+        g_sbas, observations = self._make_data_system()
+        diag = batch_lstsq(
+            g_sbas,
+            observations,
+            dtype=self.dtype,
+            device=self.device,
+            verbose=self.verbose,
+            tqdm_args={"desc": "  SBAS data diagnostics"},
+            return_numpy=False,
+            rcond=self._rcond,
+        )
+        return out.solution, diag
 
 
 def device_mem_size(device: str | torch.device | None) -> int:
@@ -504,6 +891,18 @@ def _check_gamma(gamma: float) -> None:
     if gamma <= 0:
         msg = "gamma must be positive"
         logger.error(msg, extra={"gamma": gamma})
+        raise ValueError(msg)
+
+
+def _check_rcond(rcond: float) -> None:
+    """Validate the relative cutoff for unconstrained directions."""
+    if not isinstance(rcond, (float, int)) or isinstance(rcond, bool):
+        msg = "rcond must be either float or int"
+        logger.error(msg, extra={"rcond_type": type(rcond).__name__})
+        raise TypeError(msg)
+    if not 0.0 < float(rcond) < 1.0:
+        msg = "rcond must be in (0, 1)"
+        logger.error(msg, extra={"rcond": rcond})
         raise ValueError(msg)
 
 
@@ -646,26 +1045,6 @@ def _calculate_residual(
     return residual
 
 
-@overload
-def batch_lstsq(
-    G: np.ndarray,
-    d: np.ndarray,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    verbose: bool = True,
-    tqdm_args: dict | None = None,
-    return_numpy: bool = True,
-) -> NDArray[np.floating]: ...
-@overload
-def batch_lstsq(
-    G: torch.Tensor,
-    d: torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    verbose: bool = True,
-    tqdm_args: dict | None = None,
-    return_numpy: bool = False,
-) -> torch.Tensor: ...
 def batch_lstsq(
     G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
@@ -674,7 +1053,8 @@ def batch_lstsq(
     verbose: bool = True,
     tqdm_args: dict | None = None,
     return_numpy: bool = True,
-) -> np.ndarray | torch.Tensor:
+    rcond: float = 1e-10,
+) -> LstsqResult:
     """Batch least-squares solver for solving the least squares problem.
 
     Parameters
@@ -695,13 +1075,17 @@ def batch_lstsq(
         Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm#tqdm-objects>`_
         Object for progress bar.
     return_numpy : bool, optional
-        Return numpy array if True, otherwise torch tensor, by default True.
+        Return numpy arrays if True, otherwise torch tensors, by default True.
+    rcond : float, optional
+        Relative cutoff separating determined from unconstrained
+        directions, forwarded to :func:`censored_lstsq`. Default is 1e-10.
 
     Returns
     -------
-    x : np.ndarray | torch.Tensor
-        (n_im x n_pt) matrix that minimizes norm(M*(GX - d)). If return_numpy is
-        True, return a numpy array, otherwise return a torch tensor.
+    LstsqResult
+        Result whose ``solution`` is the (n_param x n_pt) matrix that
+        minimizes ``norm(M*(GX - d))``, with the per-pixel diagnostics
+        stitched from every patch.
 
     """
     if tqdm_args is None:
@@ -712,7 +1096,14 @@ def batch_lstsq(
     n_param = G.shape[1] if G.ndim == 2 else G.shape[2]
     device = parse_device(device)
 
-    result = torch.full((n_param, n_pt), torch.nan, dtype=dtype)
+    result = torch.full((n_param, n_pt), torch.nan, dtype=dtype, device=device)
+    result_diag = LstsqResult(
+        solution=result,
+        is_constrained=torch.zeros((n_param, n_pt), dtype=torch.bool, device=device),
+        rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
+        n_observations=torch.zeros(n_pt, dtype=torch.int64, device=device),
+        condition_number=torch.full((n_pt,), torch.nan, dtype=dtype, device=device),
+    )
     mem_size = device_mem_size(device)
     patch_col = _get_patch_col(G, d, mem_size, dtype)
     if verbose:
@@ -721,65 +1112,76 @@ def batch_lstsq(
     for col in patch_col:
         c0, c1 = int(col[0]), int(col[1])
         if G.ndim == 2:
-            result[:, c0:c1] = censored_lstsq(
+            chunk = censored_lstsq(
                 G=G,
                 d=d[:, c0:c1],
                 dtype=dtype,
                 device=device,
                 return_numpy=False,
+                rcond=rcond,
             )
         elif G.ndim == 3:
-            result[:, c0:c1] = censored_lstsq(
+            chunk = censored_lstsq(
                 G=G[c0:c1, :, :],
                 d=d[:, c0:c1],
                 dtype=dtype,
                 device=device,
                 return_numpy=False,
+                rcond=rcond,
             )
         else:
             msg = "Dimension of G must be 2 or 3"
             raise ValueError(msg)
+        result[:, c0:c1] = chunk.solution
+        result_diag.is_constrained[:, c0:c1] = chunk.is_constrained
+        result_diag.rank[c0:c1] = chunk.rank
+        result_diag.n_observations[c0:c1] = chunk.n_observations
+        result_diag.condition_number[c0:c1] = chunk.condition_number
     if return_numpy:
-        result = result.cpu().numpy()
-    return result
+        return result_diag.numpy()
+    return result_diag
 
 
-@overload
 def censored_lstsq(
     G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
     device: str | torch.device | None = None,
     return_numpy: bool = True,
-) -> np.ndarray: ...
-@overload
-def censored_lstsq(
-    G: np.ndarray | torch.Tensor,
-    d: np.ndarray | torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    return_numpy: bool = False,
-) -> torch.Tensor: ...
-def censored_lstsq(
-    G: np.ndarray | torch.Tensor,
-    d: np.ndarray | torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    return_numpy: bool = True,
-) -> np.ndarray | torch.Tensor:
-    """Solves least squares problem subject to missing data.
+    *,
+    rcond: float = 1e-10,
+) -> LstsqResult:
+    """Solve least squares subject to missing data, rank-robustly.
 
     Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/.
 
+    Every pixel is solved through the normal equations ``T = G' M G``
+    with ``M`` the pixel's valid-row mask (NaN rows in ``d`` are missing
+    observations):
+
+    1. Pixels with no valid observation stay NaN and are reported with
+       ``rank == 0``.
+    2. Pixels whose ``T`` passes a Cholesky factorization with a healthy
+       pivot ratio are solved exactly through the Cholesky factor.
+    3. Remaining pixels are rank deficient (e.g. a date isolated in the
+       pair network by missing data). They receive the minimum-norm
+       least-squares solution via a batched eigendecomposition with the
+       relative cutoff ``rcond``; eigenvalues below ``rcond`` times the
+       largest are treated as unconstrained directions.
+
+    Floating-point Cholesky can slip through near-zero pivots, so the
+    fast path additionally requires the smallest-to-largest ratio of the
+    factor diagonal to exceed ``1e-6``; pixels failing only this screen
+    are still solved correctly by the minimum-norm path.
+
     .. note::
-        This function is used for solving the least squares problem with **missing
-        data**. The missing data is represented by nan values in the data matrix
-        ``d``. If there are no nan values in d, you are recommended to use
-        :func:`torch.linalg.lstsq` instead.
+        Missing data is represented by NaN values in ``d``. Systems with
+        no NaN and known full rank are solved by the fast path
+        automatically; no separate solver is needed.
 
     Parameters
     ----------
-    G : np.ndarray | torch.Tensor,
+    G : np.ndarray | torch.Tensor
         model field matrix in shape of (n_im, n_param) or (n_pt, n_im, n_param).
         If G is 3D, the first dimension is the G matrix for each pixel.
     d : np.ndarray | torch.Tensor, (n_im, n_pt) matrix
@@ -790,60 +1192,117 @@ def censored_lstsq(
         The compute device for torch.Tensor. If None, use GPU if available,
         otherwise use CPU.
     return_numpy : bool, optional
-        Return numpy array if True, otherwise torch tensor, by default True.
+        Return numpy arrays if True, otherwise torch tensors, by default True.
+    rcond : float, optional
+        Relative cutoff for unconstrained directions on the minimum-norm
+        path. Default is 1e-10.
 
     Returns
     -------
-    X : np.ndarray | torch.Tensor
-        (n_im x n_pt) matrix that minimizes norm(M*(GX - d)).
+    LstsqResult
+        Result whose ``solution`` is the (n_param x n_pt) matrix that
+        minimizes ``norm(M*(GX - d))``, with minimum norm on
+        rank-deficient pixels and NaN where a pixel has no valid
+        observation. The per-pixel ``is_constrained``, ``rank``,
+        ``n_observations``, and ``condition_number`` are always filled.
 
     """
     device = parse_device(device)
 
     G = torch.as_tensor(G, dtype=dtype, device=device)  # noqa: N806
     d = torch.as_tensor(d, dtype=dtype, device=device)
+    if d.ndim == 1:
+        d = d[:, None]
 
-    # set nan values to zero for calculation, and get the mask for valid pixels
     d_nan = torch.isnan(d)
-    d[d_nan] = 0
-    M = ~d_nan  # noqa: N806
+    valid = ~d_nan
+    values = torch.where(d_nan, torch.zeros((), dtype=dtype, device=device), d)
 
-    # simplest way to detect rank deficiency caused by missing data
-    m = torch.sum(M, dim=0) > G.shape[-1]
+    n_param = G.shape[-1]
+    n_pt = d.shape[-1]
+    n_obs = valid.sum(dim=0)
 
-    x = torch.full((G.shape[-1], d.shape[-1]), torch.nan, dtype=dtype, device=device)
-    if G.ndim == 2:
-        rhs = torch.matmul(G.T, M[:, m] * d[:, m]).T[:, :, None]  # n x r x 1 tensor
-        T = torch.matmul(  # noqa: N806
-            G.T[None, :, :],
-            M[:, m].T[:, :, None] * G[None, :, :],
-        )  # n x r x r tensor
-    else:
-        rhs = torch.matmul(
-            G[m].permute(0, 2, 1),
-            (M[:, m] * d[:, m]).T[:, :, None],
-        )  # n x r x 1 tensor
-        # n x r x r tensor
-        T = torch.matmul(G[m].permute(0, 2, 1), M[:, m].T[:, :, None] * G[m])  # noqa: N806
+    x = torch.full((n_param, n_pt), torch.nan, dtype=dtype, device=device)
+    diag = LstsqResult(
+        solution=x,
+        is_constrained=torch.zeros((n_param, n_pt), dtype=torch.bool, device=device),
+        rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
+        n_observations=n_obs.to(torch.int64),
+        condition_number=torch.full((n_pt,), torch.nan, dtype=dtype, device=device),
+    )
 
-    # transpose to get r x n
-    x[:, m] = torch.squeeze(torch.linalg.solve(T, rhs), dim=2).T
+    solvable = torch.nonzero(n_obs > 0).flatten()
+    gw = None
+    t_mat = None
+    rhs = None
+    if solvable.numel() > 0:
+        m_sel = valid[:, solvable]
+        d_sel = values[:, solvable]
+        if G.ndim == 2:
+            gw = m_sel.T.unsqueeze(2) * G.unsqueeze(0)
+        else:
+            gw = G[solvable] * m_sel.T.unsqueeze(-1)
+        t_mat = torch.matmul(gw.mT, gw)
+        rhs = torch.matmul(gw.mT, d_sel.T.unsqueeze(2))
+
+        ell, info = torch.linalg.cholesky_ex(t_mat)
+        pivots = torch.diagonal(ell, dim1=1, dim2=2)
+        pivot_ratio = torch.where(
+            info == 0,
+            pivots.amin(dim=1) / pivots.amax(dim=1).clamp_min(torch.finfo(dtype).tiny),
+            torch.full((solvable.numel(),), torch.inf, dtype=dtype, device=device),
+        )
+        spd = (info == 0) & (pivot_ratio > _PIVOT_RATIO_MIN)
+
+        n_sel = solvable.numel()
+        x_sel = torch.empty((n_param, n_sel), dtype=dtype, device=device)
+        rank_sel = torch.empty(n_sel, dtype=torch.int64, device=device)
+        cond_sel = torch.empty(n_sel, dtype=dtype, device=device)
+        constrained_sel = torch.ones((n_param, n_sel), dtype=torch.bool, device=device)
+
+        if bool(spd.any()):
+            x_spd = torch.cholesky_solve(rhs[spd], ell[spd]).squeeze(-1).T
+            x_sel[:, spd] = x_spd
+            rank_sel[spd] = n_param
+            cond_sel[spd] = pivot_ratio[spd]
+
+        deficient = ~spd
+        if bool(deficient.any()):
+            w_e, v_e = torch.linalg.eigh(t_mat[deficient])
+            lam_max = w_e[:, -1:]
+            keep = w_e > lam_max * rcond
+            rank_sel[deficient] = keep.sum(dim=1).to(torch.int64)
+            lam_min = torch.where(keep, w_e, torch.full_like(w_e, torch.inf)).amin(
+                dim=1
+            )
+            cond_sel[deficient] = lam_max[:, 0] / lam_min
+            w_inv = torch.where(keep, 1.0 / w_e, torch.zeros_like(w_e))
+            x_def = torch.matmul(
+                v_e,
+                w_inv.unsqueeze(-1) * torch.matmul(v_e.mT, rhs[deficient]),
+            )
+            x_sel[:, deficient] = x_def.squeeze(-1).T
+            # column mass of the null-space eigenvectors: a parameter j is
+            # constrained iff e_j has no projection onto the null space
+            null_mass = (v_e * v_e * (~keep).unsqueeze(1)).sum(dim=2)
+            constrained_sel[:, deficient] = (null_mass < _NULL_MASS_TOL).T
+
+        x[:, solvable] = x_sel
+        diag.rank[solvable] = rank_sel
+        diag.condition_number[solvable] = cond_sel
+        diag.is_constrained[:, solvable] = constrained_sel
 
     device_type = device.type
     if device_type != "cpu":
-        x_np = x.detach().cpu()
         # clear cache manually to avoid memory overflow
-        del G, d, M, m, d_nan, T, rhs, x
+        del G, d, values, gw, t_mat, rhs, x
         if device_type == "cuda":
             torch.cuda.empty_cache()
         elif device_type == "mps":
             torch.mps.empty_cache()
-        if return_numpy:
-            x_np = x_np.numpy()
-        return x_np
     if return_numpy:
-        return x.numpy()
-    return x
+        return diag.numpy()
+    return diag
 
 
 def calculate_u(
@@ -880,34 +1339,50 @@ def calculate_u(
 
     Examples
     --------
-    get the loops from the pairs:
+    Build the loops from a small pair network, then align the unwrapped
+    phases with the pairs present in the loops:
 
-    >>> loops = pairs.build_loops()
-    >>> idx = pairs.where(
-    ...     loops.pairs
-    ... )  # get the index of the pairs in the loops from the input pairs
+    >>> import numpy as np
+    >>> import faninsar as fis
+    >>> from faninsar.timeseries import NSBAS
+    >>> names = [
+    ...     "20170101_20170113",
+    ...     "20170101_20170125",
+    ...     "20170101_20170206",
+    ...     "20170113_20170125",
+    ...     "20170113_20170206",
+    ...     "20170125_20170206",
+    ... ]
+    >>> pairs = fis.Pairs.from_names(names)
+    >>> unw = np.arange(12, dtype=np.float64).reshape(6, 2)
+    >>> loops = pairs.build_loops(edge_days=12)
+    >>> idx = pairs.where(loops.pairs)  # index of the loop pairs among the input pairs
     >>> unw_used = unw[idx]
 
     calculate u by loops and unwrapped interferometric phases:
 
-    >>> u = np.zeros_like(unw, dtype=np.float32)
-    >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used))
+    >>> u = np.zeros_like(unw)
+    >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used, device="cpu"))
+    >>> u.shape
+    (6, 2)
 
-    calculate the corrected interferometric phases
+    calculate the corrected interferometric phases:
 
     >>> unw_c = unw - 2 * np.pi * u
+    >>> unw_c.shape
+    (6, 2)
 
     """
-    C = loops.loop_matrix()  # noqa: N806
+    device = parse_device(device)
+    unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
+    C = torch.as_tensor(loops.loop_matrix(), dtype=dtype, device=device)  # noqa: N806
 
     # edge pairs are not contributing to the loop closure phase, remove them
     # from the matrix C to avoid being involved in the calculation of u
-    mask = loops.pairs.where(loops.diagonal_pairs)
+    mask = torch.as_tensor(
+        loops.pairs.where(loops.diagonal_pairs), dtype=torch.long, device=device
+    )
     Cc = C[:, mask]  # noqa: N806
-
-    C = torch.as_tensor(C, dtype=dtype, device=device)  # noqa: N806
-    unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
-    Cc = torch.as_tensor(Cc, dtype=dtype, device=device)  # noqa: N806
 
     closure_phase = torch.mm(C, unw_phases)
 
@@ -923,7 +1398,7 @@ def calculate_u(
             device=device,
             tqdm_args={"desc": "  Calculate u"},
             return_numpy=False,
-        )
+        ).solution
     else:
         uc = torch.linalg.lstsq(Cc, closure_phase).solution
 

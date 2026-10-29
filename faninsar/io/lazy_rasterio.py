@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING, Literal
 import dask
 import dask.array as da
 import rasterio
+from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     import numpy as np
+    from rasterio.crs import CRS
 
 
 class LazyRasterioReader:
@@ -36,6 +38,12 @@ class LazyRasterioReader:
     lock : bool, optional
         Whether to use locks for thread safety. Rasterio usually doesn't
         need this. Default is False.
+    warp_crs : CRS, optional
+        Target CRS to warp the source to during chunk reads. If None
+        (default), the source is read without reprojection. When given and
+        different from the source CRS, reads are performed through a
+        :class:`rasterio.vrt.WarpedVRT` so pixel windows are interpreted in
+        the target CRS.
 
     Attributes
     ----------
@@ -75,10 +83,12 @@ class LazyRasterioReader:
         path: str,
         chunks: tuple[int, int] | dict[str, int] | None = None,
         lock: bool = False,
+        warp_crs: CRS | None = None,
     ) -> None:
         """Initialize LazyRasterioReader."""
         self.path = path
         self.lock = lock
+        self.warp_crs = warp_crs
 
         # Normalize chunks
         if chunks is None:
@@ -90,13 +100,26 @@ class LazyRasterioReader:
 
         # Read metadata only (no data loading)
         with rasterio.open(path) as src:
-            self.shape = src.shape
-            self.dtype = src.dtypes[0]
-            self.crs = src.crs
-            self.transform = src.transform
-            self.nodata = src.nodata
-            self.count = src.count
-            self.bounds = src.bounds
+            self._needs_warp = (
+                warp_crs is not None and src.crs is not None and src.crs != warp_crs
+            )
+            if self._needs_warp:
+                with WarpedVRT(src, crs=warp_crs) as vrt:
+                    self.shape = vrt.shape
+                    self.dtype = vrt.dtypes[0]
+                    self.crs = vrt.crs
+                    self.transform = vrt.transform
+                    self.nodata = vrt.nodata
+                    self.count = vrt.count
+                    self.bounds = vrt.bounds
+            else:
+                self.shape = src.shape
+                self.dtype = src.dtypes[0]
+                self.crs = src.crs
+                self.transform = src.transform
+                self.nodata = src.nodata
+                self.count = src.count
+                self.bounds = src.bounds
 
     def _make_chunk_reader(
         self, band: int = 1, window: Window | None = None
@@ -132,10 +155,18 @@ class LazyRasterioReader:
                 Data for this chunk.
 
             """
+
+            def read(ds: rasterio.DatasetReader, window: Window | None) -> np.ndarray:
+                """Read data from an opened (possibly warped) dataset."""
+                return ds.read(band, window=window, masked=True)
+
             if block_id is None:
                 # Read entire array
                 with rasterio.open(self.path) as src:
-                    return src.read(band, window=window, masked=True)
+                    if self._needs_warp:
+                        with WarpedVRT(src, crs=self.warp_crs) as vrt:
+                            return read(vrt, window)
+                    return read(src, window)
 
             # Calculate chunk position in global array
             row_idx, col_idx = block_id
@@ -166,7 +197,10 @@ class LazyRasterioReader:
 
             # Read using rasterio
             with rasterio.open(self.path) as src:
-                return src.read(band, window=chunk_window, masked=True)
+                if self._needs_warp:
+                    with WarpedVRT(src, crs=self.warp_crs) as vrt:
+                        return read(vrt, chunk_window)
+                return read(src, chunk_window)
 
         return read_chunk
 
@@ -223,6 +257,9 @@ class LazyMultiFileReader:
         - ``"auto"`` or ``{}``: Auto-detect from first file's block size.
         - ``int``: Use same size for both y and x dimensions.
         - ``dict``: Specify 'y' and 'x' separately, e.g., ``{"y": 256, "x": 512}``.
+    warp_crs : CRS, optional
+        Target CRS to warp sources to during chunk reads. If None (default),
+        sources are read without reprojection.
 
     Attributes
     ----------
@@ -253,13 +290,18 @@ class LazyMultiFileReader:
         self,
         paths: list[str],
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        warp_crs: CRS | None = None,
     ) -> None:
         """Initialize LazyMultiFileReader."""
         self.paths = paths
+        self.warp_crs = warp_crs
         self._chunks = self._resolve_chunks(chunks, paths[0] if paths else None)
 
         # Create reader for each file
-        self.readers = [LazyRasterioReader(path, chunks=self._chunks) for path in paths]
+        self.readers = [
+            LazyRasterioReader(path, chunks=self._chunks, warp_crs=warp_crs)
+            for path in paths
+        ]
 
     @staticmethod
     def _resolve_chunks(  # noqa: PLR0911

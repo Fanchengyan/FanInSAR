@@ -12,12 +12,14 @@ from faninsar.core.baseline import Baselines
 from faninsar.core.pair import Pair, Pairs
 from faninsar.core.sar_property import Frequency, Wavelength
 
+# Defined before the grouped facades: dataset modules may read the package
+# version while ``faninsar`` itself is still initializing.
+__version__ = "0.1.dev0"
+
 # Import grouped facades only after core values exist. Dataset modules use
 # these values in their type-level imports during package initialization.
 from faninsar import data, network, remote, stack  # isort: skip
 from faninsar.network import Network
-
-__version__ = "0.1.dev0"
 
 # Hard cap: the root surface is deliberately limited to the stable scientific
 # values and grouped workflow facades below.

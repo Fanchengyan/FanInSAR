@@ -18,17 +18,24 @@ from faninsar.missions.nisar.adapter import (
 
 
 def __getattr__(name: str) -> Any:
-    """Load the concrete NISAR Stack adapter lazily."""
+    """Load the concrete NISAR Stack adapter and GUNW datasets lazily."""
     if name == "NISARStack":
         from faninsar.missions.nisar.stack import NISARStack
 
         return NISARStack
+    if name in {"NISAR", "NISARIonosphere", "NisarCoherenceDataset"}:
+        from faninsar.missions.nisar import gunw
+
+        return getattr(gunw, name)
     raise AttributeError(name)
 
 
 __all__ = [
+    "NISAR",
+    "NISARIonosphere",
     "NISARStack",
     "NisarAdmissionPolicy",
+    "NisarCoherenceDataset",
     "NisarSensor",
     "admit_nisar_source",
     "normalize_channel",

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from faninsar.timeseries.coherence_weight import (
+    WeightFunc,
+    coherence_to_weight,
+    normalize_weight_func,
+)
 from faninsar.timeseries.export import (
     ExporterRegistry,
     NetcdfExporter,
@@ -31,6 +36,8 @@ from faninsar.timeseries.results import (
     invert_unwrapped_pairs,
 )
 from faninsar.timeseries.solver import (
+    LstsqResult,
+    NSBASResult,
     NSBASSolver,
     batch_lstsq,
     calculate_u,
@@ -59,6 +66,8 @@ __all__ = [
     "FreezeThawCycleModel",
     "FreezeThawCycleModelWithVelocity",
     "LinearModel",
+    "LstsqResult",
+    "NSBASResult",
     "NSBASSolver",
     "NetcdfExporter",
     "QuadraticModel",
@@ -71,15 +80,18 @@ __all__ = [
     "TimeSeriesModels",
     "Uncertainty",
     "UncertaintyPropagation",
+    "WeightFunc",
     "batch_lstsq",
     "calculate_u",
     "censored_lstsq",
+    "coherence_to_weight",
     "data2param",
     "data2param_cov",
     "data2param_sequence",
     "get_var_patch",
     "invert",
     "invert_unwrapped_pairs",
+    "normalize_weight_func",
     "read_timeseries",
     "registry",
     "safe_remove",

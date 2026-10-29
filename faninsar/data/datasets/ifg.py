@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from pyproj.crs import CRS
 
     from faninsar.core import Baselines, PhaseDeformationConverter
+    from faninsar.data.datasets.gacos import GACOS
 
 logger = setup_logger(__name__)
 
@@ -244,13 +245,22 @@ class InterferogramDataset(PairDataset):
     pattern_unw = "*"
     #: pattern used to find coherence files.
     pattern_coh = "*"
+    #: pattern used to find line-of-sight angle files. ``None`` skips auto-attach.
+    pattern_los: str | None = None
     #: value range of coherence.
     coh_range: tuple[float, float] = (0, 1)
+    #: default angle type for :meth:`load_los_ratio`.
+    los_angle_type: Literal["incidence", "look"] = "look"
+    #: class used to build the coherence dataset. Subclasses whose coherence
+    #: products need a different reader (e.g. HDF5 subdatasets) override this.
+    _coh_dataset_cls: type[CoherenceDataset] = CoherenceDataset
 
     _ds_coh: CoherenceDataset
     _ds_dem: RasterDataset | None = None
     _ds_mask: RasterDataset | None = None
     _ds_aps: RasterDataset | None = None
+    _ds_los: RasterDataset | None = None
+    _ds_gacos: GACOS | None = None
 
     def __init__(
         self,
@@ -270,6 +280,7 @@ class InterferogramDataset(PairDataset):
         verbose: bool = True,
         keep_common: bool = True,
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -331,6 +342,10 @@ class InterferogramDataset(PairDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all files, rewriting the entries. If False (default), reuse
+            previously written manifest entries when they are present.
 
         """
         root_dir = Path(root_dir)
@@ -338,6 +353,7 @@ class InterferogramDataset(PairDataset):
         self.cache = cache
         self.resampling = resampling
         self.verbose = verbose
+        self._reindex = reindex
 
         if paths_unw is None:
             paths_unw = sorted(set(root_dir.rglob(self.pattern_unw)))
@@ -386,9 +402,10 @@ class InterferogramDataset(PairDataset):
             verbose=verbose,
             ds_name="Interferogram",
             chunks=chunks,
+            reindex=reindex,
         )
 
-        self._ds_coh = CoherenceDataset(
+        self._ds_coh = self._coh_dataset_cls(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,
@@ -404,6 +421,7 @@ class InterferogramDataset(PairDataset):
             ds_name="Coherence",
             chunks=chunks,
             pair_parser=self.parse_pairs,
+            reindex=reindex,
         )
         self._ds_coh._range = self.coh_range
 
@@ -419,6 +437,9 @@ class InterferogramDataset(PairDataset):
         self._assign_pairs_from_paths()
 
         self._ds_coh._assign_pairs_from_paths()
+        self._ds_los = None
+        self._ds_gacos = None
+        self._attach_los_dataset()
 
     def _deduplicate_pairs(
         self, paths: np.ndarray, dataset_name: str
@@ -511,6 +532,16 @@ class InterferogramDataset(PairDataset):
         return self._ds_los
 
     @property
+    def gacos_dataset(self) -> GACOS | None:
+        """Return the attached GACOS dataset. If None, no GACOS data is used."""
+        return self._ds_gacos
+
+    @property
+    def gacos(self) -> GACOS | None:
+        """Return the attached GACOS dataset. If None, no GACOS data is used."""
+        return self._ds_gacos
+
+    @property
     def dem_dataset(self) -> RasterDataset | None:
         """Return the DEM dataset. If None, no DEM data is used."""
         return self._ds_dem
@@ -540,6 +571,7 @@ class InterferogramDataset(PairDataset):
         kwargs.setdefault("cache", self.cache)
         kwargs.setdefault("resampling", self.resampling)
         kwargs.setdefault("verbose", self.verbose)
+        kwargs.setdefault("reindex", self._reindex)
         return kwargs
 
     def _ensure_ds(
@@ -587,6 +619,35 @@ class InterferogramDataset(PairDataset):
         kwargs.setdefault("ds_name", "ApsPairs")
         self._ds_aps = self._ensure_ds(aps_dataset, "aps_dataset", ApsPairs, **kwargs)
 
+    def set_gacos_dataset(
+        self,
+        gacos_dataset: GACOS | None = None,
+        **kwargs: dict,
+    ) -> None:
+        """Attach a GACOS dataset, inheriting crs, res, and roi from this dataset.
+
+        Parameters
+        ----------
+        gacos_dataset : GACOS, optional
+            An existing GACOS dataset. If None, a new GACOS object is created
+            from ``kwargs``.
+        **kwargs : dict, optional
+            Keyword arguments used to create a new GACOS object if
+            ``gacos_dataset`` is None. ``crs``, ``res``, and ``roi`` default
+            to this interferogram dataset.
+
+        """
+        from faninsar.data.datasets.gacos import GACOS
+
+        kwargs.setdefault("ds_name", "GACOS")
+        kwargs.setdefault("nodata", np.nan)
+        self._ds_gacos = self._ensure_ds(
+            gacos_dataset,
+            "gacos_dataset",
+            GACOS,
+            **kwargs,
+        )
+
     def set_los_dataset(
         self,
         los_dataset: RasterDataset | None = None,
@@ -594,10 +655,11 @@ class InterferogramDataset(PairDataset):
     ) -> None:
         """Set the los dataset.
 
-        los file could be incidence angle (relative to vertical) or look angle
-        (relative to horizontal). This file is used to convert differential
-        atmospheric phase from vertical to line-of-sight (LOS) direction or
-        convert LOS deformation phase to vertical.
+        los file could be incidence angle (relative to vertical) or look
+        angle (relative to horizontal, including HyP3 ``lv_theta``). This
+        file is used to convert differential atmospheric phase from
+        vertical to line-of-sight (LOS) direction or convert LOS
+        deformation phase to vertical.
 
         Parameters
         ----------
@@ -610,6 +672,31 @@ class InterferogramDataset(PairDataset):
         """
         kwargs.setdefault("ds_name", "LOS")
         self._ds_los = self._ensure_ds(los_dataset, "los_dataset", **kwargs)
+
+    def _attach_los_dataset(self) -> None:
+        """Attach LOS files found under ``root_dir`` when ``pattern_los`` is set."""
+        if not self.pattern_los:
+            return
+        suffix = self.pattern_los.lstrip("*")
+        paths = sorted(
+            path
+            for path in Path(self.root_dir).rglob(f"*{suffix}")
+            if path.is_file() and path.name.endswith(suffix)
+        )
+        if not paths:
+            logger.warning(
+                "No LOS files matching %s found under %s; "
+                "los_dataset was not attached.",
+                self.pattern_los,
+                self.root_dir,
+            )
+            return
+        # A single LOS file is sufficient — every granule in one track shares
+        # the same incidence angle, so keep only the first path for both the
+        # manifest entry and the runtime dataset.
+        self.set_los_dataset(
+            root_dir=self.root_dir, paths=paths[:1], verbose=self.verbose
+        )
 
     def set_dem_dataset(
         self,
@@ -642,7 +729,7 @@ class InterferogramDataset(PairDataset):
     def load_los_ratio(
         self,
         roi: BoundingBox | None = None,
-        angle_type: Literal["incidence", "look"] = "look",
+        angle_type: Literal["incidence", "look"] | None = None,
     ) -> np.ndarray:
         """Load and convert los angle map to ratio map for given region of interest.
 
@@ -656,20 +743,34 @@ class InterferogramDataset(PairDataset):
             region of interest to load. If None, the roi of the dataset will be
             used.
         angle_type : Literal['incidence', 'look'], optional
-            angle type, one of ['incidence', 'look']. 'incidence' means incidence
-            angle (relative to vertical) and 'look' means look angle (relative to
-            horizontal). Default is 'look'.
+            Angle type. ``incidence`` is from vertical and uses ``cos(θ)``.
+            ``look`` is from horizontal (HyP3 ``lv_theta``) and uses
+            ``sin(θ)``. Default is :attr:`los_angle_type` (``"look"`` on
+            HyP3 and the interferogram base class).
 
         """
         if self.los_dataset is None:
             return None
+        if angle_type is None:
+            angle_type = self.los_angle_type
+        if roi is None:
+            roi = self.roi if self.roi is not None else self.los_dataset.roi
 
         sample_theta = self.los_dataset[roi]
-        arr_theta = sample_theta.boxes.data.squeeze((0, 1))
+        arr_theta = np.asarray(sample_theta["data"], dtype=np.float64)
+        arr_theta = np.squeeze(arr_theta)
+        if arr_theta.ndim == 0:
+            arr_theta = arr_theta.reshape(1)
+        elif arr_theta.ndim > 2:
+            arr_theta = arr_theta[0]
         if angle_type == "incidence":
             los_ratio = np.cos(arr_theta)
         elif angle_type == "look":
             los_ratio = np.sin(arr_theta)
+        else:
+            msg = f"angle_type must be 'incidence' or 'look', got {angle_type!r}"
+            logger.error(msg)
+            raise ValueError(msg)
         return los_ratio
 
     def get_nan_count(
@@ -918,6 +1019,7 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
         verbose: bool = True,
         keep_common: bool = True,
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -979,6 +1081,10 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all files, rewriting the entries. If False (default), reuse
+            previously written manifest entries when they are present.
 
         """
         root_dir = Path(root_dir)
@@ -1005,6 +1111,7 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             verbose=verbose,
             keep_common=keep_common,
             chunks=chunks,
+            reindex=reindex,
         )
 
     def _get_sub_dataset_paths(self, file_paths: list[str], group: str) -> list[str]:

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC
 from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
 import rioxarray  # noqa: F401
 
+from faninsar import __version__ as _faninsar_version
 from faninsar.core.acquisition import Acquisition
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 
+from . import manifest as _manifest
 from .raster import RasterDataset
 
 if TYPE_CHECKING:
@@ -29,6 +32,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the dataset and attach acquisition metadata."""
         super().__init__(*args, **kwargs)
+        self._manifest_date_strings: list[str] | None = self._manifest_extra("date")
         self._assign_dates_from_paths()
 
     @property
@@ -36,19 +40,59 @@ class TimeSeriesDataset(RasterDataset, ABC):
         """Return the date for each acquisition in the dataset."""
         return self._dates
 
+    def _manifest_extra(self, key: str) -> list | None:
+        """Return the per-file manifest values for ``key``, or None."""
+        snapshot = self._manifest_snapshot(self._files.paths.tolist())
+        if snapshot is None:
+            return None
+        values = [row.get(key) for row in snapshot["files"]]
+        if any(v is None for v in values):
+            return None
+        return values
+
+    def _manifest_write_extras(self, key: str, values: list) -> None:
+        """Write ``values`` back into the manifest under ``key``."""
+        snapshot = self._manifest_snapshot(self._files.paths.tolist())
+        if snapshot is None:
+            return
+        files = snapshot["files"]
+        for row, value in zip(files, values, strict=True):
+            row[key] = _manifest.encode_file_row({"v": value})["v"]
+        attrs = dict(snapshot["attrs"])
+        attrs.setdefault("crs", self.crs)
+        attrs.setdefault("res", self.res)
+        attrs.setdefault("dtype", self.dtype)
+        attrs.setdefault("nodata", self.nodata)
+        attrs.setdefault("bounds", tuple(self.bounds) if self.index.bounds else None)
+        with contextlib.suppress(OSError):
+            _manifest.write_entry(
+                self.root_dir,
+                self._manifest_name(),
+                self._files.paths.tolist(),
+                files,
+                attrs,
+                _faninsar_version,
+            )
+
     def _assign_dates_from_paths(self) -> None:
         """Parse acquisition dates from current file list."""
         paths = self._files.paths.tolist()
         if len(paths) == 0:
             self._dates = Acquisition([])
             self._files.loc[:, "date"] = pd.NaT
+            self._manifest_write_extras("date", [])
             return
 
-        parsed = self.parse_dates(paths)
-        if not isinstance(parsed, Acquisition):
-            acquisitions = Acquisition(parsed)
+        if self._manifest_date_strings is not None:
+            # Manifest restored the parsed dates — instantiate directly,
+            # skipping the filename-regex round trip.
+            parsed_dates = pd.to_datetime(self._manifest_date_strings, format="%Y%m%d")
+            acquisitions = Acquisition(parsed_dates)
         else:
-            acquisitions = parsed
+            parsed = self.parse_dates(paths)
+            acquisitions = (
+                parsed if isinstance(parsed, Acquisition) else Acquisition(parsed)
+            )
 
         if len(acquisitions) != len(self._files):
             msg = (
@@ -60,6 +104,13 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self._dates = acquisitions
         date_series = pd.Series(acquisitions.values, index=self._files.index)
         self._files.loc[:, "date"] = pd.to_datetime(date_series)
+        self._manifest_write_extras(
+            "date",
+            [
+                pd.Timestamp(v).strftime("%Y%m%d") if v is not None else None
+                for v in acquisitions.values
+            ],
+        )
 
     @classmethod
     def parse_dates(cls, paths: Iterable[str | PathLike]) -> Acquisition:

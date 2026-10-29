@@ -26,6 +26,7 @@ from rasterio.warp import Resampling
 from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 
+from faninsar import __version__ as _faninsar_version
 from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.io.export.kmz import array2kmz
@@ -34,6 +35,7 @@ from faninsar.logging import setup_logger
 from faninsar.processing.geometry.coordinates import bounds_from_xy, xy_from_transform
 from faninsar.processing.geometry.profiles import Profile
 
+from . import manifest as _manifest
 from ._base_common import (
     _serialize_bbox,
     _serialize_points,
@@ -154,6 +156,7 @@ class RasterDataset(GeoDataset):
         verbose: bool = True,
         ds_name: str = "",
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new raster dataset instance.
 
@@ -207,6 +210,11 @@ class RasterDataset(GeoDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry for
+            this dataset and rescan the files, rewriting the entry. If False
+            (default), reuse a previously written manifest entry when it is
+            present and consistent with the current paths.
 
         Raises
         ------
@@ -233,11 +241,14 @@ class RasterDataset(GeoDataset):
         self.verbose = verbose
         self.ds_name = ds_name
         self._chunks = self._normalize_chunks(chunks)
+        self._reindex = reindex
 
         if paths is None:
             paths = []
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
             for file_path in sorted(self.root_dir.rglob(self.pattern)):
+                if file_path.name == _manifest.MANIFEST_FILENAME:
+                    continue
                 match = re.match(filename_regex, file_path.name)
                 if match is not None:
                     paths.append(str(file_path))
@@ -245,14 +256,14 @@ class RasterDataset(GeoDataset):
             paths = [str(p) for p in paths]
 
         # Scan files and extract metadata (always sequential, metadata is lightweight)
-        files_df = self._scan_files_sequential(paths, crs)
+        manifest_attrs = self._scan_files_sequential(paths, crs)
 
         # Store files information
-        self._files = files_df
+        self._files = self._last_files_df
 
         # Determine final attributes based on user parameters and file metadata
         final_crs, final_res, final_dtype, final_nodata = (
-            self._determine_final_attributes(files_df, crs, res, dtype, nodata)
+            self._determine_final_attributes(self._files, crs, res, dtype, nodata)
         )
 
         # Set final attributes
@@ -262,6 +273,14 @@ class RasterDataset(GeoDataset):
         self.nodata = final_nodata
         self.count = self._count
         self.roi = roi
+
+        if manifest_attrs is not None:
+            # Manifest hit — the attrs dict already carries the resolved
+            # crs/res/dtype/nodata/bounds, so re-emit it verbatim instead of
+            # deriving them again.
+            self._manifest_persist(paths, manifest_attrs)
+        else:
+            self._manifest_persist(paths)
 
     @staticmethod
     def _normalize_chunks(
@@ -422,7 +441,8 @@ class RasterDataset(GeoDataset):
                 file_res = src.res
                 file_dtype = src.dtypes[0]
                 file_nodata = src.nodata
-                file_bounds = src.bounds
+                file_width = src.width
+                file_height = src.height
 
                 # Extract colormap if available
                 colormap = None
@@ -445,6 +465,8 @@ class RasterDataset(GeoDataset):
                     "file_res": file_res,
                     "file_dtype": file_dtype,
                     "file_nodata": file_nodata,
+                    "width": file_width,
+                    "height": file_height,
                     "crs": target_crs or file_crs,
                     "bounds": transformed_bounds,
                     "res": transformed_res,
@@ -461,6 +483,8 @@ class RasterDataset(GeoDataset):
                 "file_res": None,
                 "file_dtype": None,
                 "file_nodata": None,
+                "width": None,
+                "height": None,
                 "crs": None,
                 "bounds": None,
                 "res": None,
@@ -526,10 +550,55 @@ class RasterDataset(GeoDataset):
 
         return files_df
 
+    def _manifest_name(self) -> str:
+        """Return the manifest entry name for this dataset instance."""
+        return _manifest.slugify(self.ds_name or self.__class__.__name__)
+
+    def _manifest_snapshot(self, paths: list[str]) -> dict[str, Any] | None:
+        """Return the manifest entry for this dataset, or None on a miss."""
+        return _manifest.read_entry(self.root_dir, self._manifest_name(), paths)
+
+    def _manifest_persist(
+        self, paths: list[str], attrs: dict[str, Any] | None = None
+    ) -> None:
+        """Write the current scan results (or restored ``attrs``) to the manifest."""
+        files = getattr(self, "_last_scan_metadata", None) or []
+        if attrs is None:
+            attrs = {
+                "crs": self.crs,
+                "res": self.res,
+                "dtype": self.dtype,
+                "nodata": self.nodata,
+                "bounds": tuple(self.bounds) if self.index.bounds else None,
+            }
+        try:
+            _manifest.write_entry(
+                self.root_dir,
+                self._manifest_name(),
+                paths,
+                files,
+                attrs,
+                _faninsar_version,
+            )
+        except OSError as e:
+            if self.verbose:
+                logger.warning(
+                    "Unable to write manifest for %s: %s",
+                    self._manifest_name(),
+                    e,
+                )
+
     def _scan_files_sequential(
         self, paths: list[str], target_crs: CRS | None = None
-    ) -> pd.DataFrame:
-        """Scan files sequentially and extract metadata.
+    ) -> dict[str, Any] | None:
+        """Scan files and extract metadata.
+
+        On a manifest hit the snapshot's ``attrs`` is returned (the resolved
+        ``crs``/``res``/``dtype``/``nodata``/``bounds``) and the restored
+        file metadata is left in ``self._last_files_df``. On a miss the scan
+        runs and ``None`` is returned; the caller then derives the final
+        attributes from ``self._last_files_df`` and calls
+        ``_manifest_persist`` to record them.
 
         Parameters
         ----------
@@ -540,10 +609,30 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        pd.DataFrame
-            DataFrame containing file metadata
+        dict or None
+            The manifest's resolved attrs on a hit, else None.
 
         """
+        if not self._reindex:
+            snapshot = self._manifest_snapshot(paths)
+            if snapshot is not None:
+                logger.info(
+                    "Restored %d file(s) for '%s' from %s",
+                    len(snapshot["files"]),
+                    self._manifest_name(),
+                    _manifest.manifest_path(self.root_dir),
+                )
+                self._last_scan_metadata = snapshot["files"]
+                self._last_files_df = self._process_scan_results(snapshot["files"])
+                return snapshot["attrs"]
+
+        logger.info(
+            "Scanning %d file(s) for '%s' under %s",
+            len(paths),
+            self._manifest_name(),
+            self.root_dir,
+        )
+
         # Add progress bar if verbose
         paths_iter = (
             tqdm(paths, desc="Scanning files", unit=" files") if self.verbose else paths
@@ -555,8 +644,9 @@ class RasterDataset(GeoDataset):
             metadata = self._extract_single_file_metadata(path, target_crs)
             file_metadata_list.append(metadata)
 
-        # Process results and return DataFrame
-        return self._process_scan_results(file_metadata_list)
+        self._last_scan_metadata = file_metadata_list
+        self._last_files_df = self._process_scan_results(file_metadata_list)
+        return None
 
     def _determine_final_attributes(
         self,
@@ -865,7 +955,7 @@ class RasterDataset(GeoDataset):
             indexes=bands_idx,
             window=win,
             masked=True,
-            boundless=self.same_crs,
+            boundless=self.same_crs and not isinstance(vrt_fh, WarpedVRT),
             # WarpedVRT not supports boundless: https://github.com/rasterio/rasterio/issues/2084
         )
 
@@ -1261,17 +1351,24 @@ class RasterDataset(GeoDataset):
         """
         resolved_chunks = chunks if chunks is not None else self._chunks
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        bbox_list = [self._ensure_query_crs(b) for b in bbox_list]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
         # Create multi-file lazy reader
-        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
+        with self._open_query_source(paths[0]) as src:
+            needs_warp = src.crs is not None and src.crs != self.crs
+        multi_reader = LazyMultiFileReader(
+            [self._to_read_path(p) for p in paths],
+            chunks=resolved_chunks,
+            warp_crs=self.crs if needs_warp else None,
+        )
 
         # Single bbox input (not a list) -> DataArray at root
         if not isinstance(bbox, list):
             single_bbox = bbox_list[0]
 
             # Calculate window using first file
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     with WarpedVRT(src, crs=self.crs) as vrt:
                         win = vrt.window(*single_bbox)
@@ -1328,7 +1425,7 @@ class RasterDataset(GeoDataset):
         children = {}
         for i, single_bbox in enumerate(bbox_list):
             # Calculate window using first file
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     with WarpedVRT(src, crs=self.crs) as vrt:
                         win = vrt.window(*single_bbox)
@@ -1411,7 +1508,13 @@ class RasterDataset(GeoDataset):
         resolved_chunks = chunks if chunks is not None else self._chunks
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
-        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
+        with self._open_query_source(paths[0]) as src:
+            needs_warp = src.crs is not None and src.crs != self.crs
+        multi_reader = LazyMultiFileReader(
+            [self._to_read_path(p) for p in paths],
+            chunks=resolved_chunks,
+            warp_crs=self.crs if needs_warp else None,
+        )
 
         n_polygons = len(polygons)
         children = {}
@@ -1424,7 +1527,7 @@ class RasterDataset(GeoDataset):
             poly_bbox = BoundingBox(minx, miny, maxx, maxy, crs=polygons.crs)
 
             # Calculate window
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     poly_bbox = poly_bbox.to_crs(self.crs)
                     with WarpedVRT(src, crs=self.crs) as vrt:
@@ -1800,6 +1903,7 @@ class RasterDataset(GeoDataset):
         """
         v = self._resolve_verbose(verbose)
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        bbox_list = [self._ensure_query_crs(b) for b in bbox_list]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
 
@@ -1947,6 +2051,50 @@ class RasterDataset(GeoDataset):
             src.close()
             return vrt
         return src
+
+    def _open_query_source(self, path: str) -> DatasetReader:
+        """Open a georeferenced source used to compute lazy query windows.
+
+        Parameters
+        ----------
+        path : str
+            path to the file to open.
+
+        Returns
+        -------
+        DatasetReader
+            opened dataset used to compute query windows and transforms.
+
+        Notes
+        -----
+        Subclasses can override this method to attach georeferencing or
+        other metadata that is not stored in the file itself (e.g. HDF5
+        subdatasets without embedded geotransforms).
+
+        """
+        return rasterio.open(path)
+
+    def _to_read_path(self, path: str) -> str:
+        """Return the path used by lazy readers to open a file.
+
+        Parameters
+        ----------
+        path : str
+            path stored in the dataset files metadata.
+
+        Returns
+        -------
+        str
+            path that can be opened directly by rasterio.
+
+        Notes
+        -----
+        Subclasses can override this method to convert stored paths into a
+        form readable by rasterio (e.g. restoring subdataset syntax mangled
+        by pathlib normalization).
+
+        """
+        return path
 
     def _indexes2paths(self, indexes: int | Iterable[int] | None) -> list[str]:
         """Convert file indexes to file paths.
