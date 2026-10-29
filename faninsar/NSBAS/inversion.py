@@ -714,43 +714,7 @@ class NSBASSolver:
 
         n_param = len(self.model.param_names) if self.model is not None else 0
         n_pair = len(self.pairs)
-        if diagnostics and self.model is None:
-            result, data_diag = batch_lstsq(
-                self.G,
-                self.d,
-                dtype=self.dtype,
-                device=self.device,
-                verbose=self.verbose,
-                tqdm_args={"desc": "  NSBAS inversion"},
-                return_numpy=False,
-                rcond=self._rcond,
-                diagnostics=True,
-            )
-        else:
-            result = batch_lstsq(
-                self.G,
-                self.d,
-                dtype=self.dtype,
-                device=self.device,
-                verbose=self.verbose,
-                tqdm_args={"desc": "  NSBAS inversion"},
-                return_numpy=False,
-                rcond=self._rcond,
-            )
-            data_diag = None
-        if diagnostics and self.model is not None:
-            g_sbas, observations = self._make_data_system()
-            _, data_diag = batch_lstsq(
-                g_sbas,
-                observations,
-                dtype=self.dtype,
-                device=self.device,
-                verbose=self.verbose,
-                tqdm_args={"desc": "  SBAS data diagnostics"},
-                return_numpy=False,
-                rcond=self._rcond,
-                diagnostics=True,
-            )
+        result, data_diag = self._solve(diagnostics)
         residual = _calculate_residual(
             self.G,
             self.d,
@@ -775,12 +739,7 @@ class NSBASSolver:
         if diagnostics:
             if return_numpy:
                 data_diag = data_diag.numpy()
-            diag_fields = {
-                "is_constrained": data_diag.is_constrained,
-                "n_observations": data_diag.n_observations,
-                "rank": data_diag.rank,
-                "condition_number": data_diag.condition_number,
-            }
+            diag_fields = vars(data_diag)
         return NSBASResult(
             increments=incs,
             model_parameters=params,
@@ -788,6 +747,42 @@ class NSBASSolver:
             model_residuals=residual_tsm,
             **diag_fields,
         )
+
+    def _solve(self, diagnostics: bool) -> tuple[Tensor, LstsqDiagnostics | None]:
+        """Solve ``d = Gm`` and optionally the data-only diagnostics.
+
+        Without a model the main solve is the data-only system, so its
+        diagnostics come for free. With a model the solved system is
+        augmented with model rows, and the diagnostics require a
+        separate solve of the SBAS block alone.
+        """
+        want_diag = diagnostics and self.model is None
+        out = batch_lstsq(
+            self.G,
+            self.d,
+            dtype=self.dtype,
+            device=self.device,
+            verbose=self.verbose,
+            tqdm_args={"desc": "  NSBAS inversion"},
+            return_numpy=False,
+            rcond=self._rcond,
+            diagnostics=want_diag,
+        )
+        result, diag = out if want_diag else (out, None)
+        if diagnostics and self.model is not None:
+            g_sbas, observations = self._make_data_system()
+            _, diag = batch_lstsq(
+                g_sbas,
+                observations,
+                dtype=self.dtype,
+                device=self.device,
+                verbose=self.verbose,
+                tqdm_args={"desc": "  SBAS data diagnostics"},
+                return_numpy=False,
+                rcond=self._rcond,
+                diagnostics=True,
+            )
+        return result, diag
 
 
 def device_mem_size(device: str | torch.device | None) -> int:
