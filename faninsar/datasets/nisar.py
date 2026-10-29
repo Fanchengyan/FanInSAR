@@ -235,6 +235,13 @@ class NisarH5Mixin:
         source = parts[0] if parts is not None else str(path)
         return Path(source).name
 
+    def _manifest_comparable_path(self, path: str) -> str | list[str]:
+        """Return the backing granule path of an HDF5 subdataset URI."""
+        parts = self._split_hdf5_subdataset(path)
+        if parts is None:
+            return str(path)
+        return parts[0]
+
     @classmethod
     def _h5_files_from(cls, paths: Iterable[PathLike]) -> list[Path]:
         """Return the granule file paths of paths or HDF5 subdataset paths."""
@@ -524,6 +531,7 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
         verbose: bool = True,
         keep_common: bool = True,
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new NISAR dataset instance.
 
@@ -582,6 +590,10 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
             - ``"auto"`` or ``{}``: Lazy loading with auto-detected block size.
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all granules, rewriting the entries. If False (default),
+            reuse previously written manifest entries when they are present.
 
         """
         self.polarization = polarization.upper()
@@ -618,6 +630,7 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
             verbose=verbose,
             keep_common=keep_common,
             chunks=chunks,
+            reindex=reindex,
         )
 
     @property
@@ -821,6 +834,7 @@ class NISARIonosphere(NisarH5Mixin, PairDataset):
         verbose: bool = True,
         ds_name: str = "NISARIonosphere",
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new NISARIonosphere dataset instance.
 
@@ -871,6 +885,10 @@ class NISARIonosphere(NisarH5Mixin, PairDataset):
             - ``"auto"`` or ``{}``: Lazy loading with auto-detected block size.
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all granules, rewriting the entries. If False (default),
+            reuse previously written manifest entries when they are present.
 
         Notes
         -----
@@ -926,4 +944,5 @@ class NISARIonosphere(NisarH5Mixin, PairDataset):
             verbose=verbose,
             ds_name=ds_name,
             chunks=chunks,
+            reindex=reindex,
         )

@@ -25,6 +25,7 @@ from rasterio.warp import Resampling
 from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 
+from faninsar import __version__ as _faninsar_version
 from faninsar._core.geo import (
     GeoGrid,
     Profile,
@@ -36,6 +37,7 @@ from faninsar.backends import LazyMultiFileReader
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
+from . import manifest as _manifest
 from ._base_common import (
     _serialize_bbox,
     _serialize_points,
@@ -156,6 +158,7 @@ class RasterDataset(GeoDataset):
         verbose: bool = True,
         ds_name: str = "",
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new raster dataset instance.
 
@@ -209,6 +212,11 @@ class RasterDataset(GeoDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry for
+            this dataset and rescan the files, rewriting the entry. If False
+            (default), reuse a previously written manifest entry when it is
+            present and consistent with the current paths.
 
         Raises
         ------
@@ -235,11 +243,14 @@ class RasterDataset(GeoDataset):
         self.verbose = verbose
         self.ds_name = ds_name
         self._chunks = self._normalize_chunks(chunks)
+        self._reindex = reindex
 
         if paths is None:
             paths = []
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
             for file_path in sorted(self.root_dir.rglob(self.pattern)):
+                if file_path.name == _manifest.MANIFEST_FILENAME:
+                    continue
                 match = re.match(filename_regex, file_path.name)
                 if match is not None:
                     paths.append(str(file_path))
@@ -424,7 +435,8 @@ class RasterDataset(GeoDataset):
                 file_res = src.res
                 file_dtype = src.dtypes[0]
                 file_nodata = src.nodata
-                file_bounds = src.bounds
+                file_width = src.width
+                file_height = src.height
 
                 # Extract colormap if available
                 colormap = None
@@ -447,6 +459,8 @@ class RasterDataset(GeoDataset):
                     "file_res": file_res,
                     "file_dtype": file_dtype,
                     "file_nodata": file_nodata,
+                    "width": file_width,
+                    "height": file_height,
                     "crs": target_crs or file_crs,
                     "bounds": transformed_bounds,
                     "res": transformed_res,
@@ -463,6 +477,8 @@ class RasterDataset(GeoDataset):
                 "file_res": None,
                 "file_dtype": None,
                 "file_nodata": None,
+                "width": None,
+                "height": None,
                 "crs": None,
                 "bounds": None,
                 "res": None,
@@ -528,6 +544,48 @@ class RasterDataset(GeoDataset):
 
         return files_df
 
+    def _manifest_name(self) -> str:
+        """Return the manifest entry name for this dataset instance."""
+        return _manifest.slugify(self.ds_name or self.__class__.__name__)
+
+    def _manifest_comparable_path(self, path: str) -> str | list[str]:
+        """Return the filesystem path(s) a manifest entry should compare.
+
+        The default implementation returns ``path`` unchanged. Subclasses that
+        expose logical paths which do not exist on disk (e.g. HDF5 subdataset
+        URIs of the form ``hdf5:"file"::/group``) must override this to map
+        those URIs back to the backing granule path(s).
+        """
+        return path
+
+    def _manifest_paths_match(self, entry_paths: list[str], paths: list[str]) -> bool:
+        """Return True when the stored paths describe the current path list."""
+        expected = _manifest._normalize_paths_for_compare(
+            entry_paths, self._manifest_comparable_path
+        )
+        actual = _manifest._normalize_paths_for_compare(
+            paths, self._manifest_comparable_path
+        )
+        return expected == actual
+
+    def _manifest_restore(
+        self, paths: list[str], target_crs: CRS | None
+    ) -> list[dict[str, Any]] | None:
+        """Return manifest-restored per-file metadata, or None on a miss."""
+        raw_files = self._manifest_lookup(paths)
+        if raw_files is None:
+            return None
+        return _manifest._restore_files_rows(raw_files, paths, target_crs)
+
+    def _manifest_lookup(self, paths: list[str]) -> list[dict[str, Any]] | None:
+        """Fetch the raw ``files`` list for this dataset's manifest entry."""
+        entry = _manifest.read_raw_entry(self.root_dir, self._manifest_name())
+        if entry is None:
+            return None
+        if not self._manifest_paths_match(entry["paths"], paths):
+            return None
+        return entry["files"]
+
     def _scan_files_sequential(
         self, paths: list[str], target_crs: CRS | None = None
     ) -> pd.DataFrame:
@@ -535,7 +593,7 @@ class RasterDataset(GeoDataset):
 
         Parameters
         ----------
-        paths : list[str]
+        paths : list of str
             List of file paths to scan
         target_crs : CRS, optional
             Target CRS for coordinate transformation
@@ -546,6 +604,11 @@ class RasterDataset(GeoDataset):
             DataFrame containing file metadata
 
         """
+        if not self._reindex:
+            restored = self._manifest_restore(paths, target_crs)
+            if restored is not None:
+                return self._process_scan_results(restored)
+
         # Add progress bar if verbose
         paths_iter = (
             tqdm(paths, desc="Scanning files", unit=" files") if self.verbose else paths
@@ -556,6 +619,24 @@ class RasterDataset(GeoDataset):
         for path in paths_iter:
             metadata = self._extract_single_file_metadata(path, target_crs)
             file_metadata_list.append(metadata)
+
+        # Persist the raw metadata to the manifest so subsequent
+        # instantiations can skip this scan entirely.
+        try:
+            _manifest.write_entry(
+                self.root_dir,
+                self._manifest_name(),
+                paths,
+                file_metadata_list,
+                _faninsar_version,
+            )
+        except OSError as e:
+            if self.verbose:
+                logger.warning(
+                    "Unable to write manifest for %s: %s",
+                    self._manifest_name(),
+                    e,
+                )
 
         # Process results and return DataFrame
         return self._process_scan_results(file_metadata_list)
@@ -1109,16 +1190,18 @@ class RasterDataset(GeoDataset):
                         qroot["boxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
                     qroot["polygons"] = _serialize_polygons(query.polygons)
-            root_attrs.update({
-                "query_json": json.dumps(qroot),
-                "query_repr": (
-                    "GeoQuery("
-                    f"points={query.points is not None}, "
-                    f"boxes={query.boxes is not None}, "
-                    f"polygons={query.polygons is not None}"
-                    ")"
-                ),
-            })
+            root_attrs.update(
+                {
+                    "query_json": json.dumps(qroot),
+                    "query_repr": (
+                        "GeoQuery("
+                        f"points={query.points is not None}, "
+                        f"boxes={query.boxes is not None}, "
+                        f"polygons={query.polygons is not None}"
+                        ")"
+                    ),
+                }
+            )
         except Exception:
             pass
         root_ds = xr.Dataset(attrs=root_attrs)
@@ -1298,10 +1381,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1353,10 +1438,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1459,10 +1546,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with lazy array
             wkt = poly_geom.wkt if hasattr(poly_geom, "wkt") else str(poly_geom)
@@ -1475,11 +1564,13 @@ class RasterDataset(GeoDataset):
                     "nodata": self.nodata,
                     "lazy": True,
                     "polygon_wkt": wkt,
-                    "query_json": json.dumps({
-                        "type": "Polygon",
-                        "crs": str(self.crs) if self.crs is not None else None,
-                        "wkt": wkt,
-                    }),
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
@@ -1526,23 +1617,27 @@ class RasterDataset(GeoDataset):
         y_pts = np.asarray(pts.y, dtype=float)
 
         coords = self._file_coords(resolved_indexes, paths, files_df)
-        coords.update({
-            "point": ("point", np.arange(data.shape[-1])),
-            "x": ("point", x_pts),
-            "y": ("point", y_pts),
-        })
+        coords.update(
+            {
+                "point": ("point", np.arange(data.shape[-1])),
+                "x": ("point", x_pts),
+                "y": ("point", y_pts),
+            }
+        )
         if data.ndim == 3:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
         ds = xr.Dataset({"data": (dims, data)}, coords=coords)
         # Dual-track saving: query_json + human-readable query_repr
         qjson = json.dumps(_serialize_points(points))
-        ds.attrs.update({
-            "crs": str(self.crs) if self.crs is not None else None,
-            "nodata": self.nodata,
-            "query_json": qjson,
-            "query_repr": f"Points(count={len(points)}, crs={points.crs})",
-        })
+        ds.attrs.update(
+            {
+                "crs": str(self.crs) if self.crs is not None else None,
+                "nodata": self.nodata,
+                "query_json": qjson,
+                "query_repr": f"Points(count={len(points)}, crs={points.crs})",
+            }
+        )
         return ds
 
     def _make_bbox_ds(
@@ -1569,10 +1664,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(y)),
-            "x": ("x", np.asarray(x)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(y)),
+                "x": ("x", np.asarray(x)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1587,16 +1684,18 @@ class RasterDataset(GeoDataset):
                 "nodata": self.nodata,
             },
         )
-        ds.attrs.update({
-            "query_json": json.dumps(_serialize_bbox(single_bbox)),
-            "query_repr": (
-                "BBox("
-                f"{single_bbox.left}, {single_bbox.bottom}, "
-                f"{single_bbox.right}, {single_bbox.top}, "
-                f"crs={single_bbox.crs}"
-                ")"
-            ),
-        })
+        ds.attrs.update(
+            {
+                "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                "query_repr": (
+                    "BBox("
+                    f"{single_bbox.left}, {single_bbox.bottom}, "
+                    f"{single_bbox.right}, {single_bbox.top}, "
+                    f"crs={single_bbox.crs}"
+                    ")"
+                ),
+            }
+        )
         ds["data"] = ds["data"].fis.set_spatial_ref(
             crs=self.crs,
             x_dim="x",
@@ -1628,10 +1727,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(y)),
-            "x": ("x", np.asarray(x)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(y)),
+                "x": ("x", np.asarray(x)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1682,10 +1783,12 @@ class RasterDataset(GeoDataset):
                 dims = (file_dim, "y", "x")
 
             coords = dict(file_coords)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
             if vals_i.ndim == 4:
                 coords["band"] = ("band", np.arange(vals_i.shape[1]))
 
@@ -1704,14 +1807,18 @@ class RasterDataset(GeoDataset):
                 wkt = poly_geom.wkt
             except Exception:
                 wkt = str(poly_geom)
-            ds.attrs.update({
-                "query_json": json.dumps({
-                    "type": "Polygon",
-                    "crs": str(self.crs) if self.crs is not None else None,
-                    "wkt": wkt,
-                }),
-                "query_repr": f"Polygon(crs={self.crs})",
-            })
+            ds.attrs.update(
+                {
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
+                    "query_repr": f"Polygon(crs={self.crs})",
+                }
+            )
             ds["data"] = ds["data"].fis.set_spatial_ref(
                 crs=self.crs,
                 x_dim="x",

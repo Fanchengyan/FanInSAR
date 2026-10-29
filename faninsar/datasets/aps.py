@@ -356,6 +356,7 @@ class ApsPairs(PairDataset, ABC):
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
+        reindex: bool = False,
     ) -> None:
         """Initialize a new ApsPairs instance.
 
@@ -402,6 +403,10 @@ class ApsPairs(PairDataset, ABC):
             if True, print verbose output, default: True
         ds_name : str, optional
             name of the dataset. used for printing verbose output, default: ""
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan the files, rewriting the entry. If False (default), reuse a
+            previously written manifest entry when it is present.
 
         Raises
         ------
@@ -422,6 +427,7 @@ class ApsPairs(PairDataset, ABC):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
+            reindex=reindex,
         )
 
     @classmethod

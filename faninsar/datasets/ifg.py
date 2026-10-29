@@ -167,6 +167,7 @@ class InterferogramDataset(PairDataset):
         verbose: bool = True,
         keep_common: bool = True,
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -228,6 +229,10 @@ class InterferogramDataset(PairDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all files, rewriting the entries. If False (default), reuse
+            previously written manifest entries when they are present.
 
         """
         root_dir = Path(root_dir)
@@ -235,6 +240,7 @@ class InterferogramDataset(PairDataset):
         self.cache = cache
         self.resampling = resampling
         self.verbose = verbose
+        self._reindex = reindex
 
         if paths_unw is None:
             paths_unw = sorted(set(root_dir.rglob(self.pattern_unw)))
@@ -283,6 +289,7 @@ class InterferogramDataset(PairDataset):
             verbose=verbose,
             ds_name="Interferogram",
             chunks=chunks,
+            reindex=reindex,
         )
 
         self._ds_coh = self._coh_dataset_cls(
@@ -301,6 +308,7 @@ class InterferogramDataset(PairDataset):
             ds_name="Coherence",
             chunks=chunks,
             pair_parser=self.parse_pairs,
+            reindex=reindex,
         )
         self._ds_coh._range = self.coh_range
 
@@ -432,6 +440,7 @@ class InterferogramDataset(PairDataset):
         kwargs.setdefault("cache", self.cache)
         kwargs.setdefault("resampling", self.resampling)
         kwargs.setdefault("verbose", self.verbose)
+        kwargs.setdefault("reindex", self._reindex)
         return kwargs
 
     def _ensure_ds(
@@ -874,6 +883,7 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
         verbose: bool = True,
         keep_common: bool = True,
         chunks: dict[str, int] | int | Literal["auto"] | None = None,
+        reindex: bool = False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -935,6 +945,10 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             - ``int``: Lazy loading with same chunk size for y and x.
             - ``dict``: Lazy loading with specified y and x chunk sizes.
             Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+        reindex : bool, optional
+            If True, ignore any existing ``faninsar.manifest.json`` entry and
+            rescan all files, rewriting the entries. If False (default), reuse
+            previously written manifest entries when they are present.
 
         """
         root_dir = Path(root_dir)
@@ -961,6 +975,7 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             verbose=verbose,
             keep_common=keep_common,
             chunks=chunks,
+            reindex=reindex,
         )
 
     def _get_sub_dataset_paths(self, file_paths: list[str], group: str) -> list[str]:

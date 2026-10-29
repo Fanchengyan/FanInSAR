@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
 import rioxarray  # noqa: F401
 
+from faninsar import __version__ as _faninsar_version
 from faninsar._core.sar.pairs import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
+from . import manifest as _manifest
 from .raster import RasterDataset
 
 if TYPE_CHECKING:
@@ -67,6 +70,7 @@ class PairDataset(RasterDataset):
         """
         self._pair_parser = pair_parser
         super().__init__(*args, **kwargs)
+        self._manifest_pair_names: list[str] | None = self._manifest_extra("pair")
         self._assign_pairs_from_paths()
 
     @property
@@ -74,19 +78,51 @@ class PairDataset(RasterDataset):
         """Return Pairs parsed from filenames."""
         return self._pairs
 
+    def _manifest_extra(self, key: str) -> list | None:
+        """Return the per-file manifest values for ``key``, or None."""
+        raw = self._manifest_lookup(self._files.paths.tolist())
+        if raw is None:
+            return None
+        values = [row.get(key) for row in raw]
+        if any(v is None for v in values):
+            return None
+        return values
+
+    def _manifest_write_extras(self, key: str, values: list) -> None:
+        """Write ``values`` back into the manifest under ``key``."""
+        raw = self._manifest_lookup(self._files.paths.tolist())
+        if raw is None:
+            return
+        for row, value in zip(raw, values, strict=True):
+            row[key] = _manifest.encode_file_row({"v": value})["v"]
+        with contextlib.suppress(OSError):
+            _manifest.write_entry(
+                self.root_dir,
+                self._manifest_name(),
+                self._files.paths.tolist(),
+                raw,
+                _faninsar_version,
+            )
+
     def _assign_pairs_from_paths(self) -> None:
         """Parse interferometric pairs from current paths."""
         paths = self._files.paths.tolist()
         if len(paths) == 0:
             self._pairs = Pairs([])
             self._files.loc[:, "pair_name"] = ""
+            self._manifest_write_extras("pair", [])
             return
 
-        parser = (
-            self._pair_parser if self._pair_parser is not None else self.parse_pairs
-        )
-        parsed = parser(paths)
-        pairs = parsed if isinstance(parsed, Pairs) else Pairs(parsed)
+        if self._manifest_pair_names is not None:
+            # Manifest restored the parsed pair names — instantiate directly,
+            # skipping the filename-regex round trip.
+            pairs = Pairs.from_names(self._manifest_pair_names)
+        else:
+            parser = (
+                self._pair_parser if self._pair_parser is not None else self.parse_pairs
+            )
+            parsed = parser(paths)
+            pairs = parsed if isinstance(parsed, Pairs) else Pairs(parsed)
 
         if len(pairs) != len(self._files):
             msg = (
@@ -99,6 +135,7 @@ class PairDataset(RasterDataset):
         self._files.loc[:, "pair_name"] = pd.Series(
             pairs.to_names(), index=self._files.index
         )
+        self._manifest_write_extras("pair", pairs.to_names())
 
     @classmethod
     def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
