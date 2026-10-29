@@ -607,7 +607,20 @@ class RasterDataset(GeoDataset):
         if not self._reindex:
             restored = self._manifest_restore(paths, target_crs)
             if restored is not None:
+                logger.info(
+                    "Restored %d file(s) for '%s' from %s",
+                    len(restored),
+                    self._manifest_name(),
+                    _manifest.manifest_path(self.root_dir),
+                )
                 return self._process_scan_results(restored)
+
+        logger.info(
+            "Scanning %d file(s) for '%s' under %s",
+            len(paths),
+            self._manifest_name(),
+            self.root_dir,
+        )
 
         # Add progress bar if verbose
         paths_iter = (
