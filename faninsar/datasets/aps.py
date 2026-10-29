@@ -150,13 +150,17 @@ class ApsDataset(TimeSeriesDataset, ABC):
 
         Examples
         --------
-        >>> increments = gacos.increments(
-        ...     dates=pairs.dates,
-        ...     query=pts,
-        ...     ref_points=ref_points,
-        ...     los_ratio=los_ratio,
-        ... )
-        >>> incs_corr = incs - increments
+        Subtract the APS increments from NSBAS incremental displacement
+        (``gacos`` is a :class:`GACOS` dataset, ``pts`` the sampled
+        query points, and ``ref_points`` the reference points)::
+
+            increments = gacos.increments(
+                dates=pairs.dates,
+                query=pts,
+                ref_points=ref_points,
+                los_ratio=los_ratio,
+            )
+            incs_corr = incs - increments
 
         """
         requested = self._requested_dates(dates)
@@ -215,14 +219,16 @@ class ApsDataset(TimeSeriesDataset, ABC):
 
         Examples
         --------
-        >>> incs, *_ = solver.inverse()
-        >>> incs_corr = gacos.correct(
-        ...     incs,
-        ...     dates=pairs.dates,
-        ...     query=pts,
-        ...     ref_points=ref_points,
-        ...     los_ratio=los_ratio,
-        ... )
+        Correct the NSBAS increments right after the inversion::
+
+            incs, *_ = solver.inverse()
+            incs_corr = gacos.correct(
+                incs,
+                dates=pairs.dates,
+                query=pts,
+                ref_points=ref_points,
+                los_ratio=los_ratio,
+            )
 
         """
         increments = self.increments(

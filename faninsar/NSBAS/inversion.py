@@ -83,7 +83,13 @@ class LstsqDiagnostics:
 
 @dataclass
 class NSBASResult:
-    """Inversion result with per-pixel reliability diagnostics.
+    """Inversion result with optional per-pixel reliability diagnostics.
+
+    The four core fields are always present and tuple unpacking keeps the
+    historical ``incs, params, residual_pair, residual_tsm = inverse()``
+    pattern working. The diagnostics fields are filled only when
+    :meth:`NSBASSolver.inverse` is called with ``diagnostics=True`` and
+    are ``None`` otherwise.
 
     Attributes
     ----------
@@ -97,18 +103,22 @@ class NSBASResult:
     model_residuals : ndarray or Tensor
         ``(n_date, n_pt)`` temporal-model constraint residuals; empty
         when the solver has no model.
-    is_constrained : ndarray or Tensor
+    is_constrained : ndarray, Tensor, or None
         ``(n_date - 1, n_pt)`` bool. ``True`` where the increment is
         determined by the interferograms alone. ``False`` marks a local
         gap whose value comes from the minimum-norm convention (pure
-        SBAS) or from the temporal model (NSBAS).
-    n_observations : ndarray or Tensor
+        SBAS) or from the temporal model (NSBAS). ``None`` unless
+        ``diagnostics=True``.
+    n_observations : ndarray, Tensor, or None
         ``(n_pt,)`` int. Valid interferogram observations per pixel.
-    rank : ndarray or Tensor
-        ``(n_pt,)`` int. Rank of each pixel's data-only system.
-    condition_number : ndarray or Tensor
+        ``None`` unless ``diagnostics=True``.
+    rank : ndarray, Tensor, or None
+        ``(n_pt,)`` int. Rank of each pixel's data-only system. ``None``
+        unless ``diagnostics=True``.
+    condition_number : ndarray, Tensor, or None
         ``(n_pt,)`` float. Conditioning estimate of the data-only system
-        (see :class:`LstsqDiagnostics` for the fast-path proxy).
+        (see :class:`LstsqDiagnostics` for the fast-path proxy). ``None``
+        unless ``diagnostics=True``.
 
     """
 
@@ -116,10 +126,20 @@ class NSBASResult:
     model_parameters: NDArray[np.floating] | Tensor
     pair_residuals: NDArray[np.floating] | Tensor
     model_residuals: NDArray[np.floating] | Tensor
-    is_constrained: NDArray[np.bool_] | Tensor
-    n_observations: NDArray[np.integer] | Tensor
-    rank: NDArray[np.integer] | Tensor
-    condition_number: NDArray[np.floating] | Tensor
+    is_constrained: NDArray[np.bool_] | Tensor | None = None
+    n_observations: NDArray[np.integer] | Tensor | None = None
+    rank: NDArray[np.integer] | Tensor | None = None
+    condition_number: NDArray[np.floating] | Tensor | None = None
+
+    def __iter__(self) -> tuple:
+        """Iterate over the four core fields for tuple unpacking."""
+        core = (
+            self.increments,
+            self.model_parameters,
+            self.pair_residuals,
+            self.model_residuals,
+        )
+        return iter(core)
 
 
 class NSBASSolver:
@@ -610,7 +630,6 @@ class NSBASSolver:
                 )
         return g_sbas, observations
 
-    @overload
     def inverse(
         self,
         return_numpy: bool = True,
@@ -621,44 +640,7 @@ class NSBASSolver:
         n_looks: int | None = None,
         rcond: float | None = None,
         diagnostics: bool = False,
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-    ]: ...
-    @overload
-    def inverse(
-        self,
-        return_numpy: bool = False,
-        *,
-        coh: NDArray[np.floating] | torch.Tensor | None = None,
-        coh_threshold: float | None = None,
-        weight_func: WeightFunc | str | None = None,
-        n_looks: int | None = None,
-        rcond: float | None = None,
-        diagnostics: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]: ...
-    def inverse(
-        self,
-        return_numpy: bool = True,
-        *,
-        coh: NDArray[np.floating] | torch.Tensor | None = None,
-        coh_threshold: float | None = None,
-        weight_func: WeightFunc | str | None = None,
-        n_looks: int | None = None,
-        rcond: float | None = None,
-        diagnostics: bool = False,
-    ) -> (
-        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        | NSBASResult
-    ):
+    ) -> NSBASResult:
         """Calculate increment displacement difference by NSBAS inversion.
 
         Parameters
@@ -685,26 +667,24 @@ class NSBASSolver:
             unconstrained directions. ``None`` keeps the stored value
             (default ``1e-10``).
         diagnostics : bool, optional
-            If True, return an :class:`NSBASResult` with per-pixel
-            reliability diagnostics instead of the plain tuple. The
-            diagnostics describe the data-only (SBAS) system, so with a
-            temporal model ``is_constrained`` marks increments that the
-            interferograms alone do not determine. Default is False.
+            If True, also fill the per-pixel reliability diagnostics of
+            the returned :class:`NSBASResult` (``is_constrained``,
+            ``n_observations``, ``rank``, ``condition_number``); they
+            stay ``None`` otherwise. The diagnostics describe the
+            data-only (SBAS) system, so with a temporal model
+            ``is_constrained`` marks increments that the interferograms
+            alone do not determine. Default is False.
 
         Returns
         -------
-        incs: np.ndarray | torch.Tensor (n_date - 1, n_pt)
-            Incremental displacement
-        params: np.ndarray | torch.Tensor (n_param, n_pt)
-            parameters of model in NSBAS inversion
-        residual_pair: np.ndarray | torch.Tensor (n_pair, n_pt)
-            residual between interferograms and model result
-        residual_tsm: np.ndarray | torch.Tensor     (n_date, n_pt)
-            residual between time-series model and model result
         NSBASResult
-            When ``diagnostics=True``, the same four arrays plus
-            ``is_constrained``, ``n_observations``, ``rank``, and
-            ``condition_number``.
+            Result object with ``increments`` ``(n_date - 1, n_pt)``,
+            ``model_parameters`` ``(n_param, n_pt)``, ``pair_residuals``
+            ``(n_pair, n_pt)``, and ``model_residuals`` ``(n_date,
+            n_pt)``. Tuple unpacking keeps the historical
+            ``incs, params, residual_pair, residual_tsm = inverse()``
+            pattern working. The diagnostics fields are present only
+            when ``diagnostics=True``.
 
         Raises
         ------
@@ -791,21 +771,23 @@ class NSBASSolver:
         residual_pair = residual[:n_pair]
         residual_tsm = residual[n_pair:]
 
+        diag_fields: dict[str, NDArray | Tensor] = {}
         if diagnostics:
             if return_numpy:
                 data_diag = data_diag.numpy()
-            return NSBASResult(
-                increments=incs,
-                model_parameters=params,
-                pair_residuals=residual_pair,
-                model_residuals=residual_tsm,
-                is_constrained=data_diag.is_constrained,
-                n_observations=data_diag.n_observations,
-                rank=data_diag.rank,
-                condition_number=data_diag.condition_number,
-            )
-
-        return incs, params, residual_pair, residual_tsm
+            diag_fields = {
+                "is_constrained": data_diag.is_constrained,
+                "n_observations": data_diag.n_observations,
+                "rank": data_diag.rank,
+                "condition_number": data_diag.condition_number,
+            }
+        return NSBASResult(
+            increments=incs,
+            model_parameters=params,
+            pair_residuals=residual_pair,
+            model_residuals=residual_tsm,
+            **diag_fields,
+        )
 
 
 def device_mem_size(device: str | torch.device | None) -> int:

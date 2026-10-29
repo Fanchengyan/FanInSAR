@@ -209,17 +209,21 @@ def _solver_pairs() -> Pairs:
 class TestNSBASSolverDiagnostics:
     """NSBASSolver-level diagnostics API."""
 
-    def test_default_tuple_unchanged(self) -> None:
-        """The default inverse() return stays a four-element tuple."""
+    def test_default_returns_result_with_none_diagnostics(self) -> None:
+        """inverse() always returns NSBASResult; diagnostics stay None."""
         pairs = _solver_pairs()
         design = pairs.sbas_matrix().astype(np.float64)
         incs_true = np.array([[1.0, 0.5, -0.2], [2.0, -1.0, 0.3], [0.7, -0.4, 1.1]])
         unw = design @ incs_true
         solver = NSBASSolver(unw, pairs, verbose=False, device="cpu")
         result = solver.inverse()
-        assert isinstance(result, tuple)
-        assert len(result) == 4
-        incs, params, res_pair, res_tsm = result
+        assert isinstance(result, NSBASResult)
+        assert result.is_constrained is None
+        assert result.n_observations is None
+        assert result.rank is None
+        assert result.condition_number is None
+        incs, params, res_pair, res_tsm = result  # historical unpacking
+        assert incs is result.increments
         assert incs.shape == (3, 3)
         assert params.shape[0] == 0
         assert res_pair.shape == (5, 3)
