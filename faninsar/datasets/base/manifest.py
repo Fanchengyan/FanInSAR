@@ -13,10 +13,10 @@ Design contract
 * **Ownership** — entries are keyed by a human-readable dataset slug
   (``_manifest_name()`` on the instance) so several datasets sharing one
   ``root_dir`` (e.g. unw / coh / LOS) coexist in one file.
-* **Validation** — an entry is trusted only when (a) the envelope passes the
-  ``faninsar`` / ``schema`` gate, and (b) the stored ``paths`` list has the
-  same length and same first element as the current instantiation's paths.
-  Anything else falls back to a full rescan and the entry is rewritten.
+* **Validation** — an entry is trusted when the envelope passes the
+  ``faninsar`` / ``schema`` gate and the ``files`` list matches the number
+  of resolved paths. A stale entry is invalidated only by the caller
+  passing ``reindex=True``; the manifest does not compare paths itself.
 * **Baked values** — each entry stores the *resolved* ``crs`` / ``res`` /
   ``dtype`` / ``nodata`` / ``bounds`` captured at the end of ``__init__``.
   Restoring is a lookup, not a recompute — the caller's ``crs`` argument is
@@ -147,15 +147,6 @@ def _decode_files_rows(
     return out
 
 
-def _paths_match(entry_paths: list[str], paths: list[str]) -> bool:
-    """Cheap sanity check: length and the first path must agree."""
-    if len(entry_paths) != len(paths):
-        return False
-    if not entry_paths:
-        return True
-    return str(entry_paths[0]) == str(paths[0])
-
-
 def read_entry(  # noqa: PLR0911
     root_dir: str | PathLike,
     name: str,
@@ -168,6 +159,9 @@ def read_entry(  # noqa: PLR0911
       - ``attrs``: the resolved ``crs`` / ``res`` / ``dtype`` / ``nodata`` /
         ``bounds`` recorded when the manifest was written
       - ``paths``: the stored path list
+
+    The entry is trusted blindly when present — no path comparison. A
+    stale entry is invalidated only by the caller passing ``reindex=True``.
     """
     path = manifest_path(root_dir)
     if not path.is_file():
@@ -196,7 +190,6 @@ def read_entry(  # noqa: PLR0911
         or not isinstance(raw_files, list)
         or not isinstance(attrs_raw, dict)
         or len(raw_files) != len(paths)
-        or not _paths_match(entry_paths, paths)
     ):
         return None
     entry_crs = attrs_raw.get("crs")

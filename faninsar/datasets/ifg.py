@@ -560,7 +560,12 @@ class InterferogramDataset(PairDataset):
                 self.root_dir,
             )
             return
-        self.set_los_dataset(root_dir=self.root_dir, paths=paths, verbose=self.verbose)
+        # A single LOS file is sufficient — every granule in one track shares
+        # the same incidence angle, so keep only the first path for both the
+        # manifest entry and the runtime dataset.
+        self.set_los_dataset(
+            root_dir=self.root_dir, paths=paths[:1], verbose=self.verbose
+        )
 
     def set_dem_dataset(
         self,
