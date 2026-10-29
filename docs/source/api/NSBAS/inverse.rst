@@ -10,6 +10,8 @@ Classes
 .. autosummary::
    :toctree: generated/
 
+   LstsqResult
+   NSBASResult
    NSBASSolver
 
 

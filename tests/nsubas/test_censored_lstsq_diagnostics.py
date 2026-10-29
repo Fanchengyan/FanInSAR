@@ -9,7 +9,7 @@ import torch
 from faninsar import Pairs
 from faninsar.NSBAS import (
     LinearModel,
-    LstsqDiagnostics,
+    LstsqResult,
     NSBASResult,
     NSBASSolver,
     batch_lstsq,
@@ -54,16 +54,15 @@ class TestCensoredLstsqSolver:
         g = rng.normal(size=(6, 4))
         d = rng.normal(size=(6, 3))
         d[[1, 3], 0] = np.nan  # exactly 4 valid rows == n_param
-        x, diag = censored_lstsq(
-            g, d, device="cpu", diagnostics=True, return_numpy=True
-        )
+        res = censored_lstsq(g, d, device="cpu")
+        x = res.solution
         rows = ~np.isnan(d[:, 0])
         expected = np.linalg.lstsq(g[rows], d[rows, 0], rcond=None)[0]
         assert not np.isnan(x[:, 0]).any()
         np.testing.assert_allclose(x[:, 0], expected, rtol=1e-10, atol=1e-10)
-        assert diag.n_observations[0] == 4
-        assert diag.rank[0] == 4
-        assert diag.is_constrained[:, 0].all()
+        assert res.n_observations[0] == 4
+        assert res.rank[0] == 4
+        assert res.is_constrained[:, 0].all()
 
     def test_zero_observation_pixel_stays_nan(self) -> None:
         """Pixels without observations stay NaN with rank 0."""
@@ -71,11 +70,12 @@ class TestCensoredLstsqSolver:
         g, _ = _sbas_design(5)
         d = rng.normal(size=(g.shape[0], 2))
         d[:, 1] = np.nan
-        x, diag = censored_lstsq(g, d, device="cpu", diagnostics=True)
+        res = censored_lstsq(g, d, device="cpu")
+        x = res.solution
         assert np.isnan(x[:, 1]).all()
-        assert diag.n_observations[1] == 0
-        assert diag.rank[1] == 0
-        assert not diag.is_constrained[:, 1].any()
+        assert res.n_observations[1] == 0
+        assert res.rank[1] == 0
+        assert not res.is_constrained[:, 1].any()
         assert np.isfinite(x[:, 0]).all()
 
     def test_isolated_date_gets_min_norm_and_gap_label(self) -> None:
@@ -92,15 +92,16 @@ class TestCensoredLstsqSolver:
         d[touch, 1] = np.nan
         assert (~np.isnan(d[:, 1])).sum() > g.shape[1]  # still overdetermined
 
-        x, diag = censored_lstsq(g, d, device="cpu", diagnostics=True, rcond=1e-10)
+        res = censored_lstsq(g, d, device="cpu", rcond=1e-10)
+        x = res.solution
         expected = _oracle(g, d, 1e-10)
         np.testing.assert_allclose(x, expected, rtol=1e-8, atol=1e-8)
 
-        assert diag.rank[1] == n_date - 2  # one unconstrained direction
+        assert res.rank[1] == n_date - 2  # one unconstrained direction
         # the two increments around the isolated date are exactly the gap
-        assert not diag.is_constrained[isolated - 1 : isolated + 1, 1].any()
-        assert np.delete(diag.is_constrained[:, 1], [isolated - 1, isolated]).all()
-        assert diag.is_constrained[:, 0].all()
+        assert not res.is_constrained[isolated - 1 : isolated + 1, 1].any()
+        assert np.delete(res.is_constrained[:, 1], [isolated - 1, isolated]).all()
+        assert res.is_constrained[:, 0].all()
 
     def test_random_dropout_matches_numpy_oracle(self) -> None:
         """Random dropout solutions match the numpy min-norm oracle."""
@@ -110,30 +111,31 @@ class TestCensoredLstsqSolver:
         d[rng.random(d.shape) < 0.15] = np.nan
         d[:, 7] = np.nan  # one unsolvable pixel
 
-        x, diag = censored_lstsq(g, d, device="cpu", diagnostics=True)
+        res = censored_lstsq(g, d, device="cpu")
+        x = res.solution
         expected = _oracle(g, d, 1e-10)
-        solvable = diag.n_observations > 0
+        solvable = res.n_observations > 0
         np.testing.assert_allclose(
             x[:, solvable], expected[:, solvable], rtol=1e-8, atol=1e-8
         )
         assert np.isnan(x[:, 7]).all()
-        assert (diag.condition_number[solvable] > 0).all()
-        assert (diag.rank[solvable] >= 1).all()
+        assert (res.condition_number[solvable] > 0).all()
+        assert (res.rank[solvable] >= 1).all()
         # rank-deficient pixels must carry at least one False label
-        deficient = solvable & (diag.rank < g.shape[1])
-        assert (np.atleast_2d(~diag.is_constrained[:, deficient]).sum(axis=0) > 0).all()
+        deficient = solvable & (res.rank < g.shape[1])
+        assert (np.atleast_2d(~res.is_constrained[:, deficient]).sum(axis=0) > 0).all()
 
     def test_full_rank_diagnostics_fast_path(self) -> None:
         """Full-rank systems report fast-path diagnostics."""
         g, _ = _sbas_design(5, seed=5)
         rng = np.random.default_rng(5)
         d = g @ rng.normal(size=(4, 3))
-        _x, diag = censored_lstsq(g, d, device="cpu", diagnostics=True)
-        assert diag.is_constrained.all()
-        assert (diag.rank == g.shape[1]).all()
-        assert np.isfinite(diag.condition_number).all()
-        assert (diag.condition_number > 1e-6).all()  # pivot-ratio proxy
-        assert (diag.n_observations == g.shape[0]).all()
+        res = censored_lstsq(g, d, device="cpu")
+        assert res.is_constrained.all()
+        assert (res.rank == g.shape[1]).all()
+        assert np.isfinite(res.condition_number).all()
+        assert (res.condition_number > 1e-6).all()  # pivot-ratio proxy
+        assert (res.n_observations == g.shape[0]).all()
 
     def test_weighted_3d_g_matches_per_pixel_oracle(self) -> None:
         """3D per-pixel weighted systems match a per-pixel numpy oracle."""
@@ -148,14 +150,14 @@ class TestCensoredLstsqSolver:
         d_w = np.where(np.isnan(d), np.nan, d * w_sqrt)
         g_3d = np.repeat(g[None, :, :], n_pt, axis=0) * w_sqrt.T[:, :, None]
 
-        x3, _ = censored_lstsq(g_3d, d_w, device="cpu", diagnostics=True)
+        x3 = censored_lstsq(g_3d, d_w, device="cpu").solution
         for px in range(n_pt):
             rows = ~np.isnan(d_w[:, px])
             sol, *_ = np.linalg.lstsq(g_3d[px][rows], d_w[rows, px], rcond=1e-10)
             np.testing.assert_allclose(x3[:, px], sol, rtol=1e-9, atol=1e-9)
         # identical unweighted systems must agree between 2D and 3D layouts
-        x2 = censored_lstsq(g, d, device="cpu")
-        x3u = censored_lstsq(np.repeat(g[None], n_pt, axis=0), d, device="cpu")
+        x2 = censored_lstsq(g, d, device="cpu").solution
+        x3u = censored_lstsq(np.repeat(g[None], n_pt, axis=0), d, device="cpu").solution
         np.testing.assert_allclose(x2, x3u, rtol=1e-9, atol=1e-9)
 
     def test_diagnostics_shapes_and_types(self) -> None:
@@ -163,24 +165,25 @@ class TestCensoredLstsqSolver:
         g, _ = _sbas_design(4, seed=7)
         rng = np.random.default_rng(7)
         d = g @ rng.normal(size=(3, 5))
-        x, diag = censored_lstsq(g, d, device="cpu", diagnostics=True)
-        assert isinstance(diag, LstsqDiagnostics)
-        assert diag.is_constrained.shape == x.shape
-        assert diag.is_constrained.dtype == bool
-        assert diag.rank.shape == (5,)
-        assert diag.n_observations.shape == (5,)
-        assert diag.condition_number.shape == (5,)
+        res = censored_lstsq(g, d, device="cpu")
+        x = res.solution
+        assert isinstance(res, LstsqResult)
+        (x_unpacked,) = res
+        assert x_unpacked is x
+        assert res.is_constrained.shape == x.shape
+        assert res.is_constrained.dtype == bool
+        assert res.rank.shape == (5,)
+        assert res.n_observations.shape == (5,)
+        assert res.condition_number.shape == (5,)
 
     def test_torch_return(self) -> None:
         """Torch tensors are returned when return_numpy is False."""
         g, _ = _sbas_design(4, seed=8)
         rng = np.random.default_rng(8)
         d = g @ rng.normal(size=(3, 2))
-        x, diag = censored_lstsq(
-            g, d, device="cpu", return_numpy=False, diagnostics=True
-        )
-        assert isinstance(x, torch.Tensor)
-        assert isinstance(diag.is_constrained, torch.Tensor)
+        res = censored_lstsq(g, d, device="cpu", return_numpy=False)
+        assert isinstance(res.solution, torch.Tensor)
+        assert isinstance(res.is_constrained, torch.Tensor)
 
     def test_batch_lstsq_passes_diagnostics_through(self) -> None:
         """batch_lstsq stitches diagnostics across patches."""
@@ -188,10 +191,10 @@ class TestCensoredLstsqSolver:
         rng = np.random.default_rng(9)
         d = g @ rng.normal(size=(5, 12))
         d[rng.random(d.shape) < 0.1] = np.nan
-        x, diag = batch_lstsq(g, d, device="cpu", verbose=False, diagnostics=True)
-        assert x.shape == (g.shape[1], 12)
-        assert diag.is_constrained.shape == x.shape
-        assert diag.n_observations.shape == (12,)
+        res = batch_lstsq(g, d, device="cpu", verbose=False)
+        assert res.solution.shape == (g.shape[1], 12)
+        assert res.is_constrained.shape == res.solution.shape
+        assert res.n_observations.shape == (12,)
 
 
 def _solver_pairs() -> Pairs:

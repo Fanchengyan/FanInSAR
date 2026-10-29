@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 import numpy as np
 import psutil
@@ -36,11 +36,19 @@ _NULL_MASS_TOL = 1e-8
 
 
 @dataclass
-class LstsqDiagnostics:
-    """Per-pixel reliability diagnostics of a censored least-squares solve.
+class LstsqResult:
+    """Censored least-squares result with per-pixel reliability diagnostics.
+
+    The diagnostics are by-products of the hybrid solve and always
+    filled. Iterating yields the solution, so ``x, = result`` keeps a
+    tuple-style assignment working.
 
     Attributes
     ----------
+    solution : Tensor
+        ``(n_param, n_pt)`` matrix that minimizes ``norm(M*(GX - d))``,
+        with minimum norm on rank-deficient pixels and NaN where a
+        pixel has no valid observation.
     is_constrained : Tensor
         ``(n_param, n_pt)`` bool. ``True`` where the parameter is
         determined by the observations. ``False`` marks a local gap whose
@@ -57,23 +65,30 @@ class LstsqDiagnostics:
 
     """
 
+    solution: Tensor
     is_constrained: Tensor
     rank: Tensor
     n_observations: Tensor
     condition_number: Tensor
 
-    def cpu(self) -> LstsqDiagnostics:
+    def __iter__(self) -> tuple:
+        """Iterate over the solution for tuple-style unpacking."""
+        return iter((self.solution,))
+
+    def cpu(self) -> LstsqResult:
         """Return a copy with every field on the CPU."""
-        return LstsqDiagnostics(
+        return LstsqResult(
+            solution=self.solution.cpu(),
             is_constrained=self.is_constrained.cpu(),
             rank=self.rank.cpu(),
             n_observations=self.n_observations.cpu(),
             condition_number=self.condition_number.cpu(),
         )
 
-    def numpy(self) -> LstsqDiagnostics:
+    def numpy(self) -> LstsqResult:
         """Return a copy with every field as a NumPy array."""
-        return LstsqDiagnostics(
+        return LstsqResult(
+            solution=self.solution.cpu().numpy(),
             is_constrained=self.is_constrained.cpu().numpy(),
             rank=self.rank.cpu().numpy(),
             n_observations=self.n_observations.cpu().numpy(),
@@ -117,7 +132,7 @@ class NSBASResult:
         unless ``diagnostics=True``.
     condition_number : ndarray, Tensor, or None
         ``(n_pt,)`` float. Conditioning estimate of the data-only system
-        (see :class:`LstsqDiagnostics` for the fast-path proxy). ``None``
+        (see :class:`LstsqResult` for the fast-path proxy). ``None``
         unless ``diagnostics=True``.
 
     """
@@ -739,7 +754,11 @@ class NSBASSolver:
         if diagnostics:
             if return_numpy:
                 data_diag = data_diag.numpy()
-            diag_fields = vars(data_diag)
+            diag_fields = {
+                key: value
+                for key, value in vars(data_diag).items()
+                if key != "solution"
+            }
         return NSBASResult(
             increments=incs,
             model_parameters=params,
@@ -748,7 +767,7 @@ class NSBASSolver:
             **diag_fields,
         )
 
-    def _solve(self, diagnostics: bool) -> tuple[Tensor, LstsqDiagnostics | None]:
+    def _solve(self, diagnostics: bool) -> tuple[Tensor, LstsqResult | None]:
         """Solve ``d = Gm`` and optionally the data-only diagnostics.
 
         Without a model the main solve is the data-only system, so its
@@ -756,7 +775,6 @@ class NSBASSolver:
         augmented with model rows, and the diagnostics require a
         separate solve of the SBAS block alone.
         """
-        want_diag = diagnostics and self.model is None
         out = batch_lstsq(
             self.G,
             self.d,
@@ -766,23 +784,23 @@ class NSBASSolver:
             tqdm_args={"desc": "  NSBAS inversion"},
             return_numpy=False,
             rcond=self._rcond,
-            diagnostics=want_diag,
         )
-        result, diag = out if want_diag else (out, None)
-        if diagnostics and self.model is not None:
-            g_sbas, observations = self._make_data_system()
-            _, diag = batch_lstsq(
-                g_sbas,
-                observations,
-                dtype=self.dtype,
-                device=self.device,
-                verbose=self.verbose,
-                tqdm_args={"desc": "  SBAS data diagnostics"},
-                return_numpy=False,
-                rcond=self._rcond,
-                diagnostics=True,
-            )
-        return result, diag
+        if not diagnostics:
+            return out.solution, None
+        if self.model is None:
+            return out.solution, out
+        g_sbas, observations = self._make_data_system()
+        diag = batch_lstsq(
+            g_sbas,
+            observations,
+            dtype=self.dtype,
+            device=self.device,
+            verbose=self.verbose,
+            tqdm_args={"desc": "  SBAS data diagnostics"},
+            return_numpy=False,
+            rcond=self._rcond,
+        )
+        return out.solution, diag
 
 
 def device_mem_size(device: str | torch.device | None) -> int:
@@ -982,26 +1000,6 @@ def _calculate_residual(
     return residual
 
 
-@overload
-def batch_lstsq(
-    G: np.ndarray,
-    d: np.ndarray,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    verbose: bool = True,
-    tqdm_args: dict | None = None,
-    return_numpy: bool = True,
-) -> NDArray[np.floating]: ...
-@overload
-def batch_lstsq(
-    G: torch.Tensor,
-    d: torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    verbose: bool = True,
-    tqdm_args: dict | None = None,
-    return_numpy: bool = False,
-) -> torch.Tensor: ...
 def batch_lstsq(
     G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
@@ -1011,8 +1009,7 @@ def batch_lstsq(
     tqdm_args: dict | None = None,
     return_numpy: bool = True,
     rcond: float = 1e-10,
-    diagnostics: bool = False,
-) -> np.ndarray | torch.Tensor | tuple:
+) -> LstsqResult:
     """Batch least-squares solver for solving the least squares problem.
 
     Parameters
@@ -1033,21 +1030,17 @@ def batch_lstsq(
         Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm#tqdm-objects>`_
         Object for progress bar.
     return_numpy : bool, optional
-        Return numpy array if True, otherwise torch tensor, by default True.
+        Return numpy arrays if True, otherwise torch tensors, by default True.
     rcond : float, optional
         Relative cutoff separating determined from unconstrained
         directions, forwarded to :func:`censored_lstsq`. Default is 1e-10.
-    diagnostics : bool, optional
-        If True, also return the :class:`LstsqDiagnostics` collected from
-        every patch. Default is False.
 
     Returns
     -------
-    x : np.ndarray | torch.Tensor
-        (n_im x n_pt) matrix that minimizes norm(M*(GX - d)). If return_numpy is
-        True, return a numpy array, otherwise a torch tensor.
-    diagnostics : LstsqDiagnostics, optional
-        Per-pixel diagnostics, only when ``diagnostics=True``.
+    LstsqResult
+        Result whose ``solution`` is the (n_param x n_pt) matrix that
+        minimizes ``norm(M*(GX - d))``, with the per-pixel diagnostics
+        stitched from every patch.
 
     """
     if tqdm_args is None:
@@ -1059,16 +1052,13 @@ def batch_lstsq(
     device = parse_device(device)
 
     result = torch.full((n_param, n_pt), torch.nan, dtype=dtype, device=device)
-    result_diag = None
-    if diagnostics:
-        result_diag = LstsqDiagnostics(
-            is_constrained=torch.zeros(
-                (n_param, n_pt), dtype=torch.bool, device=device
-            ),
-            rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
-            n_observations=torch.zeros(n_pt, dtype=torch.int64, device=device),
-            condition_number=torch.full((n_pt,), torch.nan, dtype=dtype, device=device),
-        )
+    result_diag = LstsqResult(
+        solution=result,
+        is_constrained=torch.zeros((n_param, n_pt), dtype=torch.bool, device=device),
+        rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
+        n_observations=torch.zeros(n_pt, dtype=torch.int64, device=device),
+        condition_number=torch.full((n_pt,), torch.nan, dtype=dtype, device=device),
+    )
     mem_size = device_mem_size(device)
     patch_col = _get_patch_col(G, d, mem_size, dtype)
     if verbose:
@@ -1084,7 +1074,6 @@ def batch_lstsq(
                 device=device,
                 return_numpy=False,
                 rcond=rcond,
-                diagnostics=diagnostics,
             )
         elif G.ndim == 3:
             chunk = censored_lstsq(
@@ -1094,31 +1083,20 @@ def batch_lstsq(
                 device=device,
                 return_numpy=False,
                 rcond=rcond,
-                diagnostics=diagnostics,
             )
         else:
             msg = "Dimension of G must be 2 or 3"
             raise ValueError(msg)
-        if diagnostics:
-            result[:, c0:c1] = chunk[0]
-            chunk_diag = chunk[1]
-            result_diag.is_constrained[:, c0:c1] = chunk_diag.is_constrained
-            result_diag.rank[c0:c1] = chunk_diag.rank
-            result_diag.n_observations[c0:c1] = chunk_diag.n_observations
-            result_diag.condition_number[c0:c1] = chunk_diag.condition_number
-        else:
-            result[:, c0:c1] = chunk
+        result[:, c0:c1] = chunk.solution
+        result_diag.is_constrained[:, c0:c1] = chunk.is_constrained
+        result_diag.rank[c0:c1] = chunk.rank
+        result_diag.n_observations[c0:c1] = chunk.n_observations
+        result_diag.condition_number[c0:c1] = chunk.condition_number
     if return_numpy:
-        result = result.cpu().numpy()
-        if diagnostics:
-            return result, result_diag.numpy()
-        return result
-    if diagnostics:
-        return result, result_diag
-    return result
+        return result_diag.numpy()
+    return result_diag
 
 
-@overload
 def censored_lstsq(
     G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
@@ -1127,34 +1105,7 @@ def censored_lstsq(
     return_numpy: bool = True,
     *,
     rcond: float = 1e-10,
-    diagnostics: bool = False,
-) -> np.ndarray | tuple[np.ndarray, LstsqDiagnostics]: ...
-@overload
-def censored_lstsq(
-    G: np.ndarray | torch.Tensor,
-    d: np.ndarray | torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    return_numpy: bool = False,
-    *,
-    rcond: float = 1e-10,
-    diagnostics: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, LstsqDiagnostics]: ...
-def censored_lstsq(
-    G: np.ndarray | torch.Tensor,
-    d: np.ndarray | torch.Tensor,
-    dtype: torch.dtype = torch.float64,
-    device: str | torch.device | None = None,
-    return_numpy: bool = True,
-    *,
-    rcond: float = 1e-10,
-    diagnostics: bool = False,
-) -> (
-    np.ndarray
-    | torch.Tensor
-    | tuple[np.ndarray, LstsqDiagnostics]
-    | tuple[torch.Tensor, LstsqDiagnostics]
-):
+) -> LstsqResult:
     """Solve least squares subject to missing data, rank-robustly.
 
     Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/.
@@ -1196,23 +1147,19 @@ def censored_lstsq(
         The compute device for torch.Tensor. If None, use GPU if available,
         otherwise use CPU.
     return_numpy : bool, optional
-        Return numpy array if True, otherwise torch tensor, by default True.
+        Return numpy arrays if True, otherwise torch tensors, by default True.
     rcond : float, optional
         Relative cutoff for unconstrained directions on the minimum-norm
         path. Default is 1e-10.
-    diagnostics : bool, optional
-        If True, additionally return the per-pixel
-        :class:`LstsqDiagnostics`. Default is False.
 
     Returns
     -------
-    X : np.ndarray | torch.Tensor
-        (n_param x n_pt) matrix that minimizes norm(M*(GX - d)), with
-        minimum norm on rank-deficient pixels and NaN where a pixel has
-        no valid observation.
-    diagnostics : LstsqDiagnostics, optional
-        Per-pixel ``is_constrained``, ``rank``, ``n_observations``, and
-        ``condition_number``, only when ``diagnostics=True``.
+    LstsqResult
+        Result whose ``solution`` is the (n_param x n_pt) matrix that
+        minimizes ``norm(M*(GX - d))``, with minimum norm on
+        rank-deficient pixels and NaN where a pixel has no valid
+        observation. The per-pixel ``is_constrained``, ``rank``,
+        ``n_observations``, and ``condition_number`` are always filled.
 
     """
     device = parse_device(device)
@@ -1231,7 +1178,8 @@ def censored_lstsq(
     n_obs = valid.sum(dim=0)
 
     x = torch.full((n_param, n_pt), torch.nan, dtype=dtype, device=device)
-    diag = LstsqDiagnostics(
+    diag = LstsqResult(
+        solution=x,
         is_constrained=torch.zeros((n_param, n_pt), dtype=torch.bool, device=device),
         rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
         n_observations=n_obs.to(torch.int64),
@@ -1301,24 +1249,15 @@ def censored_lstsq(
 
     device_type = device.type
     if device_type != "cpu":
-        x_np = x.detach().cpu()
-        diag_np = diag.cpu()
         # clear cache manually to avoid memory overflow
-        del G, d, values, gw, t_mat, rhs, x, diag
+        del G, d, values, gw, t_mat, rhs, x
         if device_type == "cuda":
             torch.cuda.empty_cache()
         elif device_type == "mps":
             torch.mps.empty_cache()
-        if return_numpy:
-            x_np = x_np.numpy()
-        if diagnostics:
-            return x_np, diag_np.numpy() if return_numpy else diag_np
-        return x_np
     if return_numpy:
-        x = x.numpy()
-    if diagnostics:
-        return x, diag.numpy() if return_numpy else diag
-    return x
+        return diag.numpy()
+    return diag
 
 
 def calculate_u(
@@ -1414,7 +1353,7 @@ def calculate_u(
             device=device,
             tqdm_args={"desc": "  Calculate u"},
             return_numpy=False,
-        )
+        ).solution
     else:
         uc = torch.linalg.lstsq(Cc, closure_phase).solution
 

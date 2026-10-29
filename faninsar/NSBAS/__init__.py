@@ -1,6 +1,6 @@
 from .freeze_thaw_process import FreezeThawCycle
 from .inversion import (
-    LstsqDiagnostics,
+    LstsqResult,
     NSBASResult,
     NSBASSolver,
     batch_lstsq,
