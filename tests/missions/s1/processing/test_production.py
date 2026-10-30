@@ -405,11 +405,11 @@ def test_read_prepared_geometry_field_adapts_provider_payload() -> None:
 
     class Provider:
         def read_prepared_geometry(
-            self, _geometry_handle: object, _token: object
+            self, _geometry_handle: object
         ) -> PreparedGeometryArrayPayload:
             return payload
 
-    field = read_prepared_geometry_field(Provider(), object(), object())
+    field = read_prepared_geometry_field(Provider(), object())
     assert isinstance(field, PreparedGeometryField)
     assert field.field.range_offset_px is payload.range_offset_px
     assert not field.field.range_offset_px.flags.writeable

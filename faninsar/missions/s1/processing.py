@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict
 import numpy as np
 
 from faninsar.data.query import BoundingBox, Polygons
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1 import (
     open_safe_product,
     read_eof_orbit,
@@ -81,11 +81,7 @@ if TYPE_CHECKING:
     from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-    from faninsar.processing.geometry.prepared import (
-        PhaseState,
-        ProviderLeaseToken,
-        ResourceLimits,
-    )
+    from faninsar.processing.geometry.prepared import PhaseState
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.memory import MemoryWatchdog
     from faninsar.processing.unwrapping.common import SpatialUnwrapResult
@@ -548,23 +544,20 @@ class PreparedGeometryField:
 def read_prepared_geometry_field(
     provider: object,
     geometry_handle: object,
-    token: object,
 ) -> PreparedGeometryField:
     """Read and validate one provider-bound geometry field for production.
 
-    The provider owns generation pinning, payload hashes, and NumPy decoding;
-    this adapter only maps its validated read-only arrays into the production
-    ``OffsetFieldResult`` consumed by :func:`stage_coregister`.  It deliberately
-    does not accept raw paths or caller-supplied shapes.
+    The provider owns payload decoding; this adapter only maps its validated
+    read-only arrays into the production ``OffsetFieldResult`` consumed by
+    :func:`stage_coregister`.  It deliberately does not accept raw paths or
+    caller-supplied shapes.
 
     Parameters
     ----------
     provider : object
-        Provider implementing ``read_prepared_geometry(handle, token)``.
+        Provider implementing ``read_prepared_geometry(handle)``.
     geometry_handle : object
-        Capability-bound geometry handle returned by the provider.
-    token : object
-        Live provider lease token.
+        Geometry handle returned by the provider.
 
     Returns
     -------
@@ -585,7 +578,7 @@ def read_prepared_geometry_field(
         PreparedGeometryArrayPayload,
     )
 
-    payload = reader(geometry_handle, token)
+    payload = reader(geometry_handle)
     if not isinstance(payload, PreparedGeometryArrayPayload):
         reject_invalid_state(
             "prepared provider returned an invalid geometry payload record"
@@ -608,18 +601,15 @@ def read_prepared_geometry_field(
 def read_prepared_lut(
     provider: object,
     lut_handle: object,
-    token: object,
 ) -> Geo2RdrLUT:
     """Read one provider-owned LUT without reopening a raw memmap path.
 
     Parameters
     ----------
     provider : object
-        Provider implementing ``read_prepared_lut(handle, token)``.
+        Provider implementing ``read_prepared_lut(handle)``.
     lut_handle : object
-        Capability-bound LUT handle returned by the provider.
-    token : object
-        Live provider lease token.
+        LUT handle returned by the provider.
 
     Returns
     -------
@@ -641,7 +631,7 @@ def read_prepared_lut(
         PreparedLutArrayPayload,
     )
 
-    payload = reader(lut_handle, token)
+    payload = reader(lut_handle)
     if not isinstance(payload, PreparedLutArrayPayload):
         reject_invalid_state("prepared provider returned an invalid LUT payload")
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
@@ -657,70 +647,6 @@ def read_prepared_lut(
         row0=row0,
         col0=col0,
     )
-
-
-def _worker_prepared_provider(
-    root: str | Path,
-    token: ProviderLeaseToken,
-    resource_limits: ResourceLimits | None,
-) -> object:
-    """Attach a worker-local provider to an already pinned generation.
-
-    Prepared generations are owned and pinned by the parent process.  A
-    spawned worker therefore receives only the serializable store root and
-    lease capability, then asks the provider adapter to attach that lease to
-    its own read registry.  The compatibility fallback supports providers
-    exposing the instance-level ``attach_worker_lease`` seam while the
-    class-level ``from_worker_generation`` adapter is deployed.
-
-    Parameters
-    ----------
-    root : str or pathlib.Path
-        Provider-owned prepared-generation store root.
-    token : ProviderLeaseToken
-        Serialized capability for the pinned generation.
-    resource_limits : ResourceLimits or None
-        Authenticated limits bound to the token, when available.
-
-    Returns
-    -------
-    object
-        Provider adapter suitable for :func:`read_prepared_lut`.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        If no worker attach seam is exposed by the provider.
-
-    """
-    from faninsar.processing.geometry.prepared_provider import (
-        LocalPreparedGeometryProvider,
-    )
-
-    factory = getattr(LocalPreparedGeometryProvider, "from_worker_generation", None)
-    if callable(factory):
-        if resource_limits is None:
-            reject_invalid_state(
-                "prepared LUT worker attachment requires resource_limits"
-            )
-        return factory(Path(root), token, resource_limits)
-
-    # This branch is intentionally narrow: it remains useful for a provider
-    # implementation that has landed the instance seam but not the factory.
-    def callback(**_kwargs: object) -> object:
-        """Reject accidental worker-side publication attempts."""
-        reject_invalid_state("worker prepared provider cannot publish generations")
-
-    provider = LocalPreparedGeometryProvider(Path(root), callback)
-    attach = getattr(provider, "attach_worker_lease", None)
-    if not callable(attach):
-        reject_invalid_state(
-            "prepared provider does not expose a worker generation attach seam"
-        )
-    if resource_limits is None:
-        reject_invalid_state("prepared LUT worker attachment requires resource_limits")
-    attach(token, resource_limits)
-    return provider
 
 
 def _own_geo_valid_mask(array: np.ndarray | None) -> np.ndarray | None:
@@ -3012,38 +2938,6 @@ def _as_optional_frame_sequence(
     return list(paths)
 
 
-def _snapshot_paths(
-    paths: Sequence[Path],
-    snapshot_root: str | Path,
-) -> list[Path]:
-    """Copy local input paths into one immutable source snapshot root."""
-    from faninsar.processing.runtime.source_snapshots import snapshot_local_source
-
-    root = Path(snapshot_root)
-    cache: dict[str, Path] = {}
-    snapshots: list[Path] = []
-    for path in paths:
-        key = str(path.absolute())
-        snapshot = cache.get(key)
-        if snapshot is None:
-            snapshot = snapshot_local_source(path, root).path
-            cache[key] = snapshot
-        snapshots.append(snapshot)
-    return snapshots
-
-
-def _snapshot_optional_paths(
-    paths: Sequence[Path | None],
-    snapshot_root: str | Path,
-) -> list[Path | None]:
-    """Snapshot optional orbit paths while preserving frame cardinality."""
-    present = [path for path in paths if path is not None]
-    if not present:
-        return [None] * len(paths)
-    snapshots = iter(_snapshot_paths(present, snapshot_root))
-    return [next(snapshots) if path is not None else None for path in paths]
-
-
 def _burst_index_list(
     value: list[int] | range | str,
     swath: str,
@@ -3292,8 +3186,7 @@ def resolve_auto_dem(
     west, south, east, north = (float(value) for value in bounds)
     if not (-180.0 <= west <= east <= 180.0 and -90.0 <= south <= north <= 90.0):
         message = f"invalid automatic DEM bounds: {bounds!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     name = output_name or os.environ.get("FANINSAR_DEM_NAME", "dem.tif")
     out_path = Path(output_dir) / "dem" / name
     if out_path.is_file():

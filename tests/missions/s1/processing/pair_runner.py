@@ -46,11 +46,7 @@ from faninsar.missions.s1.processing import (
     _roi_burst_window,
     _scene_id,
     _select_bursts_by_roi,
-    _snapshot_optional_paths,
-    _snapshot_paths,
     _swath_range_offsets,
-    _worker_prepared_provider,
-    read_prepared_lut,
     resolve_auto_dem,
     stage_coregister,
     stage_deramp,
@@ -71,12 +67,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from faninsar.missions.s1.types import S1Product
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.geometry import DEM
-    from faninsar.processing.geometry.prepared import (
-        PreparedLutHandle,
-        ProviderLeaseToken,
-        ResourceLimits,
-    )
     from faninsar.processing.mosaicking.grid import GeoGridSpec
 
 logger = setup_logger(__name__)
@@ -313,15 +305,6 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         ``{"unit": unit_or_None, "stage_times": dict}``.
 
     """
-    if (
-        bool(task.get("require_worker_bootstrap"))
-        and os.environ.get("FANINSAR_WORKER_BOOTSTRAPPED") != "1"
-    ):
-        reject_invalid_state(
-            "resource-gated burst worker was started without numerical "
-            "runtime bootstrap"
-        )
-
     from dataclasses import replace as _replace
 
     from faninsar.missions.s1 import read_eof_orbit, read_full_burst
@@ -369,42 +352,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     geo_footprint_mask_enabled = bool(task.get("geo_footprint_mask_enabled", True))
     scene_store_dir = task.get("scene_store_dir")
     scene_grid_shape = task.get("scene_grid_shape")
-    prepared_lut_handle = task.get("prepared_geo_lut_handle")
-    prepared_provider_token = task.get("prepared_provider_token")
-    prepared_provider_root = task.get("prepared_provider_root")
-    prepared_resource_limits = task.get("resource_limits")
-    prepared_values = (
-        prepared_lut_handle,
-        prepared_provider_token,
-        prepared_provider_root,
-    )
-    if any(value is not None for value in prepared_values) and not all(
-        value is not None for value in prepared_values
-    ):
-        reject_invalid_state(
-            "prepared Geo LUT worker inputs must include handle, lease token, "
-            "and provider root"
-        )
     prepared_geo_lut: Geo2RdrLUT | None = None
-    if prepared_lut_handle is not None:
-        from faninsar.processing.geometry.prepared import (
-            ProviderLeaseToken as _ProviderLeaseToken,
-        )
-
-        if coregistration_grid != "geo":
-            reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
-        if not isinstance(prepared_provider_token, _ProviderLeaseToken):
-            reject_invalid_state("prepared Geo LUT worker lease token is invalid")
-        provider = _worker_prepared_provider(
-            prepared_provider_root,
-            prepared_provider_token,
-            prepared_resource_limits,
-        )
-        prepared_geo_lut = read_prepared_lut(
-            provider,
-            prepared_lut_handle,
-            prepared_provider_token,
-        )
 
     load_started = time.perf_counter()
     ref_product = open_safe_product(ref_path)
@@ -755,11 +703,6 @@ def _produce_interferogram_pair(
     geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
-    resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
-    | None = None,
-    prepared_provider_root: str | Path | None = None,
-    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -802,11 +745,6 @@ def _produce_interferogram_pair(
     geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
-    resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
-    | None = None,
-    prepared_provider_root: str | Path | None = None,
-    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -850,11 +788,6 @@ def _produce_interferogram_pair(
     geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
-    resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
-    | None = None,
-    prepared_provider_root: str | Path | None = None,
-    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -943,23 +876,6 @@ def _produce_interferogram_pair(
     n_jobs : int, optional
         Number of parallel burst workers (default 1; applies to radar mode
         with an ROI and to geo mode).
-    resource_limits : ResourceLimits, optional
-        Authenticated finite resource profile.  When supplied, sweep/geo
-        burst execution reserves worker slots and output files before
-        submission and monitors the complete parent-plus-descendant RSS tree
-        at 100 ms.  A missing profile keeps compatibility but is not a
-        qualified resource-gate run.
-    prepared_geo_lut_handles : mapping, optional
-        Per-unit prepared LUT handles and lease tokens keyed by burst task
-        tag.  These are consumed by geographic workers without rebuilding
-        geo2rdr LUTs.
-    prepared_provider_root : path, optional
-        Provider-owned prepared-generation store root used by workers to
-        attach the lease token and read ``prepared_geo_lut_handles``.
-    source_snapshot_root : path, optional
-        Caller-owned private root for immutable local SAFE, orbit, and DEM
-        snapshots.  When supplied, all local source paths are copied and the
-        copied paths—not the original aliases—are used for parsing and reads.
     roi_buffer_m : float, optional
         Physical margin in meters kept around the ROI (default 320).  In geo
         mode it is applied in the grid CRS; in radar mode it is converted to
@@ -993,10 +909,6 @@ def _produce_interferogram_pair(
         Single-config state, or per-config outcomes for a sweep.
 
     """
-    if (
-        prepared_geo_lut_handles is not None or prepared_provider_root is not None
-    ) and coregistration_grid != "geo":
-        reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
     if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs < 1:
         reject_invalid_state("n_jobs must be a positive integer")
     _, resolved_ampcor_device = resolve_ampcor_policy(executor, device)
@@ -1035,10 +947,6 @@ def _produce_interferogram_pair(
             geo_footprint_mask_enabled=geo_footprint_mask_enabled,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
-            resource_limits=resource_limits,
-            prepared_geo_lut_handles=prepared_geo_lut_handles,
-            prepared_provider_root=prepared_provider_root,
-            source_snapshot_root=source_snapshot_root,
             roi_buffer_m=roi_buffer_m,
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
@@ -1053,19 +961,6 @@ def _produce_interferogram_pair(
     from faninsar.missions.s1.safe import open_safe_product
 
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
-    snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
-    if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
-        from faninsar.processing.runtime.source_snapshots import snapshot_local_source
-
-        if dem_sampler.path is not None:
-            dem_snapshot = snapshot_local_source(
-                dem_sampler.path,
-                snapshot_root / "dem",
-            )
-            dem_sampler = DEM.from_raster(
-                dem_snapshot.path,
-                vertical_datum=dem_sampler.vertical_datum,
-            )
     if geoid_correction and isinstance(dem_sampler, PublicRasterDEM):
         dem_sampler = dem_sampler.to_raster(
             dem_sampler.grid,
@@ -1088,17 +983,6 @@ def _produce_interferogram_pair(
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
-    if snapshot_root is not None:
-        primary_paths = _snapshot_paths(primary_paths, snapshot_root / "safe")
-        sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
-        ref_orbits = _snapshot_optional_paths(
-            ref_orbits,
-            snapshot_root / "orbit",
-        )
-        sec_orbits = _snapshot_optional_paths(
-            sec_orbits,
-            snapshot_root / "orbit",
-        )
 
     primary_products = [open_safe_product(path) for path in primary_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
@@ -1732,11 +1616,6 @@ def _produce_interferogram_sweep(
     dem_source: str | None = None,
     record_scientific_lineage: bool = False,
     n_jobs: int = 1,
-    resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
-    | None = None,
-    prepared_provider_root: str | Path | None = None,
-    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
@@ -1744,10 +1623,6 @@ def _produce_interferogram_sweep(
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.s1.safe import open_safe_product
 
-    if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
-        reject_invalid_state(
-            "prepared Geo LUT reuse requires both handles and provider root"
-        )
     if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs < 1:
         reject_invalid_state("n_jobs must be a positive integer")
     _, resolved_ampcor_device = resolve_ampcor_policy(executor, device)
@@ -1756,13 +1631,6 @@ def _produce_interferogram_sweep(
             "explicit CUDA Ampcor is incompatible with ProcessPoolExecutor "
             "n_jobs > 1; use n_jobs=1 for device-local admission"
         )
-    if prepared_geo_lut_handles is not None and coregistration_grid != "geo":
-        reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
-    if prepared_geo_lut_handles is not None and not isinstance(
-        prepared_geo_lut_handles, Mapping
-    ):
-        reject_invalid_state("prepared Geo LUT handles must be a mapping")
-
     single_config = _is_multilook_pair(multilook)
     if single_config:
         configs = [tuple(int(part) for part in multilook)]
@@ -1788,19 +1656,6 @@ def _produce_interferogram_sweep(
                 shutil.rmtree(stale)
 
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
-    snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
-    if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
-        from faninsar.processing.runtime.source_snapshots import snapshot_local_source
-
-        if dem_sampler.path is not None:
-            dem_snapshot = snapshot_local_source(
-                dem_sampler.path,
-                snapshot_root / "dem",
-            )
-            dem_sampler = DEM.from_raster(
-                dem_snapshot.path,
-                vertical_datum=dem_sampler.vertical_datum,
-            )
     if geoid_correction and isinstance(dem_sampler, PublicRasterDEM):
         dem_sampler = dem_sampler.to_raster(
             dem_sampler.grid,
@@ -1823,17 +1678,6 @@ def _produce_interferogram_sweep(
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
-    if snapshot_root is not None:
-        primary_paths = _snapshot_paths(primary_paths, snapshot_root / "safe")
-        sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
-        ref_orbits = _snapshot_optional_paths(
-            ref_orbits,
-            snapshot_root / "orbit",
-        )
-        sec_orbits = _snapshot_optional_paths(
-            sec_orbits,
-            snapshot_root / "orbit",
-        )
     primary_products = [open_safe_product(path) for path in primary_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
     if swaths is None:
@@ -2031,9 +1875,6 @@ def _produce_interferogram_sweep(
             geo_footprint_mask_enabled=geo_footprint_mask_enabled,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
-            resource_limits=resource_limits,
-            prepared_geo_lut_handles=prepared_geo_lut_handles,
-            prepared_provider_root=prepared_provider_root,
             roi_buffer_m=roi_buffer_m,
             record_scientific_lineage=record_scientific_lineage,
         )
@@ -2115,10 +1956,6 @@ def _archive_burst_ifgs(
     geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
-    resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
-    | None = None,
-    prepared_provider_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
@@ -2136,16 +1973,6 @@ def _archive_burst_ifgs(
 
     if coregistration_grid == "geo" and (geo_grid is None or geo_work_dir is None):
         reject_invalid_state("geo coregistration requires geo_grid and geo_work_dir")
-    if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
-        reject_invalid_state(
-            "prepared Geo LUT reuse requires both handles and provider root"
-        )
-    if prepared_geo_lut_handles is not None:
-        if coregistration_grid != "geo":
-            reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
-        if not isinstance(prepared_geo_lut_handles, Mapping):
-            reject_invalid_state("prepared Geo LUT handles must be a mapping")
-
     ifg_dir = work_dir / "ifgs"
     ifg_dir.mkdir(parents=True, exist_ok=True)
     units: list[dict[str, Any]] = []
@@ -2233,19 +2060,6 @@ def _archive_burst_ifgs(
     for swath in reversed(swath_tuple):
         for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
             tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
-            prepared_lut_handle: object | None = None
-            prepared_provider_token: object | None = None
-            if prepared_geo_lut_handles is not None:
-                if tag not in prepared_geo_lut_handles:
-                    reject_invalid_state(
-                        "prepared Geo LUT handles are missing burst tag " + tag
-                    )
-                entry = prepared_geo_lut_handles[tag]
-                if not isinstance(entry, tuple) or len(entry) != 2:
-                    reject_invalid_state(
-                        "prepared Geo LUT handle entry must be a handle/token pair"
-                    )
-                prepared_lut_handle, prepared_provider_token = entry
             task_args.append(
                 {
                     "tag": tag,
@@ -2284,80 +2098,20 @@ def _archive_burst_ifgs(
                         if coregistration_grid == "geo" and geo_grid is not None
                         else frame_shape
                     ),
-                    "prepared_geo_lut_handle": prepared_lut_handle,
-                    "prepared_provider_token": prepared_provider_token,
-                    "prepared_provider_root": prepared_provider_root,
-                    "resource_limits": resource_limits,
                     "record_scientific_lineage": record_scientific_lineage,
-                    "require_worker_bootstrap": (
-                        resource_limits is not None and n_jobs > 1
-                    ),
                 }
             )
 
     expected_tags = tuple(str(task["tag"]) for task in task_args)
     if len(expected_tags) != len(set(expected_tags)):
         reject_invalid_state("burst selection contains duplicate unit tags")
-    if prepared_geo_lut_handles is not None and set(prepared_geo_lut_handles) != set(
-        expected_tags
-    ):
-        reject_invalid_state(
-            "prepared Geo LUT handles must cover exactly the selected burst tags"
-        )
+    if n_jobs > 1 and len(task_args) > 1:
+        from concurrent.futures import ProcessPoolExecutor
 
-    from contextlib import nullcontext
-
-    from faninsar.processing.runtime.resources import ProcessTreeAdmission
-
-    worker_count = min(max(1, n_jobs), max(1, len(task_args)))
-    output_file_count = len(task_args) * (4 if coregistration_grid == "geo" else 3)
-    if resource_limits is None:
-        logger.info(
-            "burst archive running without an authenticated resource profile; "
-            "resource-gate evidence is not claimed"
-        )
-        admission_context = nullcontext()
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_process_burst_worker, task_args))
     else:
-        admission_context = ProcessTreeAdmission.from_limits(
-            resource_limits,
-            work_dir,
-            workers=worker_count,
-            files=output_file_count,
-        )
-
-    with admission_context:
-        if n_jobs > 1 and len(task_args) > 1:
-            from concurrent.futures import ProcessPoolExecutor
-
-            pool_kwargs: dict[str, object] = {"max_workers": n_jobs}
-            if resource_limits is not None:
-                from multiprocessing import get_context
-
-                from faninsar.processing.runtime.resources import (
-                    bootstrap_worker_runtime,
-                )
-
-                pool_kwargs.update(
-                    {
-                        "mp_context": get_context("spawn"),
-                        "initializer": bootstrap_worker_runtime,
-                        "initargs": (1,),
-                    }
-                )
-            with ProcessPoolExecutor(**pool_kwargs) as pool:
-                results = list(pool.map(_process_burst_worker, task_args))
-        else:
-            results = [_process_burst_worker(task) for task in task_args]
-
-    resource_watchdog = getattr(admission_context, "watchdog", None)
-    resource_peak_rss_bytes = 0
-    resource_sample_count = 0
-    if resource_watchdog is not None:
-        resource_sample_count = len(resource_watchdog.samples)
-        resource_peak_rss_bytes = max(
-            (snapshot.rss_bytes for snapshot in resource_watchdog.samples),
-            default=0,
-        )
+        results = [_process_burst_worker(task) for task in task_args]
 
     ordered_results: list[tuple[dict[str, object], dict[str, float]]] = []
     produced_tags: set[str] = set()
@@ -2421,8 +2175,6 @@ def _archive_burst_ifgs(
         "grid_mode": "geo" if coregistration_grid == "geo" else "radar",
         "geo_grid": geo_grid,
         "geo_prefix_state": geo_prefix_state,
-        "resource_peak_rss_bytes": resource_peak_rss_bytes,
-        "resource_sample_count": resource_sample_count,
     }
 
 
@@ -2552,8 +2304,6 @@ def _merge_burst_ifgs(
         "units": units,
         "frame_count": max(frame_indices) + 1 if frame_indices else 0,
         "total_seconds": time.perf_counter() - archive["prefix_started"],
-        "resource_peak_rss_bytes": archive.get("resource_peak_rss_bytes", 0),
-        "resource_sample_count": archive.get("resource_sample_count", 0),
     }
 
 
@@ -2646,8 +2396,6 @@ def _finalize_sweep_config(
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
             "merge": float(merged.get("merge_s", 0.0)),
-            "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
-            "resource_sample_count": merged.get("resource_sample_count", 0),
         },
     )
     _inherit_coregistration_residuals(result, origin)
@@ -2796,8 +2544,6 @@ def _merge_geo_ifgs(
         "grid_mode": "geo",
         "geo_grid": geo_grid,
         "height_field": height_field,
-        "resource_peak_rss_bytes": archive.get("resource_peak_rss_bytes", 0),
-        "resource_sample_count": archive.get("resource_sample_count", 0),
     }
 
 
@@ -2862,8 +2608,6 @@ def _finalize_geo_config(
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
             "merge": float(merged.get("merge_s", 0.0)),
-            "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
-            "resource_sample_count": merged.get("resource_sample_count", 0),
         },
     )
     _inherit_coregistration_residuals(result, origin)

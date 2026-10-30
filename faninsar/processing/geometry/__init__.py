@@ -17,7 +17,7 @@ from .boundary import (
     evaluate_canonical_boundary,
     normalize_result_boundary,
 )
-from .cache import ArtifactValidationError, CachePathError, validate_artifact
+from .cache import ArtifactValidationError, validate_artifact
 from .converters import GeoDataFormatConverter
 from .coordinates import (
     bounds_from_xy,
@@ -46,8 +46,6 @@ from .fetch import (
     EGM96,
     EGM2008_2_5,
     Fetch,
-    GeoidArtifactError,
-    GeoidOfflineError,
     GeoidResource,
     GeoidResourceError,
 )
@@ -55,7 +53,6 @@ from .geoid import GeoidSampler, load_geoid
 from .grids import GeoGrid, GeoGridMixin, GridSpec, format_bounds_and_crs
 from .lut_cache import TransformCacheKey, read_transform_cache, write_transform_cache
 from .orbit import (
-    OrbitInterpolationError,
     OrbitInterpolator,
     OrbitState,
     interpolate_orbit,
@@ -66,18 +63,9 @@ from .prepare_production import (
     run_rdr2geo,
     run_rdr2geo_chunked,
 )
-from .prepared_provider import (
-    LocalPreparedGeometryProvider,
+from .prepared import (
     PreparedGeometryArrayPayload,
     PreparedLutArrayPayload,
-    PreparedScenePayload,
-    ScenePreparationCallback,
-)
-from .prepared_store import (
-    PreparedGenerationLease,
-    PreparedGenerationReader,
-    PreparedGenerationRecord,
-    PreparedGenerationStore,
 )
 from .profiles import Profile
 from .public import (
@@ -85,12 +73,10 @@ from .public import (
     NativeContextInputs,
     PreparedGeometry,
     execute_geometry,
-    execute_geometry_v2,
     prepare_geometry,
-    prepare_geometry_v2,
 )
 from .raster_ops import match_to_raster
-from .resources import ResourceBudget, ResourcePreflightError, preflight_grid
+from .resources import ResourceBudget, preflight_grid
 from .seam import (
     SOURCE_KERNEL_RADIUS,
     SOURCE_KERNEL_SIZE,
@@ -125,8 +111,6 @@ _PROVIDER_EXPORTS = {
     "PC_REGISTRY",
     "PC_STAC_URL",
     "PcStacSource",
-    "ProviderUnavailableError",
-    "SourceConflictError",
     "SourceResource",
     "get_provider",
     "materialize_source",
@@ -166,7 +150,6 @@ __all__ = [
     "BackendSelector",
     "BaselineComponents",
     "BoundaryDecision",
-    "CachePathError",
     "CandidateKey",
     "ConstantDEM",
     "DEMProduct",
@@ -177,41 +160,28 @@ __all__ = [
     "GeoDataFormatConverter",
     "GeoGrid",
     "GeoGridMixin",
-    "GeoidArtifactError",
-    "GeoidOfflineError",
     "GeoidResource",
     "GeoidResourceError",
     "GeoidSampler",
     "GeometryValidationError",
     "GridSpec",
-    "LocalPreparedGeometryProvider",
     "NativeContextInputs",
     "NativeSpan",
     "Operation",
     "OperationSettings",
-    "OrbitInterpolationError",
     "OrbitInterpolator",
     "OrbitState",
     "PcStacSource",
-    "PreparedGenerationLease",
-    "PreparedGenerationReader",
-    "PreparedGenerationRecord",
-    "PreparedGenerationStore",
     "PreparedGeometry",
     "PreparedGeometryArrayPayload",
     "PreparedLutArrayPayload",
-    "PreparedScenePayload",
     "Profile",
-    "ProviderUnavailableError",
     "RadarGeometryModel",
     "RasterDEM",
     "RawSpan",
     "ResourceBudget",
-    "ResourcePreflightError",
-    "ScenePreparationCallback",
     "SeamAwareSourceSampler",
     "SolverSettings",
-    "SourceConflictError",
     "SourceDEM",
     "SourceResource",
     "TransformCacheKey",
@@ -225,7 +195,6 @@ __all__ = [
     "ecef_to_llh",
     "evaluate_canonical_boundary",
     "execute_geometry",
-    "execute_geometry_v2",
     "fetch_required",
     "format_bounds_and_crs",
     "geoinfo_from_xy",
@@ -242,7 +211,6 @@ __all__ = [
     "plan_query_windows",
     "preflight_grid",
     "prepare_geometry",
-    "prepare_geometry_v2",
     "prepare_production_geometry",
     "read_transform_cache",
     "requires_fetch",

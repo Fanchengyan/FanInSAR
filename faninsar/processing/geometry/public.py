@@ -1,5 +1,4 @@
 # ruff: noqa: A002, EM101, EM102, TRY003
-
 """Public preparation and execution boundary for geometry v2.
 
 The public boundary is intentionally small.  Preparation creates the eager
@@ -22,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.geometry.backend_dispatch import (
     CandidateKey,
     Dispatcher,
@@ -59,8 +58,6 @@ if TYPE_CHECKING:
     from faninsar.processing.geometry.native_v2.builder import PreparedNativeCandidate
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.processing.runtime.types import DeviceLike
-
-logger = setup_logger(__name__)
 
 BackendSelector: TypeAlias = Literal["native", "compile", "eager", "auto"]
 NativeExecutor: TypeAlias = Callable[..., object] | ModuleType
@@ -108,8 +105,7 @@ def _cuda_dem_metadata_abi_order(metadata: Sequence[float]) -> tuple[float, ...]
     """
     if len(metadata) != 4:
         message = "DEM metadata must contain exactly four values"
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     return (metadata[1], metadata[0], metadata[3], metadata[2])
 
 
@@ -161,15 +157,13 @@ def _resolve_native_entrypoint(
                 "rdr2geo native execution requires an extension module; "
                 "pass the module so public dispatch can select rdr2geo_cpu_dem"
             )
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         return executor
     device_name = "cuda" if device.kind == "cuda" else "cpu"
     if operation is Operation.RDR2GEO:
         if ecef and device_name != "cuda":
             message = "native ECEF execution is currently CUDA-only"
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         symbol = (
             "rdr2geo_cuda_ecef"
             if ecef
@@ -180,8 +174,7 @@ def _resolve_native_entrypoint(
     entry = getattr(executor, symbol, None)
     if not callable(entry):
         message = f"native geometry module is missing required entrypoint {symbol}"
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     if not isinstance(executor, ModuleType):
         return entry
 
@@ -214,8 +207,7 @@ def _resolve_native_entrypoint(
             message = (
                 "native model_parameters must follow the canonical five-field order"
             )
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         sensing, interval, starting_range, spacing, wavelength = map(float, parameters)
         if operation is Operation.RDR2GEO:
             dem_values, dem_metadata, dem_bounds = context[5:]
@@ -566,16 +558,14 @@ def _validate_public_inputs(
 
             if value.dtype != np.dtype(np.float64):
                 message = f"geometry input {index} must have dtype float64"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             try:
                 normalized_value = torch.as_tensor(
                     value, dtype=torch.float64, device=target_device
                 ).contiguous()
             except Exception as error:
                 message = "native CUDA inputs could not be copied to the target device"
-                logger.exception(message)
-                raise GeometryValidationError(message) from error
+                reject(message, GeometryValidationError, cause=error)
             validate_tensor_span(
                 normalized_value,
                 expected_dtype=torch.float64,
@@ -859,16 +849,13 @@ def _normalize_ecef_result(
         values = tuple(np.asarray(value) for value in result)
         if any(value.dtype != np.dtype(np.float64) for value in values):
             message = "ECEF result arrays must have float64 dtype"
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
     else:
         message = "ECEF executor returned neither a 17-field nor 3-array result"
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     if any(value.shape != shape for value in values):
         message = "ECEF result arrays have an incompatible shape"
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     return values
 
 
@@ -953,12 +940,10 @@ class PreparedGeometry:
         """
         if self.operation is not Operation.RDR2GEO:
             message = "execute_ecef is only available for rdr2geo"
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         if selector not in ("native", "compile", "eager", "auto"):
             message = f"unknown ECEF selector: {selector}"
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         alternate: dict[str, Callable[..., object]] = {}
         if self._native_ecef_execute is not None:
             alternate["native"] = self._native_ecef_execute
@@ -1099,8 +1084,7 @@ def prepare_geometry(
                 "extension module as native_executor so public dispatch selects "
                 "rdr2geo_cpu_dem"
             )
-            logger.error(message)
-            raise DispatchError(message)
+            reject(message, DispatchError)
         derived_key = _key(op, "native", eager, profile, native_candidate)
         if (
             native_executor is not None
@@ -1186,8 +1170,7 @@ def prepare_geometry(
         def execute_native_ecef(*args: object) -> object:
             """Execute the typed seventeen-field native ECEF entry point."""
             if native_ecef_entry is None:
-                logger.error("native CUDA ECEF executor is missing")
-                raise DispatchError("native CUDA ECEF executor is missing")
+                reject("native CUDA ECEF executor is missing", DispatchError)
             native_inputs = _validate_public_inputs(
                 op,
                 normalized_shape,
@@ -1237,15 +1220,10 @@ def execute_geometry(
     return prepared.execute(*inputs, selector=selector)
 
 
-prepare_geometry_v2 = prepare_geometry
-execute_geometry_v2 = execute_geometry
-
 __all__ = [
     "BackendSelector",
     "NativeContextInputs",
     "PreparedGeometry",
     "execute_geometry",
-    "execute_geometry_v2",
     "prepare_geometry",
-    "prepare_geometry_v2",
 ]
