@@ -88,6 +88,11 @@ class Acquisition(pd.DatetimeIndex):
     This class is a wrapper around :class:`pandas.DatetimeIndex` to handle
     SAR acquisition dates in FanInSAR.
 
+    Set-style ``+``/``-``/``&``/``|``/``^`` operators combine two date sets
+    and return :class:`Acquisition` views; the named methods
+    :meth:`union`, :meth:`difference`, :meth:`intersection`, and
+    :meth:`symmetric_difference` do the same. Element-wise arithmetic with
+    scalars or :class:`pandas.Timedelta` keeps the pandas behaviour.
     """
 
     dims = ("dates",)
@@ -184,3 +189,72 @@ class Acquisition(pd.DatetimeIndex):
     def data(self) -> np.ndarray:
         """Return the internal data of the index."""
         return self._data
+
+    # ---- set-style combination -------------------------------------------
+
+    @staticmethod
+    def _ensure_acquisition(other: object) -> Acquisition:
+        """Coerce a date collection operand to ``Acquisition``.
+
+        A plain :class:`pandas.DatetimeIndex` is wrapped because
+        ``DatetimeIndex`` set methods assert ``type(other) is type(self)``
+        on the subclass.
+        """
+        if isinstance(other, Acquisition):
+            return other
+        if isinstance(other, pd.DatetimeIndex):
+            return Acquisition(other)
+        message = (
+            "expected an Acquisition, DatetimeIndex, or list of dates; "
+            f"got {type(other).__name__}"
+        )
+        raise TypeError(message)
+
+    def union(self, other: object, sort: bool = True) -> Acquisition:  # type: ignore[override]
+        """Return the set union of two date collections as ``Acquisition``."""
+        result = super().union(self._ensure_acquisition(other), sort=sort)
+        return Acquisition(result)
+
+    def difference(self, other: object, sort: bool = True) -> Acquisition:  # type: ignore[override]
+        """Return the set difference ``self - other`` as ``Acquisition``."""
+        result = super().difference(self._ensure_acquisition(other), sort=sort)
+        return Acquisition(result)
+
+    def intersection(self, other: object, sort: bool = True) -> Acquisition:  # type: ignore[override]
+        """Return the set intersection of two date collections as ``Acquisition``."""
+        result = super().intersection(self._ensure_acquisition(other), sort=sort)
+        return Acquisition(result)
+
+    def symmetric_difference(
+        self, other: object, result_name: object = None, sort: bool = True
+    ) -> Acquisition:  # type: ignore[override]
+        """Return the symmetric difference of two date collections."""
+        del result_name
+        result = super().symmetric_difference(
+            self._ensure_acquisition(other), sort=sort
+        )
+        return Acquisition(result)
+
+    def __add__(self, other: object) -> Acquisition:
+        """Return the set union ``self | other`` as ``Acquisition``."""
+        if isinstance(other, pd.DatetimeIndex):
+            return self.union(other)
+        return Acquisition(super().__add__(other))
+
+    def __sub__(self, other: object) -> Acquisition:
+        """Return the set difference ``self - other`` as ``Acquisition``."""
+        if isinstance(other, pd.DatetimeIndex):
+            return self.difference(other)
+        return Acquisition(super().__sub__(other))
+
+    def __and__(self, other: object) -> Acquisition:
+        """Return the set intersection ``self & other`` as ``Acquisition``."""
+        return self.intersection(other)
+
+    def __or__(self, other: object) -> Acquisition:
+        """Return the set union ``self | other`` as ``Acquisition``."""
+        return self.union(other)
+
+    def __xor__(self, other: object) -> Acquisition:
+        """Return the symmetric difference ``self ^ other`` as ``Acquisition``."""
+        return self.symmetric_difference(other)

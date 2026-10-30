@@ -31,6 +31,56 @@ class TestAcquisition:
         assert stats["unique"] == 10
         assert stats["total"] == 10
 
+    def test_set_operators(self):
+        """Set-style operators return Acquisition views."""
+        left = Acquisition(pd.DatetimeIndex(["2023-01-01", "2023-01-03"]))
+        right = Acquisition(pd.DatetimeIndex(["2023-01-03", "2023-01-05"]))
+
+        union = left + right
+        assert isinstance(union, Acquisition)
+        expected = pd.DatetimeIndex(["2023-01-01", "2023-01-03", "2023-01-05"])
+        assert union.tolist() == list(expected)
+        assert (left | right).tolist() == union.tolist()
+        assert left.union(right).tolist() == union.tolist()
+
+        diff = left - right
+        assert isinstance(diff, Acquisition)
+        assert diff.tolist() == list(pd.DatetimeIndex(["2023-01-01"]))
+        assert left.difference(right).tolist() == diff.tolist()
+
+        inter = left & right
+        assert isinstance(inter, Acquisition)
+        assert inter.tolist() == list(pd.DatetimeIndex(["2023-01-03"]))
+        assert left.intersection(right).tolist() == inter.tolist()
+
+        sym = left ^ right
+        assert isinstance(sym, Acquisition)
+        assert sym.tolist() == list(pd.DatetimeIndex(["2023-01-01", "2023-01-05"]))
+        assert left.symmetric_difference(right).tolist() == sym.tolist()
+
+    def test_set_operators_with_datetime_index(self):
+        """A plain DatetimeIndex operand works the same as Acquisition."""
+        acq = Acquisition(pd.DatetimeIndex(["2023-01-01", "2023-01-03"]))
+        other = pd.DatetimeIndex(["2023-01-03"])
+
+        assert (acq - other).tolist() == list(pd.DatetimeIndex(["2023-01-01"]))
+        assert (acq + other).tolist() == list(
+            pd.DatetimeIndex(["2023-01-01", "2023-01-03"])
+        )
+
+    def test_scalar_arithmetic_unchanged(self):
+        """Timedelta arithmetic keeps pandas element-wise behaviour."""
+        acq = Acquisition(pd.DatetimeIndex(["2023-01-01"]))
+        shifted = acq + pd.Timedelta(days=1)
+        assert isinstance(shifted, Acquisition)
+        assert shifted.tolist() == list(pd.DatetimeIndex(["2023-01-02"]))
+
+    def test_set_operators_reject_scalar(self):
+        """A non-index operand falls through to pandas' arithmetic error."""
+        acq = Acquisition(pd.DatetimeIndex(["2023-01-01"]))
+        with pytest.raises(TypeError):
+            acq - "2023-01-01"
+
 
 class TestCreateDaysSpanIndex:
     """Test the creation of DaySpan with different type inputs."""
