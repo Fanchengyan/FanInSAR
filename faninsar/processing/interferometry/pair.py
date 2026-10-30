@@ -302,11 +302,11 @@ def _sliding_coherence(
 
 
 def _block_finite_mean(array: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
-    """Average finite values over non-overlapping blocks, retaining tails."""
+    """Average finite values over non-overlapping blocks, dropping tails."""
     height, width = array.shape
     az_looks, rg_looks = multilook
     output = np.full(
-        ((height + az_looks - 1) // az_looks, (width + rg_looks - 1) // rg_looks),
+        (height // az_looks, width // rg_looks),
         np.nan,
         dtype=np.float64,
     )
@@ -335,8 +335,9 @@ def form_interferogram(
     ``coherence_window`` is a centered, stride-one ``(azimuth, range)``
     support with odd axes at least 3. It is computed at full ``H x W`` and
     then reduced by finite-only blocks. ``None`` computes direct MLE per
-    output block. Multilook blocks start at ``(0, 0)``, retain tails, and use
-    ``ceil`` dimensions.
+    output block. Multilook blocks start at ``(0, 0)`` and use ``floor``
+    dimensions: a trailing partial look block is dropped, matching ISCE2
+    ``mroipac.looks.Looks`` and the geocode ``layer_frame_shape`` contract.
     """
     coherence_window = validate_coherence_window(coherence_window)
     if primary.shape != secondary.shape or primary.ndim != 2:
@@ -352,8 +353,8 @@ def form_interferogram(
     az_looks, rg_looks = multilook
     use_dead_mask = dead_pixel_amp_threshold > 0.0
     height, width = primary.shape
-    out_h = (height + az_looks - 1) // az_looks
-    out_w = (width + rg_looks - 1) // rg_looks
+    out_h = height // az_looks
+    out_w = width // rg_looks
     finite_pair = np.isfinite(primary.real) & np.isfinite(primary.imag)
     finite_pair &= np.isfinite(secondary.real) & np.isfinite(secondary.imag)
     if use_dead_mask:

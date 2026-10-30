@@ -72,16 +72,18 @@ def test_coherence_window_none_is_a_valid_direct_mle_branch() -> None:
         multilook=(2, 2),
         coherence_window=None,
     )
-    assert product.complex.shape == (1, 2)
+    assert product.complex.shape == (1, 1)
     assert product.valid_mask is not None
-    assert product.valid_mask.tolist() == [[True, True]]
+    assert product.valid_mask.tolist() == [[True]]
     assert np.allclose(product.coherence, 1.0, equal_nan=False)
 
 
-def test_multilook_retains_partial_tail_with_actual_sample_count() -> None:
-    """Output blocks start at zero, retain tails, and divide by valid counts."""
+def test_multilook_drops_partial_tail_blocks() -> None:
+    """Output blocks start at zero and drop trailing partial look blocks."""
     primary = np.ones((3, 5), dtype=np.complex64)
     secondary = np.ones((3, 5), dtype=np.complex64)
+    # This tail sample sits in the dropped row-2 / col-4 partial block and
+    # must not appear in the floored output.
     primary[2, 4] = 3.0 + 0.0j
     product = form_interferogram(
         primary,
@@ -89,8 +91,8 @@ def test_multilook_retains_partial_tail_with_actual_sample_count() -> None:
         multilook=(2, 2),
         coherence_window=None,
     )
-    assert product.complex.shape == (2, 3)
-    assert product.complex[1, 2] == pytest.approx(3.0 + 0.0j)
+    assert product.complex.shape == (1, 2)
+    assert np.all(product.complex == pytest.approx(1.0 + 0.0j))
 
 
 def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support() -> (
@@ -126,9 +128,8 @@ def test_two_stage_coherence_uses_full_resolution_sliding_mle() -> None:
         multilook=(2, 2),
         coherence_window=(3, 3),
     )
-    assert product.coherence.shape == (2, 2)
+    assert product.coherence.shape == (1, 1)
     assert product.coherence[0, 0] < 1.0
-    assert product.coherence[1, 1] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(

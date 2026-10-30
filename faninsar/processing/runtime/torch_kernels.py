@@ -523,8 +523,10 @@ def multilook_interferogram_torch(
     # describes complex support, while coherence is NaN when the support count
     # is below two.
     height, width = p.shape
-    out_h = (height + az_looks - 1) // az_looks
-    out_w = (width + rg_looks - 1) // rg_looks
+    # floor dimensions: a trailing partial look block is dropped, matching
+    # ISCE2 ``mroipac.looks.Looks`` and the geocode layer-frame contract.
+    out_h = height // az_looks
+    out_w = width // rg_looks
     padded_height = out_h * az_looks
     padded_width = out_w * rg_looks
     finite_pair = torch.isfinite(p.real) & torch.isfinite(p.imag)
@@ -542,9 +544,9 @@ def multilook_interferogram_torch(
     padded_valid = torch.zeros(
         (padded_height, padded_width), dtype=torch.bool, device=resolved
     )
-    padded_p[:height, :width] = p_clean
-    padded_s[:height, :width] = s_clean
-    padded_valid[:height, :width] = finite_pair
+    padded_p[:] = p_clean[:padded_height, :padded_width]
+    padded_s[:] = s_clean[:padded_height, :padded_width]
+    padded_valid[:] = finite_pair[:padded_height, :padded_width]
     pr = padded_p.real.reshape(out_h, az_looks, out_w, rg_looks)
     pi = padded_p.imag.reshape(out_h, az_looks, out_w, rg_looks)
     sr = padded_s.real.reshape(out_h, az_looks, out_w, rg_looks)
@@ -621,11 +623,12 @@ def multilook_interferogram_torch(
         # otherwise extrapolate a window from its neighbours and leak into
         # tail-block means that the NumPy reference never averages.  The
         # centre cell itself may be invalid -- the NumPy reference estimates
-        # from the surrounding valid samples either way.
-        in_bounds = torch.zeros(
+        # from the surrounding valid samples either way.  With floor
+        # dimensions the padded frame is cropped to whole look blocks, so
+        # every cell is a real array cell.
+        in_bounds = torch.ones(
             (padded_height, padded_width), dtype=torch.bool, device=resolved
         )
-        in_bounds[:height, :width] = True
         sliding_valid = (
             in_bounds & (sliding_count >= 2.0) & (pooled[2] > 0.0) & (pooled[3] > 0.0)
         )
