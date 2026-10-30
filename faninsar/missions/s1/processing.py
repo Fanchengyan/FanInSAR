@@ -685,7 +685,7 @@ class ProductionPairState:
     secondary_aligned: np.ndarray | None = None
     secondary_aligned_is_flattened: bool = False
     range_offset_flatten_phase: np.ndarray | None = None
-    complex_ifg: np.ndarray | None = None
+    complex: np.ndarray | None = None
     complex_ifg_flat: np.ndarray | None = None
     topo_phase: np.ndarray | None = None
     coherence: np.ndarray | None = None
@@ -2106,18 +2106,18 @@ def stage_interferogram(
             from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
             complex_ifg = run_goldstein_filter(
-                ifg.complex_ifg,
+                ifg.complex,
                 alpha=goldstein_alpha,
                 window=32,
                 device=device,
                 client=dask_client,
             )
         else:
-            complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
+            complex_ifg = goldstein_filter(ifg.complex, alpha=goldstein_alpha)
     else:
-        complex_ifg = ifg.complex_ifg
+        complex_ifg = ifg.complex
     complex_ifg, coherence, wrapped = mask_invalid_looks(complex_ifg, ifg.coherence)
-    state.complex_ifg = complex_ifg
+    state.complex = complex_ifg
     state.coherence = coherence if coherence is not None else ifg.coherence
     state.wrapped_phase = wrapped
     n_invalid = int(np.isnan(state.wrapped_phase).sum())
@@ -2130,7 +2130,7 @@ def stage_interferogram(
         state,
         "form_interferogram",
         (primary_lineage_input, secondary_lineage_input),
-        (state.complex_ifg, state.coherence, state.wrapped_phase),
+        (state.complex, state.coherence, state.wrapped_phase),
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
     )
@@ -2194,10 +2194,10 @@ def stage_flatten(
     the residual is near zero and this step is a no-op in practice.
 
     """
-    if state.complex_ifg is None:
+    if state.complex is None:
         reject_invalid_state("flatten requires interferogram")
-    complex_input = state.complex_ifg
-    height, width = state.complex_ifg.shape
+    complex_input = state.complex
+    height, width = state.complex.shape
     # Multilooked grid → full-res radar indices on the geometry model.
     # Geometry (0,0) is the array origin (already cropped). Use look-window
     # centres rather than leading edges so path-length phase matches the
@@ -2252,7 +2252,7 @@ def stage_flatten(
                 f"FLATTEN range-offset screen only (ISCE2 parity); "
                 f"screen_std={screen_std:.3f} residual_span={residual_span:.3f} rad"
             )
-            flat = state.complex_ifg
+            flat = state.complex
             state.topo_phase = np.zeros((height, width), dtype=np.float32)
             # Do NOT remove a residual azimuth ramp here: ISCE2 does not apply
             # one in its flatten step, and the estimated ramp was found to
@@ -2261,14 +2261,14 @@ def stage_flatten(
             topo, topo_valid_frac, rms, span = _topographic_phase()
             # Fallback: no stored range-offset phase, use scale estimation.
             scale, residual_rms = estimate_residual_topographic_scale(
-                state.complex_ifg,
+                state.complex,
                 topo,
                 coherence=state.coherence,
             )
             if abs(scale) > 1e-3 and topo_valid_frac > 0.05:
                 residual_topo = (scale * topo).astype(np.float64)
                 flat = _flatten_complex_ifg(
-                    state.complex_ifg,
+                    state.complex,
                     residual_topo,
                     device,
                     dask_client,
@@ -2280,7 +2280,7 @@ def stage_flatten(
                     f"topo_valid_frac={topo_valid_frac:.3f}"
                 )
             else:
-                flat = state.complex_ifg
+                flat = state.complex
                 state.note(
                     f"FLATTEN range-offset only (no residual DEM; "
                     f"scale={scale:.3f} residual_rms={residual_rms:.3f} "
@@ -2322,17 +2322,17 @@ def stage_flatten(
     # path-length geometric model and remove it from the unflattened product.
     topo, topo_valid_frac, rms, span = _topographic_phase()
     az_ramp = estimate_residual_azimuth_ramp(
-        state.complex_ifg,
+        state.complex,
         topo,
         coherence=state.coherence,
         **azimuth_ramp_device_kwargs(device),
     )
     if abs(az_ramp) > 1e-6:
-        state.complex_ifg = remove_azimuth_phase_ramp(state.complex_ifg, az_ramp)
+        state.complex = remove_azimuth_phase_ramp(state.complex, az_ramp)
         state.note(f"FLATTEN residual_az_ramp={az_ramp:.5f} rad/az_sample")
 
     flat = _flatten_complex_ifg(
-        state.complex_ifg,
+        state.complex,
         topo,
         device,
         dask_client,
@@ -2341,8 +2341,8 @@ def stage_flatten(
     # Keep invalid looks as NaN through ramp/topo multiply (0·e^{iφ}=0 would
     # otherwise repaint a solid phase=0 black edge on the burst margin).
     # Remask the ramp-corrected unflattened ifg for intermediate products.
-    state.complex_ifg, state.coherence, _ = mask_invalid_looks(
-        state.complex_ifg, state.coherence
+    state.complex, state.coherence, _ = mask_invalid_looks(
+        state.complex, state.coherence
     )
     # wrapped_phase must track the flattened product that stage_write archives
     # as complex_ifg (complex_ifg_flat), not the unflattened angle.
@@ -2394,9 +2394,7 @@ def stage_unwrap(
 
     """
     ifg = (
-        state.complex_ifg_flat
-        if state.complex_ifg_flat is not None
-        else state.complex_ifg
+        state.complex_ifg_flat if state.complex_ifg_flat is not None else state.complex
     )
     if ifg is None or state.coherence is None:
         reject_invalid_state("unwrap requires interferogram")
@@ -2425,9 +2423,7 @@ def stage_unwrap(
     )
 
     flat_src = (
-        state.complex_ifg_flat
-        if state.complex_ifg_flat is not None
-        else state.complex_ifg
+        state.complex_ifg_flat if state.complex_ifg_flat is not None else state.complex
     )
     unw_corr, z_corr, _screen, span, applied = apply_residual_phase_screen_to_products(
         unwrapped_phase=state.unwrapped_phase,
@@ -2497,7 +2493,7 @@ def stage_write(
 ) -> ProductionPairState:
     """Write radar products, geocoded layers, baselines, and STAC with bbox."""
     if (
-        state.complex_ifg is None
+        state.complex is None
         or state.coherence is None
         or state.wrapped_phase is None
         or state.unwrapped_phase is None
@@ -2546,10 +2542,10 @@ def stage_write(
 
     product = PairProductArrays(
         pair_id=state.pair_id,
-        complex_ifg=(
+        complex=(
             state.complex_ifg_flat
             if state.complex_ifg_flat is not None
-            else state.complex_ifg
+            else state.complex
         ),
         coherence=state.coherence,
         wrapped_phase=state.wrapped_phase,

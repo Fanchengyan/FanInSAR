@@ -599,11 +599,6 @@ class Interferogram:
         return self.pair.secondary_string()
 
     @property
-    def unwrapped(self) -> NDArray | None:
-        """Return the unwrapped phase representation."""
-        return self.unwrapped_phase
-
-    @property
     def samples(self) -> NDArray | None:
         """Return complex samples under the processing seam alias."""
         return self.complex_phase
@@ -614,8 +609,8 @@ class Interferogram:
         return self.complex_phase
 
     @property
-    def complex_ifg(self) -> NDArray | None:
-        """Return the complex representation under its legacy alias."""
+    def complex(self) -> NDArray | None:
+        """Return the complex representation under its short alias."""
         return self.complex_phase
 
     @property

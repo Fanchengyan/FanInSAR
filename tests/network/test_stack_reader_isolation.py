@@ -118,17 +118,17 @@ def test_pair_queries_ignore_missing_other_pair_product(tmp_path: Path) -> None:
     stack, _phase, coherence = _stack_with_missing_other_pair(tmp_path)
     collection = StackInterferogramCollection(stack)
 
-    assert collection.exists(TARGET, "complex_ifg") is True
+    assert collection.exists(TARGET, "complex") is True
     assert collection.exists(TARGET, "coherence") is True
     np.testing.assert_allclose(
         collection.open(TARGET, "coherence").values,
         coherence,
     )
-    complex_path = collection.path(TARGET, "complex_ifg")
-    assert complex_path == collection.root / TARGET / "complex_ifg.zarr"
+    complex_path = collection.path(TARGET, "complex")
+    assert complex_path == collection.root / TARGET / "complex.zarr"
     assert complex_path.is_dir()
     assets = collection.item(TARGET)["assets"]
-    assert {"complex_ifg", "coherence"}.issubset(assets)
+    assert {"complex", "coherence"}.issubset(assets)
     assert "wrapped_phase" not in assets
 
 
@@ -137,13 +137,13 @@ def test_pair_queries_ignore_corrupt_other_pair_product(tmp_path: Path) -> None:
     stack, _phase, coherence = _stack_with_corrupt_other_pair(tmp_path)
     collection = StackInterferogramCollection(stack)
 
-    assert collection.exists(TARGET, "complex_ifg") is True
+    assert collection.exists(TARGET, "complex") is True
     np.testing.assert_allclose(
         collection.open(TARGET, "coherence").values,
         coherence,
     )
-    assert collection.path(TARGET, "complex_ifg").is_dir()
-    assert "complex_ifg" in collection.item(TARGET)["assets"]
+    assert collection.path(TARGET, "complex").is_dir()
+    assert "complex" in collection.item(TARGET)["assets"]
 
 
 def test_exists_reads_metadata_only(
@@ -159,7 +159,7 @@ def test_exists_reads_metadata_only(
 
     # The check observes only product metadata; any payload read is a bug.
     monkeypatch.setattr(ifg_store, "read_zarr_array", boom)
-    assert collection.exists(TARGET, "complex_ifg") is True
+    assert collection.exists(TARGET, "complex") is True
     assert collection.exists(TARGET, "coherence") is True
     assert collection.exists(TARGET, "wrapped_phase") is True
     assert collection.exists(TARGET, "unw_phase") is False
@@ -188,7 +188,7 @@ def test_open_reads_only_the_target_raster(
     monkeypatch.setattr(InterferogramArtifactStore, "open", recording_open)
     monkeypatch.setattr(ifg_store, "read_zarr_array", recording_read)
     np.testing.assert_allclose(
-        collection.open(TARGET, "complex_ifg").values,
+        collection.open(TARGET, "complex").values,
         np.exp(1j * phase).astype(np.complex64),
     )
 
@@ -203,12 +203,12 @@ def test_unknown_pair_is_rejected_without_touching_products(tmp_path: Path) -> N
     collection = StackInterferogramCollection(stack)
 
     with pytest.raises(KeyError):
-        collection.open(UNPLANNED, "complex_ifg")
+        collection.open(UNPLANNED, "complex")
     with pytest.raises(KeyError):
-        collection.path(UNPLANNED, "complex_ifg")
+        collection.path(UNPLANNED, "complex")
     with pytest.raises(KeyError):
         collection.item(UNPLANNED)
-    assert collection.exists(UNPLANNED, "complex_ifg") is False
+    assert collection.exists(UNPLANNED, "complex") is False
 
 
 def test_missing_target_product_still_fails(tmp_path: Path) -> None:
@@ -217,13 +217,13 @@ def test_missing_target_product_still_fails(tmp_path: Path) -> None:
     collection = StackInterferogramCollection(stack)
 
     with pytest.raises(InvalidProcessingStateError):
-        collection.open(OTHER, "complex_ifg")
+        collection.open(OTHER, "complex")
     with pytest.raises(InvalidProcessingStateError):
-        collection.path(OTHER, "complex_ifg")
+        collection.path(OTHER, "complex")
     with pytest.raises(InvalidProcessingStateError):
         collection.item(OTHER)
     with pytest.raises(InvalidProcessingStateError):
-        collection.exists(OTHER, "complex_ifg")
+        collection.exists(OTHER, "complex")
 
 
 def test_whole_network_reads_remain_strict(tmp_path: Path) -> None:
@@ -232,7 +232,7 @@ def test_whole_network_reads_remain_strict(tmp_path: Path) -> None:
     collection = StackInterferogramCollection(stack)
 
     with pytest.raises(InvalidProcessingStateError, match="does not exactly match"):
-        collection.open_stack("complex_ifg")
+        collection.open_stack("complex")
     with pytest.raises(InvalidProcessingStateError, match="does not exactly match"):
         _ = collection.index_metadata
     with pytest.raises(InvalidProcessingStateError, match="does not exactly match"):
@@ -245,7 +245,7 @@ def test_whole_network_reads_reject_corrupt_members(tmp_path: Path) -> None:
     collection = StackInterferogramCollection(stack)
 
     with pytest.raises(InvalidProcessingStateError):
-        collection.open_stack("complex_ifg")
+        collection.open_stack("complex")
     with pytest.raises(InvalidProcessingStateError):
         _ = collection.index_metadata
 
@@ -275,7 +275,7 @@ def test_open_stack_explicit_subset_reads_only_selected_pairs(
 
     monkeypatch.setattr(InterferogramArtifactStore, "open", recording_open)
     monkeypatch.setattr(ifg_store, "read_zarr_array", recording_read)
-    opened_data = collection.open_stack("complex_ifg", pairs=subset)
+    opened_data = collection.open_stack("complex", pairs=subset)
 
     expected = np.stack(
         [np.exp(1j * phase).astype(np.complex64)] * 2,
@@ -292,9 +292,9 @@ def test_open_stack_explicit_subset_reads_only_selected_pairs(
     )
 
     with pytest.raises(InvalidProcessingStateError):
-        collection.open_stack("complex_ifg", pairs=Pairs.from_names([OTHER]))
+        collection.open_stack("complex", pairs=Pairs.from_names([OTHER]))
     with pytest.raises(KeyError):
-        collection.open_stack("complex_ifg", pairs=Pairs.from_names([UNPLANNED]))
+        collection.open_stack("complex", pairs=Pairs.from_names([UNPLANNED]))
 
 
 def test_target_pair_constraints_still_enforced(tmp_path: Path) -> None:
@@ -305,7 +305,7 @@ def test_target_pair_constraints_still_enforced(tmp_path: Path) -> None:
 
     _write_pair_product(stack, TARGET, phase=phase, looks=(2, 2))
     with pytest.raises(InvalidProcessingStateError, match="looks"):
-        collection.open(TARGET, "complex_ifg")
+        collection.open(TARGET, "complex")
 
     _write_pair_product(
         stack,
@@ -314,4 +314,4 @@ def test_target_pair_constraints_still_enforced(tmp_path: Path) -> None:
         pair=("20240113", "20240125"),
     )
     with pytest.raises(InvalidProcessingStateError, match="pair"):
-        collection.open(TARGET, "complex_ifg")
+        collection.open(TARGET, "complex")

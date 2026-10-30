@@ -46,7 +46,7 @@ def test_multilook_uses_boxcar_not_lanczos_on_impulse() -> None:
     primary[0, 0] = impulse_value
 
     product = form_interferogram(primary, secondary, multilook=(az_looks, rg_looks))
-    ifg = product.complex_ifg
+    ifg = product.complex
 
     assert ifg.shape == (height // az_looks, width // rg_looks)
 

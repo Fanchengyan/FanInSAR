@@ -81,8 +81,8 @@ def test_interferogram_stage_applies_screen_with_ifg_sign_and_preserves_amplitud
         multilook=(1, 1),
         flatten_stage="interferogram",
     )
-    np.testing.assert_allclose(np.angle(product.complex_ifg), -phase, atol=1e-6)
-    np.testing.assert_allclose(np.abs(product.complex_ifg), 1.0, atol=1e-6)
+    np.testing.assert_allclose(np.angle(product.complex), -phase, atol=1e-6)
+    np.testing.assert_allclose(np.abs(product.complex), 1.0, atol=1e-6)
 
 
 def test_default_coregistration_remains_unflattened_at_ifg_boundary(
@@ -92,7 +92,7 @@ def test_default_coregistration_remains_unflattened_at_ifg_boundary(
     reference = _scene(tmp_path, "20240101")
     secondary = _scene(tmp_path, "20240113")
     product = form_merged_scene_interferogram(reference, secondary, multilook=(1, 1))
-    np.testing.assert_allclose(product.complex_ifg, 1.0 + 0.0j)
+    np.testing.assert_allclose(product.complex, 1.0 + 0.0j)
 
 
 def test_mixed_flattening_stages_fail_closed(tmp_path: Path) -> None:

@@ -560,7 +560,7 @@ def _schedule_multilook_interferogram(
             device=worker_device,
         )
         return (
-            product.complex_ifg,
+            product.complex,
             product.coherence,
             product.wrapped_phase,
             product.amplitude,
@@ -859,7 +859,7 @@ def run_multilook_interferogram(
         futures = resolved_client.compute(list(graphs))
         computed = resolved_client.gather(futures)
         return InterferogramProduct(
-            complex_ifg=computed[0],
+            complex=computed[0],
             coherence=computed[1],
             wrapped_phase=computed[2],
             amplitude=computed[3],

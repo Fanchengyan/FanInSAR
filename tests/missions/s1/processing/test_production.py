@@ -740,7 +740,7 @@ def test_stage_interferogram_with_synthetic() -> None:
     state.primary_deramped = np.ones((16, 16), dtype=np.complex64)
     state.secondary_aligned = np.ones((16, 16), dtype=np.complex64)
     result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
-    assert result.complex_ifg is not None
+    assert result.complex is not None
     assert result.coherence is not None
     assert result.wrapped_phase is not None
     assert "IFG" in " ".join(result.log)
@@ -876,16 +876,16 @@ def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
     state.primary_deramped = primary
     state.secondary_aligned = secondary
     result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
-    assert result.complex_ifg is not None
+    assert result.complex is not None
     assert result.wrapped_phase is not None
     assert result.coherence is not None
-    assert result.complex_ifg.shape == (8, 8)
+    assert result.complex.shape == (8, 8)
     # Bottom ML row fully invalid → NaN, not phase 0.
-    assert np.all(~np.isfinite(result.complex_ifg[-1].real))
+    assert np.all(~np.isfinite(result.complex[-1].real))
     assert np.all(np.isnan(result.wrapped_phase[-1]))
     assert np.all(np.isnan(result.coherence[-1]))
     # Interior remains finite.
-    assert np.all(np.isfinite(result.complex_ifg[2:6, 2:6].real))
+    assert np.all(np.isfinite(result.complex[2:6, 2:6].real))
     assert np.all(np.isfinite(result.wrapped_phase[2:6, 2:6]))
 
 
@@ -912,7 +912,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     # Unflattened phase ≈ 0.5 rad; zero-power bottom row (black-edge risk).
     ifg = (np.exp(1j * 0.5) * np.ones((h, w))).astype(np.complex64)
     ifg[-1, :] = 0
-    state.complex_ifg = ifg
+    state.complex = ifg
     state.coherence = np.ones((h, w), dtype=np.float32)
     state.coherence[-1, :] = 0
 
@@ -931,7 +931,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     result = stage_flatten(state)
     assert result.complex_ifg_flat is not None
     assert result.wrapped_phase is not None
-    assert result.complex_ifg is not None
+    assert result.complex is not None
     complex_ifg_flat = result.complex_ifg_flat
     wrapped_phase = result.wrapped_phase
     # Edge: invalid looks are NaN on both flat product and wrapped phase.
@@ -939,7 +939,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     assert np.all(np.isnan(wrapped_phase[-1]))
     # Interior: wrapped_phase == angle(flat), not unflattened phase.
     flat_ph = np.angle(complex_ifg_flat[0, 0])
-    unflat_ph = np.angle(result.complex_ifg[0, 0])
+    unflat_ph = np.angle(result.complex[0, 0])
     assert np.isclose(wrapped_phase[0, 0], flat_ph, atol=1e-5)
     assert abs(float(wrapped_phase[0, 0]) - float(unflat_ph)) > 0.1
     # Topo removal shifts phase by ~0.3 rad relative to unflattened.
@@ -969,7 +969,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
         dem=ConstantDEM(0.0),
     )
     phase = np.linspace(-1.0, 1.0, 64, dtype=np.float32).reshape(shape)
-    state.complex_ifg = np.exp(1j * phase).astype(np.complex64)
+    state.complex = np.exp(1j * phase).astype(np.complex64)
     state.coherence = np.ones(shape, dtype=np.float32)
     state.secondary_aligned_is_flattened = True
     # Full-res range-offset phase that cancels the dual-orbit topo after ML
@@ -1030,7 +1030,7 @@ def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
 
     assert state.wrapped_phase is not None
     assert state.coherence is not None
-    assert state.complex_ifg is not None
+    assert state.complex is not None
     assert state.unwrapped_phase is None
     assert state.connected_components is None
     assert np.isfinite(state.wrapped_phase).all()
@@ -1048,7 +1048,7 @@ def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
     root = zarr.open_group(str(zpath), mode="w")
     root.create_array("wrapped_phase", data=state.wrapped_phase, overwrite=True)
     root.create_array("coherence", data=state.coherence, overwrite=True)
-    root.create_array("complex_ifg", data=state.complex_ifg, overwrite=True)
+    root.create_array("complex", data=state.complex, overwrite=True)
     root.attrs["unwrap_executed"] = "False"
     root.attrs["stop_after"] = "interferogram"
     reopened = zarr.open_group(str(zpath), mode="r")
@@ -1117,7 +1117,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
         secondary=sec,
         dem=ConstantDEM(0.0),
     )
-    state.complex_ifg = np.ones((8, 8), dtype=np.complex64)
+    state.complex = np.ones((8, 8), dtype=np.complex64)
     state.complex_ifg_flat = np.ones((8, 8), dtype=np.complex64)
     state.coherence = np.ones((8, 8), dtype=np.float32)
     state.wrapped_phase = np.zeros((8, 8), dtype=np.float32)
@@ -1135,7 +1135,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
     assert "WRITE" in " ".join(result.log)
 
     root = zarr.open_group(str(result.zarr_path), mode="r")
-    assert "complex_ifg" in root
+    assert "complex" in root
     assert "coherence" in root
     assert "unwrapped_phase" in root
     assert "dense_geometry_offsets" in str(root.attrs["coregistration_timings_s"])
@@ -1152,7 +1152,7 @@ def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
         dem=ConstantDEM(0.0),
         coregistration_grid="geo",
     )
-    state.complex_ifg = np.ones((4, 4), dtype=np.complex64)
+    state.complex = np.ones((4, 4), dtype=np.complex64)
     state.complex_ifg_flat = np.ones((4, 4), dtype=np.complex64)
     state.coherence = np.ones((4, 4), dtype=np.float32)
     state.wrapped_phase = np.zeros((4, 4), dtype=np.float32)
@@ -1213,7 +1213,7 @@ def test__produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
     assert state.zarr_path.exists()
     assert state.stac_path is not None
     assert state.stac_path.exists()
-    assert state.complex_ifg is not None
+    assert state.complex is not None
     assert state.coherence is not None
     assert state.wrapped_phase is not None
     assert state.unwrapped_phase is not None
@@ -1226,7 +1226,7 @@ def test__produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
     assert "WRITE" in log_text
 
     root = zarr.open_group(str(state.zarr_path), mode="r")
-    assert "complex_ifg" in root
+    assert "complex" in root
     assert "coherence" in root
     assert "geocoded" not in root
 

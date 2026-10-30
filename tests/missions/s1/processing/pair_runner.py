@@ -533,7 +533,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     stage_times["interferogram"] = _clock_stop(device, t0)
     t0 = _clock_start(device)
     if coregistration_grid == "geo":
-        state.complex_ifg_flat = state.complex_ifg
+        state.complex_ifg_flat = state.complex
         state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
         stage_times["flatten"] = 0.0
     else:
@@ -546,7 +546,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     ifg_full = (
         state.complex_ifg_flat
         if state.complex_ifg_flat is not None
-        else state.complex_ifg
+        else state.complex
     )
     if ifg_full is None:
         reject_invalid_state(tag + ": no interferogram produced")
@@ -1433,7 +1433,7 @@ def _produce_interferogram_pair(
             ifg_full = (
                 state.complex_ifg_flat
                 if state.complex_ifg_flat is not None
-                else state.complex_ifg
+                else state.complex
             )
             if ifg_full is None:
                 reject_invalid_state(tag + ": no interferogram produced")
@@ -1528,7 +1528,7 @@ def _produce_interferogram_pair(
             list(origin_state.scientific_lineage) if origin_state is not None else []
         ),
         phase_state=(origin_state.phase_state if origin_state is not None else None),
-        complex_ifg=merged_ifg,
+        complex=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
         wrapped_phase=wrapped,
@@ -2388,7 +2388,7 @@ def _finalize_sweep_config(
         record_scientific_lineage=origin.record_scientific_lineage,
         scientific_lineage=list(origin.scientific_lineage),
         phase_state=origin.phase_state,
-        complex_ifg=merged_ifg,
+        complex=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
         wrapped_phase=wrapped,
@@ -2599,7 +2599,7 @@ def _finalize_geo_config(
         record_scientific_lineage=record_scientific_lineage,
         scientific_lineage=list(origin.scientific_lineage),
         phase_state=origin.phase_state,
-        complex_ifg=merged_ifg,
+        complex=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
         wrapped_phase=wrapped,

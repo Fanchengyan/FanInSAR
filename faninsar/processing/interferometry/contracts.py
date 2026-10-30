@@ -27,7 +27,7 @@ class InterferogramStack:
     stack_id: str
     pairs: Pairs
     interferograms: tuple[Interferogram, ...]
-    unwrapped: NDArray[np.floating] | None = None
+    unwrapped_phase: NDArray[np.floating] | None = None
     coherence: NDArray[np.floating] | None = None
 
     def __post_init__(self) -> None:
@@ -47,15 +47,15 @@ class InterferogramStack:
                 reject_invalid_state(
                     f"interferogram {ifg.pair_id!r} does not match pair {name!r}"
                 )
-        if self.unwrapped is not None and self.unwrapped.shape[0] != n:
+        if self.unwrapped_phase is not None and self.unwrapped_phase.shape[0] != n:
             reject_invalid_state(
-                f"unwrapped axis0 {self.unwrapped.shape[0]} != pairs {n}"
+                f"unwrapped axis0 {self.unwrapped_phase.shape[0]} != pairs {n}"
             )
 
     def unwrapped_matrix(self) -> NDArray[np.floating]:
         """Return an ``(n_pair, n_pixel)`` unwrapped phase matrix."""
-        if self.unwrapped is not None:
-            arr = np.asarray(self.unwrapped, dtype=np.float64)
+        if self.unwrapped_phase is not None:
+            arr = np.asarray(self.unwrapped_phase, dtype=np.float64)
             if arr.ndim == 1:
                 return arr.reshape(len(self.pairs), -1)
             if arr.ndim > 2:
@@ -64,11 +64,11 @@ class InterferogramStack:
 
         rows: list[np.ndarray] = []
         for ifg in self.interferograms:
-            if ifg.unwrapped is None:
+            if ifg.unwrapped_phase is None:
                 reject_invalid_state(
                     f"Interferogram {ifg.pair_id!r} has no unwrapped phase"
                 )
-            rows.append(np.asarray(ifg.unwrapped, dtype=np.float64).reshape(-1))
+            rows.append(np.asarray(ifg.unwrapped_phase, dtype=np.float64).reshape(-1))
         return np.stack(rows, axis=0)
 
     @classmethod
@@ -103,7 +103,7 @@ class InterferogramStack:
             stack_id=stack_id,
             pairs=pairs,
             interferograms=ifgs,
-            unwrapped=values,
+            unwrapped_phase=values,
             coherence=coherence_values,
         )
 

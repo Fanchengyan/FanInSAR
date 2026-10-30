@@ -142,8 +142,8 @@ def test_reopen_after_stages_reuses_committed_work(tmp_path: Path) -> None:
     reopened.form_interferograms()
     reopened.unwrap(SpatialIRLS())
     np.testing.assert_allclose(
-        reopened.unwrapped.values,
-        stack.unwrapped.values,
+        reopened.unwrapped_phase.values,
+        stack.unwrapped_phase.values,
     )
 
 

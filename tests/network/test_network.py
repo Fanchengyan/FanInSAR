@@ -78,7 +78,7 @@ def test_from_stack_shares_the_live_product_index(tmp_path: Path) -> None:
 
     assert network.root == stack.config.work_dir
     assert network.network_generation_id == stack.network_generation_id
-    assert network.interferograms.pairs().to_names().tolist() == ["20240101_20240113"]
+    assert network.interferograms.pairs.to_names().tolist() == ["20240101_20240113"]
     unwrapped = network.interferograms.open_stack("unw_phase")
     np.testing.assert_allclose(unwrapped.values[0], 0.2)
 

@@ -72,7 +72,7 @@ def test_write_mosaic_zarr_round_trip(tmp_path: Path) -> None:
     out = write_mosaic_zarr(mosaic, tmp_path / "mosaic.zarr", pair_id="test_pair")
     assert out.exists()
     root = zarr.open_group(str(out), mode="r")
-    assert "complex_ifg" in root
+    assert "complex" in root
     assert "coherence" in root
     assert "weight_sum" in root
     assert "n_bursts" in root

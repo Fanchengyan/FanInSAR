@@ -72,8 +72,8 @@ def test_torch_windowed_coherence_matches_numpy_reference(
     np.testing.assert_array_equal(np.isnan(torch_coh), np.isnan(reference_coh))
     np.testing.assert_array_equal(product.valid_mask, reference.valid_mask)
     np.testing.assert_allclose(
-        product.complex_ifg,
-        reference.complex_ifg,
+        product.complex,
+        reference.complex,
         rtol=1e-6,
         atol=1e-6,
         equal_nan=True,

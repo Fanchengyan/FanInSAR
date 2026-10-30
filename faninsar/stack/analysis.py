@@ -269,7 +269,7 @@ def estimate_ionosphere(
         ]
         unwrap_results = [
             unwrap(
-                product.complex_ifg,
+                product.complex,
                 # mask-before-estimate: the water mask must gate the unwrap
                 # INPUT, not only the solve afterwards; otherwise snaphu/IRLS
                 # integrate decorrelated ocean pixels (ALOS2 WB1 ion grid).

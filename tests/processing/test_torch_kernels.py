@@ -229,8 +229,8 @@ def test_multilook_interferogram_torch_matches_numpy() -> None:
         device="cpu",
     )
     np.testing.assert_allclose(
-        product.complex_ifg,
-        reference.complex_ifg,
+        product.complex,
+        reference.complex,
         rtol=1e-4,
         atol=1e-5,
     )
@@ -274,8 +274,8 @@ def test_multilook_interferogram_torch_dead_pixel_mask_matches_numpy() -> None:
         device="cpu",
     )
     np.testing.assert_allclose(
-        product.complex_ifg,
-        reference.complex_ifg,
+        product.complex,
+        reference.complex,
         rtol=1e-4,
         atol=1e-5,
     )
@@ -316,7 +316,7 @@ def test_multilook_interferogram_torch_singleton_keeps_ifg_but_not_coherence() -
 
     assert product.valid_mask is not None
     assert bool(product.valid_mask[0, 0])
-    assert product.complex_ifg[0, 0] == pytest.approx(2.0 + 0.0j)
+    assert product.complex[0, 0] == pytest.approx(2.0 + 0.0j)
     assert np.isnan(product.coherence[0, 0])
 
 

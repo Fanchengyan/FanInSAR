@@ -697,7 +697,7 @@ def multilook_interferogram_torch(
     from faninsar.processing.interferometry.pair import InterferogramProduct
 
     return InterferogramProduct(
-        complex_ifg=complex_ifg,
+        complex=complex_ifg,
         coherence=coherence_np,
         wrapped_phase=wrapped_np,
         amplitude=amplitude_np,

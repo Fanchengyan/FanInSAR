@@ -580,8 +580,8 @@ def test_schedule_multilook_interferogram_matches_numpy() -> None:
     )
     computed = tuple(np.asarray(graph.compute()) for graph in graphs)
     reference = form_interferogram(primary, secondary, multilook=(2, 4))
-    assert computed[0].shape == reference.complex_ifg.shape
-    np.testing.assert_allclose(computed[0], reference.complex_ifg, rtol=1e-4, atol=1e-5)
+    assert computed[0].shape == reference.complex.shape
+    np.testing.assert_allclose(computed[0], reference.complex, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(computed[1], reference.coherence, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(
         computed[2],

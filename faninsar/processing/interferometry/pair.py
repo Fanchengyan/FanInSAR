@@ -16,7 +16,7 @@ logger = setup_logger(__name__)
 class InterferogramProduct:
     """Complex interferogram and derived quality layers."""
 
-    complex_ifg: np.ndarray
+    complex: np.ndarray
     coherence: np.ndarray
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
@@ -259,7 +259,7 @@ def _legacy_form_interferogram(
     wrapped = np.angle(ifg).astype(np.float32)
     wrapped = np.where(np.isfinite(ifg.real) & np.isfinite(ifg.imag), wrapped, np.nan)
     return InterferogramProduct(
-        complex_ifg=ifg.astype(np.complex64, copy=False),
+        complex=ifg.astype(np.complex64, copy=False),
         coherence=coherence,
         wrapped_phase=wrapped.astype(np.float32, copy=False),
         amplitude=amplitude,
@@ -410,7 +410,7 @@ def form_interferogram(
     wrapped = np.angle(ifg).astype(np.float32)
     wrapped[invalid] = np.nan
     return InterferogramProduct(
-        complex_ifg=ifg,
+        complex=ifg,
         coherence=coherence,
         wrapped_phase=wrapped,
         amplitude=amplitude,

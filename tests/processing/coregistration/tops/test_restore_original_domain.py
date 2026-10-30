@@ -68,15 +68,15 @@ def test_deramped_single_remap_matches_integer_shifted_interferogram() -> None:
     ref_out = reramp(ref_d, carrier_ref)
     good_ifg = form_interferogram(ref_out, sec_resamp, multilook=(2, 4))
 
-    mask = (np.abs(raw_ifg.complex_ifg) > 0.1) & (np.abs(good_ifg.complex_ifg) > 0.1)
-    dph = np.angle(raw_ifg.complex_ifg * np.conj(good_ifg.complex_ifg))
+    mask = (np.abs(raw_ifg.complex) > 0.1) & (np.abs(good_ifg.complex) > 0.1)
+    dph = np.angle(raw_ifg.complex * np.conj(good_ifg.complex))
     assert mask.any()
     assert float(np.sqrt(np.mean(dph[mask] ** 2))) < 0.15
     assert float(np.abs(np.mean(np.exp(1j * dph[mask])))) > 0.95
 
     sec_wrong = reramp(sec_d_shifted, carrier_sec)
     bad_ifg = form_interferogram(ref_out, sec_wrong, multilook=(2, 4))
-    dph_bad = np.angle(raw_ifg.complex_ifg * np.conj(bad_ifg.complex_ifg))
+    dph_bad = np.angle(raw_ifg.complex * np.conj(bad_ifg.complex))
     assert float(np.abs(np.mean(np.exp(1j * dph_bad[mask])))) < 0.5
     assert float(np.sqrt(np.mean(dph_bad[mask] ** 2))) > 0.8
 
@@ -131,8 +131,8 @@ def test_deramped_remap_fractional_shift_phase_error_bound() -> None:
     expected = 0.5 * geo_phase - (-0.5) * (0.03 * src_c + 0.008 * src_r)
     # After form_interferogram (ref * conj(sec)) in original domain, carrier
     # should cancel if reramp uses ref carrier on both — residual ≈ geo only.
-    dph = np.angle(ifg.complex_ifg * np.exp(-1j * expected))
-    mask = interior & (np.abs(ifg.complex_ifg) > 0.5)
+    dph = np.angle(ifg.complex * np.exp(-1j * expected))
+    mask = interior & (np.abs(ifg.complex) > 0.5)
     assert mask.any()
     rmse = float(np.sqrt(np.mean(dph[mask] ** 2)))
     # Bound well below the historical ~1 rad formation gap.

@@ -72,7 +72,7 @@ def test_coherence_window_none_is_a_valid_direct_mle_branch() -> None:
         multilook=(2, 2),
         coherence_window=None,
     )
-    assert product.complex_ifg.shape == (1, 2)
+    assert product.complex.shape == (1, 2)
     assert product.valid_mask is not None
     assert product.valid_mask.tolist() == [[True, True]]
     assert np.allclose(product.coherence, 1.0, equal_nan=False)
@@ -89,8 +89,8 @@ def test_multilook_retains_partial_tail_with_actual_sample_count() -> None:
         multilook=(2, 2),
         coherence_window=None,
     )
-    assert product.complex_ifg.shape == (2, 3)
-    assert product.complex_ifg[1, 2] == pytest.approx(3.0 + 0.0j)
+    assert product.complex.shape == (2, 3)
+    assert product.complex[1, 2] == pytest.approx(3.0 + 0.0j)
 
 
 def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support() -> (
@@ -111,7 +111,7 @@ def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support(
 
     assert product.valid_mask is not None
     assert bool(product.valid_mask[0, 0])
-    assert product.complex_ifg[0, 0] == pytest.approx(2.0 + 0.0j)
+    assert product.complex[0, 0] == pytest.approx(2.0 + 0.0j)
     assert np.isnan(product.coherence[0, 0])
 
 

@@ -573,7 +573,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
     single_root = zarr.open_group(str(single.zarr_path), mode="r")
     sweep_root = zarr.open_group(str(outcome.zarr_path), mode="r")
     single_shape = tuple(single_root["wrapped_phase"].shape)
-    for layer in ("unwrapped_phase", "coherence", "wrapped_phase", "complex_ifg"):
+    for layer in ("unwrapped_phase", "coherence", "wrapped_phase", "complex"):
         np.testing.assert_allclose(
             np.asarray(single_root[layer]),
             np.asarray(sweep_root[layer]),

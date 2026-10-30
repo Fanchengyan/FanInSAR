@@ -221,7 +221,7 @@ def test_secondary_pair_ifg_uses_both_secondary_payloads(tmp_path: Path) -> None
         CoregisteredSceneStore.open(third),
     )
     np.testing.assert_array_equal(
-        product.complex_ifg, np.full((2, 2), -1.0j, dtype=np.complex64)
+        product.complex, np.full((2, 2), -1.0j, dtype=np.complex64)
     )
 
 
@@ -251,7 +251,7 @@ def test_ifg_leaves_a_unit_missing_from_one_date_blank(tmp_path: Path) -> None:
     assert product.valid_mask[:2].all()
     assert not product.valid_mask[2:].any()
     np.testing.assert_array_equal(
-        product.complex_ifg[:2], np.full((2, 4), -1.0, dtype=np.complex64)
+        product.complex[:2], np.full((2, 4), -1.0, dtype=np.complex64)
     )
     by_tag = form_scene_interferograms(
         CoregisteredSceneStore.open(second), CoregisteredSceneStore.open(partial)
@@ -472,7 +472,7 @@ def test_merged_scene_interferogram_uses_global_origins_before_looks(
             np.full((1, 2), 1.0j, dtype=np.complex64),
         )
     )
-    np.testing.assert_array_equal(product.complex_ifg, expected)
+    np.testing.assert_array_equal(product.complex, expected)
     np.testing.assert_array_equal(product.coherence, np.ones((2, 2), np.float32))
 
 

@@ -974,7 +974,7 @@ def form_merged_scene_interferogram(
                 filter_device = device
                 if filter_device in {"", "auto"}:
                     filter_device = "cuda" if torch.cuda.is_available() else "cpu"
-                tensor = torch.as_tensor(product.complex_ifg, device=filter_device)
+                tensor = torch.as_tensor(product.complex, device=filter_device)
                 support = torch.as_tensor(
                     product.valid_mask, dtype=torch.bool, device=filter_device
                 )
@@ -987,7 +987,7 @@ def form_merged_scene_interferogram(
                 )
                 assert result_coh is not None
                 return InterferogramProduct(
-                    complex_ifg=result_ifg,
+                    complex=result_ifg,
                     coherence=result_coh,
                     wrapped_phase=result_phase,
                     amplitude=np.abs(result_ifg).astype(np.float32),
@@ -1003,21 +1003,21 @@ def form_merged_scene_interferogram(
                 from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
                 filtered = run_goldstein_filter(
-                    product.complex_ifg,
+                    product.complex,
                     alpha=goldstein_alpha,
                     window=32,
                     device=device,
                     client=dask_client,
                 )
             else:
-                filtered = goldstein_filter(product.complex_ifg, alpha=goldstein_alpha)
+                filtered = goldstein_filter(product.complex, alpha=goldstein_alpha)
             filtered, coherence, wrapped = mask_invalid_looks(
                 filtered,
                 product.coherence,
             )
             assert coherence is not None
             return InterferogramProduct(
-                complex_ifg=filtered,
+                complex=filtered,
                 coherence=coherence,
                 wrapped_phase=wrapped,
                 amplitude=np.abs(filtered).astype(np.float32),
@@ -1183,7 +1183,7 @@ def form_merged_scene_interferogram(
         valid_mask = np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
     assert coherence_out is not None
     return InterferogramProduct(
-        complex_ifg=merged_ifg,
+        complex=merged_ifg,
         coherence=coherence_out,
         wrapped_phase=wrapped,
         amplitude=np.abs(merged_ifg).astype(np.float32),
@@ -1229,7 +1229,7 @@ def form_scene_interferograms(
             primary,
             secondary,
             multilook=multilook,
-        ).complex_ifg
+        ).complex
         if goldstein_alpha > 0.0:
             from faninsar.processing.runtime.dask_gpu import should_accelerate
 

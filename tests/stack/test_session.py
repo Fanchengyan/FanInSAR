@@ -540,7 +540,7 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
     store = InterferogramArtifactStore.open(output_root)
     assert store.pair == dates
     assert store.shape == (2, 2)
-    np.testing.assert_array_equal(store.read().complex_ifg, np.conj(secondary))
+    np.testing.assert_array_equal(store.read().complex, np.conj(secondary))
 
 
 def test_stack_applies_multilook_before_publishing_ifg(
@@ -595,13 +595,13 @@ def test_stack_applies_multilook_before_publishing_ifg(
 
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
-    payload = InterferogramArtifactStore.open(stack.ifg_dirs[0]).read().complex_ifg
+    payload = InterferogramArtifactStore.open(stack.ifg_dirs[0]).read().complex
     expected = goldstein_filter(
         form_interferogram(
             reference,
             secondary,
             multilook=(2, 2),
-        ).complex_ifg,
+        ).complex,
         alpha=0.5,
     )
     np.testing.assert_array_equal(payload, expected)
@@ -673,7 +673,7 @@ def test_live_stack_network_view_exposes_committed_ifg_pairs(
     network = stack.network
     assert network is not None
     assert network.interferograms is not None
-    assert network.interferograms.pairs().to_names().tolist() == [
+    assert network.interferograms.pairs.to_names().tolist() == [
         "20240101_20240113",
         "20240113_20240125",
         "20240101_20240125",
@@ -686,10 +686,10 @@ def test_live_stack_network_view_exposes_committed_ifg_pairs(
     ]
     assert ifg_products
     assert all(
-        product.asset_location.endswith("complex_ifg.zarr") for product in ifg_products
+        product.asset_location.endswith("complex.zarr") for product in ifg_products
     )
     assert all(Path(product.asset_location).is_dir() for product in ifg_products)
-    opened = network.interferograms.open_stack("complex_ifg")
+    opened = network.interferograms.open_stack("complex")
     assert opened.shape == (3, 3, 4)
     np.testing.assert_allclose(opened.values, np.stack([np.exp(1j * phase)] * 3))
 
@@ -753,7 +753,7 @@ def test_replacing_an_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) ->
         filter_parameters=store.filter_parameters,
         source_manifest_digests=store.source_manifest_digests,
         grid_identity=store.grid_identity,
-        complex_ifg=artifact.complex_ifg * 1.0,
+        complex_ifg=artifact.complex * 1.0,
         coherence=artifact.coherence,
         replace_existing=True,
     )
@@ -835,7 +835,7 @@ def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
             phase,
         )
         item = collection.item(pair_id)
-        assert {"complex_ifg", "unw_phase"}.issubset(item["assets"])
+        assert {"complex", "unw_phase"}.issubset(item["assets"])
 
 
 def test_live_stack_network_per_pair_reads_ignore_other_pairs(tmp_path: Path) -> None:

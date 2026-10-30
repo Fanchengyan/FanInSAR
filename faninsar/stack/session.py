@@ -1019,7 +1019,7 @@ class Stack(NetworkContract):
         return StackInterferogramCollection(self)
 
     @property
-    def unwrapped(self) -> Any:
+    def unwrapped_phase(self) -> Any:
         """Return the unwrapped-phase cube of every planned Pair.
 
         Returns
@@ -1387,8 +1387,8 @@ class Stack(NetworkContract):
         Parameters
         ----------
         product : GeocodeableProduct
-            Lazy layer such as ``stack.interferograms[pair].wrapped`` or
-            ``stack.interferograms[pair].unwrapped``, or an in-memory
+            Lazy layer such as ``stack.interferograms[pair].wrapped_phase`` or
+            ``stack.interferograms[pair].unwrapped_phase``, or an in-memory
             :class:`~faninsar.processing.geocoding.RadarDomainProduct`.
             Products carry ``name``, two-dimensional ``values``,
             ``asset_kind``, ``full_radar_shape``, ``multilook``, and ``origin``.
@@ -1442,11 +1442,11 @@ class Stack(NetworkContract):
         Examples
         --------
         >>> ifg = stack.interferograms["20240101_20240113"]
-        >>> wrapped = stack.geocode(ifg.wrapped)
-        >>> unwrapped = stack.geocode(ifg.unwrapped)
+        >>> wrapped = stack.geocode(ifg.wrapped_phase)
+        >>> unwrapped = stack.geocode(ifg.unwrapped_phase)
         >>> derived_geo = stack.geocode(derived, path="results/filtered_phase")
         >>> coarser = stack.geocode(
-        ...     ifg.wrapped, grid=stack.resolve_grid(resolution_m=60.0)
+        ...     ifg.wrapped_phase, grid=stack.resolve_grid(resolution_m=60.0)
         ... )
 
         """
@@ -3495,12 +3495,12 @@ class Stack(NetworkContract):
                     expected_shape=(
                         valid_mask.shape
                         if valid_mask is not None
-                        else product.complex_ifg.shape
+                        else product.complex.shape
                     ),
                 )
                 if mask_plane is not None:
                     if valid_mask is None:
-                        valid_mask = np.isfinite(product.complex_ifg)
+                        valid_mask = np.isfinite(product.complex)
                     valid_mask = _apply_mask_to_valid_mask(valid_mask, mask_plane)
 
                 write_ifg_artifact(
@@ -3524,7 +3524,7 @@ class Stack(NetworkContract):
                     phase_screen_digests=phase_screen_digests,
                     phase_screen_domain=primary_store.domain,
                     phase_screen_grid_identity=primary_store.grid_identity,
-                    complex_ifg=product.complex_ifg,
+                    complex_ifg=product.complex,
                     coherence=product.coherence,
                     valid_mask=valid_mask,
                     replace_existing=overwrite,
@@ -3592,7 +3592,7 @@ class Stack(NetworkContract):
             for kind, location, digest, lineage in (
                 (
                     AssetKind.COMPLEX_INTERFEROGRAM,
-                    store.root / "complex_ifg.zarr",
+                    store.root / "complex.zarr",
                     store.write_id,
                     (store.write_id,),
                 ),

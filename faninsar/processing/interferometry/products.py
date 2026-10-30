@@ -151,7 +151,7 @@ class PairProductArrays:
     """In-memory pair product layers ready for persistence."""
 
     pair_id: str
-    complex_ifg: np.ndarray
+    complex: np.ndarray
     coherence: np.ndarray
     wrapped_phase: np.ndarray
     unwrapped_phase: np.ndarray
@@ -188,7 +188,7 @@ def write_pair_zarr(
     path.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.open_group(str(path), mode="w")
     layers = {
-        "complex_ifg": product.complex_ifg,
+        "complex": product.complex,
         "coherence": product.coherence,
         "wrapped_phase": product.wrapped_phase,
         "unwrapped_phase": product.unwrapped_phase,

@@ -74,7 +74,7 @@ class StackInterferogramDataset:
 
     """
 
-    complex_ifg: np.ndarray
+    complex: np.ndarray
     coherence: np.ndarray | None
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
@@ -123,7 +123,7 @@ class StackInterferogramDataset:
             )
             reject(message, ValueError, cause=error)
 
-        complex_ifg = artifact.complex_ifg
+        complex_ifg = artifact.complex
         coherence = artifact.coherence
         wrapped_phase = artifact.wrapped_phase
         amplitude = artifact.amplitude
@@ -138,7 +138,7 @@ class StackInterferogramDataset:
             if coherence is not None:
                 valid_mask &= np.isfinite(coherence)
         return cls(
-            complex_ifg=complex_ifg,
+            complex=complex_ifg,
             coherence=coherence,
             wrapped_phase=wrapped_phase,
             amplitude=amplitude,

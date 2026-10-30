@@ -248,6 +248,7 @@ class InterferogramCollection:
             and not p.name.endswith(".zarr")
         )
 
+    @property
     def pairs(self) -> Pairs:
         """Return the :class:`Pairs` object for this collection."""
         if self._pairs is None:
@@ -289,7 +290,7 @@ class InterferogramCollection:
 
     def summary(self) -> dict[str, Any]:
         """Return a collection-level summary."""
-        pairs_obj = self.pairs()
+        pairs_obj = self.pairs
         pair_list = pairs_obj.to_names().tolist() if len(pairs_obj) > 0 else []
         assets_by_pair: dict[str, list[str]] = {}
         for pname in pair_list:
@@ -872,7 +873,7 @@ class InterferogramCollection:
 
         # Fallback: eager concat of per-pair COGs (existing behaviour).
         if pairs is None:
-            pairs = self.pairs()
+            pairs = self.pairs
 
         pair_names = pairs.to_names().tolist()
         arrays: list[xr.DataArray] = []
@@ -965,7 +966,7 @@ class InterferogramCollection:
 
             shutil.rmtree(out)
 
-        pairs_obj = self.pairs()
+        pairs_obj = self.pairs
         pair_names = pairs_obj.to_names().tolist()
 
         arrays: list[xr.DataArray] = []
@@ -1030,7 +1031,7 @@ class InterferogramCollection:
         """
         from faninsar.data.datasets.ifg import InterferogramDataset
 
-        pairs_obj = self.pairs()
+        pairs_obj = self.pairs
         pair_names = pairs_obj.to_names().tolist() if len(pairs_obj) > 0 else []
 
         paths_unw: list[Path] = []

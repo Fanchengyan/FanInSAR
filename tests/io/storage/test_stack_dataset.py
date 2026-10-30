@@ -36,7 +36,7 @@ def test_stack_dataset_reads_named_fields_from_product(tmp_path: Path) -> None:
     store = _write_store(tmp_path, "ifg")
     dataset = StackInterferogramDataset.from_product(store)
 
-    assert dataset.complex_ifg.shape == (2, 3)
+    assert dataset.complex.shape == (2, 3)
     assert dataset.coherence.shape == (2, 3)
     np.testing.assert_array_equal(
         dataset.wrapped_phase, np.zeros((2, 3), dtype=np.float32)
@@ -51,7 +51,7 @@ def test_stack_dataset_reads_named_fields_from_product(tmp_path: Path) -> None:
     # Derived layers never materialize their own stores.
     assert sorted(path.name for path in (tmp_path / "ifg").iterdir()) == [
         "coherence.zarr",
-        "complex_ifg.zarr",
+        "complex.zarr",
         "item.json",
     ]
 
@@ -64,7 +64,7 @@ def test_stack_dataset_preserves_missing_optional_coherence(tmp_path: Path) -> N
     np.testing.assert_array_equal(dataset.valid_mask, np.ones((2, 3), dtype=bool))
     assert store.read().coherence is None
     assert sorted(path.name for path in (tmp_path / "ifg_without_coherence").iterdir()) == [
-        "complex_ifg.zarr",
+        "complex.zarr",
         "item.json",
     ]
 

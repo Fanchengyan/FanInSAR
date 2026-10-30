@@ -206,7 +206,7 @@ def test_stack_network_exposes_its_interferogram_collection(tmp_path: Path) -> N
     network = stack.network
 
     assert network is not None
-    assert network.interferograms.pairs().to_names().tolist() == ["20240101_20240113"]
+    assert network.interferograms.pairs.to_names().tolist() == ["20240101_20240113"]
     spatial = network.interferograms.spatial_metadata
     assert spatial["domain"] == "radar"
     assert spatial["shape"] == [2, 3]

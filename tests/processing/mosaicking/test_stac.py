@@ -123,7 +123,7 @@ def test_write_mosaic_stac_item(tmp_path: Path) -> None:
     assert item["properties"]["merge_domain"] == "complex"
     assert "bbox" in item
     assert len(item["bbox"]) == 4
-    assert item["assets"]["complex_ifg"]["href"].endswith("mosaic.zarr/complex_ifg")
+    assert item["assets"]["complex"]["href"].endswith("mosaic.zarr/complex")
     # source burst ids recorded
     assert "faninsar:source_bursts" in item["properties"]
 

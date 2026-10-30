@@ -207,7 +207,7 @@ def write_mosaic_zarr(
     path.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.open_group(str(path), mode="w")
 
-    root.create_array("complex_ifg", data=np.asarray(mosaic.complex), overwrite=True)
+    root.create_array("complex", data=np.asarray(mosaic.complex), overwrite=True)
     if mosaic.coherence is not None:
         root.create_array(
             "coherence", data=np.asarray(mosaic.coherence), overwrite=True
@@ -328,8 +328,8 @@ def write_mosaic_stac_item(
             "faninsar:resolution_m": list(mosaic.grid.resolution_m),
         },
         "assets": {
-            "complex_ifg": {
-                "href": str(Path(zarr_path).name) + "/complex_ifg",
+            "complex": {
+                "href": str(Path(zarr_path).name) + "/complex",
                 "type": "application/vnd.zarr",
                 "roles": ["data"],
             },
