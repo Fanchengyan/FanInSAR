@@ -2,11 +2,17 @@
 
 The collection reads ``ifg/ml_AxR/<pair>`` and ``unwrap/ml_AxR/<pair>``
 products in place; nothing is copied into a second layout.
+
+``sel(looks=, pair=, pairs=)`` returns an immutable view bound to a
+committed multilook tree or a subset of the planned Pair network
+(PROPOSAL-0064); the default view binds ``StackConfig.multilook`` and the
+full network.
 """
 
 from __future__ import annotations
 
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -43,20 +49,170 @@ def _canonical_asset_name(name: str) -> str:
     return canonical
 
 
+@dataclass(frozen=True, slots=True)
+class _Selection:
+    """Internal selection carried by one collection view (PROPOSAL-0064).
+
+    ``looks`` picks a committed ``ifg/ml_AxR`` tree; ``pairs`` narrows the
+    planned Pair network to a subset. ``None`` means the Stack defaults —
+    ``StackConfig.multilook`` and the full planned network.
+    """
+
+    looks: tuple[int, int] | None = None
+    pairs: Pairs | None = None
+
+    def __post_init__(self) -> None:
+        """Validate looks shape; subset-of-plan is checked by ``sel``."""
+        if self.looks is not None and (
+            not isinstance(self.looks, tuple)
+            or len(self.looks) != 2
+            or any(
+                not isinstance(v, int) or isinstance(v, bool) or v < 1
+                for v in self.looks
+            )
+        ):
+            message = f"looks must be two positive integers; got {self.looks!r}"
+            raise ValueError(message)
+
+
 class StackInterferogramCollection(InterferogramCollection):
     """Read-only interferogram collection backed by a Stack work directory.
 
     Parameters
     ----------
     stack : Stack
-        The Stack whose planned Pair network and multilook select the
-        products.
+        The Stack whose planned Pair network and committed multilook trees
+        back the view.
+    selection : _Selection, optional
+        ``looks``/``pairs`` bound to this view. ``None`` selects
+        ``stack.config.multilook`` and the whole planned network. Build
+        constrained views with :meth:`sel`, never by mutating the
+        collection in place.
 
     """
 
-    def __init__(self, stack: Stack) -> None:
-        """Bind the collection to a Stack."""
+    def __init__(self, stack: Stack, selection: _Selection | None = None) -> None:
+        """Bind the collection to a Stack and an immutable selection."""
         self._stack = stack
+        self._selection = selection or _Selection()
+
+    @property
+    def looks(self) -> tuple[int, int]:
+        """Return the multilook this view reads.
+
+        ``sel(looks=)`` overrides it; otherwise it is
+        ``stack.config.multilook``.
+        """
+        if self._selection.looks is not None:
+            return self._selection.looks
+        looks = self._stack.config.multilook
+        return (int(looks[0]), int(looks[1]))
+
+    @property
+    def available_looks(self) -> list[tuple[int, int]]:
+        """Return the committed multilook views under ``work_dir/ifg``.
+
+        The list enumerates ``ml_AxR`` directories on disk, so every entry
+        names a committed product view regardless of completeness.
+        """
+        ifg_root = self._stack.config.work_dir / "ifg"
+        if not ifg_root.is_dir():
+            return []
+        views: list[tuple[int, int]] = []
+        for path in ifg_root.iterdir():
+            if not path.is_dir() or not path.name.startswith("ml_"):
+                continue
+            try:
+                az_str, rg_str = path.name[3:].split("x", 1)
+                views.append((int(az_str), int(rg_str)))
+            except ValueError:
+                continue
+        return sorted(set(views))
+
+    def sel(
+        self,
+        *,
+        looks: tuple[int, int] | None = None,
+        pair: str | Pair | None = None,
+        pairs: Any = None,
+    ) -> StackInterferogramCollection | InterferogramLayers:
+        """Return a view bound to a committed multilook or Pair subset.
+
+        Parameters
+        ----------
+        looks : tuple[int, int], optional
+            ``(azimuth, range)`` look factors of a committed
+            ``ifg/ml_AxR`` view. The view must exist on disk; reading it
+            still enforces per-pair validation. ``None`` keeps the current
+            ``self.looks``.
+        pair : str or Pair, optional
+            One canonical pair id or :class:`Pair`. A scalar demotes the
+            collection to that pair's :class:`InterferogramLayers` — the
+            same object ``collection[pair]`` returns. Mutually exclusive
+            with ``pairs``.
+        pairs : Pairs, optional
+            A :class:`Pairs` subset of the planned network. The returned
+            collection reads only those pairs; every name must belong to
+            the planned network.
+
+        Returns
+        -------
+        StackInterferogramCollection or InterferogramLayers
+            A new collection when only ``looks``/``pairs`` are given, or the
+            pair's layer view when ``pair`` is a scalar.
+
+        Raises
+        ------
+        TypeError
+            If ``pair`` and ``pairs`` are both given, or ``pairs`` is not a
+            :class:`Pairs`.
+        KeyError
+            If a scalar ``pair`` is not part of the planned network.
+        ValueError
+            If ``looks`` is not two positive integers, ``pairs`` is not a
+            subset of the planned network, or no dims select anything.
+
+        """
+        if pair is not None and pairs is not None:
+            message = "sel accepts exactly one of pair= or pairs="
+            raise TypeError(message)
+        if looks is not None and (
+            not isinstance(looks, tuple)
+            or len(looks) != 2
+            or any(
+                not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in looks
+            )
+        ):
+            message = f"looks must be two positive integers; got {looks!r}"
+            raise ValueError(message)
+        selection = _Selection(
+            looks=self._selection.looks if looks is None else looks,
+            pairs=self._selection.pairs,
+        )
+        if pair is not None:
+            pair_id = pair.name if isinstance(pair, Pair) else str(pair)
+            if pair_id not in self.pairs.to_names().tolist():
+                raise KeyError(pair)
+            view = StackInterferogramCollection(self._stack, selection)
+            return view._load_layers(pair_id)
+        if pairs is not None:
+            if not isinstance(pairs, Pairs):
+                message = f"pairs must be a Pairs instance; got {type(pairs).__name__}"
+                raise TypeError(message)
+            planned = set(self._planned_pairs().to_names().tolist())
+            requested = pairs.to_names().tolist()
+            if not requested or not set(requested).issubset(planned):
+                message = "pairs must be a non-empty subset of the planned network"
+                raise ValueError(message)
+            # Copy so a caller retaining the input Pairs cannot mutate this
+            # view's selection via Pairs.sort(inplace=True) (PROPOSAL-0064
+            # review: immutable views must not alias a mutable caller object).
+            selection = _Selection(looks=selection.looks, pairs=pairs.copy())
+            return StackInterferogramCollection(self._stack, selection)
+        if looks is None:
+            message = "sel requires at least one of looks=, pair=, or pairs="
+            raise ValueError(message)
+        return StackInterferogramCollection(self._stack, selection)
 
     def __getitem__(
         self, pair: str | Pair | Pairs
@@ -83,7 +239,7 @@ class StackInterferogramCollection(InterferogramCollection):
         Raises
         ------
         KeyError
-            If any requested Pair is not part of this Stack.
+            If any requested Pair is not part of this view's selection.
 
         """
         if isinstance(pair, Pairs):
@@ -142,14 +298,14 @@ class StackInterferogramCollection(InterferogramCollection):
 
     @property
     def root(self) -> Path:
-        """Return the IFG product directory of the configured multilook."""
-        looks = self._stack.config.multilook
+        """Return the IFG product directory of this view's multilook."""
+        looks = self.looks
         return self._stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}"
 
     @property
     def index_metadata(self) -> dict[str, Any]:
-        """Return the Network index metadata for the committed Pair set."""
-        stores = self._stores()
+        """Return the Network index metadata for this view's Pair set."""
+        stores = self._selected_stores()
         assets_by_pair: dict[str, list[str]] = {}
         for store in stores:
             assets = ["complex", "wrapped_phase", "amplitude"]
@@ -178,7 +334,7 @@ class StackInterferogramCollection(InterferogramCollection):
             instead of fabricating it.
 
         """
-        stores = self._stores()
+        stores = self._selected_stores()
         if not stores:
             message = "Stack has no interferogram products"
             raise ValueError(message)
@@ -194,9 +350,8 @@ class StackInterferogramCollection(InterferogramCollection):
             values["transform"] = list(first.transform)
         return values
 
-    @property
-    def pairs(self) -> Pairs:
-        """Return the planned Stack Pair graph."""
+    def _planned_pairs(self) -> Pairs:
+        """Return the planned Stack Pair graph (unselected)."""
         from faninsar.stack.session import _iter_pair_dates
 
         return Pairs.from_names(
@@ -206,9 +361,37 @@ class StackInterferogramCollection(InterferogramCollection):
             ]
         )
 
+    @property
+    def pairs(self) -> Pairs:
+        """Return this view's Pair graph.
+
+        The planned network on the default view, or the selected subset on
+        a ``sel(pairs=)`` view.
+        """
+        if self._selection.pairs is not None:
+            return self._selection.pairs
+        return self._planned_pairs()
+
     def _stores(self) -> list[InterferogramArtifactStore]:
-        """Open the exact planned IFG product set."""
-        return self._stack._pair_artifact_stores(looks=self._stack.config.multilook)
+        """Open the exact planned IFG product set of this view's multilook.
+
+        The strict check runs against the *planned* network regardless of a
+        ``sel(pairs=)`` subset: network-integrity discovery never shrinks
+        (PROPOSAL-0059 AC#6). Use :meth:`_selected_stores` for the subset
+        view's reads.
+        """
+        return self._stack._pair_artifact_stores(looks=self.looks)
+
+    def _selected_stores(self) -> list[InterferogramArtifactStore]:
+        """Open the IFG product stores of this view's selected pairs.
+
+        On the default view this is the strict full-network set. On a
+        ``sel(pairs=)`` subset it opens only the selected products; each
+        still passes :meth:`_pair_store`'s per-pair validation.
+        """
+        if self._selection.pairs is None:
+            return self._stores()
+        return [self._pair_store(pair_id) for pair_id in self.pairs.to_names()]
 
     def _pair_store(self, pair: str) -> InterferogramArtifactStore:
         """Return the IFG product store of one planned Pair.
@@ -221,7 +404,7 @@ class StackInterferogramCollection(InterferogramCollection):
         Raises
         ------
         KeyError
-            If the Pair is not part of this Stack.
+            If the Pair is not part of this view's selection.
         InvalidProcessingStateError
             If the requested Pair product is missing, damaged, or inconsistent
             with the Stack configuration.
@@ -238,10 +421,7 @@ class StackInterferogramCollection(InterferogramCollection):
             reject_invalid_state(
                 "Stack IFG artifact pair differs from the configured network"
             )
-        azimuth_looks, range_looks = (
-            int(self._stack.config.multilook[0]),
-            int(self._stack.config.multilook[1]),
-        )
+        azimuth_looks, range_looks = (int(self.looks[0]), int(self.looks[1]))
         if store.looks != (azimuth_looks, range_looks):
             reject_invalid_state("Stack IFG artifacts use mixed or unexpected looks")
         if store.domain != self._stack.config.coregistration_grid:
@@ -272,13 +452,14 @@ class StackInterferogramCollection(InterferogramCollection):
         pairs: Any = None,
         chunks: Any = None,
     ) -> xr.DataArray:
-        """Open a named asset across the planned Pair network.
+        """Open a named asset across this view's Pair network.
 
         Short public names (``wrapped``, ``unwrapped``) are accepted alongside
         the internal asset names (``wrapped_phase``, ``unw_phase``).
 
-        An explicit ``pairs`` subset touches only the selected Pair products;
-        a whole-network read keeps the strict exact planned-set check.
+        On the default view a whole-network read keeps the strict exact
+        planned-set check; an explicit ``pairs`` argument further narrows
+        within this view's selection.
         """
         del chunks
         requested = (
@@ -287,7 +468,7 @@ class StackInterferogramCollection(InterferogramCollection):
             else pairs.to_names().tolist()
         )
         canonical = _canonical_asset_name(name)
-        if pairs is None:
+        if pairs is None and self._selection.pairs is None:
             by_pair = {_pair_id(store): store for store in self._stores()}
             stores = [by_pair[pair] for pair in requested]
         else:
@@ -391,7 +572,7 @@ class StackInterferogramCollection(InterferogramCollection):
         }
 
     def summary(self) -> dict[str, Any]:
-        """Return a summary of the committed Stack products."""
+        """Return a summary of this view's committed Stack products."""
         index = self.index_metadata
         return {
             "root": str(self.root),
@@ -402,9 +583,10 @@ class StackInterferogramCollection(InterferogramCollection):
         }
 
     def unwrap_write_ids(self) -> dict[str, str]:
-        """Return the ``write_id`` of each Pair's current unwrap product."""
+        """Return the ``write_id`` of each selected Pair's current unwrap product."""
         return {
-            _pair_id(store): store.unwrap_product().write_id for store in self._stores()
+            _pair_id(store): store.unwrap_product().write_id
+            for store in self._selected_stores()
         }
 
     def to_zarr_stack(
@@ -415,7 +597,7 @@ class StackInterferogramCollection(InterferogramCollection):
         chunks: tuple[int, int, int] = (1, 512, 512),
         overwrite: bool = False,
     ) -> Path:
-        """Export one asset across the Pair network as an xarray Zarr cube.
+        """Export one asset across this view's Pair network as a Zarr cube.
 
         Parameters
         ----------
@@ -449,6 +631,7 @@ class StackInterferogramCollection(InterferogramCollection):
 def _pair_id(store: InterferogramArtifactStore) -> str:
     """Return the canonical Pair id of one IFG product."""
     return f"{store.pair[0]}_{store.pair[1]}"
+
 
 class StackSceneCollection(dict):
     """Dict of committed scene products with session-bound layer views.

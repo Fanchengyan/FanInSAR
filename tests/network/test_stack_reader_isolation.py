@@ -57,10 +57,17 @@ def _write_pair_product(
     phase: np.ndarray,
     coherence: np.ndarray | None = None,
     looks: tuple[int, int] = (1, 1),
+    dir_looks: tuple[int, int] | None = None,
     pair: tuple[str, str] | None = None,
 ) -> Path:
-    """Commit one small synthetic IFG product for the planned network."""
-    root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+    """Commit one small synthetic IFG product for the planned network.
+
+    ``looks`` is recorded on the product; ``dir_looks`` overrides the
+    ``ml_AxR`` directory so tests can place a mismatched product into the
+    view being read. ``None`` keeps them the same.
+    """
+    ml = dir_looks or looks
+    root = stack.config.work_dir / "ifg" / f"ml_{ml[0]}x{ml[1]}" / pair_id
     if coherence is None:
         coherence = np.full(phase.shape, 0.75, dtype=np.float32)
     write_ifg_artifact(
@@ -303,7 +310,7 @@ def test_target_pair_constraints_still_enforced(tmp_path: Path) -> None:
     phase = np.full((3, 4), 0.2, dtype=np.float32)
     collection = StackInterferogramCollection(stack)
 
-    _write_pair_product(stack, TARGET, phase=phase, looks=(2, 2))
+    _write_pair_product(stack, TARGET, phase=phase, looks=(2, 2), dir_looks=(1, 1))
     with pytest.raises(InvalidProcessingStateError, match="looks"):
         collection.open(TARGET, "complex")
 
