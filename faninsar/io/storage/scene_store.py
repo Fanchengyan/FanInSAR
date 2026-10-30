@@ -411,6 +411,14 @@ class CoregisteredSceneStore:
         """Return whether this product holds the Stack Reference acquisition."""
         return self.date_id == self.reference_id
 
+    def __repr__(self) -> str:
+        """Return a concise one-line scene-product summary."""
+        return (
+            f"CoregisteredSceneStore(date={self.date_id!r}, role={self.role!r}, "
+            f"units={len(self.units)}, shape={self.grid_shape}, "
+            f"domain={self.domain!r})"
+        )
+
     @property
     def radar_geometry(self) -> dict[str, object] | None:
         """Return the persisted Reference frame geometry record, if any."""
@@ -1554,6 +1562,20 @@ class SceneLayers:
         from faninsar.network.products import AssetKind
 
         return self._layer("phase", AssetKind.WRAPPED_PHASE)
+
+    def __repr__(self) -> str:
+        """Return a concise summary of this scene layer view."""
+        selected = (
+            len(self._selection)
+            if self._selection is not None
+            else len(self._store.units)
+        )
+        frame = "full" if self._full else "bbox"
+        return (
+            f"SceneLayers(date={self._store.date_id!r}, kind={self.unit_kind!r}, "
+            f"units={selected}/{len(self._store.units)}, frame={frame!r}, "
+            f"layers=['slc', 'amplitude', 'intensity', 'phase'])"
+        )
 
 
 __all__ = [

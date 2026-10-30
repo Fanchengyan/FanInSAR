@@ -741,3 +741,10 @@ class InterferogramLayers:
     def connected_components(self) -> ProductLayer:
         """Return integer component labels sampled with nearest neighbors."""
         return self._unwrap_layer("connected_components", AssetKind.LABEL)
+
+    def __repr__(self) -> str:
+        """Return a concise summary of this per-Pair IFG layer view."""
+        return (
+            f"InterferogramLayers(pair={self._product.path.name!r}, "
+            f"looks={self.multilook}, layers={self.layers})"
+        )

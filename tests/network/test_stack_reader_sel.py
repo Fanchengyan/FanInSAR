@@ -299,3 +299,30 @@ def test_sel_returns_independent_views(tmp_path: Path) -> None:
     assert v2.pairs.to_names().tolist() == [TARGET]
     assert collection.looks == (1, 1)
     assert collection.pairs.to_names().tolist() == list(PLANNED)
+
+
+def test_collection_repr_shows_pairs_table(tmp_path: Path) -> None:
+    """Repr shows the view header plus the Pairs table."""
+    stack, _p1, _p10 = _stack_two_multilooks(tmp_path)
+    collection = StackInterferogramCollection(stack)
+
+    text = repr(collection)
+    assert "StackInterferogramCollection(3 pairs, looks=1x1" in text
+    assert "primary" in text
+    assert "secondary" in text
+    assert "2024-01-01" in text
+    assert "2024-01-25" in text
+    assert str(collection) == "StackInterferogramCollection(3 pairs, looks=1x1)"
+
+    subset = collection.sel(pairs=Pairs.from_names([TARGET]))
+    assert "(1 pairs" in repr(subset)
+    assert OTHER not in repr(subset)
+
+
+def test_interferogram_layers_repr(coregistered_stack: Stack) -> None:
+    """InterferogramLayers repr names the pair and accessible layers."""
+    _write_ifg(coregistered_stack)
+    layers = coregistered_stack.interferograms["20240101_20240113"]
+    text = repr(layers)
+    assert "InterferogramLayers(pair='20240101_20240113'" in text
+    assert "wrapped_phase" in text

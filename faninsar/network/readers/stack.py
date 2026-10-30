@@ -12,11 +12,13 @@ full network.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from faninsar.core import Pair, Pairs
@@ -625,6 +627,22 @@ class StackInterferogramCollection(InterferogramCollection):
         data.to_dataset(name=name).to_zarr(str(out), mode="w", consolidated=False)
         return out
 
+    def __str__(self) -> str:
+        """Return a one-line summary of this view."""
+        return (
+            f"StackInterferogramCollection({len(self.pairs)} pairs, "
+            f"looks={self.looks[0]}x{self.looks[1]})"
+        )
+
+    def __repr__(self) -> str:
+        """Return a header plus the Pairs table of this view."""
+        looks = self.looks
+        header = (
+            f"StackInterferogramCollection({len(self.pairs)} pairs, "
+            f"looks={looks[0]}x{looks[1]}, root={self.root!r})"
+        )
+        return f"{header}\n{self.pairs._to_frame().__repr__()}"
+
 
 def _pair_id(store: InterferogramArtifactStore) -> str:
     """Return the canonical Pair id of one IFG product."""
@@ -634,22 +652,170 @@ def _pair_id(store: InterferogramArtifactStore) -> str:
 class StackSceneCollection(dict):
     """Dict of committed scene products with session-bound layer views.
 
-    ``stack.scenes`` returns this ``dict`` subclass purely to overload
-    ``__getitem__`` for :class:`Acquisition` input — ``["date"]`` still
+    ``stack.scenes`` returns this ``dict`` subclass — ``["date"]`` still
     returns a :class:`CoregisteredSceneStore`, but bound to the Stack so
-    its ``.layers`` view carries ``_session``/``_upstream``. An
-    ``Acquisition`` index returns ``dict[date, SceneLayers]`` keyed on
-    dates.
+    its ``.layers`` view carries ``_session``/``_upstream``. Beyond the
+    dict behaviour it mirrors :class:`StackInterferogramCollection`:
+    :attr:`acquisitions` exposes the date axis as an :class:`Acquisition`
+    index and :meth:`sel` returns immutable date-subset views (or demotes
+    to one date's :class:`SceneLayers` on a scalar key).
     """
 
     def __init__(
         self,
         stack: Stack,
         stores: dict[str, CoregisteredSceneStore],
+        selected: frozenset[str] | None = None,
     ) -> None:
-        """Bind the collection to a Stack and its committed scene stores."""
+        """Bind the collection to a Stack and its committed scene stores.
+
+        Parameters
+        ----------
+        stack : Stack
+            The Stack whose committed ``coreg/<date>`` products back the
+            view.
+        stores : dict[str, CoregisteredSceneStore]
+            Every committed scene product, keyed on its canonical date id.
+        selected : frozenset[str], optional
+            The date subset this view exposes. ``None`` selects all
+            committed dates. Build constrained views with :meth:`sel`,
+            never by mutating the collection in place.
+
+        """
         super().__init__(stores)
         self._stack = stack
+        self._selected = selected
+
+    # ---- date axis -----------------------------------------------------
+
+    @property
+    def dates(self) -> list[str]:
+        """Return this view's selected date ids in sorted order."""
+        committed = dict.keys(self)
+        if self._selected is None:
+            return sorted(committed)
+        return sorted(self._selected & committed)
+
+    @property
+    def acquisitions(self) -> Acquisition:
+        """Return this view's date axis as an :class:`Acquisition` index."""
+        from faninsar.core.acquisition import Acquisition
+
+        return Acquisition(pd.to_datetime(self.dates, format="%Y%m%d"))
+
+    @property
+    def reference(self) -> str | None:
+        """Return the Reference acquisition date, when it is committed."""
+        return self._stack.reference
+
+    # ---- read views ----------------------------------------------------
+
+    def _selected_stores(self) -> dict[str, CoregisteredSceneStore]:
+        """Return committed stores of this view's selected dates."""
+        return {date: self[date] for date in self.dates if date in self}
+
+    def sel(
+        self,
+        *,
+        dates: Acquisition | slice | list[str] | tuple[str, ...] | str,
+    ) -> StackSceneCollection | SceneLayers:
+        """Return a view narrowed to a date subset.
+
+        Parameters
+        ----------
+        dates : Acquisition, slice, list of str, or str
+            A :class:`Acquisition` index, a date-``str`` list, or a
+            ``slice`` of date bounds selects a subset and returns a new
+            :class:`StackSceneCollection`; a scalar date string or a
+            record-shaped ``Acquisition`` demotes the collection to that
+            scene's :class:`SceneLayers` — the same object
+            ``collection[date].layers`` returns. Mirrors the xarray
+            ``sel`` scalar-vs-list demotion rule used by
+            :meth:`StackInterferogramCollection.sel`.
+
+        Returns
+        -------
+        StackSceneCollection or SceneLayers
+            A new collection for multi-date selections, or the scene's
+            layer view for a scalar date selection.
+
+        Raises
+        ------
+        TypeError
+            If ``dates`` is not a supported selection type.
+        KeyError
+            If ``dates`` names an uncommitted scene product.
+        ValueError
+            If the selection is empty.
+
+        """
+        from faninsar.core.acquisition import Acquisition
+
+        scalar_id: str | None = None
+        if isinstance(dates, str):
+            scalar_id = dates
+        elif isinstance(dates, Acquisition) and hasattr(dates, "_physical_key"):
+            scalar_id = str(dates.strftime("%Y%m%d")[0])
+        if scalar_id is not None:
+            if scalar_id not in self:
+                raise KeyError(dates)
+            return self[scalar_id].layers
+
+        if isinstance(dates, slice):
+            lo = self._date_bound(dates.start, min)
+            hi = self._date_bound(dates.stop, max)
+            subset = {date for date in self.dates if lo <= date <= hi}
+        elif isinstance(dates, Acquisition):
+            subset = set(
+                self._normalize_dates(item.strftime("%Y%m%d") for item in dates)
+            )
+        elif isinstance(dates, Iterable) and not isinstance(dates, str):
+            subset = set(self._normalize_dates(dates))
+        elif dates is None:
+            message = "sel requires dates="
+            raise ValueError(message)
+        else:
+            message = (
+                "dates must be an Acquisition, a date str, a list of date "
+                f"strings, or a slice; got {type(dates).__name__}"
+            )
+            raise TypeError(message)
+        unknown = sorted(subset - set(dict.keys(self)))
+        if unknown:
+            message = f"scene products not committed for dates: {unknown!r}"
+            raise KeyError(message)
+        if not subset:
+            message = "sel produced an empty date selection"
+            raise ValueError(message)
+        return StackSceneCollection(self._stack, dict(self), selected=frozenset(subset))
+
+    def _date_bound(self, bound: object, default: Any) -> str:
+        """Normalize one slice bound to a canonical ``%Y%m%d`` date id."""
+        if bound is None:
+            return default(self.dates, default="")
+        if isinstance(bound, str):
+            try:
+                return pd.to_datetime(bound).strftime("%Y%m%d")
+            except ValueError:
+                return bound
+        try:
+            return pd.to_datetime(bound).strftime("%Y%m%d")
+        except (KeyError, TypeError, ValueError) as error:
+            message = f"unsupported date bound {bound!r}"
+            raise TypeError(message) from error
+
+    @staticmethod
+    def _normalize_dates(values: Iterable[str]) -> list[str]:
+        """Parse date-like values into canonical ``%Y%m%d`` ids."""
+        normalized: list[str] = []
+        for value in values:
+            try:
+                normalized.append(pd.to_datetime(value).strftime("%Y%m%d"))
+            except (TypeError, ValueError):
+                normalized.append(str(value))
+        return normalized
+
+    # ---- mapping --------------------------------------------------------
 
     def _bound(self, store: CoregisteredSceneStore) -> CoregisteredSceneStore:
         """Return the store re-bound to this Stack's session."""
@@ -679,11 +845,78 @@ class StackSceneCollection(dict):
 
         if isinstance(key, Acquisition):
             if hasattr(key, "_physical_key"):
-                date_id = key.strftime("%Y%m%d")
-                return self._bound(super().__getitem__(date_id))
+                date_id = str(key.strftime("%Y%m%d")[0])
+                return self._bound(dict.__getitem__(self, date_id))
             return {
-                date: self._bound(store).layers
-                for date, store in self.items()
-                if date in {item.strftime("%Y%m%d") for item in key}
+                date: self._bound(dict.__getitem__(self, date)).layers
+                for date in self.dates
+                if date in {item.strftime("%Y%m%d") for item in key} and date in self
             }
-        return self._bound(super().__getitem__(key))
+        if isinstance(key, Iterable) and not isinstance(key, str):
+            return {
+                date: self._bound(dict.__getitem__(self, date))
+                for date in self._normalize_dates(key)
+            }
+        return self._bound(dict.__getitem__(self, str(key)))
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over this view's selected date ids."""
+        return iter(self.dates)
+
+    def keys(self) -> list[str]:
+        """Return this view's selected date ids."""
+        return self.dates
+
+    def values(self) -> list[CoregisteredSceneStore]:
+        """Return the committed stores of this view's selected dates."""
+        return [self[date] for date in self.dates]
+
+    def items(self) -> list[tuple[str, CoregisteredSceneStore]]:
+        """Return ``(date, store)`` pairs of this view's selected dates."""
+        return [(date, self[date]) for date in self.dates]
+
+    def get(
+        self, key: str, default: CoregisteredSceneStore | None = None
+    ) -> CoregisteredSceneStore | None:
+        """Return the scene store of *key*, honouring the view's selection."""
+        if self._selected is not None and str(key) not in self._selected:
+            return default
+        store = dict.get(self, str(key))
+        if store is None:
+            return default
+        return self._bound(store)
+
+    # ---- display --------------------------------------------------------
+
+    def _frame(self) -> pd.DataFrame:
+        """Return this view's committed scene metadata as a DataFrame."""
+        rows = [
+            {
+                "date": date,
+                "role": store.role,
+                "units": len(store.units),
+                "shape": "x".join(str(size) for size in store.grid_shape),
+            }
+            for date, store in (
+                (date, self[date]) for date in self.dates if date in self
+            )
+        ]
+        if not rows:
+            return pd.DataFrame(columns=["date", "role", "units", "shape"])
+        return pd.DataFrame(rows).set_index("date")
+
+    def __str__(self) -> str:
+        """Return a one-line summary of this view."""
+        return (
+            f"StackSceneCollection({len(self.dates)} scenes, "
+            f"reference={self.reference!r})"
+        )
+
+    def __repr__(self) -> str:
+        """Return a Pairs-like tabular representation of this view."""
+        header = (
+            f"StackSceneCollection({len(self.dates)} scenes, "
+            f"reference={self.reference!r}, "
+            f"root={self._stack.config.work_dir / 'coreg'!r})"
+        )
+        return f"{header}\n{self._frame().__repr__()}"

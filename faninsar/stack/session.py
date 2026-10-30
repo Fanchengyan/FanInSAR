@@ -981,7 +981,10 @@ class Stack(NetworkContract):
         them (see :attr:`reference_scene`). The returned
         :class:`StackSceneCollection` is a ``dict`` subclass — ``["date"]``
         still returns a :class:`CoregisteredSceneStore`, but bound to this
-        Stack so its ``.layers`` view carries the geocode session.
+        Stack so its ``.layers`` view carries the geocode session. Its
+        :attr:`~StackSceneCollection.acquisitions` index and
+        :meth:`~StackSceneCollection.sel` give the same immutable
+        subset-view vocabulary as :attr:`interferograms`.
         """
         from faninsar.io.storage.product import discover_products
         from faninsar.io.storage.scene_store import SCENE_KIND
