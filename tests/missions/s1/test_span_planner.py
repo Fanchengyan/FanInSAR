@@ -158,6 +158,67 @@ class TestNarrowColumn:
         assert spans == (RangeSpan(URL, 1000, 1000 + 2 * 4000 - 1, "row-0-2"),)
 
 
+class TestExactColumnSpans:
+    """``exact_columns=True`` emits one tight per-row span (narrow-ROI path)."""
+
+    def test_exact_columns_emit_per_row_column_slices(self) -> None:
+        """Each row produces one bounded ``col-{line}-{col0}-{col1}`` span."""
+        stride = 100000 * 4  # 400000 B rows
+        offsets = [500 + i * stride for i in range(3)]
+        counts = [stride] * 3
+        spans = _plan(
+            offsets,
+            counts,
+            samples=100000,
+            line0=0,
+            line1=3,
+            col0=100,
+            col1=1100,
+            exact_columns=True,
+        )
+        expected = tuple(
+            RangeSpan(
+                URL,
+                500 + line * stride + 100 * 4,
+                500 + line * stride + 1100 * 4 - 1,
+                f"col-{line}-100-1100",
+            )
+            for line in range(3)
+        )
+        assert spans == expected
+        # Each span covers exactly the requested column slice, not a row.
+        for span in spans:
+            assert span.end - span.start + 1 == (1100 - 100) * 4
+
+    def test_exact_columns_respect_nonzero_line0(self) -> None:
+        """Row index in labels follows the parent line, not the ROI index."""
+        offsets, counts = _tables_8x1000x4()
+        spans = _plan(
+            offsets,
+            counts,
+            line0=3,
+            line1=5,
+            col0=10,
+            col1=60,
+            exact_columns=True,
+        )
+        assert [span.label for span in spans] == ["col-3-10-60", "col-4-10-60"]
+        # Row 3 lives at offset 13000 in the strip table.
+        assert spans[0].start == 13000 + 10 * 4
+
+    def test_exact_columns_validate_geometry_identically(self) -> None:
+        """Column bounds are still validated against the row width."""
+        offsets, counts = _tables_8x1000x4()
+        with pytest.raises(Sentinel1ProductError):
+            _plan(offsets, counts, col0=0, col1=1001, exact_columns=True)
+
+    def test_exact_columns_default_is_off(self) -> None:
+        """Without the flag, whole-row planning is preserved verbatim."""
+        offsets, counts = _tables_8x1000x4()
+        spans = _plan(offsets, counts, line0=0, line1=2, col0=0, col1=10)
+        assert spans == (RangeSpan(URL, 1000, 1000 + 2 * 4000 - 1, "row-0-2"),)
+
+
 class TestFailClosed:
     """Compressed, tiled, or inconsistent geometry is rejected."""
 

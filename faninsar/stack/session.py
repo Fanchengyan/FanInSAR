@@ -2167,12 +2167,17 @@ class Stack(NetworkContract):
         ):
             return None
         raster = self.materialize_dem(current)
-        self.config.dem = raster
         self._ensure_wgs84_dem(raster)
-        if self._dem_source is not None or isinstance(current, SourceDEM):
-            self._capture_dem_source(current)
-            self._persist_raster_dem(raster)
-        return raster
+        # Persist any Stack-materialized raster so ``config.dem`` is a
+        # path-bound RasterDEM that ``stack.json`` identity can serialize.
+        # ``current`` may be a SourceDEM recipe, or ``None`` when the
+        # materializer used ``DEM.from_source("auto")``; both are owned by
+        # this Stack.  Reload through the persisted path so ``path`` is set.
+        self._capture_dem_source(current)
+        self._persist_raster_dem(raster)
+        persisted = self._load_persisted_raster_dem()
+        self.config.dem = persisted if persisted is not None else raster
+        return self.config.dem
 
     @classmethod
     def _search_profile(cls) -> MissionSearchProfile:

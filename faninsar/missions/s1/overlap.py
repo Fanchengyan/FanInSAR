@@ -32,9 +32,15 @@ class BurstOverlapWindow:
     swath : str
         Sub-swath name (``IW1``, ``IW2``, ...).
     top_index : int
-        Burst index *i* (earlier burst in the pair).
+        Burst index *i* (earlier burst in the pair) on the reference grid.
     bottom_index : int
-        Burst index *i + 1*.
+        Burst index *i + 1* on the reference grid.
+    secondary_top_index : int
+        Reference ``top_index`` burst's match on the secondary product's own
+        burst grid; equals ``top_index`` unless the two products clip bursts
+        to different start lines.
+    secondary_bottom_index : int
+        Reference ``bottom_index`` burst's match on the secondary product.
     top_row0 : int
         First overlap line inside burst *i* (burst-local).
     bottom_row0 : int
@@ -56,6 +62,15 @@ class BurstOverlapWindow:
     col0: int
     n_lines: int
     n_samples: int
+    secondary_top_index: int | None = None
+    secondary_bottom_index: int | None = None
+
+    def __post_init__(self) -> None:
+        """Default secondary indices to the reference (same-grid) indices."""
+        if self.secondary_top_index is None:
+            object.__setattr__(self, "secondary_top_index", self.top_index)
+        if self.secondary_bottom_index is None:
+            object.__setattr__(self, "secondary_bottom_index", self.bottom_index)
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +299,8 @@ def intersect_overlap_window(
         col0=col0,
         n_lines=n_lines,
         n_samples=n_samples,
+        secondary_top_index=window.secondary_top_index,
+        secondary_bottom_index=window.secondary_bottom_index,
     )
 
 

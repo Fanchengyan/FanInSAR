@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from faninsar.remote.errors import RemoteAccessError, RemoteIntegrityError
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+    from pathlib import Path
 
 
 def test_range_span_is_a_byte_interval_value() -> None:
@@ -564,15 +568,43 @@ def test_https_proxy_url_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _proxy_for_url("https://zipper.example.invalid/obj") is None
 
 
+class _FakeStreamContent:
+    """Chunk source shaped like ``response.content`` for the fake response."""
+
+    def __init__(self, body: bytes, *, fail_after: int | None = None) -> None:
+        self._body = body
+        self._fail_after = fail_after
+        self._drop_message = "simulated mid-stream drop"
+
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
+        import aiohttp
+
+        delivered = 0
+        for offset in range(0, len(self._body), n):
+            chunk = self._body[offset : offset + n]
+            if self._fail_after is not None:
+                remaining = self._fail_after - delivered
+                if remaining <= 0:
+                    raise aiohttp.ClientPayloadError(self._drop_message)
+                if len(chunk) > remaining:
+                    yield chunk[:remaining]
+                    raise aiohttp.ClientPayloadError(self._drop_message)
+            delivered += len(chunk)
+            yield chunk
+        if self._fail_after is not None and delivered <= self._fail_after:
+            raise aiohttp.ClientPayloadError(self._drop_message)
+
+
 class _FakeRangeResponse:
     """One 206 response with the exact Content-Range the span expects."""
 
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, *, fail_after: int | None = None) -> None:
         self._body = body
         self.status = 206
         self.headers = {
             "Content-Range": f"bytes 2-{2 + len(body) - 1}/{2 + len(body) - 1}",
         }
+        self.content = _FakeStreamContent(body, fail_after=fail_after)
 
     async def __aenter__(self) -> Self:
         return self
@@ -598,6 +630,73 @@ class _FlakySession:
         if self.calls <= self._failures:
             raise self._error
         return _FakeRangeResponse(b"CDEF")
+
+
+class _RangedFakeResponse:
+    """Fake 206 echoing the request's Range header through a chunked body."""
+
+    def __init__(
+        self,
+        payload: bytes,
+        request_start: int,
+        request_end: int,
+        *,
+        fail_after: int | None = None,
+        content_range: str | None = None,
+    ) -> None:
+        self.status = 206
+        body = payload[request_start : request_end + 1]
+        self.headers = {
+            "Content-Range": content_range
+            or f"bytes {request_start}-{request_end}/{len(payload)}"
+        }
+        self.content = _FakeStreamContent(body, fail_after=fail_after)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+class _RangedSession:
+    """Session that parses Range headers and can drop one stream mid-body."""
+
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        drop_at_call: int | None = None,
+        fail_after: int | None = None,
+        content_range: str | None = None,
+    ) -> None:
+        self._payload = payload
+        self._drop_at_call = drop_at_call
+        self._fail_after = fail_after
+        self._content_range = content_range
+        self.calls = 0
+        self.requests: list[str] = []
+
+    def get(self, url: str, **kwargs: object) -> _RangedFakeResponse:
+        del url
+        headers = kwargs.get("headers") or {}
+        start_s, end_s = str(headers.get("Range", "bytes=0-0"))[len("bytes=") :].split(
+            "-"
+        )
+        self.calls += 1
+        self.requests.append(f"{start_s}-{end_s}")
+        fail_after = (
+            self._fail_after
+            if self._drop_at_call is None or self.calls == self._drop_at_call
+            else None
+        )
+        return _RangedFakeResponse(
+            self._payload,
+            int(start_s),
+            int(end_s),
+            fail_after=fail_after,
+            content_range=self._content_range,
+        )
 
 
 def test_range_span_retries_transient_connector_errors(
@@ -648,3 +747,247 @@ def test_range_span_connector_failures_raise_after_bounded_retries(
     with pytest.raises(aiohttp.ClientOSError):
         asyncio.run(_run())
     assert session.calls == ranges_module._CONNECT_ATTEMPTS
+
+
+def test_stream_span_resumes_suffix_after_mid_stream_payload_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-stream ClientPayloadError resumes with the missing suffix range."""
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    monkeypatch.setattr(ranges_module, "_CONNECT_BACKOFF_S", 0)
+    payload = b"ABCDEFGHIJ"
+    session = _RangedSession(payload, drop_at_call=1, fail_after=2)
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=2, end=9, label="a"
+    )
+    body = bytearray()
+
+    async def _run() -> None:
+        await ranges_module._stream_span(session, span, body.extend, lambda: len(body))
+
+    asyncio.run(_run())
+    assert bytes(body) == payload[2:10]
+    assert session.requests == ["2-9", "4-9"]
+    assert session.calls == 2
+
+
+def test_stream_span_persistent_payload_drops_raise_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payload drops on every attempt surface after the bounded retry budget."""
+    import aiohttp
+
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    monkeypatch.setattr(ranges_module, "_CONNECT_BACKOFF_S", 0)
+    session = _RangedSession(b"ABCDEFGHIJ", fail_after=1)
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=0, end=9, label="a"
+    )
+    body = bytearray()
+
+    async def _run() -> None:
+        await ranges_module._stream_span(session, span, body.extend, lambda: len(body))
+
+    with pytest.raises(aiohttp.ClientPayloadError):
+        asyncio.run(_run())
+    assert session.calls == ranges_module._CONNECT_ATTEMPTS
+    assert session.requests[0] == "0-9"
+    # Each resumed attempt asks only for the missing suffix; the last
+    # request narrows to the single byte still unreceived.
+    assert session.requests[-1] == "9-9"
+    assert bytes(body) == b"ABCDEFGHIJ"
+
+
+def test_request_span_once_rejects_wrong_content_range_start() -> None:
+    """A 206 whose Content-Range start differs is not a prefix match — it fails."""
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    session = _RangedSession(b"ABCDEFGHIJ", content_range="bytes 2-9/10")
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=0, end=9, label="a"
+    )
+    body = bytearray()
+
+    async def _run() -> None:
+        await ranges_module._request_span_once(session, span, body.extend, 0)
+
+    with pytest.raises(RemoteIntegrityError) as raised:
+        asyncio.run(_run())
+    assert raised.value.reason == "content_range_mismatch"
+    assert bytes(body) == b""
+
+
+def test_request_span_once_rejects_non_206_status() -> None:
+    """A 200 response masquerading as range support fails strict validation."""
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    class _OkStatusSession(_RangedSession):
+        def get(self, url: str, **kwargs: object) -> _RangedFakeResponse:
+            response = super().get(url, **kwargs)
+            response.status = 200
+            return response
+
+    ok_session = _OkStatusSession(b"ABCDEFGHIJ")
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=0, end=9, label="a"
+    )
+    body = bytearray()
+
+    async def _run() -> None:
+        await ranges_module._request_span_once(ok_session, span, body.extend, 0)
+
+    with pytest.raises(RemoteIntegrityError) as raised:
+        asyncio.run(_run())
+    assert raised.value.reason == "content_range_mismatch"
+
+
+def test_range_fetcher_fetch_into_writes_a_part_file(tmp_path: Path) -> None:
+    """fetch_into streams the 206 body into a caller-provided part file."""
+    from aiohttp import web
+
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    payload = b"ABCDEFGHIJ"
+    part = tmp_path / "span.part"
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        assert request.headers["Range"] == "bytes=2-9"
+        return web.Response(
+            status=206,
+            body=payload[2:10],
+            headers={
+                "Content-Range": "bytes 2-9/10",
+                "Content-Encoding": "identity",
+            },
+        )
+
+    async def _run() -> int:
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            url = str(server.make_url("/obj"))
+            async with RangeFetcher() as fetcher:
+                return await fetcher.fetch_into(
+                    RangeSpan(url=url, start=2, end=9, label="a"), part
+                )
+        finally:
+            await server.close()
+
+    assert asyncio.run(_run()) == 8
+    assert part.read_bytes() == payload[2:10]
+
+
+def test_range_fetcher_fetch_into_resumes_an_existing_part_file(
+    tmp_path: Path,
+) -> None:
+    """A pre-seeded part file resumes at start+received, not at span start."""
+    from aiohttp import web
+
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    payload = b"ABCDEFGHIJ"
+    part = tmp_path / "span.part"
+    part.write_bytes(payload[2:4])
+    seen_ranges: list[str] = []
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        seen_ranges.append(request.headers["Range"])
+        assert request.headers["Range"] == "bytes=4-9"
+        return web.Response(
+            status=206,
+            body=payload[4:10],
+            headers={
+                "Content-Range": "bytes 4-9/10",
+                "Content-Encoding": "identity",
+            },
+        )
+
+    async def _run() -> int:
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            url = str(server.make_url("/obj"))
+            async with RangeFetcher() as fetcher:
+                return await fetcher.fetch_into(
+                    RangeSpan(url=url, start=2, end=9, label="a"), part
+                )
+        finally:
+            await server.close()
+
+    assert asyncio.run(_run()) == 8
+    assert seen_ranges == ["bytes=4-9"]
+    assert part.read_bytes() == payload[2:10]
+
+
+def test_range_fetcher_fetch_into_rejects_an_oversized_part_file(
+    tmp_path: Path,
+) -> None:
+    """A part file already larger than the span is an integrity failure."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    part = tmp_path / "span.part"
+    part.write_bytes(b"0123456789ABCDEF")
+
+    async def _run() -> int:
+        async with RangeFetcher() as fetcher:
+            return await fetcher.fetch_into(
+                RangeSpan(
+                    url="https://zipper.example.invalid/obj",
+                    start=0,
+                    end=3,
+                    label="a",
+                ),
+                part,
+            )
+
+    with pytest.raises(RemoteIntegrityError) as raised:
+        asyncio.run(_run())
+    assert raised.value.reason == "part_file_oversized"
+
+
+def test_range_fetcher_fetch_into_accepts_a_binary_stream() -> None:
+    """An io.BytesIO sink receives the body and reports its own position."""
+    import io
+
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    fetcher = RangeFetcher()
+    fetcher._session = _RangedSession(b"ABCDEFGHIJ")
+    sink = io.BytesIO()
+    sink.write(b"AB")
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=0, end=9, label="a"
+    )
+
+    async def _run() -> int:
+        return await fetcher.fetch_into(span, sink)
+
+    assert asyncio.run(_run()) == 10
+    assert sink.getvalue() == b"ABCDEFGHIJ"
+
+
+def test_range_fetcher_fetch_into_requires_a_tellable_writable_sink() -> None:
+    """Opaque objects without write()/tell() fail before any request."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    fetcher = RangeFetcher()
+    fetcher._session = object()
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=0, end=3, label="a"
+    )
+
+    async def _run() -> int:
+        return await fetcher.fetch_into(span, object())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError):
+        asyncio.run(_run())

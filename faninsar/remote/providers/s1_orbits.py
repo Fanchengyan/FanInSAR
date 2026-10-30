@@ -33,10 +33,10 @@ S1_ORBITS_CATALOG = "s1-orbits"
 S1_ORBITS_ORIGIN = "https://s1-orbits.s3.amazonaws.com"
 S1_ORBITS_REGIONAL_ORIGIN = "https://s1-orbits.s3.us-west-2.amazonaws.com"
 _LIST_PREFIX = re.compile(
-    r"^AUX_(?P<family>POEORB|RESORB)/S1[ABC]_OPER_AUX_(?P=family)_$"
+    r"^AUX_(?P<family>POEORB|RESORB)/S1[ABCD]_OPER_AUX_(?P=family)_$"
 )
 _OBJECT_KEY = re.compile(
-    r"^AUX_(POEORB|RESORB)/S1[ABC]_OPER_AUX_(POEORB|RESORB)_OPOD_"
+    r"^AUX_(POEORB|RESORB)/S1[ABCD]_OPER_AUX_(POEORB|RESORB)_OPOD_"
     r"\d{8}T\d{6}_V\d{8}T\d{6}_\d{8}T\d{6}\.EOF$",
     re.IGNORECASE,
 )

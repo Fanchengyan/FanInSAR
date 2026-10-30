@@ -3468,28 +3468,102 @@ def _seconds_of_day(value: datetime) -> float:
     return (value - midnight).total_seconds()
 
 
+def _burst_anx_time_s(burst: S1Burst) -> float | None:
+    """Return the burst along-track ascending-node time, or ``None``."""
+    value = getattr(burst, "azimuth_anx_time_s", None)
+    if value is None or not np.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def _burst_window_seconds(swath: S1Swath) -> float:
+    """Return one burst's azimuth extent in seconds."""
+    return float(swath.lines_per_burst) * float(swath.azimuth_time_interval_s)
+
+
+def _burst_time_axis(
+    primary_swath: S1Swath,
+    secondary_swath: S1Swath,
+) -> tuple[list[float], list[float], bool]:
+    """Return per-burst along-track times for both swaths.
+
+    Prefers ``azimuth_anx_time_s`` (orbit position), which is identical for the
+    same ground strip across Sentinel-1 units.  Falls back to
+    ``azimuth_time`` seconds-of-day when either side lacks ANX times; in that
+    case the returned flag requests circular (same-day) comparison.
+    """
+    primary_anx = [_burst_anx_time_s(burst) for burst in primary_swath.bursts]
+    secondary_anx = [_burst_anx_time_s(burst) for burst in secondary_swath.bursts]
+    anx = [value for value in primary_anx + secondary_anx if value is not None]
+    # Use ANX times only when they carry per-burst discrimination: real
+    # products set them from the annotation, while stubs may leave a single
+    # constant (e.g. 0.0) on every burst.
+    if len(primary_anx + secondary_anx) == len(anx) and len(set(anx)) > 1:
+        return (
+            [float(value) for value in primary_anx],
+            [float(value) for value in secondary_anx],
+            False,
+        )
+    primary_tod = [
+        _seconds_of_day(burst.azimuth_time) if burst.azimuth_time is not None else None
+        for burst in primary_swath.bursts
+    ]
+    secondary_tod = [
+        _seconds_of_day(burst.azimuth_time) if burst.azimuth_time is not None else None
+        for burst in secondary_swath.bursts
+    ]
+    return (
+        [value if value is not None else np.nan for value in primary_tod],
+        [value if value is not None else np.nan for value in secondary_tod],
+        True,
+    )
+
+
+def _common_burst_pairs(
+    primary_swath: S1Swath,
+    secondary_swath: S1Swath,
+) -> dict[int, int]:
+    """Return ``{primary_index: secondary_index}`` for bursts sharing ground.
+
+    Matches each primary burst to the secondary burst nearest in along-track
+    position (ISCE2 ``getBurstOffset`` model), so a whole-burst index shift
+    between products — as between Sentinel-1C and Sentinel-1D, whose bursts
+    are clipped to different start lines — still pairs the same ground strip.
+    A candidate is accepted when its position gap is within half of one
+    burst's azimuth extent.
+    """
+    primary_axis, secondary_axis, circular = _burst_time_axis(
+        primary_swath, secondary_swath
+    )
+    window_s = _burst_window_seconds(primary_swath)
+    tolerance = 0.5 * window_s
+    pairs: dict[int, int] = {}
+    for primary_index, primary_time in enumerate(primary_axis):
+        if not np.isfinite(primary_time):
+            pairs[primary_index] = primary_index
+            continue
+        best_index = -1
+        best_gap = np.inf
+        for secondary_index, secondary_time in enumerate(secondary_axis):
+            if not np.isfinite(secondary_time):
+                continue
+            gap = abs(primary_time - secondary_time)
+            if circular and gap > 12 * 3600:
+                gap = 24 * 3600 - gap
+            if gap < best_gap:
+                best_gap = gap
+                best_index = secondary_index
+        if best_index >= 0 and best_gap <= tolerance:
+            pairs[primary_index] = best_index
+    return pairs
+
+
 def _common_burst_indices(
     primary_swath: S1Swath,
     secondary_swath: S1Swath,
 ) -> list[int]:
-    common: list[int] = []
-    max_index = min(len(primary_swath.bursts), len(secondary_swath.bursts))
-    window_s = primary_swath.lines_per_burst * primary_swath.azimuth_time_interval_s
-    for index in range(max_index):
-        ref_burst = primary_swath.bursts[index]
-        sec_burst = secondary_swath.bursts[index]
-        if ref_burst.azimuth_time is None or sec_burst.azimuth_time is None:
-            common.append(index)
-            continue
-        gap = abs(
-            _seconds_of_day(ref_burst.azimuth_time)
-            - _seconds_of_day(sec_burst.azimuth_time)
-        )
-        if gap > 12 * 3600:
-            gap = 24 * 3600 - gap
-        if gap <= window_s:
-            common.append(index)
-    return common
+    """Return primary burst indices that have a ground-matched secondary."""
+    return sorted(_common_burst_pairs(primary_swath, secondary_swath))
 
 
 def _swath_range_offsets(

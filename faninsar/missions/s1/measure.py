@@ -20,7 +20,7 @@ from faninsar.missions.s1.processing import (
     BurstSelection,
     ProductionScene,
     _as_frame_paths,
-    _common_burst_indices,
+    _common_burst_pairs,
     _normalize_burst_selection,
     _radar_model,
     _scene_id,
@@ -138,7 +138,7 @@ def measure_s1_pair_misreg(
     primary_products = open_acquisition_products(primary_paths)
     secondary_products = open_acquisition_products(secondary_paths)
     swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
-    resolved = _resolve_common_bursts(
+    resolved, secondary_map = _resolve_common_bursts(
         primary_products,
         secondary_products,
         swath_tuple,
@@ -148,6 +148,7 @@ def measure_s1_pair_misreg(
         primary_products,
         primary_orbit_path=primary_orbit_path,
         resolved=resolved,
+        secondary_map=secondary_map,
         swath_tuple=swath_tuple,
     )
     if not windows:
@@ -225,8 +226,17 @@ def _resolve_common_bursts(
     secondary_products: Sequence[S1Product],
     swath_tuple: tuple[str, ...],
     bursts: BurstSelection | None,
-) -> dict[tuple[int, str], list[int]]:
-    """Intersect the requested burst selection with common primary/secondary indices."""
+) -> tuple[
+    dict[tuple[int, str], list[int]],
+    dict[tuple[int, str], dict[int, int]],
+]:
+    """Intersect the requested burst selection with common primary/secondary indices.
+
+    Returns the selected primary indices per ``(frame, swath)`` plus the
+    ``primary_index -> secondary_index`` ground match for each.  The two may
+    differ when products clip the burst grid to different start lines (e.g.
+    Sentinel-1C vs Sentinel-1D).
+    """
     frame_count = len(primary_products)
     burst_counts = {
         (frame_index, swath): len(primary_products[frame_index].swath(swath).bursts)
@@ -237,13 +247,14 @@ def _resolve_common_bursts(
         bursts, frame_count, swath_tuple, burst_counts
     )
     common_aligned: dict[tuple[int, str], list[int]] = {}
+    secondary_map: dict[tuple[int, str], dict[int, int]] = {}
     for frame_index in range(frame_count):
         for swath in swath_tuple:
             primary_swath = primary_products[frame_index].swath(swath)
             secondary_swath = secondary_products[frame_index].swath(swath)
-            common = set(_common_burst_indices(primary_swath, secondary_swath))
+            pairs = _common_burst_pairs(primary_swath, secondary_swath)
             selected = [
-                index for index in resolved[(frame_index, swath)] if index in common
+                index for index in resolved[(frame_index, swath)] if index in pairs
             ]
             if not selected:
                 reject_invalid_state(
@@ -251,7 +262,10 @@ def _resolve_common_bursts(
                     f"{frame_index} swath {swath}"
                 )
             common_aligned[(frame_index, swath)] = selected
-    return common_aligned
+            secondary_map[(frame_index, swath)] = {
+                index: pairs[index] for index in selected
+            }
+    return common_aligned, secondary_map
 
 
 def _collect_overlap_windows(
@@ -259,9 +273,15 @@ def _collect_overlap_windows(
     *,
     primary_orbit_path: Path | None,
     resolved: dict[tuple[int, str], list[int]],
+    secondary_map: dict[tuple[int, str], dict[int, int]],
     swath_tuple: tuple[str, ...],
 ) -> tuple[tuple[int, str, BurstOverlapWindow], ...]:
-    """Return overlap windows of the selected bursts, tagged by frame and swath."""
+    """Return overlap windows of the selected bursts, tagged by frame and swath.
+
+    Each window records the *secondary* burst indices beside the primary
+    ``top_index``/``bottom_index`` so secondary bursts are loaded from their
+    own grid position.
+    """
     windows: list[tuple[int, str, BurstOverlapWindow]] = []
     for frame_index, product in enumerate(primary_products):
         for swath_name in swath_tuple:
@@ -272,8 +292,21 @@ def _collect_overlap_windows(
                 product.swath(swath_name),
                 primary_orbit_path,
             )
+            pairing = secondary_map.get((frame_index, swath_name), {})
             windows.extend(
-                (frame_index, swath_name, window)
+                (
+                    frame_index,
+                    swath_name,
+                    replace(
+                        window,
+                        secondary_top_index=pairing.get(
+                            window.top_index, window.top_index
+                        ),
+                        secondary_bottom_index=pairing.get(
+                            window.bottom_index, window.bottom_index
+                        ),
+                    ),
+                )
                 for window in burst_overlap_windows(swath, burst_indices=selected)
             )
     return tuple(windows)
@@ -361,14 +394,14 @@ def _geometry_resampled_overlap(
             secondary_path,
             secondary_product,
             swath_name,
-            window.top_index,
+            int(window.secondary_top_index),
             secondary_orbit_path,
         )
         sec_bot = _load_burst_scene(
             secondary_path,
             secondary_product,
             swath_name,
-            window.bottom_index,
+            int(window.secondary_bottom_index),
             secondary_orbit_path,
         )
     except (OSError, InvalidProcessingStateError) as error:

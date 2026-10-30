@@ -29,7 +29,7 @@ from faninsar.missions.s1.processing import (
     BurstSelection,
     ProductionPairState,
     _as_frame_paths,
-    _common_burst_indices,
+    _common_burst_pairs,
     _phase_state_manifest,
     _roi_burst_window,
     _scene_id,
@@ -580,12 +580,16 @@ def coregister_s1_secondary(
             **header,
         ) as writer:
             for tag, unit in context.units.items():
-                if not _secondary_covers(unit, secondary_products, tag, date_id):
+                secondary_burst_index = _secondary_burst_index(
+                    unit, secondary_products, tag, date_id
+                )
+                if secondary_burst_index is None:
                     continue
                 payload, state = _coregister_unit(
                     context,
                     unit,
                     secondary_paths[min(unit.frame_index, len(secondary_paths) - 1)],
+                    secondary_burst_index=secondary_burst_index,
                     reference=reference,
                     misreg_az_px=float(misreg_az_px),
                     misreg_rg_px=float(misreg_rg_px),
@@ -635,25 +639,32 @@ def coregister_s1_secondary(
     return product
 
 
-def _secondary_covers(
+def _secondary_burst_index(
     unit: S1ReferenceUnit,
     secondary_products: Sequence[S1Product],
     tag: str,
     date_id: str,
-) -> bool:
-    """Return whether the secondary acquisition contains the unit's burst."""
+) -> int | None:
+    """Return the secondary-grid index of the unit's burst, or ``None``.
+
+    The reference ``unit.burst_index`` is matched to the secondary product's
+    own burst grid by along-track position, so products clipped to different
+    start lines (e.g. Sentinel-1C vs Sentinel-1D) still resolve.
+    """
     if unit.frame_index >= len(secondary_products):
         logger.info("%s: secondary %s has no frame %d", tag, date_id, unit.frame_index)
-        return False
+        return None
     names = {item.swath for item in secondary_products[unit.frame_index].swaths}
     if unit.swath not in names:
         logger.info("%s: secondary %s has no sub-swath %s", tag, date_id, unit.swath)
-        return False
+        return None
     secondary_swath = secondary_products[unit.frame_index].swath(unit.swath)
-    if unit.burst_index not in _common_burst_indices(unit.scene.swath, secondary_swath):
+    pairs = _common_burst_pairs(unit.scene.swath, secondary_swath)
+    secondary_index = pairs.get(unit.burst_index)
+    if secondary_index is None:
         logger.info("%s: secondary %s does not cover this burst", tag, date_id)
-        return False
-    return True
+        return None
+    return secondary_index
 
 
 def _coregister_unit(
@@ -661,6 +672,7 @@ def _coregister_unit(
     unit: S1ReferenceUnit,
     secondary_path: Path,
     *,
+    secondary_burst_index: int,
     reference: CoregisteredSceneStore,
     misreg_az_px: float,
     misreg_rg_px: float,
@@ -674,7 +686,7 @@ def _coregister_unit(
     secondary = load_production_scene(
         secondary_path,
         swath=unit.swath,
-        burst_index=unit.burst_index,
+        burst_index=secondary_burst_index,
         dem=context.dem,
         orbit_path=secondary_orbit_path,
         coregistration_grid=domain,
@@ -912,7 +924,7 @@ def _resolve_apply_selection(
     """
     if bursts is not None or swaths is not None:
         swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
-        resolved = _resolve_common_bursts(
+        resolved, _ = _resolve_common_bursts(
             primary_products,
             secondary_products,
             swath_tuple,
@@ -937,7 +949,7 @@ def _resolve_apply_selection(
             for swath in swath_tuple:
                 primary_swath = primary_products[frame_index].swath(swath)
                 secondary_swath = secondary_products[frame_index].swath(swath)
-                shared = set(_common_burst_indices(primary_swath, secondary_swath))
+                shared = set(_common_burst_pairs(primary_swath, secondary_swath))
                 selected = [
                     index
                     for index in resolved.get((frame_index, swath), [])
@@ -957,7 +969,7 @@ def _resolve_apply_selection(
         )
         return kept, common
     swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
-    resolved = _resolve_common_bursts(
+    resolved, _ = _resolve_common_bursts(
         primary_products,
         secondary_products,
         swath_tuple,
