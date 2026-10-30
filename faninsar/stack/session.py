@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
+    from faninsar.stack.masks import StackMasks
     from faninsar.stack.misreg import MisregRecord
     from faninsar.stack.provider import StackSceneProvider
     from faninsar.timeseries.results import TimeSeries
@@ -945,6 +946,12 @@ class Stack(NetworkContract):
     _materialized_masks: dict[tuple[tuple[str, ...], str], object] = field(
         default_factory=dict, repr=False
     )
+    _committed_mask_products: dict[tuple[str, str], str] = field(
+        default_factory=dict, repr=False
+    )
+    _persisted_mask_products: dict[tuple[str, str], Product] = field(
+        default_factory=dict, repr=False
+    )
     _radar_projected_masks: dict[str, np.ndarray] = field(
         default_factory=dict, repr=False
     )
@@ -1079,7 +1086,8 @@ class Stack(NetworkContract):
         scene_stale: list[str] = []
         scene_committed: list[str] = []
         try:
-            reference_id = self.reference_scene.write_id
+            reference_scene = self.reference_scene
+            reference_id = None if reference_scene is None else reference_scene.write_id
         except InvalidProcessingStateError:
             reference_id = None
         for date, store in sorted(self.scenes.items()):
@@ -1176,6 +1184,38 @@ class Stack(NetworkContract):
             "committed": timeseries_committed,
             "stale": timeseries_stale,
         }
+
+        masks_committed: list[str] = []
+        masks_stale: list[str] = []
+        from faninsar.stack.masks import (
+            discover_mask_products,
+            mask_recipe_identity,
+        )
+
+        registry = self.config.mask_plan.masks
+        for product in discover_mask_products(self):
+            name = str(product.properties.get("faninsar:mask_name", ""))
+            domain = str(product.properties.get("faninsar:mask_domain", ""))
+            masks_committed.append(f"{name}/{domain}")
+            stale = False
+            if name not in registry or product.properties.get(
+                "faninsar:mask_recipe_identity"
+            ) != mask_recipe_identity(registry[name]):
+                stale = True
+            if domain == "radar" and product.inputs.get("reference") != reference_id:
+                stale = True
+            if stale:
+                masks_stale.append(f"{name}/{domain}")
+        report["masks"] = {
+            "planned": sorted(registry),
+            "committed": masks_committed,
+            "missing": [
+                name
+                for name in sorted(registry)
+                if not any(entry.startswith(f"{name}/") for entry in masks_committed)
+            ],
+            "stale": masks_stale,
+        }
         report["analysis_ready"] = self.analysis_ready
         return report
 
@@ -1255,7 +1295,96 @@ class Stack(NetworkContract):
             or self._network_view.network_generation_id != self._network_generation_id
         ):
             self._network_view = Network._from_stack(self)
+            self._network_view._geometry = self._network_geometry_view()
         return self._network_view
+
+    def _network_geometry_view(self) -> object | None:
+        """Return a NetworkGeometry populated from committed stack products.
+
+        The geo-domain ``water`` mask product fills the ``water_mask`` slot
+        of the Network geometry layout (PROPOSAL-0067 decision 7): the first
+        water recipe in the MaskPlan is materialized on the EPSG:4326 grid
+        and written COG-compatibly under ``<work_dir>/geometry/`` alongside a
+        ``geometry.json`` record. ``None`` when no water recipe exists or the
+        geographic grid is unavailable.
+        """
+        from faninsar.stack.masks import water_mask_names
+
+        names = water_mask_names(self)
+        if not names:
+            return None
+        try:
+            plane = self._mask_domain_plane(
+                names[0], self._mask_registry(names[0]), domain="geo"
+            )
+        except Exception as error:
+            logger.warning(
+                "water mask for Network geometry could not be materialized: %s",
+                error,
+            )
+            return None
+        try:
+            target = self._mask_domain_grid("geo")
+        except Exception as error:
+            logger.warning("geo grid for Network geometry is unavailable: %s", error)
+            return None
+        from affine import Affine
+
+        from faninsar.network.readers.geometry import NetworkGeometry
+        from faninsar.network.readers.metadata import build_geometry_metadata
+        from faninsar.network.readers.raster_io import write_cog
+        from faninsar.processing.geometry.grids import GeoGrid
+
+        geometry_dir = self.config.work_dir / "geometry"
+        geometry_dir.mkdir(parents=True, exist_ok=True)
+        geogrid = GeoGrid(
+            Affine(*tuple(target.transform)[:6]),
+            target.shape,
+            str(target.crs),
+        )
+        water_path = geometry_dir / "water_mask.cog.tif"
+        write_cog(
+            np.asarray(plane, dtype=np.uint8),
+            water_path,
+            geogrid,
+            nodata=255,
+            dtype="uint8",
+            overwrite=True,
+        )
+        bounds = geogrid.bounds
+        resolution = geogrid.resolution
+        metadata = build_geometry_metadata(
+            crs=geogrid.crs,
+            width=geogrid.width,
+            height=geogrid.height,
+            transform=geogrid.transform,
+            bounds=(bounds.left, bounds.bottom, bounds.right, bounds.top),
+            resolution=(abs(resolution.x), abs(resolution.y)),
+            assets={
+                "water_mask": {
+                    "href": "water_mask.cog.tif",
+                    "dtype": "uint8",
+                    "nodata": 255,
+                    "shape": [int(target.height), int(target.width)],
+                }
+            },
+            source_assets={
+                "water_mask": {
+                    "source_path": str(
+                        getattr(
+                            self._persisted_mask_products.get((names[0], "geo")),
+                            "path",
+                            "",
+                        )
+                    ),
+                    "source_dtype": "uint8",
+                }
+            },
+        )
+        from faninsar.network.readers.metadata import save_json
+
+        save_json(metadata, geometry_dir / "geometry.json")
+        return NetworkGeometry(geometry_dir)
 
     @property
     def grid(self) -> GridSpec:
@@ -2581,21 +2710,22 @@ class Stack(NetworkContract):
             )
 
         masks = []
-        for definition in self.config.mask_plan.for_stage(stage):
+        named_masks: list[tuple[str, Mask]] = []
+        for name, definition in zip(
+            refs, self.config.mask_plan.for_stage(stage), strict=True
+        ):
             # Python callers may register an already normalized Mask (including
             # the deferred VectorMask returned by Mask.from_water()).  Check
             # this before looking at recipe-only fields such as ``kind``.
             if isinstance(definition, Mask):
                 recipe = getattr(definition, "_water_recipe", None)
                 if recipe is not None and recipe.get("bounds") is None:
-                    masks.append(
-                        _water_mask(
-                            provider=str(recipe.get("provider", "auto")),
-                            policy=recipe.get("policy"),
-                        )
+                    resolved_mask: Mask = _water_mask(
+                        provider=str(recipe.get("provider", "auto")),
+                        policy=recipe.get("policy"),
                     )
                 else:
-                    masks.append(definition)
+                    resolved_mask = definition
             elif definition.kind == "raster":
                 import rasterio
 
@@ -2606,20 +2736,60 @@ class Stack(NetworkContract):
                         source.transform,
                         shape=(source.height, source.width),
                     )
-                masks.append(Mask.from_raster(data, grid=source_grid))
+                resolved_mask = Mask.from_raster(data, grid=source_grid)
             elif definition.kind == "vector":
                 import geopandas as gpd
 
                 frame = gpd.read_file(definition.path)
-                masks.append(Mask.from_vector(frame))
+                resolved_mask = Mask.from_vector(frame)
             else:
-                masks.append(_water_mask(provider=definition.provider or "auto"))
+                resolved_mask = _water_mask(provider=definition.provider or "auto")
+            masks.append(resolved_mask)
+            named_masks.append((name, resolved_mask))
         combined = masks[0]
         for mask in masks[1:]:
             combined = combined + mask
         result = combined.to_raster(target)
         self._materialized_masks[key] = result
+        self._persist_stage_mask_products(stage, target, named_masks)
         return result
+
+    def _persist_stage_mask_products(
+        self,
+        stage: StageName,
+        target: object,
+        named_masks: list[tuple[str, object]],
+    ) -> None:
+        """Commit each referenced mask on this stage's target grid.
+
+        The product is owned by the mask (``masks/<name>/<domain>/``) and
+        bound to ``(mask_name, target_grid_identity)`` — the stage name is
+        deliberately absent so two stages sharing a mask set on the same
+        grid never write the raster twice (PROPOSAL-0067 decision 5).
+        """
+        from faninsar.stack.masks import (
+            mask_recipe_identity,
+            persist_mask_product,
+            stage_domain,
+        )
+
+        domain = stage_domain(self, stage)
+        for name, mask in named_masks:
+            registry_value = self.config.mask_plan.masks[name]
+            recipe_id = mask_recipe_identity(registry_value)
+            if self._committed_mask_products.get((name, domain)) == recipe_id:
+                continue
+            raster = mask.to_raster(target)
+            product = persist_mask_product(
+                self,
+                name=name,
+                definition=registry_value,
+                domain=domain,
+                target=target,
+                mask=raster,
+            )
+            self._committed_mask_products[(name, domain)] = recipe_id
+            self._persisted_mask_products[(name, domain)] = product
 
     def _ionosphere_mask_plane(
         self, ion_multilook: tuple[int, int] | None
@@ -2653,6 +2823,235 @@ class Stack(NetworkContract):
             looks=self.config.multilook,
             expected_shape=shape,
         )
+
+    # ------------------------------------------------------------------
+    # PROPOSAL-0067 persisted mask products and the ``stack.masks`` facade
+    # ------------------------------------------------------------------
+
+    @property
+    def masks(self) -> StackMasks:
+        """Return the Mapping facade over this Stack's registered masks.
+
+        ``stack.masks["water"]`` / ``stack.masks.water`` return a
+        :class:`~faninsar.stack.masks.StackMaskView`; ``combined`` is a
+        reserved virtual name for the per-stage union and is never a
+        registry key or a persisted product.
+        """
+        from faninsar.stack.masks import StackMasks
+
+        return StackMasks(self)
+
+    def _mask_domain_plane(
+        self,
+        name: str,
+        definition: object,
+        *,
+        domain: str,
+    ) -> np.ndarray:
+        """Return one mask's committed plane on the requested domain grid.
+
+        The first read materializes and commits ``masks/<name>/<domain>/``;
+        later reads (including reopened Stacks) reuse the persisted zarr.
+        """
+        from faninsar.stack.masks import (
+            grid_identity,
+            persist_mask_product,
+            read_mask_product,
+        )
+
+        key = (name, domain)
+        if key not in self._persisted_mask_products:
+            target, resolved = self._mask_domain_target(definition, domain)
+            raster = resolved.to_raster(target)
+            product = persist_mask_product(
+                self,
+                name=name,
+                definition=definition,
+                domain=domain,  # type: ignore[arg-type]
+                target=target,
+                mask=raster,
+            )
+            self._persisted_mask_products[key] = product
+            self._committed_mask_products[key] = self._recipe_identity(definition)
+            self._materialized_masks[((name,), grid_identity(target))] = raster
+        return read_mask_product(self, name=name, domain=domain)  # type: ignore[arg-type]
+
+    def _combined_mask_plane(
+        self,
+        stage: StageName,
+        refs: tuple[str, ...],
+        *,
+        domain: str,
+    ) -> np.ndarray:
+        """Return the union of the masks ``refs`` names on the domain grid.
+
+        ``combined`` is virtual: the union reuses the materialized stage
+        mask and its cache key — stage name excluded — but nothing is
+        persisted under the reserved name.
+        """
+        if not refs:
+            message = (
+                f"mask stage {stage!r} references no masks; "
+                "register stage references in the MaskPlan first"
+            )
+            reject(message, ValueError, logger=logger)
+        target = self._mask_domain_grid(domain)
+        resolved_refs: list[tuple[str, object]] = [
+            (name, self._definition_to_mask(self._mask_registry(name), target))
+            for name in refs
+        ]
+        # Reuse the stage materialization cache so a stage read and a
+        # ``combined`` read never materialize the same union twice.
+        from faninsar.stack.masks import grid_identity
+
+        cache_key = (refs, grid_identity(target))
+        cached = self._materialized_masks.get(cache_key)
+        if cached is not None:
+            return np.asarray(cached.data, dtype=np.uint8)
+        combined = resolved_refs[0][1]
+        for _name, mask in resolved_refs[1:]:
+            combined = combined + mask
+        raster = combined.to_raster(target)
+        self._materialized_masks[cache_key] = raster
+        return np.asarray(raster.data, dtype=np.uint8)
+
+    def _mask_registry(self, name: str) -> object:
+        """Return the MaskPlan registry value for ``name``."""
+        registry = self.config.mask_plan.masks
+        if name not in registry:
+            message = f"unknown mask {name!r}"
+            raise KeyError(message)
+        return registry[name]
+
+    def _definition_to_mask(self, definition: object, target: object) -> object:
+        """Bind one registry value to a concrete Mask for ``target``."""
+        from faninsar.processing.masking.mask import Mask
+
+        if isinstance(definition, Mask):
+            recipe = getattr(definition, "_water_recipe", None)
+            if recipe is not None and recipe.get("bounds") is None:
+                return self._stack_bound_water_mask(
+                    target,
+                    provider=str(recipe.get("provider", "auto")),
+                    policy=recipe.get("policy"),
+                )
+            return definition
+        kind = getattr(definition, "kind", None)
+        if kind == "raster":
+            import rasterio
+
+            from faninsar.processing.masking.mask import GridSpec
+
+            with rasterio.open(definition.path) as source:
+                data = source.read(1)
+                source_grid = GridSpec(
+                    source.crs,
+                    source.transform,
+                    shape=(source.height, source.width),
+                )
+            return Mask.from_raster(data, grid=source_grid)
+        if kind == "vector":
+            import geopandas as gpd
+
+            return Mask.from_vector(gpd.read_file(definition.path))
+        return self._stack_bound_water_mask(
+            target, provider=getattr(definition, "provider", None) or "auto"
+        )
+
+    @staticmethod
+    def _recipe_identity(definition: object) -> str:
+        """Return the canonical recipe identity of one registry value."""
+        from faninsar.stack.masks import mask_recipe_identity
+
+        return mask_recipe_identity(definition)  # type: ignore[arg-type]
+
+    def _stack_bound_water_mask(
+        self, target: object, *, provider: str, policy: object | None = None
+    ) -> object:
+        """Return the deferred water recipe bound to this Stack's grid bounds."""
+        from faninsar.processing.masking.mask import Mask
+
+        bounds = target.bounds
+        if str(target.crs) != "EPSG:4326":
+            import pyproj
+
+            transformer = pyproj.Transformer.from_crs(
+                target.crs, "EPSG:4326", always_xy=True
+            )
+            corners = [
+                transformer.transform(x, y)
+                for x, y in (
+                    (bounds[0], bounds[1]),
+                    (bounds[0], bounds[3]),
+                    (bounds[2], bounds[1]),
+                    (bounds[2], bounds[3]),
+                )
+            ]
+            bounds = (
+                min(point[0] for point in corners),
+                min(point[1] for point in corners),
+                max(point[0] for point in corners),
+                max(point[1] for point in corners),
+            )
+        return Mask.from_water(bounds=bounds, provider=provider, policy=policy)
+
+    def _mask_domain_grid(self, domain: str) -> GridSpec:
+        """Return the target grid of one persisted mask domain.
+
+        ``geo`` is the authoritative study-area ``geo_grid`` (EPSG:4326).
+        ``radar`` is the same master grid the stage path projects masks
+        through — the radar raster itself is produced by the projection
+        machinery during stage consumption; the persisted radar-domain
+        product is the canonical mask raster on that master grid bound to
+        the Reference write id.
+        """
+        from faninsar.processing.masking.mask import GridSpec
+
+        if domain == "geo":
+            grid = self._ifg_geo_grid(self.config.multilook)
+            if grid is None:
+                message = (
+                    "geo-domain mask products require an EPSG:4326 StackConfig.geo_grid"
+                )
+                reject(message, ValueError, logger=logger)
+            transform, shape = grid
+            return GridSpec("EPSG:4326", transform, shape=shape)
+        if domain == "radar":
+            master = self.config.geo_grid
+            if master is None:
+                message = (
+                    "radar-domain mask products require the authoritative "
+                    "geographic mask GridSpec (configure StackConfig.geo_grid)"
+                )
+                reject(message, ValueError, logger=logger)
+            if isinstance(master, dict):
+                if not all(key in master for key in ("crs", "transform", "shape")):
+                    reject(
+                        "radar mask projection master GridSpec is incomplete",
+                        ValueError,
+                        logger=logger,
+                    )
+                return GridSpec(
+                    master["crs"], master["transform"], shape=tuple(master["shape"])
+                )
+            if all(hasattr(master, name) for name in ("crs", "transform", "shape")):
+                return GridSpec(master.crs, master.transform, shape=master.shape)
+            reject(
+                "radar mask projection master GridSpec is incomplete",
+                ValueError,
+                logger=logger,
+            )
+        message = f"unsupported mask projection domain {domain!r}"
+        reject(message, ValueError, logger=logger)
+        raise AssertionError("unreachable")
+
+    def _mask_domain_target(
+        self, definition: object, domain: str
+    ) -> tuple[GridSpec, object]:
+        """Return ``(target_grid, resolved Mask)`` for one facade read."""
+        target = self._mask_domain_grid(domain)
+        resolved = self._definition_to_mask(definition, target)
+        return target, resolved
 
     def _unwrap_mask_identity(self, shape: tuple[int, int]) -> str | None:
         """Return the materialized unwrap-mask identity for generation binding."""

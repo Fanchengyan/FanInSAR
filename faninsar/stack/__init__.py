@@ -21,6 +21,11 @@ from faninsar.stack.mask_plan import (
     MaskDefinition,
     MaskPlan,
 )
+from faninsar.stack.masks import (
+    CombinedMaskView,
+    StackMasks,
+    StackMaskView,
+)
 from faninsar.stack.provider import (
     SceneProductionCallback,
     SourceHandle,
@@ -41,6 +46,7 @@ from faninsar.stack.stage import Stage
 __all__ = [
     "MASK_KINDS",
     "STAGES",
+    "CombinedMaskView",
     "CoregMode",
     "FlattenStage",
     "GpuMemoryReclaim",
@@ -56,6 +62,8 @@ __all__ = [
     "SourceHandle",
     "Stack",
     "StackConfig",
+    "StackMaskView",
+    "StackMasks",
     "StackSceneProvider",
     "Stage",
     "UnsupportedStackCapabilityError",

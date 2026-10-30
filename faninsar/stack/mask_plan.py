@@ -24,6 +24,9 @@ StageName = Literal["roi", "interferogram", "unwrap", "ionosphere"]
 MaskKind = Literal["raster", "vector", "water"]
 STAGES: tuple[StageName, ...] = ("roi", "interferogram", "unwrap", "ionosphere")
 MASK_KINDS = frozenset({"raster", "vector", "water"})
+# ``combined`` is the virtual per-stage union view exposed by ``stack.masks``
+# (PROPOSAL-0067); it is never a registry entry or a persisted product.
+RESERVED_MASK_NAMES = frozenset({"combined"})
 _STAGE_SET = frozenset(STAGES)
 _LEGACY_KEYS = frozenset(
     {
@@ -227,6 +230,8 @@ class MaskPlan:
         for name, value in masks.items():
             if not isinstance(name, str) or not name.strip():
                 _fail("mask registry names must be non-empty strings")
+            if name in RESERVED_MASK_NAMES:
+                _fail(f"mask name {name!r} is reserved for the virtual union view")
             if name in normalized:
                 _fail(f"duplicate mask definition {name!r}")
             if isinstance(value, MaskDefinition):
@@ -491,6 +496,10 @@ class MaskPlan:
         stages: Sequence[StageName] = (),
     ) -> Self:
         """Return a copy with a registry entry and optional stage refs added."""
+        if not isinstance(name, str) or not name.strip():
+            _fail("mask registry names must be non-empty strings")
+        if name in RESERVED_MASK_NAMES:
+            _fail(f"mask name {name!r} is reserved for the virtual union view")
         if isinstance(definition, Mapping):
             definition = MaskDefinition.from_mapping(name, definition)
         if isinstance(definition, MaskDefinition) and definition.name != name:
@@ -525,6 +534,7 @@ class MaskPlan:
 
 __all__ = [
     "MASK_KINDS",
+    "RESERVED_MASK_NAMES",
     "STAGES",
     "MaskDefinition",
     "MaskKind",
