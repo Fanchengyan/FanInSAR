@@ -133,8 +133,7 @@ class StackInterferogramCollection(InterferogramCollection):
         self,
         *,
         looks: tuple[int, int] | None = None,
-        pair: str | Pair | None = None,
-        pairs: Any = None,
+        pairs: Pairs | Pair | str | None = None,
     ) -> StackInterferogramCollection | InterferogramLayers:
         """Return a view bound to a committed multilook or Pair subset.
 
@@ -145,37 +144,33 @@ class StackInterferogramCollection(InterferogramCollection):
             ``ifg/ml_AxR`` view. The view must exist on disk; reading it
             still enforces per-pair validation. ``None`` keeps the current
             ``self.looks``.
-        pair : str or Pair, optional
-            One canonical pair id or :class:`Pair`. A scalar demotes the
-            collection to that pair's :class:`InterferogramLayers` — the
-            same object ``collection[pair]`` returns. Mutually exclusive
-            with ``pairs``.
-        pairs : Pairs, optional
-            A :class:`Pairs` subset of the planned network. The returned
-            collection reads only those pairs; every name must belong to
-            the planned network.
+        pairs : Pairs, Pair, or str, optional
+            A :class:`Pairs` selects a subset of the planned network and
+            returns a new :class:`StackInterferogramCollection`; a scalar
+            :class:`Pair` or canonical pair id demotes the collection to
+            that pair's :class:`InterferogramLayers` — the same object
+            ``collection[pair]`` returns. Mirrors the xarray ``sel``
+            scalar-vs-list demotion rule.
 
         Returns
         -------
         StackInterferogramCollection or InterferogramLayers
-            A new collection when only ``looks``/``pairs`` are given, or the
-            pair's layer view when ``pair`` is a scalar.
+            A new collection when ``pairs`` is a :class:`Pairs`, or the
+            pair's layer view when ``pairs`` is a scalar.
 
         Raises
         ------
         TypeError
-            If ``pair`` and ``pairs`` are both given, or ``pairs`` is not a
-            :class:`Pairs`.
+            If ``pairs`` is neither :class:`Pairs`, :class:`Pair`, nor
+            ``str``.
         KeyError
-            If a scalar ``pair`` is not part of the planned network.
+            If a scalar ``pairs`` is not part of the planned network.
         ValueError
             If ``looks`` is not two positive integers, ``pairs`` is not a
-            subset of the planned network, or no dims select anything.
+            non-empty subset of the planned network, or no dims select
+            anything.
 
         """
-        if pair is not None and pairs is not None:
-            message = "sel accepts exactly one of pair= or pairs="
-            raise TypeError(message)
         if looks is not None and (
             not isinstance(looks, tuple)
             or len(looks) != 2
@@ -189,16 +184,12 @@ class StackInterferogramCollection(InterferogramCollection):
             looks=self._selection.looks if looks is None else looks,
             pairs=self._selection.pairs,
         )
-        if pair is not None:
-            pair_id = pair.name if isinstance(pair, Pair) else str(pair)
-            if pair_id not in self.pairs.to_names().tolist():
-                raise KeyError(pair)
-            view = StackInterferogramCollection(self._stack, selection)
-            return view._load_layers(pair_id)
-        if pairs is not None:
-            if not isinstance(pairs, Pairs):
-                message = f"pairs must be a Pairs instance; got {type(pairs).__name__}"
-                raise TypeError(message)
+        if pairs is None:
+            if looks is None:
+                message = "sel requires at least one of looks= or pairs="
+                raise ValueError(message)
+            return StackInterferogramCollection(self._stack, selection)
+        if isinstance(pairs, Pairs):
             planned = set(self._planned_pairs().to_names().tolist())
             requested = pairs.to_names().tolist()
             if not requested or not set(requested).issubset(planned):
@@ -209,10 +200,17 @@ class StackInterferogramCollection(InterferogramCollection):
             # review: immutable views must not alias a mutable caller object).
             selection = _Selection(looks=selection.looks, pairs=pairs.copy())
             return StackInterferogramCollection(self._stack, selection)
-        if looks is None:
-            message = "sel requires at least one of looks=, pair=, or pairs="
-            raise ValueError(message)
-        return StackInterferogramCollection(self._stack, selection)
+        if isinstance(pairs, Pair):
+            pair_id = pairs.name
+        elif isinstance(pairs, str):
+            pair_id = pairs
+        else:
+            message = f"pairs must be Pairs, Pair, or str; got {type(pairs).__name__}"
+            raise TypeError(message)
+        if pair_id not in self.pairs.to_names().tolist():
+            raise KeyError(pairs)
+        view = StackInterferogramCollection(self._stack, selection)
+        return view._load_layers(pair_id)
 
     def __getitem__(
         self, pair: str | Pair | Pairs

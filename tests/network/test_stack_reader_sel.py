@@ -1,10 +1,12 @@
 """sel() multilook and Pair-subset views on StackInterferogramCollection.
 
 ``sel(looks=)`` binds the collection to a committed ``ifg/ml_AxR`` view;
-``sel(pairs=)`` narrows the read view to a subset of the planned network;
-``sel(pair=)`` demotes to that pair's ``InterferogramLayers``. Selection
-is immutable and never relaxes the strict planned-network check on
-product discovery (PROPOSAL-0059 AC#6).
+``sel(pairs=)`` narrows the read view to a subset of the planned network
+when given a :class:`Pairs`, or demotes to that pair's
+``InterferogramLayers`` when given a scalar ``Pair``/``str`` — the
+scalar-vs-collection rule mirrors xarray ``sel``. Selection is immutable
+and never relaxes the strict planned-network check on product discovery
+(PROPOSAL-0059 AC#6).
 """
 
 from __future__ import annotations
@@ -165,16 +167,22 @@ def test_sel_looks_open_stack_uses_the_selected_tree(tmp_path: Path) -> None:
 
 
 def test_sel_pair_scalar_demotes_to_layers(coregistered_stack: Stack) -> None:
-    """sel(pair=) returns the same InterferogramLayers as __getitem__."""
+    """sel(pairs=scalar) returns the same InterferogramLayers as __getitem__."""
     _write_ifg(coregistered_stack)
     collection = StackInterferogramCollection(coregistered_stack)
+    pair = coregistered_stack.pairs[0]
 
-    via_sel = collection.sel(pair="20240101_20240113")
+    via_str = collection.sel(pairs="20240101_20240113")
+    via_pair = collection.sel(pairs=pair)
     via_getitem = collection["20240101_20240113"]
-    assert isinstance(via_sel, InterferogramLayers)
+    assert isinstance(via_str, InterferogramLayers)
+    assert isinstance(via_pair, InterferogramLayers)
     assert isinstance(via_getitem, InterferogramLayers)
     np.testing.assert_allclose(
-        via_sel.wrapped_phase.values, via_getitem.wrapped_phase.values
+        via_str.wrapped_phase.values, via_getitem.wrapped_phase.values
+    )
+    np.testing.assert_allclose(
+        via_pair.wrapped_phase.values, via_getitem.wrapped_phase.values
     )
 
 
@@ -225,15 +233,15 @@ def test_sel_pairs_requires_subset_of_plan(tmp_path: Path) -> None:
         collection.sel(pairs=Pairs.from_names([]))
 
 
-def test_sel_rejects_ambiguous_args(tmp_path: Path) -> None:
-    """Pair and pairs are mutually exclusive; pairs must be a Pairs."""
+def test_sel_rejects_invalid_args(tmp_path: Path) -> None:
+    """Non-Pairs/non-scalar pairs=, empty sel, and malformed looks= fail."""
     stack = _planned_stack(tmp_path)
     collection = StackInterferogramCollection(stack)
 
-    with pytest.raises(TypeError, match="exactly one"):
-        collection.sel(pair=TARGET, pairs=Pairs.from_names([TARGET]))
-    with pytest.raises(TypeError, match="Pairs"):
-        collection.sel(pairs=TARGET)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Pairs, Pair, or str"):
+        collection.sel(pairs=123)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Pairs, Pair, or str"):
+        collection.sel(pairs=[TARGET])  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="at least one"):
         collection.sel()
     with pytest.raises(ValueError, match="looks"):

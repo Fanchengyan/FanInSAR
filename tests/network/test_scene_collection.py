@@ -120,7 +120,7 @@ def test_unbound_store_layers_geocode_raises(tmp_path: Path) -> None:
 
 def test_scene_layer_extent_and_origin(tmp_path: Path) -> None:
     stack = _stack_with_scenes(tmp_path)
-    sel = stack.scenes["20240113"].layers.select(bursts=("f0_IW1_b0",))
+    sel = stack.scenes["20240113"].layers.sel(bursts=("f0_IW1_b0",))
     assert sel.slc.extent == (8, 8)
     assert sel.slc.origin == (0, 0)
     assert sel.slc.values.shape == (8, 8)

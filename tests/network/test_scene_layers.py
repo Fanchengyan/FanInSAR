@@ -97,7 +97,7 @@ def test_select_bounding_box_and_full(tmp_path: Path) -> None:
             {"tag": "f1_iw2_b0", "payload": _payload(1), "row_origin": 0, "col_origin": 8},
         ],
     )
-    sel = store.layers.select(bursts=("f1_iw1_b0",))
+    sel = store.layers.sel(bursts=("f1_iw1_b0",))
     assert sel.slc.extent == (8, 8)
     assert sel.slc.shape == (8, 8)
     assert sel.slc.values.shape == (8, 8)
@@ -114,7 +114,7 @@ def test_select_swaths_only(tmp_path: Path) -> None:
             {"tag": "f1_iw2_b0", "payload": _payload(1), "row_origin": 0, "col_origin": 8},
         ],
     )
-    sel = store.layers.select(swaths=("iw1",))
+    sel = store.layers.sel(swaths=("iw1",))
     assert set(sel._selection) == {"f1_iw1_b0"}
 
 
@@ -132,9 +132,9 @@ def test_select_wrong_mission_alias(tmp_path: Path) -> None:
         grid_shape=(8, 8),
     )
     with pytest.raises(Exception, match="use tiles="):
-        store.layers.select(bursts=("NISAR_b000001",))
+        store.layers.sel(bursts=("NISAR_b000001",))
     with pytest.raises(Exception, match="swaths="):
-        store.layers.select(swaths=("iw1",))
+        store.layers.sel(swaths=("iw1",))
 
 
 def test_virtual_layer_derivations(tmp_path: Path) -> None:

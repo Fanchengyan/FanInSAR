@@ -1337,7 +1337,7 @@ class SceneLayers:
 
     Holds the owning :class:`CoregisteredSceneStore`, the current unit
     selection, and the optional Stack session/upstream binding injected by
-    :attr:`Stack.scenes`. Build a narrowed view with :meth:`select`; the
+    :attr:`Stack.scenes`. Build a narrowed view with :meth:`sel`; the
     default view covers every unit (union bounding box for ``slc`` reads,
     common grid for :meth:`full`).
 
@@ -1423,7 +1423,7 @@ class SceneLayers:
 
     # ---- selection ------------------------------------------------------
 
-    def select(
+    def sel(
         self,
         *,
         units: tuple[str, ...] | list[str] | None = None,
@@ -1438,7 +1438,8 @@ class SceneLayers:
         may be used alone or to expand a tag selection with the named
         swaths' units. The default read window is the selected units'
         union bounding box; :meth:`full` returns a view pinned to the
-        common grid.
+        common grid. Mirrors the xarray ``sel`` dims-as-kwargs vocabulary
+        used by :meth:`StackInterferogramCollection.sel`.
         """
         provided = [
             name
@@ -1451,7 +1452,7 @@ class SceneLayers:
         ]
         if len(provided) > 1:
             reject_invalid_state(
-                "select() accepts at most one of units=, bursts=, or tiles="
+                "sel() accepts at most one of units=, bursts=, or tiles="
             )
         kind = self.unit_kind
         if provided:
@@ -1476,7 +1477,7 @@ class SceneLayers:
             swath_tags = {tag for tag in self.units if _tag_swath(tag) in swath_set}
             tags = frozenset(set(tags) | swath_tags) if tags else frozenset(swath_tags)
         if not tags:
-            reject_invalid_state("select() produced an empty unit selection")
+            reject_invalid_state("sel() produced an empty unit selection")
         unknown = sorted(set(tags) - set(self.units))
         if unknown:
             reject_invalid_state(f"scene units not in the product: {unknown!r}")
