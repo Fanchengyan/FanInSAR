@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.processing.runtime.resources import ResourceBudget
 from faninsar.stack.mask_plan import MaskPlan
@@ -20,19 +20,12 @@ if TYPE_CHECKING:
         CoregistrationGrid,
     )
     from faninsar.processing.geometry import DEM, GridSpec
-    from faninsar.processing.geometry.prepared import (
-        ActivationToken,
-        StackActivationBinding,
-    )
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.protocols import ComputeBackend
 
 CoregMode = Literal["geometry", "nesd"]
-OnNetworkFailure = Literal["error"]
 FlattenStage = Literal["coregistration", "interferogram"]
-ActivationMode = Literal["reference", "qualified"]
-logger = setup_logger(__name__)
 
 
 @dataclass
@@ -58,7 +51,6 @@ class StackConfig:
     """
 
     work_dir: Path
-    activation_mode: ActivationMode
     coreg_mode: CoregMode = "geometry"
     flatten_stage: FlattenStage = "coregistration"
     coregistration_grid: CoregistrationGrid = "radar"
@@ -77,10 +69,6 @@ class StackConfig:
     # An empty plan is the deliberate default; water is opt-in through
     # ``MaskPlan.water()`` or an explicit registry definition.
     mask_plan: MaskPlan = field(default_factory=MaskPlan)
-    on_network_failure: OnNetworkFailure = "error"
-    activation_binding: StackActivationBinding | None = None
-    activation_token: ActivationToken | None = None
-    activation_authority_root: Path | None = None
     control_spacing: int | None = None
     n_jobs: int = 1
     retain_pair_states: bool = False
@@ -102,93 +90,40 @@ class StackConfig:
             )
         if not valid_resolution:
             message = "resolution_m must be a finite positive number"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.grid != "utm_ups":
             from faninsar.processing.geometry import GridSpec
 
             if not isinstance(self.grid, GridSpec):
                 message = "grid must be a GridSpec or 'utm_ups'"
-                logger.error(message)
-                raise TypeError(message)
+                reject(message, TypeError)
         if self.dem_cache_dir is not None:
             self.dem_cache_dir = Path(self.dem_cache_dir)
         if self.resource_budget is not None and not isinstance(
             self.resource_budget, ResourceBudget
         ):
             message = "resource_budget must be a ResourceBudget or None"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.coreg_mode not in {"geometry", "nesd"}:
             message = (
                 f"coreg_mode must be 'geometry' or 'nesd'; got {self.coreg_mode!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.flatten_stage not in {"coregistration", "interferogram"}:
             message = (
                 "flatten_stage must be 'coregistration' or 'interferogram'; "
                 f"got {self.flatten_stage!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.gpu_memory_reclaim not in {"lazy", "eager", "adaptive"}:
             message = (
                 "gpu_memory_reclaim must be 'lazy', 'eager', or 'adaptive'; "
                 f"got {self.gpu_memory_reclaim!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
-        if self.on_network_failure != "error":
-            message = (
-                "P19 qualified Stack mode is fail-closed; "
-                "on_network_failure must be 'error'"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        if self.activation_mode not in ("reference", "qualified"):
-            message = f"unsupported Stack activation mode: {self.activation_mode!r}"
-            logger.error(message)
-            raise ValueError(message)
-        if self.activation_mode == "qualified":
-            if self.activation_binding is None:
-                message = "qualified Stack mode requires an activation binding"
-                logger.error(message)
-                raise ValueError(message)
-            if self.activation_token is None:
-                message = "qualified Stack mode requires an activation token"
-                logger.error(message)
-                raise ValueError(message)
-            if self.activation_authority_root is None:
-                message = "qualified Stack mode requires an activation authority root"
-                logger.error(message)
-                raise ValueError(message)
-            if self.activation_binding.activation_mode != "qualified":
-                message = "qualified Stack mode requires a qualified binding"
-                logger.error(message)
-                raise ValueError(message)
-            if self.activation_token.mode != "qualified":
-                message = "qualified Stack mode requires a qualified token"
-                logger.error(message)
-                raise ValueError(message)
-        elif self.activation_binding is not None and (
-            self.activation_binding.activation_mode != "reference"
-        ):
-            message = "reference Stack mode cannot use a qualified binding"
-            logger.error(message)
-            raise ValueError(message)
-        elif self.activation_token is not None and (
-            self.activation_token.mode != "reference"
-        ):
-            message = "reference Stack mode cannot use a qualified token"
-            logger.error(message)
-            raise ValueError(message)
-        if self.activation_authority_root is not None:
-            self.activation_authority_root = Path(self.activation_authority_root)
+            reject(message, ValueError)
         if not isinstance(self.mask_plan, MaskPlan):
             message = "mask_plan must be a MaskPlan"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         ml = self.multilook
         self.multilook = (int(ml[0]), int(ml[1]))
 
@@ -225,20 +160,17 @@ def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
             import yaml
         except ImportError as exc:
             message = "PyYAML required for YAML configs"
-            logger.exception(message)
-            raise ImportError(message) from exc
+            reject(message, ImportError, cause=exc)
         data = yaml.safe_load(text)
         if not isinstance(data, dict):
             message = "YAML config must be a mapping"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         _reject_legacy_mask_config(data)
         return data
     data = json.loads(text)
     if not isinstance(data, dict):
         message = "JSON config must be a mapping"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     _reject_legacy_mask_config(data)
     return data
 
@@ -252,8 +184,7 @@ def _load_mask_plan(
     value = cfg["mask_plan"]
     if not isinstance(value, dict):
         message = "'mask_plan' must be a mapping"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     base_dir = Path(config).resolve().parent if not isinstance(config, dict) else None
     return MaskPlan.from_mapping(value, base_dir=base_dir)
 
@@ -273,8 +204,7 @@ def _reject_legacy_mask_config(cfg: dict[str, Any]) -> None:
             "legacy mask configuration is not supported; use explicit "
             "'mask_plan' definitions and stage references: " + ", ".join(sorted(legacy))
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
 
 def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
@@ -287,15 +217,12 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
 
             return DaskTorchBackend()
         message = f"unknown backend {backend!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return backend
 
 
 __all__ = [
-    "ActivationMode",
     "CoregMode",
     "FlattenStage",
-    "OnNetworkFailure",
     "StackConfig",
 ]
