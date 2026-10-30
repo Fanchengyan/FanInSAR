@@ -30,6 +30,11 @@ logger = setup_logger(__name__)
 #: read_layer`` computes them; no virtual payload is ever written.
 _VIRTUAL_IFG_LAYERS = ("wrapped_phase", "amplitude")
 
+#: Scene layer names served through the SCENE_KIND read branch — the persisted
+#: per-unit ``slc`` zarr payloads plus the three read-time derivations and the
+#: computed support mask. All five are virtual handles on the scene product.
+SCENE_LAYER_NAMES = ("slc", "amplitude", "intensity", "phase", "valid_mask")
+
 
 @dataclass(frozen=True, slots=True)
 class ProductLayer:
@@ -69,6 +74,10 @@ class ProductLayer:
     multilook: tuple[int, int] = (1, 1)
     origin: tuple[int, int] = (0, 0)
     crs: str | None = None
+    extent: tuple[int, int] | None = None
+    _scene_selection: frozenset[str] | None = field(
+        default=None, repr=False, compare=False
+    )
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
 
@@ -84,6 +93,8 @@ class ProductLayer:
             return self._product.asset_path(self.name)
         if self.name in _VIRTUAL_IFG_LAYERS:
             return None
+        if self._product.kind == "scene" and self.name in SCENE_LAYER_NAMES:
+            return None
         message = (
             f"layer {self.name!r} is not stored in {self._product.path}; it is "
             "neither a persisted asset nor a derivable virtual layer"
@@ -93,6 +104,8 @@ class ProductLayer:
     @property
     def shape(self) -> tuple[int, int]:
         """Return the declared layer shape without reading a raster."""
+        if self.extent is not None:
+            return self.extent
         shape = self._product.properties["faninsar:shape"]
         return int(shape[0]), int(shape[1])
 
@@ -178,9 +191,46 @@ class ProductLayer:
             )
         return InterferogramArtifactStore.open(self._product.path).read_layer(name)
 
+    def _read_scene_layer(self, name: str) -> np.ndarray:
+        """Read one scene layer through its store's mosaic reader.
+
+        ``slc`` mosaics the selected unit payloads onto their union bounding
+        box (or the common grid for a ``.full()`` layer); ``amplitude``,
+        ``intensity``, and ``phase`` derive from that mosaic; ``valid_mask``
+        computes ``isfinite(real) & isfinite(imag) & (|slc| > 0)``.
+        """
+        from faninsar.io.storage.scene_store import (
+            SCENE_KIND,
+            CoregisteredSceneStore,
+            valid_samples,
+        )
+
+        if self._product.kind != SCENE_KIND:
+            reject_invalid_state(
+                f"layer {self.name!r} is virtual and requires a scene product source"
+            )
+        store = CoregisteredSceneStore.open(self._product.path)
+        if self._scene_selection is not None:
+            store = store.select_units(self._scene_selection)
+        mosaic = store.mosaic_slc(full=self.extent is None)
+        if name == "slc":
+            return mosaic
+        if name == "amplitude":
+            return np.abs(mosaic).astype(np.float32)
+        if name == "intensity":
+            return (np.abs(mosaic) ** 2).astype(np.float32)
+        if name == "phase":
+            return np.angle(mosaic).astype(np.float32)
+        if name == "valid_mask":
+            return valid_samples(mosaic)
+        message = f"unknown scene layer: {name!r}"
+        raise FileNotFoundError(message)
+
     def _read(self, name: str) -> np.ndarray:
         if name in self._product.assets:
             values = self._product.read(name)
+        elif self._product.kind == "scene" and name in SCENE_LAYER_NAMES:
+            values = self._read_scene_layer(name)
         elif name in _VIRTUAL_IFG_LAYERS:
             values = self._read_virtual(name)
         else:
@@ -224,11 +274,126 @@ class ProductLayer:
         values.setflags(write=False)
         return values
 
+    def to_xarray(self) -> Any:
+        """Return a lazy ``xarray.DataArray`` view of this layer.
+
+        ``dask.array.from_zarr`` opens each selected unit's persisted zarr
+        lazily and a ``map_blocks`` step mosaics them onto the layer's frame
+        (bounding-box when :attr:`extent` is set, the full common grid
+        otherwise); the ``slc`` mosaic then derives ``amplitude``,
+        ``intensity``, ``phase``, or ``valid_mask``. ``validate_source``
+        runs once at build time; the returned ``DataArray`` does not
+        re-validate on ``.compute()`` — callers needing a staleness re-check
+        use :attr:`values` or :meth:`validate_source`.
+
+        Returns
+        -------
+        xarray.DataArray
+            Lazy array with dims ``("y", "x")`` and attrs ``shape``,
+            ``multilook``, ``full_radar_shape``, ``origin``, ``asset_kind``,
+            ``crs``, ``transform``, and ``source_write_id``.
+
+        """
+        import dask.array as da
+        import xarray as xr
+
+        self.validate_source()
+        product = self._product
+        if self._product.kind == "scene":
+            from faninsar.io.storage._zarr_stac import read_zarr_array
+            from faninsar.io.storage.scene_store import (
+                CoregisteredSceneStore,
+                valid_samples,
+            )
+
+            store = CoregisteredSceneStore.open(product.path)
+            if self._scene_selection is not None:
+                store = store.select_units(self._scene_selection)
+            units = store.selected_units()
+            # Lazy mosaic: each unit's zarr read is a dask.delayed block and
+            # one delayed composite places them into the layer frame with the
+            # first-valid-sample overlap rule (matching ``mosaic_slc``). The
+            # whole frame is a single dask chunk; payloads load only when the
+            # DataArray is computed.
+            full = self.extent is None
+            frame = store.grid_shape if full else store.selected_extent()
+            origin = (0, 0) if full else store.selected_origin()
+            layer_name = self.name
+
+            def _compose(*blocks: np.ndarray) -> np.ndarray:
+                out = np.full(frame, np.nan + 1j * np.nan, dtype=np.complex64)
+                for block, unit in zip(blocks, units, strict=True):
+                    r0 = unit.row_origin - origin[0]
+                    c0 = unit.col_origin - origin[1]
+                    win = out[r0 : r0 + unit.shape[0], c0 : c0 + unit.shape[1]]
+                    invalid = ~valid_samples(win)
+                    win[invalid] = block[invalid]
+                if layer_name == "slc":
+                    return out
+                if layer_name == "amplitude":
+                    return np.abs(out).astype(np.float32)
+                if layer_name == "intensity":
+                    return (np.abs(out) ** 2).astype(np.float32)
+                if layer_name == "phase":
+                    return np.angle(out).astype(np.float32)
+                if layer_name == "valid_mask":
+                    return valid_samples(out)
+                return out
+
+            from dask import delayed
+
+            blocks = [delayed(read_zarr_array)(unit.payload_path) for unit in units]
+            dtype = (
+                np.complex64
+                if layer_name == "slc"
+                else np.bool_
+                if layer_name == "valid_mask"
+                else np.float32
+            )
+            data = da.from_delayed(delayed(_compose)(*blocks), shape=frame, dtype=dtype)
+        else:
+            data = da.from_zarr(str(self.path), chunks=self.shape)
+            if self.name in _VIRTUAL_IFG_LAYERS:
+                complex_block = data
+                if self.name == "amplitude":
+                    data = da.map_blocks(
+                        lambda b: np.abs(b).astype(np.float32),
+                        complex_block,
+                        dtype=np.float32,
+                    )
+                elif self.name == "wrapped_phase":
+                    data = da.map_blocks(
+                        lambda b: np.angle(b).astype(np.float32),
+                        complex_block,
+                        dtype=np.float32,
+                    )
+        attrs = {
+            "shape": self.shape,
+            "multilook": self.multilook,
+            "full_radar_shape": self.full_radar_shape,
+            "origin": self.origin,
+            "asset_kind": None if self.asset_kind is None else str(self.asset_kind),
+            "crs": self.crs,
+            "transform": product.properties.get("proj:transform"),
+            "source_write_id": product.write_id,
+        }
+        return xr.DataArray(data, dims=("y", "x"), name=self.name, attrs=attrs)
+
     @property
     def valid_mask(self) -> np.ndarray | None:
-        """Read authoritative support, including excluded unwrap components."""
+        """Read authoritative support, including excluded unwrap components.
+
+        Scene layers compute ``isfinite(real) & isfinite(imag) & (|slc| > 0)``
+        from the mosaic on demand; persisted ``valid_mask`` assets on IFG and
+        unwrap products are read through the usual branch.
+        """
         self.validate_source()
         mask = None
+        if self._product.kind == "scene":
+            mask = self._read("valid_mask")
+            if mask.dtype != np.bool_:
+                reject_invalid_state("layer valid_mask must have boolean dtype")
+            return mask
         if "valid_mask" in self._product.assets:
             mask = self._read("valid_mask")
             if mask.dtype != np.bool_:
@@ -302,7 +467,7 @@ class ProductLayer:
         """
         import matplotlib.pyplot as plt
 
-        if self.asset_kind == AssetKind.COMPLEX_INTERFEROGRAM:
+        if self.asset_kind in (AssetKind.COMPLEX_INTERFEROGRAM, AssetKind.SLC):
             return self._plot_iq(
                 cmap=cmap,
                 vmin=vmin,

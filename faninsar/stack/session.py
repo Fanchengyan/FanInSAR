@@ -91,7 +91,10 @@ if TYPE_CHECKING:
         ProductionPairState,
     )
     from faninsar.network.layers import ProductLayer
-    from faninsar.network.readers.stack import StackInterferogramCollection
+    from faninsar.network.readers.stack import (
+        StackInterferogramCollection,
+        StackSceneCollection,
+    )
     from faninsar.processing.geocoding import GeocodeableProduct
     from faninsar.processing.geocoding.geo_resample import GeocodeKind
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
@@ -687,9 +690,11 @@ def _geocode_product_identity(
     full_radar_shape: tuple[int, int],
     looks: tuple[int, int],
     origin: tuple[int, int],
+    extent: tuple[int, int] | None = None,
+    selection: frozenset[str] | None = None,
 ) -> dict[str, object]:
     """Describe the geocode request without hashing input-array values."""
-    return {
+    payload: dict[str, object] = {
         "name": name,
         "kind": kind,
         "asset_kind": asset_tag,
@@ -702,6 +707,11 @@ def _geocode_product_identity(
         "multilook": [int(looks[0]), int(looks[1])],
         "origin": [int(origin[0]), int(origin[1])],
     }
+    if extent is not None:
+        payload["extent"] = [int(extent[0]), int(extent[1])]
+    if selection:
+        payload["selection"] = sorted(selection)
+    return payload
 
 
 def _validate_geocode_output(
@@ -964,14 +974,18 @@ class Stack(NetworkContract):
         return self.config.work_dir / "coreg" / date_id
 
     @property
-    def scenes(self) -> dict[str, CoregisteredSceneStore]:
+    def scenes(self) -> StackSceneCollection:
         """Return the committed scene products by acquisition date.
 
         Discovered from ``coreg/<date>/item.json``; the Reference is one of
-        them (see :attr:`reference_scene`).
+        them (see :attr:`reference_scene`). The returned
+        :class:`StackSceneCollection` is a ``dict`` subclass — ``["date"]``
+        still returns a :class:`CoregisteredSceneStore`, but bound to this
+        Stack so its ``.layers`` view carries the geocode session.
         """
         from faninsar.io.storage.product import discover_products
         from faninsar.io.storage.scene_store import SCENE_KIND
+        from faninsar.network.readers.stack import StackSceneCollection
 
         found: dict[str, CoregisteredSceneStore] = {}
         for product in discover_products(
@@ -979,7 +993,7 @@ class Stack(NetworkContract):
         ):
             store = CoregisteredSceneStore.open(product.path)
             found[store.date_id] = store
-        return dict(sorted(found.items()))
+        return StackSceneCollection(self, dict(sorted(found.items())))
 
     @property
     def reference_scene(self) -> CoregisteredSceneStore | None:
@@ -1493,6 +1507,14 @@ class Stack(NetworkContract):
         values = None
         if layer is not None:
             shape = layer.shape
+            extent = getattr(layer, "extent", None)
+            if extent is not None:
+                # A bounding-box-cropped layer carries its own frame shape;
+                # the guard validates the crop rather than the full common
+                # grid.  ``origin`` still feeds the Geocoder's frame
+                # placement so the window lands in the right destination
+                # cells.
+                layer_shape = extent
         else:
             values = np.asarray(product.values)
             shape = values.shape
@@ -1506,7 +1528,13 @@ class Stack(NetworkContract):
             reject(message, ValueError, logger=logger)
         destination = self._geocode_destination_grid(grid)
         target_dir = None if path is None else Path(path)
-        if layer is not None and path is None and destination == self.grid:
+        layer_extent = getattr(layer, "extent", None) if layer is not None else None
+        if (
+            layer is not None
+            and path is None
+            and destination == self.grid
+            and layer_extent is None
+        ):
             target_dir = layer.source.path / "geocoded" / layer.name
         if (
             layer is None
@@ -1526,6 +1554,10 @@ class Stack(NetworkContract):
             full_radar_shape=full_radar_shape,
             looks=looks,
             origin=origin,
+            extent=layer_extent,
+            selection=(
+                getattr(layer, "_scene_selection", None) if layer is not None else None
+            ),
         )
         geometry = self._geocode_geometry(full_radar_shape)
         reference = self.reference_scene

@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 
     import torch
 
+    from faninsar.io.storage.product import Product
+    from faninsar.network.layers import ProductLayer
+    from faninsar.network.products import AssetKind
+    from faninsar.processing.geocoding.product import GeocodeSession
     from faninsar.processing.interferometry.phase_filter import (
         PhaseFilter,
         PhaseFilterResult,
@@ -216,6 +220,82 @@ class CoregisteredSceneStore:
     flatten_stage: str = "coregistration"
     inputs: dict[str, str] = field(default_factory=dict)
     properties: dict[str, object] = field(default_factory=dict, repr=False)
+    _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
+    _upstream: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    @property
+    def layers(self) -> SceneLayers:
+        """Return the lazy raster-layer view over this scene's units.
+
+        The view is bound to the Stack session when the store was obtained
+        through :attr:`Stack.scenes`; a store opened directly has
+        ``_session=None`` and its ``.geocode()`` reports the standard
+        "not bound to a Stack session" error.
+        """
+        return SceneLayers(
+            self,
+            _session=self._session,
+            _upstream=self._upstream,
+        )
+
+    def select_units(self, tags: frozenset[str]) -> CoregisteredSceneStore:
+        """Return a view of this store narrowed to a unit subset.
+
+        The returned store shares this product's metadata and payloads but
+        exposes only the selected units; ``read``, ``mosaic_slc``, and the
+        selection-aware extent helpers all honour the subset.
+        """
+        known = self.unit_map()
+        unknown = sorted(set(tags) - set(known))
+        if unknown:
+            reject_invalid_state(f"scene units not in the product: {unknown!r}")
+        units = tuple(unit for unit in self.units if unit.tag in tags)
+        from dataclasses import replace
+
+        return replace(self, units=units)
+
+    def selected_units(self) -> tuple[SceneUnit, ...]:
+        """Return the units in this (possibly selected) view."""
+        return self.units
+
+    def selected_origin(self) -> tuple[int, int]:
+        """Return the ``(row, col)`` offset of the union bounding box."""
+        if not self.units:
+            return (0, 0)
+        row = min(unit.row_origin for unit in self.units)
+        col = min(unit.col_origin for unit in self.units)
+        return (row, col)
+
+    def selected_extent(self) -> tuple[int, int]:
+        """Return the ``(rows, cols)`` of the union bounding box."""
+        if not self.units:
+            return self.grid_shape
+        row0, col0 = self.selected_origin()
+        row1 = max(unit.row_origin + unit.shape[0] for unit in self.units)
+        col1 = max(unit.col_origin + unit.shape[1] for unit in self.units)
+        return (row1 - row0, col1 - col0)
+
+    def mosaic_slc(self, *, full: bool = False) -> np.ndarray:
+        """Mosaic the selected units' SLC payloads onto one frame.
+
+        Units composite in ``SceneUnit`` order: a later unit overwrites an
+        earlier one only on samples where the earlier is invalid
+        (``not valid_samples``), so a valid edge sample keeps the first
+        committed value. ``full=True`` writes onto the common grid; the
+        default ``False`` writes onto the selected units' union bounding
+        box.
+        """
+        shape = self.grid_shape if full else self.selected_extent()
+        origin = (0, 0) if full else self.selected_origin()
+        out = np.full(shape, np.nan + 1j * np.nan, dtype=np.complex64)
+        for unit in self.units:
+            payload, _ = self.read(unit.tag)
+            r0 = unit.row_origin - origin[0]
+            c0 = unit.col_origin - origin[1]
+            win = out[r0 : r0 + unit.shape[0], c0 : c0 + unit.shape[1]]
+            invalid = ~valid_samples(win)
+            win[invalid] = payload[invalid]
+        return out
 
     @property
     def manifest_digest(self) -> str:
@@ -1251,10 +1331,235 @@ def form_scene_interferograms(
     return outputs
 
 
+@dataclass(frozen=True, slots=True)
+class SceneLayers:
+    """Lazy raster-layer view over one coregistered scene product.
+
+    Holds the owning :class:`CoregisteredSceneStore`, the current unit
+    selection, and the optional Stack session/upstream binding injected by
+    :attr:`Stack.scenes`. Build a narrowed view with :meth:`select`; the
+    default view covers every unit (union bounding box for ``slc`` reads,
+    common grid for :meth:`full`).
+
+    Attributes
+    ----------
+    _store : CoregisteredSceneStore
+        Committed scene product backing this view.
+    _selection : frozenset[str] | None
+        Selected unit tags; ``None`` selects all units.
+    _session : GeocodeSession | None
+        Stack session injected when the store was obtained through
+        :attr:`Stack.scenes`; ``None`` on a directly opened store.
+    _upstream : tuple[Product, ...]
+        Upstream products (Reference) bound for ``validate_reference``.
+
+    """
+
+    _store: CoregisteredSceneStore
+    _selection: frozenset[str] | None = None
+    _full: bool = False
+    _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
+    _upstream: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    # ---- unit vocabulary ------------------------------------------------
+
+    @property
+    def units(self) -> tuple[str, ...]:
+        """Return all unit tags in mission-neutral vocabulary."""
+        return tuple(unit.tag for unit in self._store.units)
+
+    @property
+    def unit_kind(self) -> str:
+        """Classify the unit vocabulary of this product.
+
+        Ordered first-match-wins: ``NISAR_b*`` → ``"tile"``; a two- or
+        three-part tag whose last segment starts with ``b`` and whose head
+        is ``f``-prefixed or a bare swath → ``"burst"``; anything else →
+        ``"unit"``.
+        """
+        tags = self.units
+        if not tags:
+            return "unit"
+        if any(tag.startswith("NISAR_b") for tag in tags):
+            return "tile"
+        for tag in tags:
+            parts = tag.split("_")
+            if (
+                len(parts) == 3
+                and parts[0].startswith("f")
+                and parts[2].startswith("b")
+            ):
+                return "burst"
+            if len(parts) == 2 and parts[1].startswith("b"):
+                return "burst"
+        return "unit"
+
+    @property
+    def bursts(self) -> tuple[str, ...]:
+        """Return unit tags when this product is burst-organized (S1)."""
+        if self.unit_kind != "burst":
+            reject_invalid_state(
+                f"scene product units are {self.unit_kind}s, not bursts; "
+                "use `units` or `tiles`"
+            )
+        return self.units
+
+    @property
+    def tiles(self) -> tuple[str, ...]:
+        """Return unit tags when this product is tile-organized (NISAR)."""
+        if self.unit_kind != "tile":
+            reject_invalid_state(
+                f"scene product units are {self.unit_kind}s, not tiles; "
+                "use `units` or `bursts`"
+            )
+        return self.units
+
+    @property
+    def swaths(self) -> tuple[str, ...]:
+        """Return the distinct swath names of a burst-organized product."""
+        if self.unit_kind != "burst":
+            return ()
+        return tuple(sorted({_tag_swath(tag) for tag in self.units}))
+
+    # ---- selection ------------------------------------------------------
+
+    def select(
+        self,
+        *,
+        units: tuple[str, ...] | list[str] | None = None,
+        bursts: tuple[str, ...] | list[str] | None = None,
+        tiles: tuple[str, ...] | list[str] | None = None,
+        swaths: tuple[str, ...] | list[str] | None = None,
+    ) -> SceneLayers:
+        """Return a view narrowed to a unit subset.
+
+        At most one of ``units=``/``bursts=``/``tiles=`` names the selected
+        tags; ``swaths=`` is honoured only on a ``burst``-kind product and
+        may be used alone or to expand a tag selection with the named
+        swaths' units. The default read window is the selected units'
+        union bounding box; :meth:`full` returns a view pinned to the
+        common grid.
+        """
+        provided = [
+            name
+            for name, value in (
+                ("units", units),
+                ("bursts", bursts),
+                ("tiles", tiles),
+            )
+            if value is not None
+        ]
+        if len(provided) > 1:
+            reject_invalid_state(
+                "select() accepts at most one of units=, bursts=, or tiles="
+            )
+        kind = self.unit_kind
+        if provided:
+            name = provided[0]
+            value = {"units": units, "bursts": bursts, "tiles": tiles}[name]
+            expected = {"burst": "bursts", "tile": "tiles", "unit": "units"}[kind]
+            if name not in {expected, "units"}:
+                reject_invalid_state(
+                    f"scene product units are {kind}s; use {expected}= "
+                    f"(or the neutral units=), not {name}="
+                )
+            tags = frozenset(str(tag) for tag in value or ())
+        else:
+            tags = frozenset()
+        if swaths is not None:
+            if kind != "burst":
+                reject_invalid_state(
+                    "swaths= is only valid on burst-organized (Sentinel-1) "
+                    "scene products"
+                )
+            swath_set = {str(s) for s in swaths}
+            swath_tags = {tag for tag in self.units if _tag_swath(tag) in swath_set}
+            tags = frozenset(set(tags) | swath_tags) if tags else frozenset(swath_tags)
+        if not tags:
+            reject_invalid_state("select() produced an empty unit selection")
+        unknown = sorted(set(tags) - set(self.units))
+        if unknown:
+            reject_invalid_state(f"scene units not in the product: {unknown!r}")
+        from dataclasses import replace
+
+        return replace(self, _selection=tags)
+
+    def full(self) -> SceneLayers:
+        """Return a view pinned to the full common grid.
+
+        The returned view reads the selected units onto the common-grid
+        frame (``extent=None``) instead of their union bounding box.
+        """
+        from dataclasses import replace
+
+        return replace(self, _full=True)
+
+    @property
+    def _active_store(self) -> CoregisteredSceneStore:
+        """Return the store narrowed to the current selection."""
+        if self._selection is None:
+            return self._store
+        return self._store.select_units(self._selection)
+
+    def _layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
+        """Build one lazy :class:`ProductLayer` bound to this view."""
+        from faninsar.io.storage.product import open_product
+        from faninsar.network.layers import ProductLayer
+
+        store = self._active_store
+        extent = None if self._full else store.selected_extent()
+        origin = (0, 0) if self._full else store.selected_origin()
+        product = open_product(store.root, kind=SCENE_KIND)
+        return ProductLayer(
+            product,
+            name,
+            asset_kind,
+            store.grid_shape,
+            multilook=(1, 1),
+            origin=origin,
+            crs=store.crs,
+            extent=extent,
+            _scene_selection=self._selection,
+            _upstream=self._upstream,
+            _session=self._session,
+        )
+
+    # ---- raster layers ---------------------------------------------------
+
+    @property
+    def slc(self) -> ProductLayer:
+        """Return the virtual mosaic of the selected units' SLC payloads."""
+        from faninsar.network.products import AssetKind
+
+        return self._layer("slc", AssetKind.SLC)
+
+    @property
+    def amplitude(self) -> ProductLayer:
+        """Return ``|slc|`` — the magnitude of the complex mosaic."""
+        from faninsar.network.products import AssetKind
+
+        return self._layer("amplitude", AssetKind.AMPLITUDE)
+
+    @property
+    def intensity(self) -> ProductLayer:
+        """Return ``|slc|²`` — the squared magnitude of the complex mosaic."""
+        from faninsar.network.products import AssetKind
+
+        return self._layer("intensity", AssetKind.AMPLITUDE)
+
+    @property
+    def phase(self) -> ProductLayer:
+        """Return ``angle(slc)`` — the raw SLC phase in ``[-pi, pi]``."""
+        from faninsar.network.products import AssetKind
+
+        return self._layer("phase", AssetKind.WRAPPED_PHASE)
+
+
 __all__ = [
     "NISAR_GEO_COVERAGE_POLICY",
     "SCENE_KIND",
     "CoregisteredSceneStore",
+    "SceneLayers",
     "SceneUnit",
     "SceneWriter",
     "form_merged_scene_interferogram",

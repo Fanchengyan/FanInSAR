@@ -17,7 +17,12 @@ from faninsar.core import Pair, Pairs
 from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
+    from faninsar.core.acquisition import Acquisition
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+    from faninsar.io.storage.scene_store import (
+        CoregisteredSceneStore,
+        SceneLayers,
+    )
     from faninsar.network.layers import InterferogramLayers
     from faninsar.stack.session import Stack
 
@@ -444,3 +449,60 @@ class StackInterferogramCollection(InterferogramCollection):
 def _pair_id(store: InterferogramArtifactStore) -> str:
     """Return the canonical Pair id of one IFG product."""
     return f"{store.pair[0]}_{store.pair[1]}"
+
+class StackSceneCollection(dict):
+    """Dict of committed scene products with session-bound layer views.
+
+    ``stack.scenes`` returns this ``dict`` subclass purely to overload
+    ``__getitem__`` for :class:`Acquisition` input — ``["date"]`` still
+    returns a :class:`CoregisteredSceneStore`, but bound to the Stack so
+    its ``.layers`` view carries ``_session``/``_upstream``. An
+    ``Acquisition`` index returns ``dict[date, SceneLayers]`` keyed on
+    dates.
+    """
+
+    def __init__(
+        self,
+        stack: Stack,
+        stores: dict[str, CoregisteredSceneStore],
+    ) -> None:
+        """Bind the collection to a Stack and its committed scene stores."""
+        super().__init__(stores)
+        self._stack = stack
+
+    def _bound(self, store: CoregisteredSceneStore) -> CoregisteredSceneStore:
+        """Return the store re-bound to this Stack's session."""
+        from dataclasses import replace
+
+        from faninsar.io.storage.product import open_product
+
+        reference = self._stack.reference_scene
+        upstream = (open_product(reference.root),) if reference is not None else ()
+        return replace(store, _session=self._stack, _upstream=upstream)
+
+    def __getitem__(
+        self, key: str | Acquisition
+    ) -> CoregisteredSceneStore | dict[str, SceneLayers]:
+        """Return one scene store, or per-date ``SceneLayers`` for an index.
+
+        Parameters
+        ----------
+        key : str or Acquisition
+            A ``str`` date id or a single ``Acquisition`` record returns the
+            committed :class:`CoregisteredSceneStore`; an ``Acquisition``
+            index (``pd.DatetimeIndex``) returns ``dict[date, SceneLayers]``
+            keyed on the dates it names.
+
+        """
+        from faninsar.core.acquisition import Acquisition
+
+        if isinstance(key, Acquisition):
+            if hasattr(key, "_physical_key"):
+                date_id = key.strftime("%Y%m%d")
+                return self._bound(super().__getitem__(date_id))
+            return {
+                date: self._bound(store).layers
+                for date, store in self.items()
+                if date in {item.strftime("%Y%m%d") for item in key}
+            }
+        return self._bound(super().__getitem__(key))

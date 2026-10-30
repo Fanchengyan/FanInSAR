@@ -13,9 +13,6 @@ from faninsar.io.storage.ifg_store import write_ifg_artifact, write_unwrapped_ar
 from faninsar.missions.s1 import S1Stack
 from faninsar.network import Network
 
-if TYPE_CHECKING:
-    pass
-
 
 def _stack_with_network(tmp_path: Path) -> S1Stack:
     """Build one small Stack with a complete IFG and unwrap product."""

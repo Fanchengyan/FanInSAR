@@ -16,7 +16,7 @@ def test_kernel_table_covers_every_asset_kind_member() -> None:
     """Every enumerated AssetKind member has exactly one geocode kernel."""
     members = list(AssetKind)
     assert set(ASSET_KIND_GEOCODE_KERNELS) == set(members)
-    assert len(members) == 8
+    assert len(members) == 9
 
 
 def test_kernel_values_are_stable() -> None:
@@ -30,6 +30,7 @@ def test_kernel_values_are_stable() -> None:
         AssetKind.AMPLITUDE: "continuous",
         AssetKind.COHERENCE: "continuous",
         AssetKind.LABEL: "label",
+        AssetKind.SLC: "complex",
     }
     assert dict(ASSET_KIND_GEOCODE_KERNELS) == expected
 

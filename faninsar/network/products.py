@@ -69,6 +69,7 @@ class AssetKind(StrEnum):
     AMPLITUDE = "amplitude"
     COHERENCE = "coherence"
     LABEL = "label"
+    SLC = "slc"
 
     # Short aliases are useful to adapters while retaining one serialized
     # vocabulary.  StrEnum aliases do not create additional enum values.
@@ -93,6 +94,7 @@ ASSET_KIND_GEOCODE_KERNELS: Mapping[AssetKind, GeocodeKind] = MappingProxyType(
         AssetKind.AMPLITUDE: "continuous",
         AssetKind.COHERENCE: "continuous",
         AssetKind.LABEL: "label",
+        AssetKind.SLC: "complex",
     }
 )
 
