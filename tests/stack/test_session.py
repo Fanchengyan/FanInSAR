@@ -18,10 +18,6 @@ from faninsar.io.storage.ifg_store import (
 from faninsar.io.storage.scene_store import write_scene
 from faninsar.missions.s1 import S1Stack
 from faninsar.network.products import AssetKind
-from faninsar.processing.geometry.prepared import (
-    ActivationToken,
-    StackActivationBinding,
-)
 from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
@@ -29,7 +25,6 @@ from faninsar.processing.interferometry.pair import (
 from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
-from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
 
 from tests.support.scene_stores import write_test_scene
@@ -55,7 +50,6 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         coreg_mode="nesd",
         pairs=Pairs.from_names(
             ["20240101_20240113", "20240113_20240125", "20240101_20240125"]
@@ -110,7 +104,6 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         coreg_mode="geometry",
         pair_max_interval=2,
         pair_max_days=60,
@@ -150,7 +143,6 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         # Identity includes coreg_mode; this is not testing NESD physics.
         coreg_mode="nesd",
         swaths=("IW1", "IW2"),
@@ -164,31 +156,18 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
     assert len(digest) == 64
 
 
-def test_coreg_resume_identity_binds_provider_window_channel_and_source_metadata(
+def test_coreg_resume_identity_binds_science_window_and_source_inputs(
     tmp_path: Path,
 ) -> None:
-    """Provider-owned window, channel, and source content invalidate reuse."""
+    """Science window and source content changes invalidate scene reuse."""
     stack = _stack_with_three_date_network(tmp_path)
     stack.config.extra.update(
         {
             "mission": "NISAR",
             "product": "RSLC",
-            "frequency": "B",
-            "polarization": "HH",
             "nisar_window": (0, 16, 0, 16),
         }
     )
-    stack.scene_provider = SimpleNamespace(
-        name="NISAR RSLC",
-        capability="scene-production",
-        produce_pair=lambda *_args, **_kwargs: None,
-        identity_metadata={"provider_revision": "v1"},
-    )
-    stack._nisar_channel = ("B", "HH")
-    stack._nisar_results = {
-        stack.reference: SimpleNamespace(source_id="reference", content_digest="m1"),
-        "20240113": SimpleNamespace(source_id="secondary", content_digest="s1"),
-    }
     initial = stack._coreg_resume_identity(
         "20240113",
         misreg_az_px=0.0,
@@ -201,24 +180,14 @@ def test_coreg_resume_identity_binds_provider_window_channel_and_source_metadata
         misreg_az_px=0.0,
         misreg_rg_px=0.0,
     )
-    stack.config.extra["nisar_window"] = (0, 16, 0, 16)
-    stack._nisar_channel = ("A", "HH")
-    changed_channel = stack._coreg_resume_identity(
+    changed_misreg = stack._coreg_resume_identity(
         "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-    stack._nisar_channel = ("B", "HH")
-    stack._nisar_results["20240113"].content_digest = "s2"
-    changed_source = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
+        misreg_az_px=0.5,
         misreg_rg_px=0.0,
     )
 
     assert initial != changed_window
-    assert initial != changed_channel
-    assert initial != changed_source
+    assert initial != changed_misreg
 
 
 def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
@@ -239,111 +208,25 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Runtime image, CUDA, and callback changes cannot reuse coregistration."""
-    from faninsar.stack import session as session_module
-
-    stack = _stack_with_three_date_network(tmp_path)
-    initial = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-
-    monkeypatch.setattr(
-        session_module,
-        "_runtime_image_identity",
-        lambda: {"platform": "different-runtime-image"},
-    )
-    changed_image = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-    assert changed_image != initial
-
-    monkeypatch.setattr(
-        session_module,
-        "_cuda_runtime_identity",
-        lambda: {
-            "available": True,
-            "driver": "different-driver",
-            "runtime": "different-runtime",
-            "devices": [{"index": 0, "uuid": "different-uuid", "name": "different"}],
-        },
-    )
-    changed_cuda = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-    assert changed_cuda != changed_image
-
-    def callback(_reference: object, _secondary: object, **_kwargs: object) -> None:
-        """Mutation-only callback fixture."""
-
-    stack.scene_provider = SimpleNamespace(produce_pair=callback)
-    changed_callback = stack._coreg_resume_identity(
-        "20240113",
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
-    )
-    assert changed_callback != changed_cuda
-
-
-def test_ifg_resume_binds_runtime_fingerprint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """IFG source lineage includes the same runtime fingerprint as coreg."""
-    from faninsar.stack import session as session_module
-
-    stack = _stack_with_three_date_network(tmp_path)
-    data = np.ones((2, 2), dtype=np.complex64)
-    for date_id in stack.catalog.dates:
-        write_test_scene(
-            stack.config.work_dir,
-            date_id=date_id,
-            reference_id=stack.reference,
-            payload=data,
-        )
-
-    stack.form_interferograms(multilook=(1, 1))
-    store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
-    assert store.source_manifest_digests[
-        "runtime"
-    ] == session_module._runtime_fingerprint(
-        session_module._provider_callback(stack.scene_provider)
-    )
-
-    monkeypatch.setattr(
-        session_module, "_runtime_fingerprint", lambda _callback: "f" * 64
-    )
-    from faninsar.processing.errors import InvalidProcessingStateError
-
-    with pytest.raises(InvalidProcessingStateError, match="lineage"):
-        stack.form_interferograms(multilook=(1, 1))
-
-
-def test_coreg_reuse_redoes_scene_after_provider_identity_change(
+def test_coreg_reuse_redoes_scene_after_science_config_change(
     tmp_path: Path,
 ) -> None:
-    """A scene coregistered under another source window is not reused."""
+    """A scene coregistered under another science config is not reused."""
     stack = _stack_with_three_date_network(tmp_path)
-    stack.config.extra.update({"mission": "NISAR", "nisar_window": (0, 16, 0, 16)})
-    stack.scene_provider = SimpleNamespace(
-        name="NISAR RSLC",
-        capability="scene-production",
-        produce_pair=lambda *_args, **_kwargs: None,
-        identity_metadata={"provider_revision": "v1"},
-    )
+    stack.config.extra.update({"nisar_window": (0, 16, 0, 16)})
     date_id = "20240113"
+    payload = np.ones((2, 2), dtype=np.complex64)
+    write_test_scene(
+        stack.config.work_dir,
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        payload=payload,
+    )
     write_test_scene(
         stack.config.work_dir,
         date_id=date_id,
         reference_id=stack.reference,
-        payload=np.ones((2, 2), dtype=np.complex64),
+        payload=payload,
         properties={
             "faninsar:coreg_identity": stack._coreg_resume_identity(
                 date_id, misreg_az_px=0.0, misreg_rg_px=0.0
@@ -527,7 +410,6 @@ def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
     """StackConfig coerces multilook to int pair."""
     cfg = StackConfig(
         work_dir=tmp_path,
-        activation_mode="reference",
         multilook=(2, 10),
     )
     assert cfg.multilook == (2, 10)
@@ -535,7 +417,7 @@ def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
 
 def test_stack_config_default_multilook_is_isce2_like(tmp_path: Path) -> None:
     """Stack defaults to five azimuth by two range looks."""
-    cfg = StackConfig(work_dir=tmp_path, activation_mode="reference")
+    cfg = StackConfig(work_dir=tmp_path)
     assert cfg.multilook == (5, 2)
 
 
@@ -549,19 +431,12 @@ def test_stack_formation_validates_coherence_before_scene_io(tmp_path: Path) -> 
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
 
     with pytest.raises(ValueError, match="odd integers >= 3"):
         stack.form_interferograms(coherence_window=(2, 5))
 
     assert not (tmp_path / "out").exists()
-
-
-def test_stack_requires_explicit_activation_namespace(tmp_path: Path) -> None:
-    """Corrected Stack execution has no implicit reference activation path."""
-    with pytest.raises(TypeError, match="activation_mode"):
-        StackConfig(work_dir=tmp_path)  # type: ignore[call-arg]
 
 
 def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
@@ -581,27 +456,10 @@ def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         coregistration_grid="geo",
         geo_grid=grid,
     )
     assert stack._burst_kwargs()["geo_grid"] is grid
-
-
-def test_stack_config_rejects_degrade_to_pair(tmp_path: Path) -> None:
-    """Qualified Stack configuration cannot silently change coreg semantics."""
-    with pytest.raises(ValueError, match="fail-closed"):
-        StackConfig(  # type: ignore[arg-type]
-            work_dir=tmp_path,
-            activation_mode="reference",
-            on_network_failure="degrade_to_pair",
-        )
-
-
-def test_stack_config_rejects_qualified_mode_without_binding(tmp_path: Path) -> None:
-    """Qualified production mode cannot bypass its activation record."""
-    with pytest.raises(ValueError, match="activation binding"):
-        StackConfig(work_dir=tmp_path, activation_mode="qualified")
 
 
 def test_stack_measure_misreg_keeps_ampcor_range_residual(
@@ -619,7 +477,6 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         coreg_mode="nesd",
         pair_max_interval=2,
         pair_max_days=60,
@@ -659,7 +516,6 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         safe_paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
     stack.prepare_scenes()
 
@@ -712,7 +568,6 @@ def test_stack_applies_multilook_before_publishing_ifg(
     stack = S1Stack.from_safes(
         safe_paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         dask_client=client,
     )
     stack.prepare_scenes()
@@ -750,119 +605,6 @@ def test_stack_applies_multilook_before_publishing_ifg(
         alpha=0.5,
     )
     np.testing.assert_array_equal(payload, expected)
-
-
-def test_qualified_stack_form_requires_matching_activation_record(
-    tmp_path: Path,
-) -> None:
-    """Qualified IFG formation consumes only its matching scene artifact record."""
-    dates = ("20160101", "20160113")
-    safe_paths = []
-    for date_id in dates:
-        path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
-        path.mkdir()
-        safe_paths.append(path)
-    authority_root = tmp_path / "authority"
-    authority = LocalActivationAuthority.initialize(authority_root)
-    _ = authority.issue_gate_event(
-        event_id="p18-provider",
-        gate_id="P18-provider-qualified",
-        producer_commit="p18-provider-commit",
-        predecessor_event_ids=(),
-        provider_receipt_digest="a" * 64,
-        parent_manifest_digest="b" * 64,
-        evidence_digest="1" * 64,
-        activation_mode="qualified",
-    )
-    _ = authority.issue_gate_event(
-        event_id="p19-correctness",
-        gate_id="P19-stack-correctness-verified",
-        producer_commit="p19-correctness-commit",
-        predecessor_event_ids=("p18-provider",),
-        provider_receipt_digest="a" * 64,
-        parent_manifest_digest="c" * 64,
-        evidence_digest="2" * 64,
-        activation_mode="reference",
-    )
-    _ = authority.issue_gate_event(
-        event_id="p18-stack",
-        gate_id="P18-stack-qualified",
-        producer_commit="p18-commit",
-        predecessor_event_ids=("p19-correctness",),
-        provider_receipt_digest="a" * 64,
-        parent_manifest_digest="c" * 64,
-        evidence_digest="e" * 64,
-        activation_mode="qualified",
-    )
-    _ = authority.issue_gate_event(
-        event_id="p19-qualified",
-        gate_id="P19-stack-qualified-activation",
-        producer_commit="p19-commit",
-        predecessor_event_ids=("p18-stack",),
-        provider_receipt_digest="a" * 64,
-        parent_manifest_digest="c" * 64,
-        evidence_digest="e" * 64,
-        activation_mode="qualified",
-    )
-    token_template = ActivationToken(
-        intent_id="intent",
-        parent_id="stack-generation",
-        parent_manifest_digest="c" * 64,
-        root_device=1,
-        root_inode=2,
-        namespace="scene_artifact_v1",
-        mode="qualified",
-        domain="radar",
-        policy_identity="policy-v1",
-        code_identity="code-v1",
-        schema="scene_artifact_v1",
-        provider_receipt_digest="a" * 64,
-        threshold_configuration_hash="d" * 64,
-        qualification_evidence_digest="e" * 64,
-        p19_qualified_event_ids=("p19-qualified",),
-        p18_stack_gate_event_id="p18-stack",
-        fence_epoch=1,
-        issuer_record_digest="0" * 64,
-    )
-    token = authority.issue_token(token_template)
-    binding = StackActivationBinding(
-        provider_parent_generation_id="provider-parent",
-        qualification_receipt_digest="a" * 64,
-        p19_correctness_event_id="p19-correctness",
-        activation_mode="qualified",
-        p19_qualified_event_id="p19-qualified",
-        p18_stack_gate_event_id="p18-stack",
-        stack_generation_id="stack-generation",
-        p19_qualified_event_ids=("p19-qualified",),
-        activation_token_digest=token.digest(),
-    )
-    stack = S1Stack.from_safes(
-        safe_paths,
-        work_dir=tmp_path / "out",
-        activation_mode="qualified",
-        activation_binding=binding,
-        activation_token=token,
-        activation_authority_root=authority_root,
-    )
-    stack.prepare_scenes()
-    reference = np.ones((2, 2), dtype=np.complex64)
-    secondary = np.full((2, 2), 1.0 + 2.0j, dtype=np.complex64)
-    for date_id in dates:
-        write_test_scene(
-            stack.config.work_dir,
-            date_id=date_id,
-            reference_id=dates[0],
-            payload=reference if date_id == dates[0] else secondary,
-            reference_payload=reference,
-            tag="IW1_b0",
-            row_origin=0,
-            col_origin=0,
-        )
-    stack._write_qualified_activation_record()
-
-    stack.form_interferograms(multilook=(1, 1))
-    assert stack.ifg_dirs
-    assert not stack.analysis_ready
 
 
 def test_stack_unwrap_loads_persisted_pair_artifacts(
@@ -1276,7 +1018,6 @@ def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         multilook=(1, 1),
     ).prepare_scenes()
     data = np.ones((2, 2), dtype=np.complex64)
@@ -1508,10 +1249,9 @@ def test_stack_config_gpu_memory_reclaim_defaults_to_adaptive(tmp_path: Path) ->
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
     assert stack.config.gpu_memory_reclaim == "adaptive"
-    config = StackConfig(work_dir=tmp_path / "cfg", activation_mode="reference")
+    config = StackConfig(work_dir=tmp_path / "cfg")
     assert config.gpu_memory_reclaim == "adaptive"
 
 
@@ -1611,7 +1351,6 @@ def test_stack_dask_persist_stage_reclaim_uses_client_run(
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         gpu_memory_reclaim="eager",
         dask_client=FakeClient(),
     )

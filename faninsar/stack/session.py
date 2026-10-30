@@ -13,12 +13,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import importlib.metadata
 import json
 import os
-import platform
-import sys
-import sysconfig
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
@@ -35,7 +31,7 @@ from faninsar.io.storage.scene_store import (
     form_merged_scene_interferogram,
     validate_reference_binding,
 )
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.network.network import Network, NetworkContract
 from faninsar.network.products import (
     ASSET_KIND_GEOCODE_KERNELS,
@@ -68,7 +64,6 @@ from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.processing.unwrapping.snaphu_backend import Snaphu
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
-    ActivationMode,
     CoregMode,
     FlattenStage,
     StackConfig,
@@ -101,10 +96,6 @@ if TYPE_CHECKING:
     from faninsar.processing.geocoding.geo_resample import GeocodeKind
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
     from faninsar.processing.geometry import DEM, GridSpec
-    from faninsar.processing.geometry.prepared import (
-        ActivationToken,
-        StackActivationBinding,
-    )
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.resources import ResourceBudget
@@ -438,297 +429,71 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-def _callable_identity(callback: object | None) -> dict[str, str] | None:
-    """Return the stable import identity of a callback, when available.
+def _software_fingerprint(stack: Stack) -> str:
+    """Return a deterministic digest of the producing software stack.
 
-    Parameters
-    ----------
-    callback : object, optional
-        Provider callback or callable object.
-
-    Returns
-    -------
-    dict[str, str] or None
-        Module and qualified name, without serializing the callable repr.
-
+    The fingerprint binds the package version, the mission, and the
+    numerical library versions so a product records which software wrote it.
+    It is intentionally environment-free: it does not depend on the host,
+    CUDA devices, or provider instances, so reopening an unchanged product
+    under the same versions stays valid.
     """
-    if callback is None:
-        return None
-    return {
-        "module": str(getattr(callback, "__module__", type(callback).__module__)),
-        "qualname": str(getattr(callback, "__qualname__", type(callback).__qualname__)),
-    }
-
-
-def _provider_callback(provider: object | None) -> object | None:
-    """Return a provider's production callback without inspecting its repr."""
-    if provider is None:
-        return None
-    callback = getattr(provider, "produce_pair", None)
-    if callback is None and callable(provider):
-        callback = provider
-    return callback
-
-
-def _distribution_version(names: tuple[str, ...]) -> str | None:
-    """Read the first installed distribution version from a name allowlist."""
-    for name in names:
-        try:
-            return str(importlib.metadata.version(name))
-        except importlib.metadata.PackageNotFoundError:
-            continue
-        except Exception:
-            logger.debug("Unable to inspect distribution version: %s", name)
-            continue
-    return None
-
-
-def _loaded_module_version(names: tuple[str, ...]) -> str | None:
-    """Read a version from an already-loaded optional module, if exposed."""
-    for name in names:
-        module = sys.modules.get(name)
-        value = getattr(module, "__version__", None) if module is not None else None
-        if value is not None:
-            return str(value)
-    return None
-
-
-def _distribution_version(names: tuple[str, ...]) -> str | None:
-    """Read the first installed distribution version from a name allowlist."""
-    for name in names:
-        try:
-            return str(importlib.metadata.version(name))
-        except importlib.metadata.PackageNotFoundError:
-            continue
-        except Exception:
-            logger.debug("Unable to inspect distribution version: %s", name)
-            continue
-    return None
-
-
-def _loaded_module_version(names: tuple[str, ...]) -> str | None:
-    """Read a version from an already-loaded optional module, if exposed."""
-    for name in names:
-        module = sys.modules.get(name)
-        value = getattr(module, "__version__", None) if module is not None else None
-        if value is not None:
-            return str(value)
-    return None
-
-
-def _runtime_image_identity() -> dict[str, object]:
-    """Return bounded platform metadata identifying the runtime image."""
-    os_release: dict[str, str] = {}
-    try:
-        raw_release = platform.freedesktop_os_release()
-    except (AttributeError, OSError):
-        raw_release = {}
-    for name in ("ID", "VERSION_ID", "BUILD_ID", "IMAGE_ID", "IMAGE_VERSION"):
-        value = raw_release.get(name)
-        if value:
-            os_release[name.lower()] = str(value)
-    return {
-        "platform": platform.platform(aliased=True, terse=True),
-        "system": platform.system(),
-        "release": platform.release(),
-        "machine": platform.machine(),
-        "os_release": os_release,
-    }
-
-
-def _cuda_runtime_identity() -> dict[str, object]:
-    """Return serializable CUDA availability and physical-device identity."""
-    identity: dict[str, object] = {
-        "available": False,
-        "driver": None,
-        "runtime": None,
-        "devices": [],
+    payload = {
+        "faninsar": _faninsar_version(),
+        "mission": type(stack).__name__,
+        "numpy": np.__version__,
     }
     try:
         import torch
-    except Exception:
-        return identity
-    cuda = getattr(torch, "cuda", None)
-    if cuda is None:
-        return identity
-    try:
-        available = bool(cuda.is_available())
-    except Exception:
-        return identity
-    identity["available"] = available
-    version = getattr(torch, "version", None)
-    cuda_runtime = getattr(version, "cuda", None)
-    identity["runtime"] = None if cuda_runtime is None else str(cuda_runtime)
-    driver = getattr(cuda, "driver_version", None)
-    if driver is None:
-        driver = getattr(cuda, "get_driver_version", None)
-    try:
-        if callable(driver):
-            driver = driver()
-    except Exception:
-        driver = None
-    identity["driver"] = None if driver is None else str(driver)
-    if not available:
-        return identity
-    try:
-        count = int(cuda.device_count())
-    except Exception:
-        return identity
-    devices: list[dict[str, object]] = []
-    for index in range(max(0, count)):
-        try:
-            properties = cuda.get_device_properties(index)
-            devices.append(
-                {
-                    "index": index,
-                    "uuid": (
-                        None
-                        if getattr(properties, "uuid", None) is None
-                        else str(properties.uuid)
-                    ),
-                    "name": (
-                        None
-                        if getattr(properties, "name", None) is None
-                        else str(properties.name)
-                    ),
-                }
-            )
-        except Exception:
-            # An unavailable device is still represented by the count and the
-            # availability bit; never let diagnostics prevent S1 execution.
-            devices.append({"index": index, "uuid": None, "name": None})
-    identity["devices"] = devices
-    return identity
 
-
-def _runtime_image_identity() -> dict[str, object]:
-    """Return bounded platform metadata identifying the runtime image."""
-    os_release: dict[str, str] = {}
-    try:
-        raw_release = platform.freedesktop_os_release()
-    except (AttributeError, OSError):
-        raw_release = {}
-    for name in ("ID", "VERSION_ID", "BUILD_ID", "IMAGE_ID", "IMAGE_VERSION"):
-        value = raw_release.get(name)
-        if value:
-            os_release[name.lower()] = str(value)
-    return {
-        "platform": platform.platform(aliased=True, terse=True),
-        "system": platform.system(),
-        "release": platform.release(),
-        "machine": platform.machine(),
-        "os_release": os_release,
-    }
-
-
-def _cuda_runtime_identity() -> dict[str, object]:
-    """Return serializable CUDA availability and physical-device identity."""
-    identity: dict[str, object] = {
-        "available": False,
-        "driver": None,
-        "runtime": None,
-        "devices": [],
-    }
-    try:
-        import torch
-    except Exception:
-        return identity
-    cuda = getattr(torch, "cuda", None)
-    if cuda is None:
-        return identity
-    try:
-        available = bool(cuda.is_available())
-    except Exception:
-        return identity
-    identity["available"] = available
-    version = getattr(torch, "version", None)
-    cuda_runtime = getattr(version, "cuda", None)
-    identity["runtime"] = None if cuda_runtime is None else str(cuda_runtime)
-    driver = getattr(cuda, "driver_version", None)
-    if driver is None:
-        driver = getattr(cuda, "get_driver_version", None)
-    try:
-        if callable(driver):
-            driver = driver()
-    except Exception:
-        driver = None
-    identity["driver"] = None if driver is None else str(driver)
-    if not available:
-        return identity
-    try:
-        count = int(cuda.device_count())
-    except Exception:
-        return identity
-    devices: list[dict[str, object]] = []
-    for index in range(max(0, count)):
-        try:
-            properties = cuda.get_device_properties(index)
-            devices.append(
-                {
-                    "index": index,
-                    "uuid": (
-                        None
-                        if getattr(properties, "uuid", None) is None
-                        else str(properties.uuid)
-                    ),
-                    "name": (
-                        None
-                        if getattr(properties, "name", None) is None
-                        else str(properties.name)
-                    ),
-                }
-            )
-        except Exception:
-            # An unavailable device is still represented by the count and the
-            # availability bit; never let diagnostics prevent S1 execution.
-            devices.append({"index": index, "uuid": None, "name": None})
-    identity["devices"] = devices
-    return identity
-
-
-def _stack_runtime_identity(callback: object | None) -> dict[str, object]:
-    """Build the canonical runtime identity used by all Stack resume stages."""
-    compiler = sysconfig.get_config_var("CC")
-    compiler_name = None
-    if compiler:
-        compiler_name = Path(str(compiler).split()[0]).name
-    return {
-        "versions": {
-            "faninsar": _distribution_version(("FanInSAR", "faninsar")),
-            "nisar": _distribution_version(("nisar", "nisar-products"))
-            or _loaded_module_version(("nisar", "nisar.products")),
-            "isce3": _distribution_version(("isce3", "isce3-python"))
-            or _loaded_module_version(("isce3",)),
-            "numpy": np.__version__,
-            "python": platform.python_version(),
-        },
-        "compiler": {
-            "python": platform.python_compiler(),
-            "python_build": list(platform.python_build()),
-            "c_compiler": compiler_name,
-            "implementation": sys.implementation.name,
-            "cache_tag": sys.implementation.cache_tag,
-        },
-        "runtime_image": _runtime_image_identity(),
-        "cuda": _cuda_runtime_identity(),
-        "callback": _callable_identity(callback),
-    }
-
-
-def _runtime_fingerprint(callback: object | None) -> str:
-    """Return the canonical digest of one Stack execution runtime."""
-    payload = _stack_runtime_identity(callback)
-    try:
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as error:
-        logger.exception("Stack runtime identity cannot be canonicalized")
-        reject_invalid_state(f"Stack runtime identity cannot be canonicalized: {error}")
+        payload["torch"] = str(torch.__version__)
+    except ImportError:
+        payload["torch"] = None
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _faninsar_version() -> str:
+    """Return the installed FanInSAR version, or ``unknown``."""
+    try:
+        import importlib.metadata
+
+        return str(importlib.metadata.version("FanInSAR"))
+    except Exception:
+        try:
+            from faninsar import __version__
+
+            return str(__version__)
+        except Exception:
+            return "unknown"
+
+
+def _dem_sampler_identity(dem: object | None) -> object:
+    """Return a JSON-serializable identity for a DEM sampler.
+
+    ``RasterDEM`` exposes a stable content ``identity`` covering array and
+    file-backed rasters.  Nested samplers (for example a geoid-adjusted DEM)
+    are decomposed through their dataclass fields.  Recipe-style DEMs
+    (``SourceDEM``, ``ConstantDEM``, file-backed ``RasterDEM``) fall back to
+    the strict science encoder.
+    """
+    if dem is None:
+        return None
+    identity = getattr(dem, "identity", None)
+    if isinstance(identity, str) and identity:
+        return {"type": type(dem).__qualname__, "identity": identity}
+    if is_dataclass(dem) and not isinstance(dem, type):
+        return {
+            "type": f"{type(dem).__module__}.{type(dem).__qualname__}",
+            "fields": {
+                item.name: _dem_sampler_identity(getattr(dem, item.name))
+                for item in fields(dem)
+                if not item.name.startswith("_")
+            },
+        }
+    from faninsar.stack.identity import encode_value
+
+    return encode_value(dem)
 
 
 def _phase_screen_lineage(
@@ -863,8 +628,7 @@ def _geocode_product_name(product: object) -> str:
             "geocode product must expose a 'name' that is one safe path "
             f"component; got {name!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return name
 
 
@@ -880,8 +644,7 @@ def _geocode_int_pair(product: object, attribute: str) -> tuple[int, int]:
             f"geocode product attribute {attribute!r} must be a two-integer "
             f"tuple; got {value!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return int(value[0]), int(value[1])
 
 
@@ -900,8 +663,7 @@ def _geocode_resolve_kind(product: object) -> tuple[GeocodeKind, str | None]:
             "geocode product must declare asset_kind; construct a "
             "RadarDomainProduct with AssetKind.LABEL for label masks"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     resolved_kind: GeocodeKind | None
     try:
         resolved_kind = ASSET_KIND_GEOCODE_KERNELS.get(AssetKind(raw))
@@ -912,8 +674,7 @@ def _geocode_resolve_kind(product: object) -> tuple[GeocodeKind, str | None]:
             f"geocode could not infer a resampling kernel from asset_kind "
             f"{raw!r}; use a member of faninsar.network.products.AssetKind"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return resolved_kind, asset_tag
 
 
@@ -953,8 +714,7 @@ def _validate_geocode_output(
         protected.append(layer.source.path.resolve())
     if any(resolved == source or resolved in source.parents for source in protected):
         message = f"geocode output cannot replace a source or its ancestor: {target}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     for parent in resolved.parents:
         item_path = parent / "item.json"
         if item_path.is_file():
@@ -966,13 +726,11 @@ def _validate_geocode_output(
             )
             if not allowed:
                 message = f"geocode output would alter source product {owner.path}"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
     if target.exists():
         if not target.is_dir() or target.is_symlink():
             message = f"geocode path must name a product directory: {target}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         item_path = target / "item.json"
         if item_path.is_file():
             try:
@@ -983,12 +741,10 @@ def _validate_geocode_output(
                 kind = None
             if kind is not None and kind != GEOCODED_KIND:
                 message = f"geocode output cannot replace source product {target}"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
         elif any(target.iterdir()):
             message = f"geocode output contains unrelated files: {target}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
 
 
 def _load_geocoded_product(
@@ -1017,8 +773,7 @@ def _load_geocoded_product(
             "identity (grid, kernel, or source content changed); pass "
             "overwrite=True to replace it"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     if inputs is not None and product.inputs != inputs:
         stale = [
             key
@@ -1030,8 +785,7 @@ def _load_geocoded_product(
             f"source ({', '.join(sorted(stale))}); pass overwrite=True to "
             "regenerate it"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     import rasterio
 
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
@@ -1303,7 +1057,6 @@ class Stack(NetworkContract):
         report: dict[str, object] = {
             "work_dir": str(work),
             "reference": self.reference,
-            "activation_mode": self.config.activation_mode,
         }
         planned_dates = sorted(self.catalog.paths)
         scene_stale: list[str] = []
@@ -1456,8 +1209,7 @@ class Stack(NetworkContract):
                 "the Reference radar geometry is not available; run "
                 "coregister_scenes with coregistration_grid='radar' first"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return radar_geometry_from_record(record), reference.grid_shape
 
     @property
@@ -1715,8 +1467,7 @@ class Stack(NetworkContract):
                     f"{parsed.to_string()}; use raster reprojection or export "
                     "for an output or grid change"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             logger.warning(
                 "geocode: product %r is already georeferenced in %s; "
                 "returning it unchanged",
@@ -1730,12 +1481,10 @@ class Stack(NetworkContract):
         origin = _geocode_int_pair(product, "origin")
         if any(value < 1 for value in looks):
             message = f"multilook must contain positive integers; got {looks}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if any(value < 0 for value in origin):
             message = f"origin must contain non-negative integers; got {origin}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         from faninsar.processing.geocoding.product import layer_frame_shape
 
         layer_shape = layer_frame_shape(
@@ -1754,8 +1503,7 @@ class Stack(NetworkContract):
                 f"{full_radar_shape}, origin={origin}, multilook={looks} "
                 f"(expected {layer_shape})"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         destination = self._geocode_destination_grid(grid)
         target_dir = None if path is None else Path(path)
         if layer is not None and path is None and destination == self.grid:
@@ -1769,8 +1517,7 @@ class Stack(NetworkContract):
             message = (
                 f"geocode output already exists: {target_dir}; pass overwrite=True"
             )
-            logger.error(message)
-            raise FileExistsError(message)
+            reject(message, FileExistsError, logger=logger)
         identity = _geocode_product_identity(
             name=name,
             kind=resolved_kind,
@@ -1874,8 +1621,7 @@ class Stack(NetworkContract):
                 f"{tuple(full_radar_shape)} but the Reference scene grid is "
                 f"{tuple(grid_shape)}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return geometry
 
     def _capture_dem_source(self, dem: object | None = None) -> None:
@@ -2188,8 +1934,7 @@ class Stack(NetworkContract):
         ``Stack`` from guessing a provider or mission.
         """
         message = f"{cls.__name__} does not provide a remote search profile"
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError, logger=logger)
 
     @classmethod
     def search(
@@ -2232,8 +1977,7 @@ class Stack(NetworkContract):
         profile = cls._search_profile()
         if not isinstance(profile, MissionSearchProfile):
             message = "mission search profile must be MissionSearchProfile"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
         merged_filters = merge_profile_filters(profile.default_filters, filters)
         from faninsar.remote import search as remote_search
 
@@ -2276,8 +2020,7 @@ class Stack(NetworkContract):
         """Validate one immutable mission preparation result."""
         if not isinstance(prepared, MissionPreparedInputs):
             message = "_prepare_mission must return MissionPreparedInputs"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
         paths = (
             *prepared.orbit_paths_by_acquisition.values(),
             *prepared.calibration_paths,
@@ -2285,8 +2028,7 @@ class Stack(NetworkContract):
         for path in paths:
             if not Path(path).is_file():
                 message = f"mission preparation path is not a file: {path}"
-                logger.error(message)
-                raise FileNotFoundError(message)
+                reject(message, FileNotFoundError, logger=logger)
         return prepared
 
     def prepare(self) -> Self:
@@ -2333,9 +2075,9 @@ class Stack(NetworkContract):
 
         The method performs no remote search. Local inputs are checked by
         stat (the recorded size must match); runtime values (device, dask
-        client, activation token and binding, provider callback) are supplied
-        as keyword arguments. Committed products are reused; a stage resumes
-        from the first Pair without one.
+        client and provider callback) are supplied as keyword arguments.
+        Committed products are reused; a stage resumes from the first Pair
+        without one.
 
         Parameters
         ----------
@@ -2344,9 +2086,7 @@ class Stack(NetworkContract):
         **runtime : Any
             Runtime-only :class:`StackConfig` values
             (``device``, ``invert_device``, ``executor``, ``n_jobs``,
-            ``gpu_memory_reclaim``, ``resource_budget``,
-            ``activation_binding``, ``activation_token``,
-            ``activation_authority_root``).
+            ``gpu_memory_reclaim``, ``resource_budget``).
 
         Returns
         -------
@@ -2365,7 +2105,7 @@ class Stack(NetworkContract):
         """
         from faninsar.stack.catalog import SceneCatalog
         from faninsar.stack.identity import (
-            RUNTIME_FIELDS,
+            UNSAVED_FIELDS,
             decode_value,
             read_stack_identity,
         )
@@ -2374,14 +2114,14 @@ class Stack(NetworkContract):
         document = read_stack_identity(root)
         mission = str(document["mission"])
         stack_cls = cls if mission == cls.__name__ else _mission_class(mission)
-        unknown = set(runtime) - RUNTIME_FIELDS - {"scene_provider"}
+        runtime_fields = UNSAVED_FIELDS - {"extra"}
+        unknown = set(runtime) - runtime_fields - {"scene_provider"}
         if unknown:
             message = (
                 "Stack.open accepts runtime values only; science options are "
                 "fixed by stack.json: " + ", ".join(sorted(unknown))
             )
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
 
         sources: dict[str, list[Path]] = {}
         for date, entries in document["inputs"]["sources"].items():
@@ -2397,8 +2137,19 @@ class Stack(NetworkContract):
         science = {
             name: decode_value(value) for name, value in document["science"].items()
         }
+        # Drop keys whose field was removed from StackConfig since the
+        # document was written; an older stack.json records more science
+        # than the current version owns.
+        known = {f.name for f in fields(StackConfig)}
+        dropped = sorted(set(science) - known)
+        if dropped:
+            logger.warning(
+                "stack.json science keys not in StackConfig are ignored on reopen: %s",
+                ", ".join(dropped),
+            )
+            for name in dropped:
+                del science[name]
         science["work_dir"] = root
-        science["activation_mode"] = document["activation_mode"]
         science.update(
             {name: value for name, value in runtime.items() if name != "scene_provider"}
         )
@@ -2467,10 +2218,6 @@ class Stack(NetworkContract):
         pair_max_days: int = 72,
         misreg_max_interval: int = 2,
         misreg_max_days: int = 36,
-        activation_mode: ActivationMode = "reference",
-        activation_binding: StackActivationBinding | None = None,
-        activation_token: ActivationToken | None = None,
-        activation_authority_root: str | Path | None = None,
         retain_pair_states: bool = False,
         record_scientific_lineage: bool = False,
         gpu_memory_reclaim: GpuMemoryReclaim = "adaptive",
@@ -2518,14 +2265,6 @@ class Stack(NetworkContract):
             mask_plan=mask_plan or MaskPlan(),
             swaths=swaths,
             bursts=bursts,
-            activation_mode=activation_mode,
-            activation_binding=activation_binding,
-            activation_token=activation_token,
-            activation_authority_root=(
-                Path(activation_authority_root)
-                if activation_authority_root is not None
-                else None
-            ),
             retain_pair_states=retain_pair_states,
             record_scientific_lineage=record_scientific_lineage,
             gpu_memory_reclaim=gpu_memory_reclaim,
@@ -2577,88 +2316,6 @@ class Stack(NetworkContract):
         covering files after local SAFE inputs already exist.
         """
         return
-
-    def _write_qualified_activation_record(self) -> None:
-        """Publish the typed P19 activation record after scene preparation."""
-        if self.config.activation_mode != "qualified":
-            return
-        binding = self.config.activation_binding
-        token = self.config.activation_token
-        if binding is None:
-            reject_invalid_state("qualified Stack activation binding is missing")
-        if token is None:
-            reject_invalid_state("qualified Stack activation token is missing")
-        authority_root = self.config.activation_authority_root
-        if authority_root is None:
-            reject_invalid_state("qualified Stack activation authority is missing")
-        from faninsar.stack.activation import LocalActivationAuthority
-
-        authority = LocalActivationAuthority.open(authority_root)
-        _ = authority.verify_token(token)
-        if binding.activation_token_digest != token.digest():
-            reject_invalid_state("activation token does not match binding digest")
-        if token.parent_id != binding.stack_generation_id:
-            reject_invalid_state(
-                "activation token parent does not match Stack generation"
-            )
-        if token.provider_receipt_digest != binding.qualification_receipt_digest:
-            reject_invalid_state("activation token receipt does not match binding")
-        if token.p18_stack_gate_event_id != binding.p18_stack_gate_event_id:
-            reject_invalid_state("activation token Stack gate does not match binding")
-        if token.p19_qualified_event_ids != binding.p19_qualified_event_ids:
-            reject_invalid_state(
-                "activation token event collection does not match binding"
-            )
-        record = {
-            "schema_version": "scene_artifact_v1",
-            "activation_mode": "qualified",
-            "stack_generation_id": binding.stack_generation_id,
-            "binding": asdict(binding),
-            "activation_token": asdict(token),
-            "activation_token_digest": token.digest(),
-            "scene_dates": list(self.catalog.dates),
-            "reference": self.reference,
-        }
-        path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(path, json.dumps(record, sort_keys=True, indent=2) + "\n")
-
-    def _require_qualified_activation_record(self) -> None:
-        """Validate the immutable activation record before production IFGs."""
-        if self.config.activation_mode != "qualified":
-            return
-        binding = self.config.activation_binding
-        token = self.config.activation_token
-        path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
-        if binding is None or token is None or not path.is_file():
-            reject_invalid_state("qualified Stack activation record is missing")
-        authority_root = self.config.activation_authority_root
-        if authority_root is None:
-            reject_invalid_state("qualified Stack activation authority is missing")
-        from faninsar.stack.activation import LocalActivationAuthority
-
-        authority = LocalActivationAuthority.open(authority_root)
-        _ = authority.verify_token(token)
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            reject_invalid_state(
-                f"qualified Stack activation record is invalid: {error}"
-            )
-        if record.get("schema_version") != "scene_artifact_v1":
-            reject_invalid_state("unsupported Stack activation record schema")
-        expected_binding = json.loads(json.dumps(asdict(binding)))
-        expected_token = json.loads(json.dumps(asdict(token)))
-        if record.get("binding") != expected_binding:
-            reject_invalid_state("Stack activation binding does not match config")
-        if record.get("activation_token") != expected_token:
-            reject_invalid_state("Stack activation token does not match config")
-        if record.get("activation_token_digest") != token.digest():
-            reject_invalid_state("Stack activation token digest is invalid")
-        if record.get("reference") != self.reference:
-            reject_invalid_state("Stack activation Reference does not match config")
-        if record.get("scene_dates") != list(self.catalog.dates):
-            reject_invalid_state("Stack activation scene set does not match catalog")
 
     def _effective_roi_with_mask(self) -> _EffectiveRoi:
         """Resolve the explicit ROI mask stage once per Stack run."""
@@ -2732,13 +2389,11 @@ class Stack(NetworkContract):
                     "radar mask projection requires the authoritative geographic "
                     "mask GridSpec (configure StackConfig.geo_grid)"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             if isinstance(master, dict):
                 if not all(key in master for key in ("crs", "transform", "shape")):
                     message = "radar mask projection master GridSpec is incomplete"
-                    logger.error(message)
-                    raise ValueError(message)
+                    reject(message, ValueError, logger=logger)
                 target = GridSpec(
                     master["crs"], master["transform"], shape=tuple(master["shape"])
                 )
@@ -2746,8 +2401,7 @@ class Stack(NetworkContract):
                 target = GridSpec(master.crs, master.transform, shape=master.shape)
             else:
                 message = "radar mask projection master GridSpec is incomplete"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             materialized = self._materialize_stage_mask(stage, target)
             if materialized is None:
                 return None
@@ -2795,13 +2449,11 @@ class Stack(NetworkContract):
                     f"projected radar mask shape {projected.shape} does not match "
                     f"IFG shape {expected_shape}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             return projected
         if domain != "geo":
             message = f"unsupported mask projection domain {domain!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         grid = self._ifg_geo_grid(looks)
         if grid is None:
             raise ValueError("interferogram masks require an EPSG:4326 geo_grid")
@@ -3095,7 +2747,14 @@ class Stack(NetworkContract):
         misreg_az_px: float,
         misreg_rg_px: float,
     ) -> str:
-        """Return the canonical identity of one coregistration request."""
+        """Return the canonical identity of one coregistration request.
+
+        The identity binds the serialized science configuration, the pair of
+        source inputs (path + stat), the applied misregistration constants,
+        and the upstream ``write_id`` bindings.  It is deliberately
+        environment-free: reopening the same Stack under another Python or
+        CUDA runtime resumes rather than recomputing an unchanged scene.
+        """
 
         def source_identity(path: Path | Sequence[Path]) -> object:
             if not isinstance(path, Path):
@@ -3104,10 +2763,6 @@ class Stack(NetworkContract):
             try:
                 stat = resolved.stat()
             except OSError:
-                # Configuration paths such as an optional cache directory do
-                # not have to exist yet.  Source paths still carry their full
-                # stat identity when available, while an absent path remains
-                # deterministic and is validated by the production call.
                 return {"path": str(resolved)}
             return {
                 "path": str(resolved),
@@ -3117,66 +2772,7 @@ class Stack(NetworkContract):
                 "mtime_ns": int(stat.st_mtime_ns),
             }
 
-        def semantic_value(value: object) -> object:
-            if value is None or isinstance(value, (str, int, float, bool)):
-                result = value
-            elif isinstance(value, Path):
-                result = source_identity(value)
-            elif isinstance(value, np.generic):
-                result = value.item()
-            elif isinstance(value, dict):
-                result = {
-                    str(key): semantic_value(item)
-                    for key, item in sorted(
-                        value.items(), key=lambda item: str(item[0])
-                    )
-                }
-            elif isinstance(value, (tuple, list)):
-                result = [semantic_value(item) for item in value]
-            elif is_dataclass(value) and not isinstance(value, type):
-                result = {
-                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
-                    "fields": {
-                        item.name: semantic_value(getattr(value, item.name))
-                        for item in fields(value)
-                        if not item.name.startswith("_")
-                    },
-                }
-            elif hasattr(value, "identity") and not callable(value.identity):
-                # Public RasterDEM uses slots, so its stable content identity
-                # is the canonical resume key rather than ``__dict__`` state.
-                result = {
-                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
-                    "identity": str(value.identity),
-                }
-            else:
-                public_state = {
-                    name: semantic_value(item)
-                    for name, item in getattr(value, "__dict__", {}).items()
-                    if not name.startswith("_") and not callable(item)
-                }
-                result = {
-                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
-                    "state": public_state,
-                }
-            return result
-
-        def dem_identity(dem: object | None) -> object:
-            return None if dem is None else semantic_value(dem)
-
-        def roi_identity(roi: object | None) -> object:
-            if roi is None:
-                return None
-            geo_interface = getattr(roi, "__geo_interface__", None)
-            if geo_interface is not None:
-                return geo_interface
-            bounds = getattr(roi, "bounds", None)
-            if bounds is not None:
-                return {"type": type(roi).__qualname__, "bounds": list(bounds)}
-            return {"type": type(roi).__qualname__, "value": str(roi)}
-
         def digest_payload(value: object) -> str:
-            """Hash one JSON-compatible identity payload."""
             try:
                 encoded = json.dumps(
                     value,
@@ -3190,222 +2786,49 @@ class Stack(NetworkContract):
                 )
             return hashlib.sha256(encoded).hexdigest()
 
-        def object_metadata(value: object) -> dict[str, object]:
-            """Extract stable source metadata without serializing object reprs."""
-            metadata: dict[str, object] = {}
-            for name in (
-                "source_id",
-                "source_path",
-                "source_uri",
-                "uri",
-                "filename",
-                "path",
-                "content_digest",
-                "source_digest",
-                "content_hash",
-                "sha256",
-                "digest",
-            ):
-                item = getattr(value, name, None)
-                if item is not None and not callable(item):
-                    metadata[name] = semantic_value(item)
-            native = getattr(value, "mission_native", None)
-            if isinstance(native, dict):
-                for name, item in native.items():
-                    key = str(name).lower()
-                    if (
-                        "id" in key
-                        or "digest" in key
-                        or "hash" in key
-                        or key in {"source", "uri", "path"}
-                    ):
-                        metadata[f"mission_native:{name}"] = semantic_value(item)
-            samples = getattr(value, "samples", None)
-            if isinstance(samples, np.ndarray):
-                # Reader products are normally lazy.  For an in-memory source,
-                # include its bytes when reasonably sized so content changes
-                # cannot reuse a prior marker without forcing a full read of a
-                # large mission product.
-                if samples.nbytes <= 32 * 1024 * 1024:
-                    metadata["samples_sha256"] = hashlib.sha256(
-                        np.ascontiguousarray(samples).tobytes()
-                    ).hexdigest()
-                else:
-                    metadata["samples_descriptor"] = {
-                        "shape": list(samples.shape),
-                        "dtype": str(samples.dtype),
-                        "nbytes": int(samples.nbytes),
-                    }
-            for name in ("content", "source_content", "data", "raw_bytes"):
-                content = getattr(value, name, None)
-                if isinstance(content, (bytes, bytearray, memoryview)):
-                    metadata[f"{name}_sha256"] = hashlib.sha256(
-                        bytes(content)
-                    ).hexdigest()
-            return metadata
-
-        def source_object_identity(acquisition_id: str) -> dict[str, object] | None:
-            """Return provider-owned identity metadata for one source, if any."""
-            objects: list[object] = []
-            results = getattr(self, "_nisar_results", None)
-            if isinstance(results, dict) and acquisition_id in results:
-                objects.append(results[acquisition_id])
-                product = getattr(results[acquisition_id], "product", None)
-                if product is not None:
-                    objects.append(product)
-            handles = getattr(self, "_nisar_handles", None)
-            lineage = getattr(self, "_nisar_lineage", None)
-            if isinstance(handles, dict) and isinstance(lineage, dict):
-                source_path = lineage.get(acquisition_id)
-                if source_path is not None:
-                    handle = handles.get(Path(source_path))
-                    if handle is not None:
-                        objects.append(handle)
-            metadata: dict[str, object] = {}
-            for item in objects:
-                metadata.update(object_metadata(item))
-            return metadata or None
-
-        def provider_identity() -> dict[str, object] | None:
-            """Collect the optional mission-provider identity contract."""
-            provider = self.scene_provider
-            if provider is None:
-                return None
-            payload: dict[str, object] = {
-                "name": str(getattr(provider, "name", type(provider).__qualname__)),
-                "capability": str(
-                    getattr(
-                        provider,
-                        "capability",
-                        getattr(provider, "unsupported_capability", "scene-production"),
-                    )
-                ),
-            }
-            capabilities = getattr(provider, "capabilities", None)
-            if capabilities is not None:
-                payload["capabilities"] = semantic_value(capabilities)
-            callback = _provider_callback(provider)
-            callback_identity = _callable_identity(callback)
-            if callback_identity is not None:
-                payload["callback"] = callback_identity
-            # Providers may expose either a plain metadata mapping or a
-            # zero-argument identity hook.  This keeps Stack mission-neutral
-            # while allowing adapters to bind windows, channels, and source
-            # lineage without Stack knowing their implementation details.
-            for name in ("identity_payload", "identity_metadata"):
-                hook = getattr(provider, name, None)
-                if hook is None:
-                    continue
-                try:
-                    metadata = hook() if callable(hook) else hook
-                except Exception as error:
-                    logger.exception("Stack provider identity hook failed")
-                    reject_invalid_state(
-                        f"Stack provider identity hook failed: {error}"
-                    )
-                payload[name] = semantic_value(metadata)
-            return payload
-
-        geo_grid = self.config.geo_grid
-        geo_grid_identity = (
-            None
-            if geo_grid is None
-            else {
-                "crs": geo_grid.crs,
-                "transform": list(geo_grid.transform),
-                "shape": list(geo_grid.shape),
-                "resolution_m": list(geo_grid.resolution_m),
-            }
-        )
-        bursts = self.config.bursts
-        swaths = None if self.config.swaths is None else list(self.config.swaths)
-        serialized_bursts: object
-        if bursts is None:
-            serialized_bursts = None
-        elif isinstance(bursts, dict):
-            serialized_bursts = {
-                str(swath): (
-                    indices
-                    if isinstance(indices, str)
-                    else [int(index) for index in indices]
-                )
-                for swath, indices in sorted(bursts.items())
-            }
-        else:
-            serialized_bursts = semantic_value(bursts)
-        # The coreg identity binds to the ROI the run actually consumed: the
-        # mask-aware effective ROI when the water mask reshaped it, otherwise
-        # the configured ROI unchanged (a degraded unmasked run resumes).
-        effective_roi = self._effective_roi_with_mask()
-        identity_roi = (
-            effective_roi.geometry
-            if effective_roi.geometry is not None
-            else self.config.roi
-        )
-        provider_payload = provider_identity()
-        provider_metadata: dict[str, object] = {}
-        if provider_payload is not None:
-            provider_metadata["provider"] = provider_payload
-            channel = getattr(self, "_nisar_channel", None)
-            if channel is None:
-                channel = getattr(self, "channel", None)
-            if channel is not None:
-                provider_metadata["channel"] = semantic_value(channel)
-            provider_metadata["stack_metadata"] = {
-                name: semantic_value(getattr(self, name))
-                for name in ("_nisar_channel", "_nisar_lineage")
-                if hasattr(self, name)
-            }
-            provider_metadata["source_objects"] = {
-                "reference": source_object_identity(self.reference),
-                "secondary": source_object_identity(date_id),
-            }
-        configuration = {
-            "coreg_mode": self.config.coreg_mode,
-            "flatten_stage": self.config.flatten_stage,
-            "coregistration_grid": self.config.coregistration_grid,
-            "esd_coherence_threshold": self.config.esd_coherence_threshold,
-            "ampcor_snr_threshold": self.config.ampcor_snr_threshold,
-            "multilook": list(self.config.multilook),
-            "goldstein_alpha": self.config.goldstein_alpha,
-            "executor": self.config.executor,
-            "device": self.config.device,
-            "invert_device": self.config.invert_device,
-            "control_spacing": self.config.control_spacing,
-            "n_jobs": self.config.n_jobs,
-            "swaths": swaths,
-            "bursts": serialized_bursts,
-            "extra": semantic_value(self.config.extra),
-        }
-        callback = _provider_callback(self.scene_provider)
-        runtime = _stack_runtime_identity(callback)
+        reference = self.reference_scene
         payload = {
             "schema": "stack_coreg_request_v1",
             "reference_id": self.reference,
             "date_id": date_id,
             "reference_source": source_identity(self.catalog.paths_for(self.reference)),
             "secondary_source": source_identity(self.catalog.paths_for(date_id)),
-            "coreg_mode": self.config.coreg_mode,
-            "flatten_stage": self.config.flatten_stage,
-            "coregistration_grid": self.config.coregistration_grid,
-            "esd_coherence_threshold": self.config.esd_coherence_threshold,
-            "ampcor_snr_threshold": self.config.ampcor_snr_threshold,
-            "swaths": swaths,
-            "bursts": serialized_bursts,
-            "roi": roi_identity(identity_roi),
-            "dem": dem_identity(self.config.dem),
-            "geo_grid": geo_grid_identity,
-            "control_spacing": self.config.control_spacing,
-            "executor": self.config.executor,
-            "device": self.config.device,
+            "science": self._coreg_science_config(),
             "misreg_az_px": float(misreg_az_px),
             "misreg_rg_px": float(misreg_rg_px),
-            "provider_metadata": provider_metadata,
-            "configuration": configuration,
-            "configuration_fingerprint": digest_payload(configuration),
-            "runtime_fingerprint": digest_payload(runtime),
+            "inputs": {
+                "reference": None if reference is None else reference.write_id,
+                **self._scene_misreg_inputs(),
+            },
         }
         return digest_payload(payload)
+
+    def _coreg_science_config(self) -> dict[str, object]:
+        """Return the JSON-encoded science config that shapes one scene."""
+        from faninsar.stack.identity import encode_value
+
+        config = self.config
+        effective_roi = self._effective_roi_with_mask()
+        roi = (
+            effective_roi.geometry if effective_roi.geometry is not None else config.roi
+        )
+        return {
+            "coreg_mode": config.coreg_mode,
+            "flatten_stage": config.flatten_stage,
+            "coregistration_grid": config.coregistration_grid,
+            "esd_coherence_threshold": config.esd_coherence_threshold,
+            "ampcor_snr_threshold": config.ampcor_snr_threshold,
+            "multilook": list(config.multilook),
+            "goldstein_alpha": config.goldstein_alpha,
+            "control_spacing": config.control_spacing,
+            "swaths": config.swaths,
+            "bursts": encode_value(config.bursts),
+            "roi": encode_value(roi),
+            "dem": _dem_sampler_identity(config.dem),
+            "geo_grid": encode_value(config.geo_grid),
+            "mask_plan": encode_value(config.mask_plan),
+            "extra": encode_value(config.extra),
+        }
 
     def _misreg_dir(self) -> Path:
         """Return the misreg product directory."""
@@ -3770,7 +3193,6 @@ class Stack(NetworkContract):
             del state
             gc.collect()
             self._reclaim_accelerator("persist")
-        self._write_qualified_activation_record()
         return self
 
     def _scene_misreg_inputs(self) -> dict[str, str]:
@@ -3894,7 +3316,6 @@ class Stack(NetworkContract):
         """
         coherence_window = validate_coherence_window(coherence_window)
         self._ensure_prepared()
-        self._require_qualified_activation_record()
 
         from faninsar.processing.runtime.resources import (
             ResourceAdmissionLedger,
@@ -3952,12 +3373,6 @@ class Stack(NetworkContract):
                 expected_sources = {
                     "primary": primary_store.manifest_digest,
                     "secondary": secondary_store.manifest_digest,
-                    # The IFG manifest is also a runtime admission boundary:
-                    # reusing bytes produced under another binary, Python,
-                    # CUDA, or provider callback identity is unsafe.
-                    "runtime": _runtime_fingerprint(
-                        _provider_callback(self.scene_provider)
-                    ),
                 }
                 mask_plan_identity = self.config.mask_plan.identity
                 mask_identity = None
@@ -3986,7 +3401,17 @@ class Stack(NetworkContract):
                         "grid_identity": existing_store.grid_identity,
                         "filter_name": existing_store.filter_name,
                         "filter_parameters": existing_store.filter_parameters,
-                        "sources": existing_store.source_manifest_digests,
+                        # Products written before the runtime fingerprint was
+                        # removed still carry a ``runtime`` entry next to the
+                        # real scene digests; it is not a source, so it does
+                        # not participate in the lineage comparison.
+                        "sources": {
+                            role: digest
+                            for role, digest in (
+                                existing_store.source_manifest_digests.items()
+                            )
+                            if role != "runtime"
+                        },
                         "flatten_stage": existing_store.flatten_stage,
                         "phase_screen_model": existing_store.phase_screen_model,
                         "phase_screen_digests": existing_store.phase_screen_digests,
@@ -4326,9 +3751,8 @@ class Stack(NetworkContract):
         )
 
         if not isinstance(unwrapper, SpatialUnwrapper):
-            logger.error("Stack unwrap requires a SpatialUnwrapper instance")
             message = "unwrapper must be a SpatialUnwrapper"
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
 
         expected_pairs = tuple(_iter_pair_dates(self.pairs))
         if not expected_pairs or len(set(expected_pairs)) != len(expected_pairs):
@@ -4458,9 +3882,8 @@ class Stack(NetworkContract):
                     except (NoValidSupportError, ResourceAdmissionError):
                         raise
                     except Exception as error:
-                        logger.exception("Stack spatial unwrap failed for %s", pair_id)
                         message = f"spatial unwrap failed for Pair {pair_id}"
-                        raise UnwrapFailedError(message) from error
+                        reject(message, UnwrapFailedError, cause=error, logger=logger)
                 finally:
                     if solver_reservation is not None:
                         solver_reservation.release()
@@ -4695,15 +4118,13 @@ class Stack(NetworkContract):
         del model
         if solver.lower() != "sbas":
             message = f"unsupported Stack time-series solver {solver!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if not self.analysis_ready:
             message = (
                 "Stack Network analysis is unavailable before every planned Pair "
                 "has a current interferogram and unwrap product"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return NetworkContract.analyze_time_series(self, **kwargs)
 
     def _analyze_network_products(
@@ -5029,7 +4450,6 @@ def _check_input(entry: object) -> Path:
         message = (
             f"Stack input is missing: {path}; restore it or rebuild the work directory"
         )
-        logger.error(message)
         reject_invalid_state(message)
     recorded = entry.get("size")
     if isinstance(recorded, int) and path.stat().st_size != recorded:
@@ -5037,7 +4457,6 @@ def _check_input(entry: object) -> Path:
             f"Stack input changed on disk: {path} recorded {recorded} bytes, "
             f"found {path.stat().st_size}"
         )
-        logger.error(message)
         reject_invalid_state(message)
     return path
 
@@ -5065,5 +4484,4 @@ def _mission_class(mission: str) -> type[Stack]:
         f"stack.json mission {mission!r} is not a known Stack subclass; rebuild "
         "this work directory with the FanInSAR version that created it"
     )
-    logger.error(message)
-    raise InvalidProcessingStateError(message)
+    return reject(message, InvalidProcessingStateError, logger=logger)

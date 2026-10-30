@@ -3,11 +3,13 @@
 The document holds identity only: mission, Reference, local inputs, the
 fully serializable science configuration, the DEM recipe, the mask plan,
 and the planned Pair networks. Results, reports, and progress never enter
-it. Every :class:`~faninsar.stack.config.StackConfig` field and every
-``extra`` key is classified as science, runtime, or derived in the tables
-below; a field added without classification fails at save time, and an
-unserializable science value fails at save time instead of silently
-changing the Stack.
+it. Every :class:`~faninsar.stack.config.StackConfig` field is either a
+saved science value or listed in :data:`UNSAVED_FIELDS` (runtime
+supplied per process, or derived from products); a field added without
+classification fails at save time, and an unserializable science value
+fails at save time instead of silently changing the Stack. ``extra``
+keys in :data:`SAVED_EXTRA_KEYS` are persisted with the science config;
+all other ``extra`` keys are session state and are ignored.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 
 if TYPE_CHECKING:
@@ -31,33 +33,11 @@ logger = setup_logger(__name__)
 STACK_IDENTITY_SCHEMA = "faninsar.stack.v1"
 STACK_JSON_NAME = "stack.json"
 
-# Science values survive reopen exactly; a changed value is rejected.
-SCIENCE_FIELDS = frozenset(
-    {
-        "coreg_mode",
-        "flatten_stage",
-        "coregistration_grid",
-        "esd_coherence_threshold",
-        "ampcor_snr_threshold",
-        "multilook",
-        "goldstein_alpha",
-        "dem",
-        "geo_grid",
-        "swaths",
-        "bursts",
-        "roi",
-        "mask_plan",
-        "control_spacing",
-        "retain_pair_states",
-        "record_scientific_lineage",
-        "grid",
-        "resolution_m",
-        "dem_cache_dir",
-        "on_network_failure",
-    }
-)
-# Runtime values are supplied per process at ``Stack.open`` and never saved.
-RUNTIME_FIELDS = frozenset(
+# StackConfig fields that never enter ``stack.json``: runtime values
+# supplied per process at ``Stack.open`` and derived values recomputed
+# from products. Every other config field is a science value that is
+# saved and must round-trip exactly.
+UNSAVED_FIELDS = frozenset(
     {
         "work_dir",
         "device",
@@ -66,15 +46,13 @@ RUNTIME_FIELDS = frozenset(
         "n_jobs",
         "gpu_memory_reclaim",
         "resource_budget",
-        "activation_binding",
-        "activation_token",
-        "activation_authority_root",
+        "extra",
     }
 )
-# Derived values are recomputed from products and never saved.
-DERIVED_FIELDS = frozenset({"extra", "activation_mode"})
-
-SCIENCE_EXTRA_KEYS = frozenset(
+# ``extra`` keys persisted with the science configuration. All other
+# keys are session state — runtime caches, provider selections, search
+# bookkeeping — and are ignored.
+SAVED_EXTRA_KEYS = frozenset(
     {
         "orbit_paths",
         "calibration_paths",
@@ -90,25 +68,6 @@ SCIENCE_EXTRA_KEYS = frozenset(
         "height_m",
     }
 )
-RUNTIME_EXTRA_KEYS = frozenset(
-    {
-        "orbit_cache_dir",
-        "geo_lut_cache_dir",
-        "geo_work_dir",
-        "admission_policy",
-    }
-)
-DERIVED_EXTRA_KEYS = frozenset(
-    {
-        "selected_footprints",
-        "excluded_acquisitions",
-        "search_product_type",
-        "search_polarizations",
-        "search_items",
-        "roi_granularity",
-        "roi_provider",
-    }
-)
 
 
 def _fail_unserializable(value: object) -> NoReturn:
@@ -117,7 +76,6 @@ def _fail_unserializable(value: object) -> NoReturn:
         f"{type(value).__name__!r}; classify the value or pass a serializable "
         "science configuration"
     )
-    logger.error(message)
     reject_invalid_state(message)
 
 
@@ -341,8 +299,7 @@ def _decode_dem(payload: Mapping[str, object]) -> Any:
     if kind == "constant":
         return DEM.from_constant(float(payload["height"]))
     message = f"stack.json DEM recipe is invalid: {kind!r}"
-    logger.error(message)
-    raise InvalidProcessingStateError(message)
+    return reject(message, InvalidProcessingStateError, logger=logger)
 
 
 def _input_record(path: Path) -> dict[str, object]:
@@ -356,7 +313,6 @@ def _input_record(path: Path) -> dict[str, object]:
     """
     if not path.exists():
         message = f"Stack input is missing: {path}"
-        logger.error(message)
         reject_invalid_state(message)
     from faninsar.remote.fetch.complete import read_verification
 
@@ -384,7 +340,7 @@ def stack_identity(stack: Stack) -> dict[str, object]:
     -------
     dict
         The identity document: schema, mission, Reference, inputs, planned
-        Pair networks, activation mode, and science configuration.
+        Pair networks, and science configuration.
 
     Raises
     ------
@@ -394,35 +350,18 @@ def stack_identity(stack: Stack) -> dict[str, object]:
 
     """
     config = stack.config
-    classified = {field.name for field in fields(type(config))}
-    unknown_fields = classified - SCIENCE_FIELDS - RUNTIME_FIELDS - DERIVED_FIELDS
-    if unknown_fields:
-        message = (
-            "StackConfig fields are not classified in the stack.json tables: "
-            + ", ".join(sorted(unknown_fields))
-        )
-        logger.error(message)
-        reject_invalid_state(message)
-    unclassified_extra = set(config.extra) - (
-        SCIENCE_EXTRA_KEYS | RUNTIME_EXTRA_KEYS | DERIVED_EXTRA_KEYS
-    )
-    if unclassified_extra:
-        message = (
-            "StackConfig.extra keys are not classified in the stack.json tables: "
-            + ", ".join(sorted(unclassified_extra))
-        )
-        logger.error(message)
-        reject_invalid_state(message)
     science: dict[str, object] = {}
-    for name in sorted(SCIENCE_FIELDS):
-        value = getattr(config, name)
-        if name == "dem" and stack._dem_source is not None:
+    for field in fields(type(config)):
+        if field.name in UNSAVED_FIELDS:
+            continue
+        value = getattr(config, field.name)
+        if field.name == "dem" and stack._dem_source is not None:
             value = stack._dem_source
-        science[name] = encode_value(value)
+        science[field.name] = encode_value(value)
     extra = {
         key: encode_value(config.extra[key])
         for key in sorted(config.extra)
-        if key in SCIENCE_EXTRA_KEYS
+        if key in SAVED_EXTRA_KEYS
     }
     return {
         "schema": STACK_IDENTITY_SCHEMA,
@@ -445,7 +384,6 @@ def stack_identity(stack: Stack) -> dict[str, object]:
         "misreg_pairs": [
             f"{first}_{second}" for first, second in _pair_dates(stack.misreg_pairs)
         ],
-        "activation_mode": config.activation_mode,
         "science": science,
         "science_extra": extra,
     }
@@ -528,7 +466,6 @@ def read_stack_identity(work_dir: str | Path) -> dict[str, object]:
             f"{path} is missing; this work directory was not created by the "
             "current FanInSAR Stack — rebuild it"
         )
-        logger.error(message)
         reject_invalid_state(message)
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -546,6 +483,5 @@ def read_stack_identity(work_dir: str | Path) -> dict[str, object]:
             f"{path} is not a FanInSAR Stack identity; rebuild this work "
             "directory with the current FanInSAR version"
         )
-        logger.error(message)
         reject_invalid_state(message)
     return document

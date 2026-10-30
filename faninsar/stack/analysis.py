@@ -54,13 +54,10 @@ IONOSPHERE_METHOD_NAME = "ionosphere_split_spectrum"
 
 
 def _runtime_identity(stack: Stack) -> str:
-    """Return the canonical Stack runtime fingerprint for admission."""
-    from faninsar.stack.session import (
-        _provider_callback,
-        _runtime_fingerprint,
-    )
+    """Return the producing software fingerprint recorded as provenance."""
+    from faninsar.stack.session import _software_fingerprint
 
-    return _runtime_fingerprint(_provider_callback(stack.scene_provider))
+    return _software_fingerprint(stack)
 
 
 def _resolve_device(stack: Stack, device: str | None) -> str:
@@ -179,7 +176,6 @@ def estimate_ionosphere(
     from faninsar.stack.session import _iter_pair_dates
 
     stack._ensure_prepared()
-    stack._require_qualified_activation_record()
 
     ion_looks = tuple(int(value) for value in (ion_multilook or stack.config.multilook))
     if len(ion_looks) != 2 or any(value < 1 for value in ion_looks):

@@ -37,7 +37,6 @@ def _stack(
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / name / "work",
-        activation_mode="reference",
         pairs=Pairs.from_names(
             [f"{first}_{second}" for first, second in zip(dates, dates[1:])]
         ),
@@ -363,12 +362,13 @@ def test_science_configuration_round_trips(tmp_path: Path) -> None:
     save_stack_identity(reopened)
 
 
-def test_unclassified_config_field_fails_at_save(
+def test_new_config_field_is_saved_as_science(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A StackConfig field added without classification fails at save."""
-    from dataclasses import dataclass, field as dc_field
+    """A StackConfig field not in UNSAVED_FIELDS is saved as a science value."""
+    from dataclasses import dataclass
+    from dataclasses import field as dc_field
     from typing import Any as AnyType
 
     from faninsar.stack.config import StackConfig
@@ -377,7 +377,7 @@ def test_unclassified_config_field_fails_at_save(
 
     @dataclass
     class Extended(StackConfig):
-        """Config carrying an unclassified field."""
+        """Config carrying an additional field."""
 
         future_option: AnyType | None = dc_field(default=None)
 
@@ -387,11 +387,13 @@ def test_unclassified_config_field_fails_at_save(
             for f in __import__("dataclasses").fields(StackConfig)
         }
     )
+    config.future_option = 3
     config.work_dir = stack.config.work_dir
     monkeypatch.setattr(type(stack), "config", config, raising=False)
     object.__setattr__(stack, "config", config)
-    with pytest.raises(InvalidProcessingStateError, match="not classified"):
-        save_stack_identity(stack)
+    path = save_stack_identity(stack)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["science"]["future_option"] == 3
 
 
 def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> None:
