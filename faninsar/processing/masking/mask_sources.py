@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from faninsar.data.query import BoundingBox
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import dem_sources as _dem_sources
 from faninsar.processing.geometry.dem_sources import _bounds_tuple
@@ -75,7 +75,6 @@ __all__ = [
     "GswOccurrenceSource",
     "MaskExtraction",
     "MaskSource",
-    "MaskSourceUnavailableError",
     "OsmOverpassSource",
     "WorldCoverWaterSource",
     "get_mask_source",
@@ -125,10 +124,6 @@ AuthClass = Literal["none", "token"]
 _EXTRACTION_MODES: frozenset[str] = frozenset({"threshold", "categorical", "vector"})
 
 BoundsLike = BoundingBox | tuple[float, float, float, float]
-
-
-class MaskSourceUnavailableError(InvalidProcessingStateError):
-    """A registry mask source cannot serve the request or is not yet wired."""
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +215,7 @@ def tile_snap(band: tuple[float, float], tile_size_deg: float) -> tuple[float, f
     """
     if tile_size_deg <= 0:
         message = f"tile_size_deg must be positive, got {tile_size_deg!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     lower, upper = float(band[0]), float(band[1])
     snapped_lower = math.floor((lower + 180.0) / tile_size_deg) * tile_size_deg - 180.0
     snapped_upper = (
@@ -412,33 +406,28 @@ class MaskSource(ABC):
         validate_mask_source_name(self.name)
         if self.tile_size_deg < 0.0:
             message = f"tile_size_deg must be >= 0, got {self.tile_size_deg!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.resolution_m < 0.0:
             message = f"resolution_m must be >= 0, got {self.resolution_m!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.extraction not in _EXTRACTION_MODES:
             message = (
                 f"invalid extraction mode {self.extraction!r}: expected one of "
                 f"{sorted(_EXTRACTION_MODES)}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.extraction == "threshold" and self.threshold is None:
             message = (
                 f"source {self.name!r} uses 'threshold' extraction but no "
                 "default threshold is configured"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.extraction == "categorical" and not self.excluded_values:
             message = (
                 f"source {self.name!r} uses 'categorical' extraction but no "
                 "excluded_values are configured"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     @abstractmethod
     def plan(self, bounds: BoundsLike) -> FetchPlan:
@@ -560,8 +549,7 @@ class OsmOverpassSource(MaskSource):
                 f"Overpass endpoint must be https (got {self.endpoint!r}); "
                 "plain-http endpoints are rejected fail-closed"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     def plan(self, bounds: BoundsLike) -> FetchPlan:
         """Fail closed: the Overpass response-size cap is pending."""
@@ -571,8 +559,7 @@ class OsmOverpassSource(MaskSource):
             "response-size cap and truncation detection are pending "
             "(PROPOSAL-0039); select 'gsw' or 'worldcover' instead"
         )
-        logger.error(message)
-        raise MaskSourceUnavailableError(message)
+        reject(message, InvalidProcessingStateError)
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +601,7 @@ def parse_mask_selection(selection: str) -> MaskSource:
             f"invalid mask selection {selection!r}: at most one ':' separator "
             "is allowed ('<product>' or '<product>:<provider>')"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     product = parts[0]
     provider = parts[1] if len(parts) == 2 else None
     if product not in MASK_PRODUCT_DEFAULTS:
@@ -623,8 +609,7 @@ def parse_mask_selection(selection: str) -> MaskSource:
         message = (
             f"unknown mask product {product!r}; valid products are: {valid_products}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     providers = MASK_PRODUCT_DEFAULTS[product]["providers"]
     default_provider = MASK_PRODUCT_DEFAULTS[product]["default"]
     if provider is None:
@@ -634,16 +619,14 @@ def parse_mask_selection(selection: str) -> MaskSource:
             f"unknown mask provider {provider!r} for product {product!r}; "
             f"valid providers are: {', '.join(sorted(providers))}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     pair = (product, provider)
     if pair not in _PRODUCT_REGISTRY:
         message = (
             f"provider {provider!r} is not wired for product {product!r} "
             "(registered but unavailable in this release)"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return get_mask_source(_PRODUCT_REGISTRY[pair])
 
 
@@ -759,5 +742,4 @@ def get_mask_source(name: str) -> MaskSource:
     message = f"unknown mask source {name!r}; valid sources are: " + ", ".join(
         list_mask_sources()
     )
-    logger.error(message)
-    raise ValueError(message) from None
+    return reject(message, ValueError, cause=None)

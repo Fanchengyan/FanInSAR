@@ -67,7 +67,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.data.query import BoundingBox
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_sources import _bounds_tuple
 from faninsar.processing.geometry.dem_transport import (
@@ -91,7 +91,6 @@ from faninsar.processing.masking.mask_sources import (
     AUTO_SOURCE_NAME,
     WATER_CLASSIFICATION_VERSION,
     MaskSource,
-    MaskSourceUnavailableError,
     get_mask_source,
 )
 
@@ -335,8 +334,7 @@ def _geojson_payload(
         categories = ("water",) * len(parts)
     if len(categories) != len(parts):
         message = "water geometry categories must align with polygons"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     features = [
         {
             "type": "Feature",
@@ -389,8 +387,7 @@ def _load_layer_features(path: Path) -> tuple[list[BaseGeometry], tuple[str, ...
         category = properties.get("category", "water")
         if category not in {"ocean", "inland", "water"}:
             message = f"invalid water layer category {category!r}"
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
         geometries.append(geometry)
         categories.append(str(category))
     return geometries, tuple(categories)
@@ -596,23 +593,20 @@ class MaskManager:
         self.cache_dir = Path(self.cache_dir)
         if not float(self.buffer_km) >= 0.0:
             message = f"buffer_km must be a number >= 0; got {self.buffer_km!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self.buffer_km = float(self.buffer_km)
         for field_name in ("ocean_shore_keep_m", "inland_shore_keep_m"):
             value = float(getattr(self, field_name))
             if not np.isfinite(value) or value < 0.0:
                 message = f"{field_name} must be a finite number >= 0; got {value!r}"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             setattr(self, field_name, value)
         if self.on_failure not in _ON_FAILURE_POLICIES:
             message = (
                 f"invalid on_failure policy {self.on_failure!r}: expected one "
                 f"of {sorted(_ON_FAILURE_POLICIES)}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.source is not None:
             entry = get_mask_source(str(self.source))
         else:
@@ -630,8 +624,7 @@ class MaskManager:
                 f"{MASK_SOURCE_URL_ENV}-style overrides must use https, "
                 f"got {self.base_url!r}"
             )
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
         parts = urllib.parse.urlsplit(base)
         if parts.username is not None or parts.password is not None:
             message = (
@@ -639,16 +632,14 @@ class MaskManager:
                 "credentials: a userinfo (user:pass@host) netloc is rejected "
                 "fail-closed at runtime"
             )
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
         if hasattr(entry, "base_url"):
             return replace(entry, base_url=base)
         message = (
             f"mask source {entry.name!r} ({entry.provider}) does not accept "
             "a base URL override; its endpoint is pinned"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        return reject(message, InvalidProcessingStateError)
 
     # -- identity -----------------------------------------------------------
 
@@ -744,8 +735,7 @@ class MaskManager:
                 f"({reason}); bounds={raw} fail closed before any tile "
                 "fetch (PROPOSAL-0039)"
             )
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
 
     def _prepare(self, bounds: Bounds) -> tuple[LonLatBounds, FetchPlan, str]:
         """Normalize bounds, guard the seam, plan, and resolve the version.
@@ -981,19 +971,16 @@ class MaskManager:
                             "water source did not qualify ocean versus inland "
                             "geometry, but category policies differ"
                         )
-                        logger.error(message)
-                        raise InvalidProcessingStateError(message)
+                        reject(message, InvalidProcessingStateError)
                     category = "inland"
                 if category not in {"ocean", "inland"}:
                     message = (
                         f"water source returned an unqualified category {category!r}"
                     )
-                    logger.error(message)
-                    raise InvalidProcessingStateError(message)
+                    reject(message, InvalidProcessingStateError)
                 if not hasattr(geometry, "is_empty"):
                     message = "water source returned a non-geometric polygon"
-                    logger.error(message)
-                    raise InvalidProcessingStateError(message)
+                    reject(message, InvalidProcessingStateError)
                 if not geometry.is_empty:
                     records.append((geometry, category))
         if not records:
@@ -1163,11 +1150,10 @@ class MaskManager:
         Raises
         ------
         InvalidProcessingStateError
-            If the antimeridian seam guard rejects the bounds (structural).
+            If the antimeridian seam guard rejects the bounds (structural),
+            or for sources that arrive already vector (not wired in v1).
         MaskProviderUnavailableError
             When any tile of the fetch set fails.
-        MaskSourceUnavailableError
-            For sources that arrive already vector (not wired in v1).
 
         """
         entry = self.source_entry
@@ -1184,8 +1170,7 @@ class MaskManager:
                     "cached water layer lacks authoritative ocean/inland category, "
                     "but category policies differ"
                 )
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
+                reject(message, InvalidProcessingStateError)
             return WaterLayer(
                 path=layer_path,
                 identity=identity,
@@ -1201,8 +1186,7 @@ class MaskManager:
                 "extraction/polygonization is not applicable and the "
                 "Overpass provider is not wired in v1"
             )
-            logger.error(message)
-            raise MaskSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         tiles = self._resolve_tiles(plan)
         parts, categories = self._vectorize_features(tiles, band)
         _atomic_write_json(layer_path, _geojson_payload(parts, categories))
@@ -1293,8 +1277,7 @@ class MaskManager:
                     "mask rasterizes onto EPSG:4326 DEM mosaics only "
                     "(fail closed)"
                 )
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
+                return reject(message, InvalidProcessingStateError)
             transform = dataset.transform
             grid_shape = (dataset.height, dataset.width)
             validity = dataset.read_masks(1) != 0
@@ -1401,16 +1384,14 @@ def get_mask_manager(
             "water mask. Point it at a folder for the raw mask tile "
             "download cache."
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
     selection = source if source is not None else os.environ.get(MASK_SOURCE_ENV)
     raw_buffer = buffer_km if buffer_km is not None else os.environ.get(MASK_BUFFER_ENV)
     try:
         resolved_buffer = 1.0 if raw_buffer is None else float(raw_buffer)
     except (TypeError, ValueError) as error:
         message = f"{MASK_BUFFER_ENV} must be a number >= 0; got {raw_buffer!r}"
-        logger.exception(message)
-        raise ValueError(message) from error
+        reject(message, ValueError, cause=error)
     return MaskManager(
         cache_dir=Path(cache_dir),
         source=selection,
@@ -1463,23 +1444,19 @@ def realize_water(
         deferred = recipe
     if not isinstance(deferred, Mapping):
         message = "water realization requires a deferred water recipe mapping"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     bounds = deferred.get("bounds")
     if bounds is None:
         message = "deferred water recipe requires finite bounds at realization"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     try:
         raw_bounds = tuple(float(value) for value in _bounds_tuple(bounds))
     except (TypeError, ValueError) as error:
         message = "deferred water recipe bounds must contain four finite numbers"
-        logger.exception(message)
-        raise ValueError(message) from error
+        reject(message, ValueError, cause=error)
     if len(raw_bounds) != 4 or not np.all(np.isfinite(raw_bounds)):
         message = "deferred water recipe bounds must contain four finite numbers"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     provider = str(deferred.get("provider", "auto"))
     if provider == "auto":
         selection = AUTO_SOURCE_NAME
@@ -1492,8 +1469,7 @@ def realize_water(
         policy = {}
     if not isinstance(policy, Mapping):
         message = "deferred water recipe policy must be a mapping"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     accepted = {
         "threshold",
         "excluded_values",
@@ -1510,13 +1486,11 @@ def realize_water(
         message = (
             f"deferred water recipe policy contains unsupported fields: {unknown!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     options = {key: value for key, value in policy.items() if key in accepted}
     if cache_dir is None and not os.environ.get(MASK_CACHE_ENV):
         message = f"{MASK_CACHE_ENV} is not set; cannot realize deferred water mask"
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
     manager = MaskManager(
         cache_dir=Path(cache_dir)
         if cache_dir is not None

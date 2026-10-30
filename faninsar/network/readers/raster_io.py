@@ -14,8 +14,6 @@ from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 from faninsar.processing.geometry.profiles import Profile
 
-from .exceptions import COGValidationError
-
 if TYPE_CHECKING:
     from os import PathLike
 
@@ -309,14 +307,14 @@ def validate_cog(raster_path: str | PathLike) -> bool:
 
     Raises
     ------
-    COGValidationError
+    ValueError
         If the file does not have COG-like properties.
 
     """
     path = Path(raster_path)
     if not path.exists():
         msg = f"File does not exist: {path}"
-        raise COGValidationError(msg)
+        raise ValueError(msg)
 
     try:
         from rio_cogeo.cogeo import cog_validate
@@ -332,7 +330,7 @@ def validate_cog(raster_path: str | PathLike) -> bool:
     with rasterio.open(path) as ds:
         if not ds.profile.get("tiled", False):
             msg = f"Raster is not tiled: {path}"
-            raise COGValidationError(msg)
+            raise ValueError(msg)
         if ds.profile.get("compress") is None:
             logger.warning("Raster has no compression: %s", path)
 

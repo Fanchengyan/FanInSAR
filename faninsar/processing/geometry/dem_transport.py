@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Literal
 
 import requests
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 
 if TYPE_CHECKING:
@@ -62,7 +62,6 @@ __all__ = [
     "FetchPlan",
     "Tile",
     "TileSet",
-    "TransientDemFetchError",
     "compute_backoff_sleep",
     "expand_tile_parts",
     "extract_zip_members",
@@ -180,15 +179,13 @@ class Artifact(FetchPlan):
         object.__setattr__(self, "scheme", str(self.scheme))
         if self.scheme not in {"https", "ftp"}:
             message = f"artifact scheme must be 'https' or 'ftp', got {self.scheme!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.members is not None and self.member_pattern is not None:
             message = (
                 "artifact plan accepts members or member_pattern, not both "
                 "(ambiguous extraction contract)"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +258,7 @@ class EarthdataCredentialProvider(CredentialProvider):
             "EARTHDATA_TOKEN environment variable "
             "(register at https://urs.earthdata.nasa.gov)."
         )
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
 
 
 def resolve_credentials(credential_ref: str) -> CredentialProvider:
@@ -271,8 +267,7 @@ def resolve_credentials(credential_ref: str) -> CredentialProvider:
         EarthdataCredentialProvider.require_available()
         return EarthdataCredentialProvider("urs.earthdata.nasa.gov")
     message = f"unknown credential reference: {credential_ref!r}"
-    logger.error(message)
-    raise ValueError(message)
+    return reject(message, ValueError)
 
 
 def redact_url(url: str) -> str:
@@ -311,10 +306,6 @@ def _scrub_message(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
-
-
-class TransientDemFetchError(InvalidProcessingStateError):
-    """Retries exhausted on a retryable failure."""
 
 
 class DemAuthProviderError(InvalidProcessingStateError):
@@ -410,7 +401,7 @@ def _request_with_retries(
                 allow_redirects=False,
             )
             if response.status_code in RETRYABLE_STATUS_CODES:
-                last_error = TransientDemFetchError(
+                last_error = InvalidProcessingStateError(
                     f"transient status {response.status_code} for {redact_url(url)}"
                 )
                 logger.warning(
@@ -438,8 +429,7 @@ def _request_with_retries(
                     f"DEM fetch failed with status {response.status_code} "
                     f"for {redact_url(url)}"
                 )
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
+                reject(message, InvalidProcessingStateError)
             return response  # noqa: TRY300
         except DemAuthProviderError:
             raise
@@ -490,8 +480,7 @@ def _request_with_retries(
         f"DEM fetch exhausted {MAX_ATTEMPTS} attempts for {redact_url(url)} "
         f"({type(last_error).__name__ if last_error else 'unknown'})"
     )
-    logger.error(message)
-    raise TransientDemFetchError(message) from last_error
+    return reject(message, InvalidProcessingStateError, cause=last_error)
 
 
 # ---------------------------------------------------------------------------
@@ -529,15 +518,13 @@ def validate_plan_urls(plan: FetchPlan) -> None:
                 f"DEM plan URL must use https and be an approved origin, got "
                 f"{redact_url(url)}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if host.lower() not in allowed:
             message = (
                 f"DEM URL host {host!r} is not in the plan allowlist "
                 f"{sorted(allowed)} ({redact_url(url)})"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     if isinstance(plan, TileSet):
         for tile in plan.tiles:
@@ -545,8 +532,7 @@ def validate_plan_urls(plan: FetchPlan) -> None:
     elif isinstance(plan, Artifact):
         if plan.scheme not in {"https", "ftp"}:
             message = f"artifact scheme must be 'https' or 'ftp', got {plan.scheme!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if plan.scheme == "https":
             _check_https(plan.url)
         else:
@@ -557,8 +543,7 @@ def validate_plan_urls(plan: FetchPlan) -> None:
                     f"FTP artifact URL host {host!r} is not in the plan "
                     f"allowlist {sorted(allowed)}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
 
 
 def _validate_redirect_chain(
@@ -593,8 +578,7 @@ def _validate_redirect_chain(
         or next_port not in (None, 443)
     ):
         message = f"redirect target must use https and have no URL credentials: {redact_url(next_url)}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     # Cross-host hops are permitted ONLY credential-free: strip auth, then
     # verify no auth provider would attach to the new host.
     if next_host != start_host:
@@ -732,8 +716,7 @@ def _record_tile_verification(target: Path, provider_checksum: str | None) -> No
             f"checksum mismatch for {target.name}: expected "
             f"{provider_checksum}, got md5:{actual.hexdigest()}"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
 
 
 def sweep_part_files(
@@ -780,16 +763,14 @@ def safe_member_target(staging_dir: Path, member_name: str) -> Path:
     normalized = member_name.replace("\\", "/")
     if normalized.startswith("/") or (len(normalized) > 1 and normalized[1] == ":"):
         message = f"archive member must be relative: {member_name!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     candidate = (staging_dir / normalized).resolve()
     containment_root = staging_dir.resolve()
     if containment_root not in candidate.parents and candidate != containment_root:
         message = (
             f"archive member escapes staging directory (zip-slip): {member_name!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return candidate
 
 
@@ -847,8 +828,7 @@ def extract_zip_members(
             f"no archive members matched members={members} / "
             f"member_pattern={member_pattern!r} in {archive_path.name}"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
     return extracted
 
 
@@ -1259,8 +1239,7 @@ def _verify_tile_decompressed(path: Path, expected: int) -> None:
             f"decompressed tile size mismatch for {path.name}: {total} "
             f"!= expected {expected}; refusing to publish corrupt data"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
 
 
 def _execute_tile_set(
@@ -1392,8 +1371,7 @@ def validate_cache_target(cache_dir: Path, target: Path) -> None:
     resolved_target = target.resolve()
     if resolved_root not in resolved_target.parents:
         message = f"cache target {target} escapes cache root {cache_dir}; refusing"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
 
 def _execute_artifact(
@@ -1439,8 +1417,7 @@ def _execute_artifact(
             if isinstance(exc, InvalidProcessingStateError):
                 raise
             message = f"FTP fetch failed for {redact_url(plan.url)}: {exc}"
-            logger.exception(message)
-            raise InvalidProcessingStateError(message) from exc
+            reject(message, InvalidProcessingStateError, cause=exc)
         _publish_target(target, part)
 
         if plan.expand == "zip":
@@ -1592,5 +1569,4 @@ def fetch_plan(
             )
         return executed
     message = f"unsupported FetchPlan subtype: {type(plan).__name__}"
-    logger.error(message)
-    raise InvalidProcessingStateError(message)
+    return reject(message, InvalidProcessingStateError)

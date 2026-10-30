@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import pytest
 
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_sources import (
     AuthenticatedGranuleSource,
     DeferredGranulePlan,
-    DemSourceUnavailableError,
     get_dem_source,
 )
 
@@ -50,7 +50,7 @@ def test_nasadem_discovery_registers_live_lcloud_provider(
     def search(*_args: object, **_kwargs: object) -> list[object]:
         return []
 
-    monkeypatch.setattr(remote, "_register_adapter", register_adapter)
+    monkeypatch.setattr("faninsar.remote.catalog._register_adapter", register_adapter)
     monkeypatch.setattr(remote, "search", search)
     dem_sources._CMR_ADAPTERS.pop("faninsar-dem-cmr-nasadem@earthdata", None)
     with monkeypatch.context() as context:
@@ -58,7 +58,7 @@ def test_nasadem_discovery_registers_live_lcloud_provider(
             "faninsar.processing.geometry.dem_transport.resolve_credentials",
             lambda _: object(),
         )
-        with contextlib.suppress(DemSourceUnavailableError):
+        with contextlib.suppress(InvalidProcessingStateError):
             source.discover(plan)
     adapter = captured["adapter"]
     assert adapter.provider == "LPCLOUD"

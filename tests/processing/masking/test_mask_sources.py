@@ -28,7 +28,6 @@ from faninsar.processing.masking.mask_sources import (
     AUTO_SOURCE_NAME,
     DEFAULT_PRODUCT,
     MaskSource,
-    MaskSourceUnavailableError,
     OsmOverpassSource,
     get_mask_source,
     list_mask_sources,
@@ -153,10 +152,6 @@ class TestMaskSourceRegistry:
         assert osm.extraction == "vector"
         assert osm.provider == "osm-overpass"
         assert osm.wired is False
-
-    def test_mask_source_unavailable_error_is_structured(self) -> None:
-        """Check the unavailable error stays a structured processing error."""
-        assert issubclass(MaskSourceUnavailableError, InvalidProcessingStateError)
 
     def test_mask_source_is_abstract_plan_only(self) -> None:
         """Check MaskSource is abstract with plan() as the only abstractmethod."""
@@ -349,7 +344,7 @@ class TestOsmOverpassSource:
     def test_plan_fails_closed_until_cap_binds(self) -> None:
         """Check plan() fails closed with the pending-cap reason."""
         source = OsmOverpassSource(name="osm-overpass", description="OSM water")
-        with pytest.raises(MaskSourceUnavailableError, match="response-size cap"):
+        with pytest.raises(InvalidProcessingStateError, match="response-size cap"):
             source.plan(_bounds(0.0, 0.0, 0.5, 0.5))
 
     def test_endpoint_is_https_enforced(self) -> None:

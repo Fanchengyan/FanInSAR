@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.data.query import BoundingBox
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 
 if TYPE_CHECKING:
@@ -46,7 +46,6 @@ __all__ = [
     "DeferredGranulePlan",
     "DeferredStacPlan",
     "DemSource",
-    "DemSourceUnavailableError",
     "FtpZipSource",
     "LatLonGridSource",
     "MosaicRecipe",
@@ -98,10 +97,6 @@ NASADEM_GRANULE_MIN_BYTES = 4 << 20
 BoundsLike = BoundingBox | tuple[float, float, float, float]
 
 
-class DemSourceUnavailableError(InvalidProcessingStateError):
-    """A registry source cannot serve the requested bounds or environment."""
-
-
 @dataclass(frozen=True, slots=True)
 class DeferredStacPlan:
     """Immutable, zero-network description of a deferred STAC query.
@@ -151,24 +146,19 @@ class DeferredStacPlan:
         parts = urllib.parse.urlsplit(self.endpoint_identity)
         if parts.scheme.lower() != "https" or not parts.hostname:
             message = "deferred STAC endpoint must be an HTTPS origin"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if parts.username or parts.password or parts.query or parts.fragment:
             message = "deferred STAC endpoint must not contain credentials or query"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if tuple(self.allowed_hosts) != (parts.hostname,):
             message = "deferred STAC endpoint host does not match allowlist"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if len(self.bounds) != 4 or not all(np.isfinite(self.bounds)):
             message = "deferred STAC bounds must be finite"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if not self.windows:
             message = "deferred STAC plan requires at least one query window"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
 
 def _stac_endpoint_identity(url: str) -> tuple[str, tuple[str, ...]]:
@@ -176,12 +166,10 @@ def _stac_endpoint_identity(url: str) -> tuple[str, tuple[str, ...]]:
     parts = urllib.parse.urlsplit(str(url))
     if parts.scheme.lower() != "https" or not parts.hostname:
         message = "STAC endpoint must be an HTTPS URL with a host"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if parts.username or parts.password or parts.query or parts.fragment:
         message = "STAC endpoint must not contain credentials or query"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     host = parts.hostname.lower()
     port = parts.port
     netloc = host if port in (None, 443) else f"{host}:{port}"
@@ -228,13 +216,11 @@ def validate_cache_relative_path(relative_path: str, cache_dir: object) -> None:
     candidate = relative_path.replace("\\\\", "/")
     if candidate.startswith("/"):
         message = f"cache-relative path must not be absolute: {relative_path!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     parts = [part for part in candidate.split("/") if part not in {"", "."}]
     if any(part == ".." for part in parts):
         message = f"cache-relative path must not contain '..': {relative_path!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
 
 _SOURCE_NAME_RE = re.compile(r"[a-z0-9]+([-_.@][a-z0-9]+)*")
@@ -248,8 +234,7 @@ def _validate_source_name(name: str) -> None:
             "[a-z0-9]+([-_.@][a-z0-9]+)* charset (they flow into cache "
             "partition directories)"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
 
 def _cell_tag(latitude_deg: float, longitude_deg: float) -> str:
@@ -509,8 +494,7 @@ class LatLonGridSource(DemSource):
                 f"invalid remote_layout {self.remote_layout!r}: expected "
                 "'copernicus' or 'skadi'"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     def plan(self, bounds: BoundsLike) -> FetchPlan:
         """Enumerate degree-cell tiles into a TileSet plan."""
@@ -662,8 +646,7 @@ class PgcQuadSource(DemSource):
         listed, truncated = self.quad_enumerator.list_quads(prefix)
         if truncated:  # pragma: no cover - defensive; loop should exhaust
             message = f"quad listing for {prefix!r} reported truncation"
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         # Listing entries may be quad directory ids ("07_40/") or full file
         # keys (".../07_40/07_40_32m_v4.1_dem.tif"); normalize to quad ids.
         listed_set = {
@@ -676,8 +659,7 @@ class PgcQuadSource(DemSource):
                 f"{sorted(expected)} but listing missed {missing}; refusing "
                 "silent quad loss"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         return expected
 
     def coverage(self, bounds: BoundsLike) -> str | None:
@@ -704,15 +686,13 @@ class PgcQuadSource(DemSource):
 
         message = self.coverage(bounds)
         if message is not None:
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         quads = self.quads_for_bounds(bounds)
         if not quads:
             message = (
                 f"no {self.collection} quads intersect bounds {_bounds_tuple(bounds)}"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         host = urllib.parse.urlsplit(self.base_url).hostname or ""
         tiles = [self._quad_tile(quad) for quad in quads]
         return TileSet(allowed_hosts=(host,), tiles=tuple(tiles))
@@ -747,15 +727,13 @@ class PgcQuadSource(DemSource):
                     f"no 2m sub-tiles found for {self.collection} quad "
                     f"{quad!r} under {prefix}"
                 )
-                logger.error(message)
-                raise DemSourceUnavailableError(message)
+                reject(message, InvalidProcessingStateError)
             return _MultiTileTile(*tiles)
         key = f"{prefix}{quad}/{quad}_{self.resolution_tag}m_{self.version}_dem.tif"
         tile = self._pgc_tile(key)
         if tile is None:
             message = f"PGC quad key missing: {key!r}"
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         return tile
 
     def _pgc_tile(self, key: str) -> Tile | None:
@@ -950,8 +928,7 @@ class _MultiTileTile(Tile):
     def __init__(self, *parts: Tile) -> None:
         if not parts:
             message = "_MultiTileTile requires at least one sub-tile"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         # Zero-arg super() breaks inside frozen+slots dataclass __init__;
         # the extra ``parts`` slot is set via object.__setattr__ after the
         # base field initialization.
@@ -1041,8 +1018,7 @@ class AuthenticatedGranuleSource(DemSource):
             _resolve_credentials("earthdata")
         except RuntimeError as exc:
             message = str(exc)
-            logger.exception(message)
-            raise DemSourceUnavailableError(message) from None
+            reject(message, InvalidProcessingStateError, cause=None)
         min_lon, min_lat, max_lon, max_lat = _bounds_tuple(bounds)
         return DeferredGranulePlan(
             allowed_hosts=(
@@ -1066,13 +1042,13 @@ class AuthenticatedGranuleSource(DemSource):
     ) -> tuple[object, ...]:
         """Discover provider assets through the registered remote CMR adapter."""
         from faninsar.data.query import BoundingBox
-        from faninsar.remote import RemoteResourceBudget, _register_adapter, search
+        from faninsar.remote import RemoteResourceBudget, search
+        from faninsar.remote.catalog import _register_adapter
         from faninsar.remote.cmr import CMRCollectionAdapter
 
         if not isinstance(plan, DeferredGranulePlan) or plan.source_name != self.name:
             message = "deferred CMR plan does not belong to this source"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         catalog = f"faninsar-dem-cmr-{self.name}"
         adapter = _CMR_ADAPTERS.get(catalog)
         if adapter is None:
@@ -1144,8 +1120,7 @@ class AuthenticatedGranuleSource(DemSource):
                 f"no CMR granules in collection {self.cmr_collection} for "
                 f"bounds {plan.bounds!r}"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         return tuple(output)
 
     def mosaic_recipe(self) -> MosaicRecipe:
@@ -1168,8 +1143,7 @@ class RoiClipSource(DemSource):
             "OpenTopography ROI clipping is reserved (unwired in v1); "
             "select a wired provider instead"
         )
-        logger.error(message)
-        raise DemSourceUnavailableError(message)
+        reject(message, InvalidProcessingStateError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1194,12 +1168,10 @@ class PcStacSource(DemSource):
         west, south, east, north = raw_bounds
         if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0):
             message = "STAC bounds longitude must be within [-180, 180]"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if south > north or not (-90.0 <= south <= 90.0 and -90.0 <= north <= 90.0):
             message = "STAC bounds latitude must be ordered within [-90, 90]"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if west > east:
             windows = ((west, south, 180.0, north), (-180.0, south, east, north))
         else:
@@ -1225,8 +1197,7 @@ class PcStacSource(DemSource):
         """
         if not isinstance(plan, DeferredStacPlan):
             message = "PcStacSource.discover requires a DeferredStacPlan"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         endpoint, allowed_hosts = _stac_endpoint_identity(self.stac_api_url)
         if (
             plan.endpoint_identity != endpoint
@@ -1237,8 +1208,7 @@ class PcStacSource(DemSource):
             or plan.allowed_hosts != allowed_hosts
         ):
             message = "deferred STAC plan does not belong to this source"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         # Keep the established optional-dependency and lightweight fake-STAC
         # seams.  Production module objects continue through the audited
         # remote adapter; these branches are only for deterministic callers
@@ -1249,8 +1219,7 @@ class PcStacSource(DemSource):
                 "provider 'pc' requires the Planetary Computer extras: "
                 "pip install 'FanInSAR[pc]' (planetary-computer + pystac-client)"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         import types
 
         if not isinstance(stack[1], types.ModuleType):
@@ -1275,8 +1244,7 @@ class PcStacSource(DemSource):
                 f"no STAC items with asset {plan.asset!r} in collection "
                 f"{plan.collection!r} for bounds {plan.bounds}"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         hosts = {
             urllib.parse.urlsplit(tile.url.split("?", 1)[0]).hostname or ""
             for tile in tiles
@@ -1321,8 +1289,7 @@ class PcStacSource(DemSource):
                 )
         if not tiles:
             message = f"no STAC coverage for {plan.bounds!r}"
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         hosts = {
             urllib.parse.urlsplit(tile.url.split("?", 1)[0]).hostname or ""
             for tile in tiles
@@ -1334,15 +1301,15 @@ class PcStacSource(DemSource):
     ) -> tuple[object, ...]:
         """Return immutable RemoteAsset values for a deferred PC plan."""
         from faninsar.data.query import BoundingBox
-        from faninsar.remote import RemoteResourceBudget, _register_adapter, search
+        from faninsar.remote import RemoteResourceBudget, search
+        from faninsar.remote.catalog import _register_adapter
         from faninsar.remote.providers.planetary_computer import (
             PlanetaryComputerAdapter,
         )
 
         if not isinstance(plan, DeferredStacPlan):
             message = "PcStacSource.discover requires a DeferredStacPlan"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         catalog = f"faninsar-dem-pc-{self.name}"
         adapter = _PC_ADAPTERS.get(catalog)
         if adapter is None:
@@ -1380,8 +1347,7 @@ class PcStacSource(DemSource):
                 f"no STAC items with asset {self.asset_key!r} in collection "
                 f"{self.collection_id!r} for bounds {plan.bounds}"
             )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
+            reject(message, InvalidProcessingStateError)
         return tuple(assets)
 
 
@@ -1432,8 +1398,7 @@ def parse_selection(selection: str) -> DemSource:
             f"invalid DEM selection {selection!r}: at most one ':' separator "
             "is allowed ('<product>' or '<product>:<provider>')"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     product = parts[0]
     provider = parts[1] if len(parts) == 2 else None
     if product not in PRODUCT_DEFAULTS:
@@ -1441,8 +1406,7 @@ def parse_selection(selection: str) -> DemSource:
         message = (
             f"unknown DEM product {product!r}; valid products are: {valid_products}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     providers = PRODUCT_DEFAULTS[product]["providers"]
     default_provider = PRODUCT_DEFAULTS[product]["default"]
     if provider is None:
@@ -1452,16 +1416,14 @@ def parse_selection(selection: str) -> DemSource:
             f"unknown DEM provider {provider!r} for product {product!r}; "
             f"valid providers are: {', '.join(sorted(providers))}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     pair = (product, provider)
     if pair not in PRODUCT_REGISTRY:
         message = (
             f"provider {provider!r} is not wired for product {product!r} "
             "(registered but unavailable in this release)"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return get_dem_source(PRODUCT_REGISTRY[pair])
 
 
@@ -1904,8 +1866,7 @@ def get_dem_source(name: str) -> DemSource:
     message = f"unknown DEM source {name!r}; valid sources are: " + ", ".join(
         list_dem_sources()
     )
-    logger.error(message)
-    raise ValueError(message) from None
+    return reject(message, ValueError, cause=None)
 
 
 def dem_catalog() -> dict[str, dict]:

@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from faninsar.missions.s1.annotation import parse_annotation_xml
-from faninsar.missions.s1.errors import UnsupportedPolarizationError
 from faninsar.missions.s1.safe import open_safe_product
 
 FIXTURE = (
@@ -240,5 +239,5 @@ def test_open_real_safe_zip_metadata_only() -> None:
 @pytest.mark.skipif(not REAL_ZIP.exists(), reason="local S1 ZIP corpus unavailable")
 def test_open_real_safe_zip_rejects_missing_polarization() -> None:
     """Reject a polarization filter that is not present in the product."""
-    with pytest.raises(UnsupportedPolarizationError, match="VH"):
+    with pytest.raises(ValueError, match="VH"):
         open_safe_product(REAL_ZIP, polarizations=("VH",))

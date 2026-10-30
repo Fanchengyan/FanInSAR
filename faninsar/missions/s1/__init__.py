@@ -5,14 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.base import Sensor, register
 from faninsar.missions.s1.annotation import (
     parse_annotation_xml,
 )
 from faninsar.missions.s1.errors import (
     Sentinel1ProductError,
-    UnsupportedPolarizationError,
     reject_product,
 )
 from faninsar.missions.s1.io import (
@@ -43,8 +42,6 @@ from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 
 SPEED_OF_LIGHT_M_S: float = 299_792_458.0
 S1_C_BAND_WAVELENGTH_M: float = 0.05546576
-
-logger = setup_logger(__name__)
 
 
 def __getattr__(name: str) -> Any:
@@ -92,8 +89,7 @@ class Sentinel1Sensor(Sensor):
         if hasattr(handle, "read_window"):
             return handle.read_window(window, **kwargs)
         message = "Sentinel1 handle does not expose read_window; use production loaders"
-        logger.error(message)
-        raise NotImplementedError(message)
+        return reject(message, NotImplementedError)
 
 
 __all__ = [
@@ -113,7 +109,6 @@ __all__ = [
     "S1Swath",
     "Sentinel1ProductError",
     "Sentinel1Sensor",
-    "UnsupportedPolarizationError",
     "burst_overlap_windows",
     "coregister_s1_scene",
     "estimate_burst_bytes",

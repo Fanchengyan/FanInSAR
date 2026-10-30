@@ -11,7 +11,7 @@ import pytest
 from faninsar import Pairs
 from faninsar.io.storage.ifg_store import write_ifg_artifact, write_unwrapped_artifact
 from faninsar.missions.s1 import S1Stack
-from faninsar.network import IncompleteNetworkProductError, Network, NetworkPathError
+from faninsar.network import Network
 
 if TYPE_CHECKING:
     pass
@@ -28,7 +28,6 @@ def _stack_with_network(tmp_path: Path) -> S1Stack:
     stack = S1Stack.from_safes(
         safe_paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         pairs=Pairs.from_names(["20240101_20240113"]),
         multilook=(1, 1),
     ).prepare_scenes()
@@ -58,7 +57,7 @@ def _stack_with_network(tmp_path: Path) -> S1Stack:
 
 def test_network_rejects_missing_directory(tmp_path: Path) -> None:
     """A path that is not a directory cannot construct a Network."""
-    with pytest.raises(NetworkPathError):
+    with pytest.raises(FileNotFoundError):
         Network(tmp_path / "missing")
 
 
@@ -99,6 +98,15 @@ def test_network_public_surface_excludes_retired_aliases() -> None:
     assert all(not hasattr(public, name) for name in retired)
 
 
-def test_incomplete_network_product_error_is_exported() -> None:
-    """The one remaining construction error stays importable."""
-    assert issubclass(IncompleteNetworkProductError, Exception)
+def test_collapsed_network_errors_are_not_exported() -> None:
+    """Collapsed custom error names are no longer importable from the package."""
+    import faninsar.network as public
+
+    collapsed = {
+        "IncompleteNetworkProductError",
+        "NetworkAnalysisError",
+        "NetworkConstructionError",
+        "NetworkPathError",
+    }
+    assert collapsed.isdisjoint(public.__all__)
+    assert all(not hasattr(public, name) for name in collapsed)

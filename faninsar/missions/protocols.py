@@ -5,14 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from faninsar.logging import setup_logger
-from faninsar.processing.errors import ProcessingContractError
+from faninsar.logging import reject
+from faninsar.processing.errors import InvalidProcessingStateError
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry.coordinates import Shape2D
     from faninsar.processing.slc.products import SLCProduct
-
-logger = setup_logger(__name__)
 
 
 @runtime_checkable
@@ -38,29 +36,6 @@ class SensorAdapter(Protocol):
         ...
 
 
-class MissingCriticalMetadataError(ProcessingContractError):
-    """Raised when a reader is missing metadata required for processing."""
-
-    def __init__(self, *, source_path: str, field: str, remedy: str) -> None:
-        """Initialize with the source path, missing field, and remedy.
-
-        Parameters
-        ----------
-        source_path : str
-            Path or URI of the product that failed validation.
-        field : str
-            Missing critical metadata field name.
-        remedy : str
-            Actionable guidance for restoring the missing field.
-
-        """
-        self.source_path = source_path
-        self.field = field
-        self.remedy = remedy
-        message = f"missing critical metadata {field!r} at {source_path}: {remedy}"
-        super().__init__(message)
-
-
 @dataclass(frozen=True, slots=True)
 class ValidSampleMask:
     """Per-line valid-sample window in radar coordinates."""
@@ -72,12 +47,10 @@ class ValidSampleMask:
         """Validate window lengths and inclusive sample bounds."""
         if len(self.first_valid_sample) != len(self.last_valid_sample):
             message = "valid-sample window lengths must match"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if not self.first_valid_sample:
             message = "valid-sample windows must not be empty"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         for first, last in zip(
             self.first_valid_sample,
             self.last_valid_sample,
@@ -85,8 +58,7 @@ class ValidSampleMask:
         ):
             if first < 0 or last < first:
                 message = "valid-sample bounds must satisfy 0 <= first <= last"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +73,7 @@ class DopplerCentroidPolynomial:
         """Validate that the Doppler polynomial is non-empty."""
         if not self.coefficients_hz:
             message = "Doppler centroid polynomial requires coefficients"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,32 +119,24 @@ def require_critical_metadata(
 
     Raises
     ------
-    MissingCriticalMetadataError
+    InvalidProcessingStateError
         If either required field is absent.
 
     """
     if doppler_centroid is None:
-        error = MissingCriticalMetadataError(
-            source_path=source_path,
-            field="doppler_centroid",
-            remedy=(
-                "restore the mission Doppler centroid polynomial from "
-                "annotation metadata before opening the SLC"
-            ),
+        message = (
+            "missing critical metadata 'doppler_centroid' at "
+            f"{source_path}: restore the mission Doppler centroid polynomial "
+            "from annotation metadata before opening the SLC"
         )
-        logger.error("%s", error)
-        raise error
+        reject(message, InvalidProcessingStateError)
     if valid_samples is None:
-        error = MissingCriticalMetadataError(
-            source_path=source_path,
-            field="valid_samples",
-            remedy=(
-                "restore first/last valid sample windows from annotation "
-                "metadata before opening the SLC"
-            ),
+        message = (
+            "missing critical metadata 'valid_samples' at "
+            f"{source_path}: restore first/last valid sample windows from "
+            "annotation metadata before opening the SLC"
         )
-        logger.error("%s", error)
-        raise error
+        reject(message, InvalidProcessingStateError)
     return doppler_centroid, valid_samples
 
 
@@ -205,20 +168,17 @@ def normalize_selection(
     for axis, (size, item) in enumerate(zip(shape, selection, strict=True)):
         if item.step not in (None, 1):
             message = f"selection step must be 1 on axis {axis}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         start, stop, _ = item.indices(size)
         if start < 0 or stop > size or start >= stop:
             message = f"selection out of bounds on axis {axis}: {item!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         normalized.append(slice(start, stop))
     return normalized[0], normalized[1]
 
 
 __all__ = [
     "DopplerCentroidPolynomial",
-    "MissingCriticalMetadataError",
     "SLCReadResult",
     "SLCReader",
     "SensorAdapter",

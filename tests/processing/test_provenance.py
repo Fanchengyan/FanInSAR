@@ -12,7 +12,6 @@ from faninsar.io.storage.provenance import (
     SoftwareIdentity,
 )
 from faninsar.io.storage.validation import (
-    ManifestValidationError,
     validate_pipeline_rebuild_manifest,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
@@ -87,7 +86,7 @@ def test_rebuild_manifest_rejects_mutated_checksum(tmp_path: Path) -> None:
     mutated = tmp_path / source.name
     mutated.write_text(yaml.safe_dump(payload, sort_keys=False))
 
-    with pytest.raises(ManifestValidationError, match="sha256"):
+    with pytest.raises(ValueError, match="sha256"):
         validate_pipeline_rebuild_manifest(mutated)
 
 
@@ -100,5 +99,5 @@ def test_rebuild_manifest_rejects_invalid_retirement_archive_digest(
     mutated = tmp_path / source.name
     mutated.write_text(yaml.safe_dump(payload, sort_keys=False))
 
-    with pytest.raises(ManifestValidationError, match="archive_sha256"):
+    with pytest.raises(ValueError, match="archive_sha256"):
         validate_pipeline_rebuild_manifest(mutated)

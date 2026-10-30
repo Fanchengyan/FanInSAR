@@ -19,10 +19,6 @@ logger = setup_logger(__name__)
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
-class CachePathError(ValueError):
-    """Raised when a cache path escapes its configured root."""
-
-
 class ArtifactValidationError(ValueError):
     """Raised when a cached or downloaded artifact has the wrong identity."""
 
@@ -58,7 +54,7 @@ def cache_artifact_path(root: Path, model: str, filename: str) -> Path:
     if not _SAFE_COMPONENT.fullmatch(model) or not _SAFE_COMPONENT.fullmatch(filename):
         message = "geoid cache model and filename must be simple path components"
         logger.warning(message)
-        raise CachePathError(message)
+        raise ValueError(message)
     model_root = (root / model).resolve(strict=False)
     candidate = (model_root / filename).resolve(strict=False)
     try:
@@ -66,7 +62,7 @@ def cache_artifact_path(root: Path, model: str, filename: str) -> Path:
     except ValueError as error:
         message = f"geoid cache path escapes configured root: {candidate}"
         logger.warning(message)
-        raise CachePathError(message) from error
+        raise ValueError(message) from error
     return candidate
 
 

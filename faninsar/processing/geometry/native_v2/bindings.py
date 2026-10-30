@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.geometry.v2 import Operation, TransformResultV2
 
 if TYPE_CHECKING:
@@ -42,7 +42,6 @@ _NATIVE_FLOAT_FIELDS = {
     "residual_doppler_hz",
 }
 _NATIVE_BOOL_FIELDS = {"converged", "max_iter_exhausted", "boundary_rechecked"}
-logger = setup_logger(__name__)
 
 
 def ecef_from_native_outputs(
@@ -73,18 +72,15 @@ def ecef_from_native_outputs(
             "native geometry ECEF ABI must return exactly seventeen fields; "
             f"received {len(outputs)}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     shape = getattr(outputs[0], "shape", None)
     if shape is None:
         message = "native geometry ECEF outputs must expose shapes"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     for name, value in zip(NATIVE_RESULT_FIELDS, outputs[:14], strict=True):
         if getattr(value, "shape", None) != shape:
             message = f"native field {name} has an incompatible shape"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         dtype = str(getattr(value, "dtype", None))
         expected = (
             {"torch.float64", "float64"}
@@ -95,8 +91,7 @@ def ecef_from_native_outputs(
         )
         if dtype not in expected:
             message = f"native field {name} has invalid dtype {dtype}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
     ecef: list[np.ndarray] = []
     for name, value in zip(
         ("ecef_x_m", "ecef_y_m", "ecef_z_m"),
@@ -105,13 +100,11 @@ def ecef_from_native_outputs(
     ):
         if getattr(value, "shape", None) != shape:
             message = f"native field {name} has an incompatible shape"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         dtype = getattr(value, "dtype", None)
         if str(dtype) not in {"torch.float64", "float64"}:
             message = f"native field {name} must have float64 dtype"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         detach = getattr(value, "detach", None)
         candidate = detach() if callable(detach) else value
         cpu = getattr(candidate, "cpu", None)

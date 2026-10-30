@@ -11,11 +11,6 @@ import xarray as xr
 from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
-from .exceptions import (
-    GridMismatchError,
-    MissingGeometryAssetError,
-    NetworkGeometryError,
-)
 from .metadata import (
     CATEGORICAL_ASSETS,
     GEOMETRY_ASSETS,
@@ -112,7 +107,7 @@ class NetworkGeometry:
                 f"geometry.json not found at {self._metadata_path}. "
                 "Create the geometry first with NetworkGeometry.from_rasters()."
             )
-            raise NetworkGeometryError(msg)
+            raise RuntimeError(msg)
         return self._metadata
 
     @classmethod
@@ -264,7 +259,7 @@ class NetworkGeometry:
             asset_path = geometry_dir / _ASSET_FILENAMES[name]
             if not validate_alignment(asset_path, ref_grid):
                 msg = f"Asset '{name}' is not aligned with the reference grid."
-                raise GridMismatchError(msg)
+                raise ValueError(msg)
 
         bounds = ref_grid.bounds
         res = ref_grid.resolution
@@ -440,7 +435,8 @@ class NetworkGeometry:
 
         asset_path = self.path(name)
         if not asset_path.exists():
-            raise MissingGeometryAssetError(name)
+            msg = f"Geometry asset '{name}' not found or not created."
+            raise FileNotFoundError(msg)
 
         da = rioxarray.open_rasterio(asset_path, masked=masked, chunks=chunks)
         if not isinstance(da, xr.DataArray):
@@ -557,14 +553,16 @@ class NetworkGeometry:
 
         Raises
         ------
-        MissingGeometryAssetError
+        FileNotFoundError
             If either incidence or azimuth asset is missing.
 
         """
         if not self.exists(incidence_name):
-            raise MissingGeometryAssetError(incidence_name)
+            msg = f"Geometry asset '{incidence_name}' not found or not created."
+            raise FileNotFoundError(msg)
         if not self.exists(azimuth_name):
-            raise MissingGeometryAssetError(azimuth_name)
+            msg = f"Geometry asset '{azimuth_name}' not found or not created."
+            raise FileNotFoundError(msg)
 
         inc = self.open(incidence_name, masked=True, chunks=chunks)
         azi = self.open(azimuth_name, masked=True, chunks=chunks)
@@ -634,7 +632,7 @@ class NetworkGeometry:
 
         Raises
         ------
-        MissingGeometryAssetError
+        FileNotFoundError
             If the named asset does not exist on disk.
 
         """
@@ -642,7 +640,8 @@ class NetworkGeometry:
 
         asset_path = self.path(name)
         if not asset_path.exists():
-            raise MissingGeometryAssetError(name)
+            msg = f"Geometry asset '{name}' not found or not created."
+            raise FileNotFoundError(msg)
         return XarrayDataset(paths=[asset_path])
 
     def open_incidence(self, **kwargs: Any) -> xr.DataArray:

@@ -1,4 +1,4 @@
-# ruff: noqa: D103, TC003, E501
+# ruff: noqa: D103, TC003
 """Public boundary tests for the DEM provider transport."""
 
 from __future__ import annotations
@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from faninsar.remote.resources.dem import (
-    BoundedTransferError,
     stream_to_cache,
     validate_https_origin,
 )
@@ -24,7 +23,7 @@ def test_stream_to_cache_accepts_exact_http_payload(tmp_path: Path) -> None:
 
 
 def test_stream_to_cache_rejects_unknown_length_over_budget(tmp_path: Path) -> None:
-    with pytest.raises(BoundedTransferError, match="maximum"):
+    with pytest.raises(ValueError, match="maximum"):
         stream_to_cache([b"1234", b"56"], tmp_path / "tile", max_bytes=5)
 
 
@@ -36,7 +35,7 @@ def test_validate_https_origin_rejects_redirect_host() -> None:
 
 
 def test_http_range_requires_exact_protocol_length(tmp_path: Path) -> None:
-    with pytest.raises(BoundedTransferError, match="Content-Range"):
+    with pytest.raises(ValueError, match="Content-Range"):
         stream_to_cache(
             [b"abcd"],
             tmp_path / "tile",

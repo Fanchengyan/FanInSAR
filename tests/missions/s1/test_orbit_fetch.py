@@ -13,7 +13,6 @@ import pytest
 
 from faninsar.missions.s1.orbit_fetch import (
     S1_ORBITS_ORIGIN,
-    S1OrbitDownloadError,
     ensure_covering_orbit_paths,
     parse_eof_filename,
     select_covering_eof_keys,
@@ -333,16 +332,16 @@ def test_http_404_is_a_download_error(
             get_status={COVERING_POEORB: 404},
         ),
     )
-    with pytest.raises(S1OrbitDownloadError, match="20240101") as caught:
+    with pytest.raises(RuntimeError, match="20240101") as caught:
         ensure_covering_orbit_paths(
             intervals={"20240101": _SCENE_INTERVAL},
             mission_ids={"20240101": "S1A"},
             cache_dir=tmp_path / "orbits",
         )
-    error = caught.value
-    assert error.status == 404
-    assert "s1-orbits" in error.host
-    assert "20240101" in error.dates
+    message = str(caught.value)
+    assert "HTTP 404" in message
+    assert "s1-orbits" in message
+    assert "20240101" in message
     assert opener.requests
 
 
@@ -357,13 +356,13 @@ def test_http_401_is_a_download_error(
             list_status=401,
         ),
     )
-    with pytest.raises(S1OrbitDownloadError, match="HTTP 401") as caught:
+    with pytest.raises(RuntimeError, match="HTTP 401") as caught:
         ensure_covering_orbit_paths(
             intervals={"20240101": _SCENE_INTERVAL},
             mission_ids={"20240101": "S1A"},
             cache_dir=tmp_path / "orbits",
         )
-    assert caught.value.status == 401
+    assert "HTTP 401" in str(caught.value)
 
 
 def test_catalog_miss_leaves_embedded_vectors(

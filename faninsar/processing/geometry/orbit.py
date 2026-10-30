@@ -8,19 +8,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.errors import ProcessingContractError
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from faninsar.core.orbit import OrbitMetadata
-
-logger = setup_logger(__name__)
-
-
-class OrbitInterpolationError(ProcessingContractError):
-    """Raised when orbit interpolation cannot produce a valid state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +45,7 @@ class OrbitInterpolator:
         """Build an interpolator from typed orbit metadata."""
         if len(orbit.vectors) < 2:
             message = "orbit interpolation requires at least two state vectors"
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         epoch = orbit.vectors[0].time
         times = np.array(
             [(vector.time - epoch).total_seconds() for vector in orbit.vectors],
@@ -60,8 +53,7 @@ class OrbitInterpolator:
         )
         if np.any(np.diff(times) <= 0):
             message = "orbit state-vector times must be strictly increasing"
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         positions = np.array(
             [vector.position_m for vector in orbit.vectors],
             dtype=np.float64,
@@ -101,22 +93,20 @@ class OrbitInterpolator:
 
         Raises
         ------
-        OrbitInterpolationError
+        ProcessingContractError
             If the epoch is outside the orbit coverage.
 
         """
         if time.tzinfo is None:
             message = "orbit evaluation time must be timezone-aware"
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         t_s = (time - self.epoch).total_seconds()
         if t_s < self.t_min_s or t_s > self.t_max_s:
             message = (
                 f"orbit time {time.isoformat()} outside coverage "
                 f"[{self.t_min_s}, {self.t_max_s}] s from epoch"
             )
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         position = tuple(float(spline(t_s)) for spline in self.trajectory_splines)
         velocity = tuple(float(spline(t_s, 1)) for spline in self.trajectory_splines)
         return OrbitState(time=time, position_m=position, velocity_m_s=velocity)  # type: ignore[arg-type]
@@ -137,7 +127,7 @@ class OrbitInterpolator:
 
         Raises
         ------
-        OrbitInterpolationError
+        ProcessingContractError
             If any time is outside the orbit coverage.
 
         """
@@ -147,8 +137,7 @@ class OrbitInterpolator:
                 f"orbit times outside coverage "
                 f"[{self.t_min_s}, {self.t_max_s}] s from epoch"
             )
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         positions = np.stack(
             [spline(times_s) for spline in self.trajectory_splines],
             axis=-1,
@@ -179,7 +168,7 @@ class OrbitInterpolator:
 
         Raises
         ------
-        OrbitInterpolationError
+        ProcessingContractError
             If any time is outside the orbit coverage.
 
         """
@@ -189,8 +178,7 @@ class OrbitInterpolator:
                 f"orbit times outside coverage "
                 f"[{self.t_min_s}, {self.t_max_s}] s from epoch"
             )
-            logger.error(message)
-            raise OrbitInterpolationError(message)
+            reject(message, ProcessingContractError)
         positions = np.stack(
             [spline(times_s) for spline in self.trajectory_splines],
             axis=-1,

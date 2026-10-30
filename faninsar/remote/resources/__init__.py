@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .dem import (
-    BoundedTransferError,
     download,
     download_ftp,
     resolve_cache_path,
@@ -14,7 +13,6 @@ from .dem import (
 )
 
 __all__ = [
-    "BoundedTransferError",
     "download",
     "download_ftp",
     "resolve_cache_path",

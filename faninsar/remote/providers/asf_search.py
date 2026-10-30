@@ -68,21 +68,8 @@ class ASFSearchError(RemoteAccessError):
     """The optional ASF discovery operation failed."""
 
 
-class EngineUnavailableError(ASFSearchError):
-    """The explicitly requested optional engine cannot be used safely."""
-
-
-class UnsupportedASFSearchVersionError(EngineUnavailableError):
-    """The installed ``asf-search`` version is outside the certified line."""
-
-
-class UnobservableASFSearchError(EngineUnavailableError):
-    """The package session cannot be instrumented before provider I/O."""
-
-
 def _error(error_type: type[ASFSearchError], reason: str, message: str) -> None:
-    """Log and raise one typed provider error."""
-    logger.error("ASF search failed: %s (%s)", message, reason)
+    """Log and raise one typed provider error via the shared remote helper."""
     _fail(error_type, reason, message)
 
 
@@ -103,7 +90,7 @@ def _load_package(package: Any | None) -> Any:
             package = importlib.import_module("asf_search")
         except ImportError as exc:
             _error(
-                EngineUnavailableError,
+                ASFSearchError,
                 "asf_search_unavailable",
                 "install the optional 'asf' dependency to use asf-search",
             )
@@ -114,7 +101,7 @@ def _load_package(package: Any | None) -> Any:
             package_version = importlib.metadata.version("asf-search")
         except importlib.metadata.PackageNotFoundError as exc:
             _error(
-                EngineUnavailableError,
+                ASFSearchError,
                 "asf_search_unavailable",
                 "asf-search has no discoverable distribution version",
             )
@@ -122,7 +109,7 @@ def _load_package(package: Any | None) -> Any:
     parsed = _version(package_version)
     if parsed is None or not (ASF_SEARCH_MIN_MAJOR <= parsed[0] < ASF_SEARCH_MAX_MAJOR):
         _error(
-            UnsupportedASFSearchVersionError,
+            ASFSearchError,
             "unsupported_asf_search_version",
             f"asf-search {package_version!r} is outside {ASF_SEARCH_COMPATIBILITY}",
         )
@@ -133,7 +120,7 @@ def _geometry_wkt(spatial: Any) -> str:
     """Translate a typed FanInSAR geometry into the package's private WKT input."""
     from shapely.geometry.base import BaseGeometry
 
-    from faninsar.remote import _query_geometry
+    from faninsar.remote.catalog import _query_geometry
 
     if isinstance(spatial, BaseGeometry):
         # ``remote.search`` has already projected the query to WGS84 before
@@ -557,7 +544,7 @@ def _response_bytes(response: Any, ledger: _CallLedger) -> None:
         content = getattr(response, "_content", None)
     if not isinstance(content, (bytes, bytearray)):
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_response",
             "asf-search response bytes cannot be metered",
         )
@@ -585,7 +572,7 @@ def _validate_request_url(
     del request_url
     if not isinstance(url, str) or not url:
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_response_url",
             "asf-search URL cannot be validated",
         )
@@ -602,7 +589,7 @@ def _strip_cross_origin_credentials(request: Any, adapter: Any) -> None:
     request_url = getattr(request, "url", None)
     if not isinstance(request_url, str) or not request_url:
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_request_url",
             "asf-search request URL cannot be validated",
         )
@@ -617,7 +604,7 @@ def _strip_cross_origin_credentials(request: Any, adapter: Any) -> None:
     headers = getattr(request, "headers", None)
     if not isinstance(headers, Mapping):
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_request_headers",
             "asf-search request headers cannot be inspected",
         )
@@ -650,7 +637,7 @@ def _response_hook(
         location = headers.get("Location") if isinstance(headers, Mapping) else None
         if not isinstance(location, str) or not location:
             _error(
-                UnobservableASFSearchError,
+                ASFSearchError,
                 "unobservable_redirect",
                 "asf-search redirect location cannot be validated",
             )
@@ -676,7 +663,7 @@ def _response_hook(
             )
             if not isinstance(previous_location, str) or not previous_location:
                 _error(
-                    UnobservableASFSearchError,
+                    ASFSearchError,
                     "unobservable_redirect",
                     "asf-search redirect location cannot be validated",
                 )
@@ -726,13 +713,13 @@ def _instrument_requests_session(
             retries.append(total)
     if retries:
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_retries",
             "asf-search session has unmetered transport retries",
         )
     if not isinstance(getattr(session, "hooks", None), Mapping):
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_session_hooks",
             "asf-search session response hooks cannot be installed",
         )
@@ -758,14 +745,14 @@ def _instrument_requests_session(
                 request_hooks = getattr(request, "hooks", None)
                 if not isinstance(request_hooks, Mapping):
                     _error(
-                        UnobservableASFSearchError,
+                        ASFSearchError,
                         "unobservable_request_hooks",
                         "asf-search request response hooks cannot be inspected",
                     )
                 response_hooks = request_hooks.setdefault("response", [])
                 if not isinstance(response_hooks, list):
                     _error(
-                        UnobservableASFSearchError,
+                        ASFSearchError,
                         "unobservable_request_hooks",
                         "asf-search request response hooks cannot be installed",
                     )
@@ -783,7 +770,7 @@ def _instrument_requests_session(
                 response_url = getattr(response, "url", None)
                 if not isinstance(response_url, str) or not response_url:
                     _error(
-                        UnobservableASFSearchError,
+                        ASFSearchError,
                         "unobservable_response_url",
                         "asf-search response URL cannot be validated",
                     )
@@ -811,7 +798,7 @@ def _instrument_generic_session(
     post = getattr(session, "post", None)
     if not callable(post):
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_session",
             "supplied ASF session does not expose a POST boundary",
         )
@@ -831,7 +818,7 @@ def _instrument_generic_session(
             request_url = args[0]
         if not isinstance(request_url, str):
             _error(
-                UnobservableASFSearchError,
+                ASFSearchError,
                 "unobservable_request_url",
                 "asf-search request URL cannot be validated",
             )
@@ -842,7 +829,7 @@ def _instrument_generic_session(
                 response.url = request_url
             except (AttributeError, TypeError) as exc:
                 _error(
-                    UnobservableASFSearchError,
+                    ASFSearchError,
                     "unobservable_response_url",
                     "asf-search response URL cannot be validated",
                 )
@@ -859,7 +846,7 @@ def _instrument_generic_session(
         session.post = metered_post
     except (AttributeError, TypeError) as exc:
         _error(
-            UnobservableASFSearchError,
+            ASFSearchError,
             "unobservable_session",
             "supplied ASF session cannot be instrumented",
         )
@@ -996,7 +983,7 @@ class ASFSearchAdapter:
         options_class = getattr(package, "ASFSearchOptions", None)
         if not callable(options_class):
             _error(
-                EngineUnavailableError,
+                ASFSearchError,
                 "missing_search_options",
                 "asf-search lacks ASFSearchOptions",
             )
@@ -1021,7 +1008,7 @@ class ASFSearchAdapter:
         if callable(search):
             return (search(opts=options),)
         _error(
-            EngineUnavailableError,
+            ASFSearchError,
             "missing_search_api",
             "asf-search exposes no discovery API",
         )
@@ -1123,7 +1110,7 @@ class ASFSearchAdapter:
                     session = requests.Session()
                 except ImportError as exc:
                     _error(
-                        EngineUnavailableError,
+                        ASFSearchError,
                         "asf_search_unavailable",
                         "requests is required by asf-search",
                     )
@@ -1226,7 +1213,7 @@ class ASFSearchAdapter:
         except (RemoteLimitError, ASFSearchError):
             raise
         except Exception as exc:
-            _error(EngineUnavailableError, "asf_search_failed", str(exc))
+            _error(ASFSearchError, "asf_search_failed", str(exc))
         finally:
             if (
                 "internal" in locals()
@@ -1242,8 +1229,6 @@ class ASFSearchAdapter:
 
 AsfSearchAdapter = ASFSearchAdapter
 ASFSearchEngineAdapter = ASFSearchAdapter
-ASFSearchUnavailableError = EngineUnavailableError
-ASFSearchVersionError = UnsupportedASFSearchVersionError
 
 
 def register_asf_search_catalog(
@@ -1275,12 +1260,7 @@ __all__ = [
     "ASFSearchAdapter",
     "ASFSearchEngineAdapter",
     "ASFSearchError",
-    "ASFSearchUnavailableError",
-    "ASFSearchVersionError",
     "AsfSearchAdapter",
-    "EngineUnavailableError",
-    "UnobservableASFSearchError",
-    "UnsupportedASFSearchVersionError",
     "register_asf_catalog",
     "register_asf_search_catalog",
 ]

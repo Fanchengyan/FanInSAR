@@ -8,12 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from faninsar.network import Network
-from faninsar.network.registry import (
-    DuplicateReaderError,
-    InvalidReaderError,
-    ReaderNotFoundError,
-    ReaderRegistry,
-)
+from faninsar.network.registry import ReaderRegistry
 
 
 def test_direct_reader_instance_bypasses_registry(tmp_path: Path) -> None:
@@ -104,9 +99,9 @@ def test_registry_isolated_and_rejects_unknown_or_non_class_readers() -> None:
 
     registry.register("fixture", Reader)
     assert registry.names == ("fixture",)
-    with pytest.raises(ReaderNotFoundError):
+    with pytest.raises(LookupError):
         ReaderRegistry().resolve("fixture")
-    with pytest.raises(InvalidReaderError, match="classes"):
+    with pytest.raises(ValueError, match="classes"):
         registry.register("module.path.Reader", "module.path.Reader")  # type: ignore[arg-type]
 
 
@@ -129,6 +124,6 @@ def test_duplicate_entry_point_metadata_fails_before_plugin_import(
     ]
     monkeypatch.setattr(metadata, "entry_points", lambda **kwargs: entry_points)
 
-    with pytest.raises(DuplicateReaderError, match="duplicate"):
+    with pytest.raises(ValueError, match="duplicate"):
         ReaderRegistry().resolve("duplicate")
     assert not loaded

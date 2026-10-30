@@ -7,9 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 class Locality(StrEnum):
@@ -43,10 +41,6 @@ MPS_SUPPORTED_OPERATIONS: Final[frozenset[str]] = frozenset(
 )
 
 
-class ExecutionValidationError(RuntimeError):
-    """Raised when an execution plan cannot safely be submitted."""
-
-
 @dataclass(frozen=True, slots=True)
 class ChunkLayout:
     """Full array shape and explicit per-axis Dask chunk lengths."""
@@ -65,8 +59,7 @@ class ChunkLayout:
         if valid_rank and valid_sizes and exact_coverage:
             return
         message = "Chunk layout must have positive dimensions and exactly cover shape"
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
 
     @property
     def maximum_chunk_shape(self) -> tuple[int, ...]:
@@ -86,8 +79,7 @@ class MemoryBudget:
         if self.worker_bytes > 0 and 0.0 < self.safety_fraction <= 1.0:
             return
         message = "Memory budget needs positive bytes and a fraction in (0, 1]"
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
 
     @property
     def usable_bytes(self) -> int:
@@ -183,8 +175,7 @@ def plan_chunks(
     """
     if not shape or target_chunk_bytes <= 0 or itemsize <= 0:
         message = "Shape, target bytes, and item size must be positive"
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
     elements = max(1, target_chunk_bytes // itemsize)
     edge = max(1, math.floor(math.exp(math.log(elements) / len(shape))))
     chunks = tuple(_split_axis(axis_size, min(axis_size, edge)) for axis_size in shape)
@@ -212,14 +203,12 @@ def estimate_peak_bytes(
         message = (
             "Item size must be positive; temporary arrays and halo must be non-negative"
         )
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
     chunk_shape = layout.maximum_chunk_shape
     if halo:
         if len(halo) != len(chunk_shape):
             message = "Halo rank must match chunk rank"
-            logger.error(message, stacklevel=2)
-            raise ExecutionValidationError(message)
+            reject(message, RuntimeError)
         chunk_shape = tuple(
             size + 2 * depth for size, depth in zip(chunk_shape, halo, strict=True)
         )
@@ -238,8 +227,7 @@ def validate_execution(
         )
         if axis_out_of_range or axis_is_fragmented:
             message = f"FFT transform axis {axis} must contain exactly one chunk"
-            logger.error(message, stacklevel=2)
-            raise ExecutionValidationError(message)
+            reject(message, RuntimeError)
 
     required_resource = _required_resource(plan)
     matching_workers = tuple(
@@ -249,8 +237,7 @@ def validate_execution(
     )
     if not matching_workers:
         message = f"No worker advertises required {required_resource or 'CPU'} resource"
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
 
     peak_bytes = estimate_peak_bytes(
         plan.layout,
@@ -263,8 +250,7 @@ def validate_execution(
             f"Estimated peak {peak_bytes} exceeds memory budget "
             f"{profile.memory.usable_bytes}"
         )
-        logger.error(message, stacklevel=2)
-        raise ExecutionValidationError(message)
+        reject(message, RuntimeError)
     return ExecutionAssignment(
         worker_name=matching_workers[0].name,
         estimated_peak_bytes=peak_bytes,
@@ -281,5 +267,4 @@ def _required_resource(plan: OperationPlan) -> str | None:
             if plan.name in MPS_SUPPORTED_OPERATIONS:
                 return "MPS"
             message = f"Operation {plan.name!r} is outside the bounded MPS subset"
-            logger.error(message, stacklevel=2)
-            raise ExecutionValidationError(message)
+            return reject(message, RuntimeError)

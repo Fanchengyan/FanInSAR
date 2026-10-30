@@ -25,18 +25,6 @@ _REQUIRED_CLASSES = {
 }
 
 
-@dataclass(slots=True)
-class ManifestValidationError(RuntimeError):
-    """Raised when a rebuild manifest does not satisfy its pinned contract."""
-
-    path: Path
-    detail: str
-
-    def __str__(self) -> str:
-        """Return a stable manifest-validation diagnostic."""
-        return f"invalid rebuild manifest: {self.path}: {self.detail}"
-
-
 @dataclass(frozen=True, slots=True)
 class ManifestValidationSummary:
     """Counts and identity returned after a manifest has been verified."""
@@ -53,7 +41,8 @@ class ManifestValidationSummary:
 
 def _fail(path: Path, detail: str) -> NoReturn:
     logger.error("rebuild manifest rejected: %s: %s", path, detail)
-    raise ManifestValidationError(path, detail)
+    message = f"invalid rebuild manifest: {path}: {detail}"
+    raise ValueError(message)
 
 
 def _mapping(value: object, path: Path, detail: str) -> Mapping[str, object]:
@@ -186,7 +175,7 @@ def validate_pipeline_rebuild_manifest(
 
     Raises
     ------
-    ManifestValidationError
+    ValueError
         If YAML shape, source classification, checksum, baseline, or oracle
         identity validation fails.
 
@@ -283,7 +272,6 @@ def validate_pipeline_rebuild_manifest(
 
 
 __all__ = [
-    "ManifestValidationError",
     "ManifestValidationSummary",
     "validate_pipeline_rebuild_manifest",
 ]

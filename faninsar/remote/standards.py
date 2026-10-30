@@ -122,14 +122,6 @@ class STACProfileError(RemoteQueryError):
     """A STAC document does not meet the registered remote profile."""
 
 
-class UnknownSTACProfileError(STACProfileError):
-    """A document declares an extension outside the supported profile."""
-
-
-class MalformedSTACItemError(STACProfileError):
-    """A STAC item is structurally invalid or has an invalid value."""
-
-
 def _fail(error_type: type[STACProfileError], reason: str, message: str) -> None:
     """Log and raise one typed profile error."""
     logger.error("STAC profile validation failed: %s (%s)", message, reason)
@@ -174,7 +166,7 @@ def _validate_extensions(item: Mapping[str, Any]) -> tuple[str, ...]:
         not isinstance(value, str) for value in declared
     ):
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_stac_extensions",
             "stac_extensions must be strings",
         )
@@ -182,7 +174,7 @@ def _validate_extensions(item: Mapping[str, Any]) -> tuple[str, ...]:
     for value in declared:
         name = _extension_name(value)
         if name is None:
-            _fail(UnknownSTACProfileError, "unknown_stac_extension", value)
+            _fail(STACProfileError, "unknown_stac_extension", value)
         if name in profiles:
             continue
         profiles.append(name)
@@ -194,17 +186,13 @@ def _utc_datetime(value: Any, field: str) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        _fail(
-            MalformedSTACItemError, "invalid_datetime", f"{field} must be an ISO string"
-        )
+        _fail(STACProfileError, "invalid_datetime", f"{field} must be an ISO string")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
-        _fail(MalformedSTACItemError, "invalid_datetime", f"{field}: {exc}")
+        _fail(STACProfileError, "invalid_datetime", f"{field}: {exc}")
     if parsed.tzinfo is None:
-        _fail(
-            MalformedSTACItemError, "naive_datetime", f"{field} must include a timezone"
-        )
+        _fail(STACProfileError, "naive_datetime", f"{field} must include a timezone")
     return parsed.astimezone(UTC)
 
 
@@ -214,13 +202,13 @@ def _validate_geometry(geometry: Any) -> Mapping[str, Any] | None:
         return None
     if not isinstance(geometry, Mapping):
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_geometry",
             "geometry must be a GeoJSON object",
         )
     if not isinstance(geometry.get("type"), str) or "coordinates" not in geometry:
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_geometry",
             "geometry must contain type and coordinates",
         )
@@ -231,20 +219,18 @@ def _asset_to_record(asset: Mapping[str, Any], key: str) -> dict[str, Any]:
     """Convert one STAC asset into the provider-neutral asset shape."""
     href = asset.get("href")
     if not isinstance(href, str) or not href:
-        _fail(
-            MalformedSTACItemError, "invalid_asset_href", f"asset {key!r} has no href"
-        )
+        _fail(STACProfileError, "invalid_asset_href", f"asset {key!r} has no href")
     parsed = urlparse(href)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_asset_href",
             f"asset {key!r} href is not HTTP(S)",
         )
     media_type = asset.get("type")
     if media_type is not None and not isinstance(media_type, str):
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_asset_media_type",
             f"asset {key!r} type must be a string",
         )
@@ -253,14 +239,14 @@ def _asset_to_record(asset: Mapping[str, Any], key: str) -> dict[str, Any]:
         isinstance(size, bool) or not isinstance(size, int) or size < 0
     ):
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_asset_size",
             f"asset {key!r} file:size must be non-negative",
         )
     checksum = asset.get("file:checksum")
     if checksum is not None and not isinstance(checksum, str):
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_asset_checksum",
             f"asset {key!r} checksum must be a string",
         )
@@ -306,10 +292,10 @@ def validate_stac_item(
 
     """
     if not isinstance(item, Mapping):
-        _fail(MalformedSTACItemError, "invalid_stac_item", "item must be a mapping")
+        _fail(STACProfileError, "invalid_stac_item", "item must be a mapping")
     if item.get("type") != "Feature":
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_stac_type",
             "STAC Item type must be Feature",
         )
@@ -322,21 +308,17 @@ def validate_stac_item(
         )
     item_id = item.get("id")
     if not isinstance(item_id, str) or not item_id:
-        _fail(
-            MalformedSTACItemError, "invalid_item_id", "STAC Item id must be non-empty"
-        )
+        _fail(STACProfileError, "invalid_item_id", "STAC Item id must be non-empty")
     geometry = _validate_geometry(item.get("geometry"))
     if geometry is None:
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "missing_geometry",
             "STAC Item needs a geometry-ready GeoJSON geometry",
         )
     properties = item.get("properties")
     if not isinstance(properties, Mapping):
-        _fail(
-            MalformedSTACItemError, "invalid_properties", "properties must be a mapping"
-        )
+        _fail(STACProfileError, "invalid_properties", "properties must be a mapping")
     datetime_value = properties.get("datetime")
     start = _utc_datetime(properties.get("start_datetime"), "start_datetime")
     end = _utc_datetime(properties.get("end_datetime"), "end_datetime")
@@ -344,13 +326,13 @@ def validate_stac_item(
         _utc_datetime(datetime_value, "datetime")
     elif start is None and end is None:
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "missing_datetime",
             "properties needs datetime or an interval",
         )
     if start is not None and end is not None and end < start:
         _fail(
-            MalformedSTACItemError,
+            STACProfileError,
             "invalid_datetime_range",
             "end_datetime precedes start_datetime",
         )
@@ -383,11 +365,11 @@ def validate_stac_item(
             )
     assets = item.get("assets")
     if not isinstance(assets, Mapping) or not assets:
-        _fail(MalformedSTACItemError, "missing_assets", "STAC Item must contain assets")
+        _fail(STACProfileError, "missing_assets", "STAC Item must contain assets")
     for key, asset in assets.items():
         if not isinstance(key, str) or not isinstance(asset, Mapping):
             _fail(
-                MalformedSTACItemError,
+                STACProfileError,
                 "invalid_asset",
                 "assets must map string names to objects",
             )
@@ -506,9 +488,7 @@ __all__ = [
     "STAC_PROFILE_VERSIONS",
     "SUPPORTED_STAC_EXTENSIONS",
     "SUPPORTED_STAC_PROFILES",
-    "MalformedSTACItemError",
     "STACProfileError",
-    "UnknownSTACProfileError",
     "map_stac_item",
     "normalize_stac_item",
     "stac_item_to_record",

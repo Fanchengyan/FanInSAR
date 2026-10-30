@@ -7,9 +7,7 @@ from typing import Any
 import pytest
 
 from faninsar.remote.standards import (
-    MalformedSTACItemError,
     STACProfileError,
-    UnknownSTACProfileError,
     normalize_stac_item,
     validate_stac_item,
 )
@@ -98,7 +96,7 @@ def test_unknown_legacy_extension_is_still_rejected() -> None:
         stac_version="1.0.0",
         stac_extensions=["https://stac-extensions.github.io/eo/v1.0.0/schema.json"],
     )
-    with pytest.raises(UnknownSTACProfileError):
+    with pytest.raises(STACProfileError):
         validate_stac_item(item)
 
 
@@ -107,7 +105,7 @@ def test_unknown_extension_fails_closed() -> None:
     item = _item(
         stac_extensions=["https://example.invalid/extensions/custom/v1/schema.json"]
     )
-    with pytest.raises(UnknownSTACProfileError) as error:
+    with pytest.raises(STACProfileError) as error:
         validate_stac_item(item)
     assert error.value.reason == "unknown_stac_extension"
 
@@ -119,7 +117,7 @@ def test_extension_schema_uri_requires_the_approved_https_host() -> None:
             "https://attacker.invalid/sar/v1.3.2/schema.json",
         ]
     )
-    with pytest.raises(UnknownSTACProfileError) as error:
+    with pytest.raises(STACProfileError) as error:
         validate_stac_item(item)
     assert error.value.reason == "unknown_stac_extension"
 
@@ -166,7 +164,7 @@ def test_normalized_properties_scrub_all_azure_sas_keys() -> None:
 
 def test_malformed_geometry_and_unqualified_insar_fields_are_typed() -> None:
     """Geometry and InSAR policy violations use typed profile errors."""
-    with pytest.raises(MalformedSTACItemError) as error:
+    with pytest.raises(STACProfileError) as error:
         validate_stac_item(_item(geometry=None))
     assert error.value.reason == "missing_geometry"
 

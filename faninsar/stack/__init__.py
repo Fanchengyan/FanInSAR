@@ -8,14 +8,8 @@ from faninsar.io.storage.ifg_store import (
     UnwrappedArtifact,
 )
 from faninsar.processing.runtime.device import GpuMemoryReclaim
-from faninsar.stack.activation import (
-    ActivationIssuerRecord,
-    LocalActivationAuthority,
-    StackGateEvent,
-)
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
-    ActivationMode,
     CoregMode,
     FlattenStage,
     StackConfig,
@@ -30,7 +24,6 @@ from faninsar.stack.mask_plan import (
 from faninsar.stack.provider import (
     SceneProductionCallback,
     SourceHandle,
-    StackProviderError,
     StackSceneProvider,
     UnsupportedStackCapabilityError,
     unavailable_scene_provider,
@@ -48,14 +41,11 @@ from faninsar.stack.stage import Stage
 __all__ = [
     "MASK_KINDS",
     "STAGES",
-    "ActivationIssuerRecord",
-    "ActivationMode",
     "CoregMode",
     "FlattenStage",
     "GpuMemoryReclaim",
     "InterferogramArtifact",
     "InterferogramArtifactStore",
-    "LocalActivationAuthority",
     "MaskDefinition",
     "MaskPlan",
     "MissionPreparedInputs",
@@ -66,8 +56,6 @@ __all__ = [
     "SourceHandle",
     "Stack",
     "StackConfig",
-    "StackGateEvent",
-    "StackProviderError",
     "StackSceneProvider",
     "Stage",
     "UnsupportedStackCapabilityError",

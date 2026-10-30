@@ -24,11 +24,8 @@ from typing import Any, Literal
 
 import xarray as xr
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
-from .exceptions import (
-    MissingInterferogramAssetError,
-)
 from .metadata import load_json, save_json
 
 logger = setup_logger(__name__)
@@ -108,8 +105,7 @@ class NetworkTimeSeries:
         p = self.displacement_path()
         if not p.exists():
             msg = f"displacement.zarr not found at {p}"
-            logger.error(msg)
-            raise FileNotFoundError(msg)
+            reject(msg, FileNotFoundError, logger=logger)
         return xr.open_zarr(p, chunks=chunks)
 
     def open(
@@ -123,13 +119,14 @@ class NetworkTimeSeries:
 
         Raises
         ------
-        MissingInterferogramAssetError
+        FileNotFoundError
             If the named asset does not exist.
 
         """
         p = self.path(name)
         if not p.exists():
-            raise MissingInterferogramAssetError(name)
+            msg = f"Time-series asset '{name}' not found."
+            raise FileNotFoundError(msg)
         import rioxarray  # noqa: F401  (registers .rio accessor)
 
         da = xr.open_dataarray(p, engine="rasterio", chunks=chunks)

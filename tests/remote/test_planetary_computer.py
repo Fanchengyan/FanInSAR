@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,12 +15,13 @@ import pytest
 
 from faninsar import remote
 from faninsar.data.query import BoundingBox
+from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.providers.planetary_computer import (
     COP_DEM_GLO30_COLLECTION,
     PlanetaryComputerAdapter,
     _instrument_session,
 )
-from faninsar.remote.standards import MalformedSTACItemError
+from faninsar.remote.standards import STACProfileError
 
 
 @dataclass
@@ -161,7 +163,7 @@ def test_planetary_computer_stac_transport_meters_response_history() -> None:
     response = _StacResponse(b"final", history=(redirected,))
     session = _StacSession(response)
     budget = remote.RemoteResourceBudget()
-    ledger = remote._CallLedger(budget)
+    ledger = _CallLedger(budget)
     adapter = PlanetaryComputerAdapter(signer=lambda value: value)
 
     restore = _instrument_session(session, ledger, adapter)
@@ -183,7 +185,7 @@ def test_planetary_computer_stac_transport_meters_response_history() -> None:
 def test_planetary_computer_stac_transport_charges_retries() -> None:
     """Transient transport failures consume the operation retry budget."""
     session = _RetryStacSession(_StacResponse(b"final"))
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_retries=1))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_retries=1))
     adapter = PlanetaryComputerAdapter(signer=lambda value: value)
 
     restore = _instrument_session(session, ledger, adapter)
@@ -236,7 +238,7 @@ def test_planetary_computer_download_signs_inside_the_mediated_stream(
         def open(self, *_args: object, **_kwargs: object) -> _Response:
             return response
 
-    monkeypatch.setattr(remote.urllib.request, "build_opener", lambda *_args: _Opener())
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_args: _Opener())
     asset = remote.RemoteAsset(
         provider="pc",
         catalog="pc-task-c-fetch",
@@ -274,7 +276,7 @@ def test_planetary_computer_default_signer_uses_real_sdk_mapping_shape(
         key="data",
         href="https://elevationeuwest.blob.core.windows.net/tile.tif",
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+    ledger = _CallLedger(remote.RemoteResourceBudget())
 
     signed_href = adapter._transfer_url(asset, budget=ledger.budget, ledger=ledger)
 
@@ -299,6 +301,6 @@ def test_planetary_computer_normalizes_and_types_malformed_stac_items() -> None:
     item = _item()
     item.id = ""
     adapter = PlanetaryComputerAdapter(client=_Client(item), signer=lambda value: value)
-    with pytest.raises(MalformedSTACItemError) as error:
+    with pytest.raises(STACProfileError) as error:
         list(adapter.items())
     assert error.value.reason == "invalid_item_id"

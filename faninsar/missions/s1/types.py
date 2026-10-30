@@ -93,7 +93,7 @@ class S1Product:
         polarization: str | None = None,
     ) -> S1Swath:
         """Return one sub-swath by name and optional polarization."""
-        from .errors import UnsupportedPolarizationError, reject_product
+        from .errors import reject_product
 
         matches = [item for item in self.swaths if item.swath == name]
         if polarization is not None:
@@ -104,6 +104,6 @@ class S1Product:
                     f"unsupported polarization {polarization!r} in product "
                     f"{self.source_path}; available={self.polarizations}"
                 )
-                raise UnsupportedPolarizationError(message)
+                raise ValueError(message)
             reject_product(f"swath {name!r} not found in product {self.source_path}")
         return matches[0]

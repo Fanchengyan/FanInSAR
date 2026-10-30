@@ -12,7 +12,7 @@ from faninsar.io.storage.arrays import (
     ChunkedZarrArrayStore,
     InMemoryArrayStore,
 )
-from faninsar.missions.protocols import MissingCriticalMetadataError
+from faninsar.processing.errors import InvalidProcessingStateError
 from tests.support.synthetic_slc import (
     SyntheticSLCReader,
     register_specs,
@@ -114,13 +114,13 @@ def test_missing_doppler_metadata_raises_typed_error() -> None:
     reader = SyntheticSLCReader(store=store, specs=register_specs(spec))
 
     with pytest.raises(
-        MissingCriticalMetadataError,
+        InvalidProcessingStateError,
         match="doppler_centroid",
     ) as caught:
         reader.open("memory://missing-doppler")
 
-    assert caught.value.source_path == "memory://missing-doppler"
-    assert "annotation" in caught.value.remedy
+    assert "memory://missing-doppler" in str(caught.value)
+    assert "annotation" in str(caught.value)
 
 
 def test_missing_valid_samples_metadata_raises_typed_error() -> None:
@@ -136,8 +136,8 @@ def test_missing_valid_samples_metadata_raises_typed_error() -> None:
     )
     reader = SyntheticSLCReader(store=store, specs=register_specs(spec))
 
-    with pytest.raises(MissingCriticalMetadataError, match="valid_samples") as caught:
+    with pytest.raises(InvalidProcessingStateError, match="valid_samples") as caught:
         reader.open("memory://missing-valid")
 
-    assert caught.value.field == "valid_samples"
-    assert "first/last valid sample" in caught.value.remedy
+    assert "valid_samples" in str(caught.value)
+    assert "first/last valid sample" in str(caught.value)

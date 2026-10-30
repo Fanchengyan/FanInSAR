@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from faninsar.data.query import BoundingBox
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_sources import (
     AUTO_SOURCE_NAME,
@@ -240,8 +240,7 @@ def _open_target(path: Path, gdal_open: str) -> list[str]:
             ]
         if not members:
             message = f"no raster members found in archive {path}"
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
         return [gdal_open.format(path=path, member=name) for name in members]
     if gdal_open.startswith("/vsicurl/"):
         return [str(path)]
@@ -256,8 +255,7 @@ def _resampling(name: str) -> object:
         return Resampling[name]
     except KeyError as exc:
         message = f"unsupported mosaic resampling {name!r}"
-        logger.exception(message)
-        raise InvalidProcessingStateError(message) from exc
+        reject(message, InvalidProcessingStateError, cause=exc)
 
 
 def resolution_m_to_degrees(resolution_m: float) -> float:
@@ -303,8 +301,7 @@ def _mosaic_arrays(
                 top = ds_top if top is None else max(top, ds_top)
         if not opened or left is None:
             message = "no DEM rasters available for mosaicking"
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
 
         width = max(1, int(np.ceil((right - left) / resolution_m)))
         height = max(1, int(np.ceil((top - bottom) / resolution_m)))
@@ -448,8 +445,7 @@ class DEMManager:
                 "provider override; select the underlying product "
                 "directly (e.g. 'glo90')"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         return parse_selection(selection)
 
     def _apply_base_override(self, entry: DemSource) -> DemSource:
@@ -459,8 +455,7 @@ class DEMManager:
                 f"FANINSAR_DEM_SOURCE_URL-style overrides must use https, "
                 f"got {self.base_url!r}"
             )
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
+            reject(message, InvalidProcessingStateError)
         if hasattr(entry, "base_url"):
             return replace(entry, base_url=self.base_url)
         if isinstance(entry, PcStacSource):
@@ -469,8 +464,7 @@ class DEMManager:
             f"source {entry.name!r} ({entry.provider}) does not accept a "
             "base URL override; its endpoint is pinned"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        return reject(message, InvalidProcessingStateError)
 
     # -- identity -----------------------------------------------------------
 
@@ -529,8 +523,7 @@ class DEMManager:
             f"source {self.source_entry.name!r} plans whole-artifact units "
             f"({type(plan).__name__}); required_tiles is undefined for it"
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        return reject(message, InvalidProcessingStateError)
 
     def _planned_fetch(self, bounds: Bounds) -> FetchPlan:
         """Resolve a registry plan at the manager's materialization boundary."""
@@ -538,8 +531,7 @@ class DEMManager:
         if isinstance(plan, DeferredStacPlan):
             if not isinstance(self.source_entry, PcStacSource):
                 message = "deferred STAC plan is only supported by PcStacSource"
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
+                reject(message, InvalidProcessingStateError)
             return self.source_entry.discover(plan)
         return plan
 
@@ -726,8 +718,7 @@ class DEMManager:
                         f"tile fetch did not produce {tile.cache_path}; "
                         "refusing to mosaic an incomplete set"
                     )
-                    logger.error(message)
-                    raise InvalidProcessingStateError(message)
+                    return reject(message, InvalidProcessingStateError)
             return list(dict.fromkeys(paths))
         if isinstance(plan, Artifact):
             return executed
@@ -1012,8 +1003,7 @@ def get_dem_manager(*, source: str | None = None) -> DEMManager:
             f"{DEM_CACHE_ENV} is not set; cannot resolve the automatic DEM. "
             "Point it at a folder for the raw DEM tile download cache."
         )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError)
     selection = (
         source
         if source is not None

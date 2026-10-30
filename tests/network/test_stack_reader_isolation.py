@@ -42,7 +42,6 @@ def _planned_stack(tmp_path: Path) -> Stack:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         pairs=Pairs.from_names(list(PLANNED)),
         multilook=(1, 1),
     )

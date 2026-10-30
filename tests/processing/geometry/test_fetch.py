@@ -8,16 +8,14 @@ from pathlib import Path
 import pytest
 
 from faninsar.processing.geometry.cache import (
-    CachePathError,
     cache_artifact_path,
     resolve_cache_root,
 )
 from faninsar.processing.geometry.fetch import (
     EGM2008_2_5,
     Fetch,
-    GeoidArtifactError,
-    GeoidOfflineError,
     GeoidResource,
+    GeoidResourceError,
 )
 
 
@@ -81,7 +79,7 @@ def test_bad_download_never_remains_in_cache(tmp_path: Path) -> None:
         transport=lambda _url: iter([b"wrong"]),
         resources={"fixture": resource},
     )
-    with pytest.raises(GeoidArtifactError):
+    with pytest.raises(GeoidResourceError):
         resolver.fetch("fixture")
     assert not (tmp_path / resource.name / resource.filename).exists()
 
@@ -98,7 +96,7 @@ def test_offline_missing_resource_fails_without_transport(
         transport=lambda url: calls.append(url) or iter([b"offline"]),
         resources={"fixture": resource},
     )
-    with pytest.raises(GeoidOfflineError):
+    with pytest.raises(GeoidResourceError):
         resolver.fetch("fixture")
     assert calls == []
 
@@ -113,7 +111,7 @@ def test_cache_root_environment_override(
 
 def test_cache_path_rejects_traversal(tmp_path: Path) -> None:
     """Cache identity components cannot escape the configured root."""
-    with pytest.raises(CachePathError):
+    with pytest.raises(ValueError):
         cache_artifact_path(tmp_path, "../escape", "file")
 
 

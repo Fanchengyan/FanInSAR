@@ -15,10 +15,10 @@ import pytest
 import requests
 import requests.adapters
 
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_transport import (
     CHUNK_SIZE_BYTES,
     RETRYABLE_STATUS_CODES,
-    TransientDemFetchError,
     Tile,
     TileSet,
     fetch_plan,
@@ -361,7 +361,7 @@ def test_exhausted_retries_raise_transient_error(
     patched_session: FakeSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Persistent 503 exhausts attempts and raises TransientDemFetchError."""
+    """Persistent 503 exhausts attempts and raises InvalidProcessingStateError."""
     monkeypatch.setattr(
         "faninsar.processing.geometry.dem_transport.compute_backoff_sleep",
         lambda attempt, retry_after=None: 0.0,
@@ -372,7 +372,7 @@ def test_exhausted_retries_raise_transient_error(
         url,
         [FakeResponse(status=503) for _ in range(10)],
     )
-    with pytest.raises(TransientDemFetchError):
+    with pytest.raises(InvalidProcessingStateError):
         _fetch_paths([(url, tmp_path / "flaky.tif")], tmp_path)
 
 

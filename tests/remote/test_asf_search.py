@@ -9,11 +9,12 @@ import pytest
 import requests
 
 from faninsar import remote
+from faninsar.remote.catalog import _register_adapter
+from faninsar.remote.errors import _fail
+from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.providers.asf_search import (
     ASFSearchAdapter,
     ASFSearchError,
-    EngineUnavailableError,
-    UnsupportedASFSearchVersionError,
     _probe_burst_safe_url,
     _transfer_burst_safe_url,
     _with_asset_link,
@@ -173,8 +174,8 @@ def test_unsupported_asf_search_fails_before_session_or_provider_io() -> None:
         session_factory=lambda: created.append(object()),
     )
 
-    with pytest.raises(UnsupportedASFSearchVersionError) as error:
-        list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+    with pytest.raises(ASFSearchError) as error:
+        list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
 
     assert error.value.reason == "unsupported_asf_search_version"
     assert created == []
@@ -189,7 +190,7 @@ def test_asf_search_uses_supplied_operation_session_and_normalizes_product() -> 
         package=module,
         session_factory=lambda: session,
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+    ledger = _CallLedger(remote.RemoteResourceBudget())
 
     records = list(adapter.items(ledger=ledger))
 
@@ -211,7 +212,7 @@ def test_asf_search_yields_intermediate_and_terminal_pages() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+    ledger = _CallLedger(remote.RemoteResourceBudget())
 
     records = list(adapter.items(ledger=ledger))
 
@@ -229,7 +230,7 @@ def test_remote_search_fetches_terminal_page_before_applying_public_limit() -> N
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-complete-before-limit", adapter)
+    _register_adapter("asf-complete-before-limit", adapter)
 
     items = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -272,7 +273,7 @@ def test_asf_search_preserves_declared_complete_safe_size() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-size", adapter)
+    _register_adapter("asf-size", adapter)
 
     items = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -296,7 +297,7 @@ def test_asf_search_maps_md5sum_to_complete_asset_checksum() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-md5sum", adapter)
+    _register_adapter("asf-md5sum", adapter)
 
     items = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -318,7 +319,7 @@ def test_asf_search_without_md5sum_leaves_checksum_none() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-no-md5sum", adapter)
+    _register_adapter("asf-no-md5sum", adapter)
 
     items = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -339,7 +340,7 @@ def test_asf_search_translates_common_direction_and_burst_filters() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-query-fields", adapter)
+    _register_adapter("asf-query-fields", adapter)
 
     remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -363,7 +364,7 @@ def test_asf_search_rejects_duplicate_common_filter_before_session_creation() ->
         package=_ASFModule(_product()),
         session_factory=lambda: created.append(object()),
     )
-    remote._register_adapter("asf-duplicate-fields", adapter)
+    _register_adapter("asf-duplicate-fields", adapter)
 
     with pytest.raises(remote.RemoteQueryError) as error:
         remote.search(
@@ -419,7 +420,7 @@ def test_compact_burst_record_exposes_complete_safe_asset() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-compact-burst", adapter)
+    _register_adapter("asf-compact-burst", adapter)
 
     item = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -458,7 +459,7 @@ def test_asf_umm_burst_service_safe_is_selected_as_complete_asset() -> None:
         package=module,
         session_factory=lambda: session,
     )
-    remote._register_adapter("asf-burst-safe", adapter)
+    _register_adapter("asf-burst-safe", adapter)
 
     item = remote.search(
         remote.Points([(0.5, 0.5)], crs=4326),
@@ -498,7 +499,7 @@ def test_asf_rejects_multiple_complete_safe_urls() -> None:
     )
 
     with pytest.raises(ASFSearchError) as raised:
-        list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+        list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
 
     assert getattr(raised.value, "reason", None) == "ambiguous_representation"
 
@@ -554,7 +555,7 @@ def test_asf_burst_transfer_performs_one_probe(
 
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: _Opener())
     adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_retries=2))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_retries=2))
 
     with pytest.raises(remote.BurstPendingError, match="burst_pending"):
         _transfer_burst_safe_url(
@@ -585,7 +586,7 @@ def test_asf_burst_poll_budget_and_backoff_are_dedicated(
 
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: _Opener())
     adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
-    ledger = remote._CallLedger(
+    ledger = _CallLedger(
         remote.RemoteResourceBudget(max_retries=1, max_poll_attempts=50)
     )
 
@@ -619,7 +620,7 @@ def test_asf_burst_poll_limit_rejects_fiftieth_pending_observation(
 
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: _Opener())
     adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_poll_attempts=50))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_poll_attempts=50))
 
     url = "https://sentinel1-burst.asf.alaska.edu/jobs/burst.zip"
     for attempt in range(50):
@@ -627,7 +628,7 @@ def test_asf_burst_poll_limit_rejects_fiftieth_pending_observation(
         assert observation.state == "pending"
         if attempt == 49:
             with pytest.raises(remote.RemoteLimitError, match="max_poll_attempts"):
-                remote._fail(remote.RemoteLimitError, "max_poll_attempts")
+                _fail(remote.RemoteLimitError, "max_poll_attempts")
             break
         ledger.poll_retry()
         url = observation.url
@@ -685,7 +686,7 @@ def test_asf_search_denies_redirect_before_following_credentials() -> None:
     )
 
     with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
-        list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+        list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
 
     assert len(transport.requests) == 1
     assert transport.requests[0].url.startswith("https://cmr.earthdata.nasa.gov/")
@@ -707,8 +708,8 @@ def test_asf_search_failure_does_not_fall_back_to_cmr() -> None:
         session_factory=lambda: session,
     )
 
-    with pytest.raises(EngineUnavailableError) as error:
-        list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+    with pytest.raises(ASFSearchError) as error:
+        list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
 
     assert error.value.reason == "asf_search_failed"
     assert session.posts == []

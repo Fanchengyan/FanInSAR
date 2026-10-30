@@ -3,7 +3,7 @@
 # The masking boundary intentionally performs driver/geometry operations in a
 # compact module.  Keep the repository's stricter migration-only checks out of
 # this implementation while retaining formatting and import checks.
-# ruff: noqa: B905, EM101, EM102, TRY003, TRY400
+# ruff: noqa: B905, EM101, EM102, TRY003
 
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ from typing import Any
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.geometry.grids import GridSpec
-
-logger = setup_logger(__name__)
 
 LonLatBounds = tuple[float, float, float, float]
 _SEAM_TOLERANCE_DEG = 1e-9
@@ -158,12 +156,10 @@ def _readonly_uint8(data: np.ndarray) -> np.ndarray:
         array = array.astype(np.uint8)
     elif array.dtype != np.uint8:
         message = f"raster mask data must be bool or uint8, got {array.dtype}"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     if np.any(~np.isin(array, np.array([0, 1, 255], dtype=np.uint8))):
         message = "raster mask data may contain only 0, 1, and 255"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     result = np.array(array, dtype=np.uint8, copy=True)
     result.setflags(write=False)
     return result
@@ -292,8 +288,7 @@ class Mask(ABC):
         """Construct a raster mask from bool or uint8 data."""
         if not isinstance(grid, GridSpec):
             message = "grid must be a GridSpec"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         return RasterMask(data, grid, source=source)
 
     @classmethod
@@ -322,14 +317,12 @@ class Mask(ABC):
         """Create a deferred water recipe without provider I/O."""
         if policy is not None and not isinstance(policy, Mapping):
             message = "water mask policy must be a mapping"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         if policy:
             unknown = sorted(set(policy) - _WATER_POLICY_KEYS)
             if unknown:
                 message = f"water mask policy contains unsupported fields: {unknown!r}"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
         return VectorMask(
             None,
             crs="EPSG:4326",
@@ -374,8 +367,7 @@ class RasterMask(Mask):
         array = _readonly_uint8(data)
         if array.shape != grid.shape:
             message = f"raster shape {array.shape} does not match grid {grid.shape}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         normalized_source = _freeze(source)
         self._data, self.grid, self.source = (
             _apply_validity(grid, array),
@@ -452,16 +444,14 @@ class RasterMask(Mask):
                 bounds = box(*bounds)
             if not hasattr(bounds, "equals"):
                 message = "raster vector conversion bounds must be a geometry"
-                logger.error(message)
-                raise TypeError(message)
+                reject(message, TypeError)
             full_bounds = box(*self.grid.bounds)
             if not bounds.equals(full_bounds):
                 message = (
                     "RasterMask.to_vector supports only the exact full grid bounds; "
                     "partial conversion is not lossless"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
 
         geometries, roles = [], []
         for value, role in ((1, "excluded"), (255, "invalid")):
@@ -562,8 +552,7 @@ class VectorMask(Mask):
             canonical_crs = pyproj.CRS.from_user_input(crs).to_string()
         except Exception as error:
             message = f"unresolvable vector CRS: {crs!r}"
-            logger.error(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
         self.geometry = tuple(geometries)
         self.crs = canonical_crs
         if roles is None and hasattr(geometry, "columns"):
@@ -578,8 +567,7 @@ class VectorMask(Mask):
         invalid_roles = set(self.roles) - {"excluded", "invalid"}
         if invalid_roles:
             message = f"unsupported vector mask roles: {sorted(invalid_roles)!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self.categories = self._normalise_field(categories, len(geometries), None)
         self.provenance = _freeze(provenance or {})
         self._water_recipe = (
@@ -681,8 +669,7 @@ class VectorMask(Mask):
             )
         ):
             message = "excluded and invalid vector roles overlap"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         result = (
             np.asarray(
                 rasterize(
@@ -799,8 +786,7 @@ class UnionMask(Mask):
                 message = (
                     f"UnionMask operands must be Mask, got {type(operand).__name__}"
                 )
-                logger.error(message)
-                raise TypeError(message)
+                reject(message, TypeError)
             flattened.extend(
                 operand.operands if isinstance(operand, UnionMask) else (operand,)
             )
@@ -842,8 +828,7 @@ class UnionMask(Mask):
         vectors = [operand.to_vector(bounds) for operand in self.operands]
         if not vectors:
             message = "empty UnionMask has no vector geometry"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         for vector in vectors:
             excluded = [
                 geometry
@@ -861,8 +846,7 @@ class UnionMask(Mask):
                 for right in invalid
             ):
                 message = "excluded and invalid vector roles overlap"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
         crs = vectors[0].crs
         if any(vector.crs != crs for vector in vectors):
             import pyproj
@@ -907,8 +891,7 @@ class UnionMask(Mask):
             for right in invalid
         ):
             message = "excluded and invalid vector roles overlap"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         return VectorMask(
             [geometry for vector in vectors for geometry in vector.geometry],
             crs=crs,

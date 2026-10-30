@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.processing.errors import ProcessingContractError
 from faninsar.processing.geometry import (
-    OrbitInterpolationError,
     OrbitInterpolator,
     ecef_to_llh,
     geometric_baseline,
@@ -68,7 +68,7 @@ def test_orbit_interpolation_matches_nodes_and_rejects_out_of_range() -> None:
     np.testing.assert_allclose(state.position_m, node.position_m, rtol=0, atol=1e-6)
     np.testing.assert_allclose(state.velocity_m_s, node.velocity_m_s, rtol=0, atol=1e-6)
 
-    with pytest.raises(OrbitInterpolationError, match="outside coverage"):
+    with pytest.raises(ProcessingContractError, match="outside coverage"):
         interpolate_orbit(orbit, orbit.vectors[0].time - timedelta(seconds=1))
 
 

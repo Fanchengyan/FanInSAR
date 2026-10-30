@@ -9,7 +9,6 @@ from faninsar.processing.runtime.execution import (
     ChunkLayout,
     DTypePolicy,
     ExecutionProfile,
-    ExecutionValidationError,
     Locality,
     MemoryBudget,
     OperationPlan,
@@ -53,7 +52,7 @@ def test_fft_rejects_multiple_chunks_on_transform_axis() -> None:
         transform_axes=(0,),
     )
 
-    with pytest.raises(ExecutionValidationError, match="transform axis 0"):
+    with pytest.raises(RuntimeError, match="transform axis 0"):
         _ = validate_execution(plan, ExecutionProfile.local_cpu())
 
 
@@ -65,7 +64,7 @@ def test_gpu_resource_rejects_profile_without_matching_worker() -> None:
         chunks=((256,), (256,)),
     )
 
-    with pytest.raises(ExecutionValidationError, match="GPU resource"):
+    with pytest.raises(RuntimeError, match="GPU resource"):
         _ = validate_execution(plan, ExecutionProfile.local_cpu())
 
 
@@ -100,7 +99,7 @@ def test_oversized_tile_rejected_by_peak_memory_estimate() -> None:
         memory=MemoryBudget(worker_bytes=128 * 1024**2, safety_fraction=0.7),
     )
 
-    with pytest.raises(ExecutionValidationError, match="memory budget"):
+    with pytest.raises(RuntimeError, match="memory budget"):
         _ = validate_execution(plan, profile)
 
 
@@ -132,7 +131,7 @@ def test_mps_rejects_operation_outside_probed_subset() -> None:
         memory=MemoryBudget(worker_bytes=1024**3),
     )
 
-    with pytest.raises(ExecutionValidationError, match="bounded MPS subset"):
+    with pytest.raises(RuntimeError, match="bounded MPS subset"):
         _ = validate_execution(plan, profile)
 
 
@@ -144,7 +143,7 @@ def test_memory_budget_rejects_malformed_values(
     worker_bytes: int, safety_fraction: float
 ) -> None:
     """Reject non-positive or unsafe worker memory policies."""
-    with pytest.raises(ExecutionValidationError, match="Memory budget"):
+    with pytest.raises(RuntimeError, match="Memory budget"):
         _ = MemoryBudget(
             worker_bytes=worker_bytes,
             safety_fraction=safety_fraction,
@@ -153,7 +152,7 @@ def test_memory_budget_rejects_malformed_values(
 
 def test_chunk_layout_rejects_incomplete_axis_coverage() -> None:
     """Reject chunks that do not exactly cover their array axis."""
-    with pytest.raises(ExecutionValidationError, match="exactly cover shape"):
+    with pytest.raises(RuntimeError, match="exactly cover shape"):
         _ = ChunkLayout(shape=(64, 64), chunks=((32,), (64,)))
 
 
@@ -161,7 +160,7 @@ def test_peak_estimator_rejects_mismatched_halo_rank() -> None:
     """Reject halo depths that cannot map to every array axis."""
     layout = ChunkLayout(shape=(64, 64), chunks=((64,), (64,)))
 
-    with pytest.raises(ExecutionValidationError, match="Halo rank"):
+    with pytest.raises(RuntimeError, match="Halo rank"):
         _ = estimate_peak_bytes(
             layout,
             itemsize=8,
@@ -182,7 +181,7 @@ def test_peak_estimator_rejects_negative_memory_inputs(
     """Reject values that could create a negative peak estimate."""
     layout = ChunkLayout(shape=(64, 64), chunks=((64,), (64,)))
 
-    with pytest.raises(ExecutionValidationError, match="non-negative"):
+    with pytest.raises(RuntimeError, match="non-negative"):
         _ = estimate_peak_bytes(
             layout,
             itemsize=itemsize,

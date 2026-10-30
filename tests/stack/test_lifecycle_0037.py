@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import pytest
 
 from faninsar.missions.s1 import S1Stack
-from faninsar.processing.errors import PairConfigurationMigrationError
 from faninsar.stack import (
     SourceHandle,
     Stack,
@@ -36,7 +35,6 @@ def test_s1_stack_installs_provider_and_groups_source_segments(tmp_path: Path) -
     stack = S1Stack.from_safes(
         [first, second, later],
         work_dir=tmp_path / "work",
-        activation_mode="reference",
     )
 
     assert stack.reference == "20240101"
@@ -50,7 +48,6 @@ def test_base_stack_provider_boundary_fails_closed(tmp_path: Path) -> None:
     stack = Stack._from_safes(
         source,
         work_dir=tmp_path / "work",
-        activation_mode="reference",
     )
 
     with pytest.raises(UnsupportedStackCapabilityError, match="scene-production"):
@@ -69,7 +66,6 @@ def test_s1_pair_engine_is_not_a_production_entry(
     stack = S1Stack.from_safes(
         source,
         work_dir=tmp_path / "work",
-        activation_mode="reference",
     )
     with pytest.raises(UnsupportedStackCapabilityError, match="scene-production"):
         stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
@@ -83,7 +79,6 @@ def test_stack_provider_receives_opaque_handles_without_path_leak(
     stack = Stack._from_safes(
         source,
         work_dir=tmp_path / "work",
-        activation_mode="reference",
     )
     received: list[tuple[SourceHandle, SourceHandle]] = []
 
@@ -120,12 +115,11 @@ def test_stack_reference_is_the_only_public_common_acquisition_name(
         source,
         work_dir=tmp_path / "work",
         reference="20240113",
-        activation_mode="reference",
     )
 
     assert stack.reference == "20240113"
     assert not hasattr(stack, "master")
-    with pytest.raises(PairConfigurationMigrationError, match="reference"):
+    with pytest.raises(RuntimeError, match="reference"):
         S1Stack.from_safes(
             source,
             work_dir=tmp_path / "old-work",

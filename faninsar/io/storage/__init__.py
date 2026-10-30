@@ -51,7 +51,6 @@ if TYPE_CHECKING:
         write_scene,
     )
     from faninsar.io.storage.validation import (
-        ManifestValidationError,
         ManifestValidationSummary,
         validate_pipeline_rebuild_manifest,
     )
@@ -84,7 +83,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ProvenanceRecord": ("provenance", "ProvenanceRecord"),
     "SoftwareIdentity": ("provenance", "SoftwareIdentity"),
     "StacProvenanceProperties": ("provenance", "StacProvenanceProperties"),
-    "ManifestValidationError": ("validation", "ManifestValidationError"),
     "ManifestValidationSummary": ("validation", "ManifestValidationSummary"),
     "validate_pipeline_rebuild_manifest": (
         "validation",
@@ -114,7 +112,6 @@ __all__ = [
     "InterferogramArtifactStore",
     "IonosphereArtifact",
     "IonosphereArtifactStore",
-    "ManifestValidationError",
     "ManifestValidationSummary",
     "ProcessingEvent",
     "Product",

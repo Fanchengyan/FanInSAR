@@ -4,17 +4,11 @@ from __future__ import annotations
 
 from typing import Never
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 class Sentinel1ProductError(RuntimeError):
     """Raised when a Sentinel-1 product cannot be opened safely."""
-
-
-class UnsupportedPolarizationError(Sentinel1ProductError):
-    """Raised when a requested polarization is absent or unsupported."""
 
 
 def reject_product(message: str) -> Never:
@@ -31,5 +25,4 @@ def reject_product(message: str) -> Never:
         Always raised after logging.
 
     """
-    logger.error("%s", message)
-    raise Sentinel1ProductError(message)
+    reject(message, Sentinel1ProductError)

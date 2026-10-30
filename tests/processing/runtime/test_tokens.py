@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from faninsar.core.physical import PhysicalType
+from faninsar.processing.errors import ProcessingContractError
 from faninsar.processing.runtime.tokens import ArrayToken, assert_token
-from faninsar.processing.errors import StageError
 
 
 def test_assert_token_ok() -> None:
@@ -16,5 +16,5 @@ def test_assert_token_ok() -> None:
 
 def test_assert_token_mismatch() -> None:
     token = ArrayToken(physical=PhysicalType.SLC_RAW)
-    with pytest.raises(StageError):
+    with pytest.raises(ProcessingContractError):
         assert_token(token, PhysicalType.IFG_COMPLEX, stage="stage_ifg")

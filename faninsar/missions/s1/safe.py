@@ -9,16 +9,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 from .annotation import parse_annotation_xml
-from .errors import UnsupportedPolarizationError, reject_product
+from .errors import reject_product
 from .types import S1Burst, S1Product, S1Swath
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-logger = setup_logger(__name__)
 
 _SUPPORTED_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
 _MISSION_PREFIXES = ("S1A", "S1B", "S1C", "S1D")
@@ -51,7 +50,7 @@ def open_safe_product(
     ------
     Sentinel1ProductError
         If the product structure or required metadata is invalid.
-    UnsupportedPolarizationError
+    ValueError
         If a requested polarization is not present.
 
     """
@@ -94,7 +93,7 @@ def open_acquisition_products(
     ------
     Sentinel1ProductError
         If a path is not a SAFE product or required metadata is invalid.
-    UnsupportedPolarizationError
+    ValueError
         If a requested polarization is not present.
 
     """
@@ -131,7 +130,7 @@ def open_safe_acquisition(
     ------
     Sentinel1ProductError
         If the inputs do not collapse to one logical product.
-    UnsupportedPolarizationError
+    ValueError
         If a requested polarization is not present.
 
     """
@@ -280,15 +279,13 @@ def _assemble_product(
     for pol in requested:
         if pol not in _SUPPORTED_POLARIZATIONS:
             message = f"unsupported polarization {pol!r}; allowed={allowed}"
-            logger.error(message)
-            raise UnsupportedPolarizationError(message)
+            reject(message, ValueError)
         if pol not in present:
             message = (
                 f"polarization {pol!r} not present in {source_path}; "
                 f"available={present}"
             )
-            logger.error(message)
-            raise UnsupportedPolarizationError(message)
+            reject(message, ValueError)
 
     filtered = tuple(swath for swath in swaths if swath.polarization in requested)
     if not filtered:

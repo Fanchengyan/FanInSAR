@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1.search import select_orbit_bindings
 from faninsar.remote.errors import RemoteAccessError
 from faninsar.remote.providers.s1_orbits import (
@@ -40,29 +40,6 @@ _EOF_NAME = re.compile(
     re.IGNORECASE,
 )
 _MISSIONS = frozenset({"S1A", "S1B", "S1C", "S1D"})
-
-
-class S1OrbitDownloadError(RuntimeError):
-    """Raised when a covering EOF list or GET fails."""
-
-    def __init__(
-        self,
-        *,
-        dates: Sequence[str],
-        host: str,
-        status: int,
-        message: str | None = None,
-    ) -> None:
-        """Record the acquisitions, host, and HTTP status of a failed download."""
-        self.dates = tuple(str(date_id) for date_id in dates)
-        self.host = host
-        self.status = int(status)
-        text = message or (
-            "orbit download failed for "
-            f"{', '.join(self.dates)} from {host} (HTTP {self.status})"
-        )
-        logger.error("%s", text)
-        super().__init__(text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,14 +155,12 @@ def _orbit_destination(cache_dir: Path, key: str) -> Path:
     parsed = parse_eof_filename(key)
     if parsed is None:
         message = f"invalid S1 orbit object key: {key}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     root = cache_dir.resolve()
     destination = (root / parsed.filename).resolve()
     if destination.parent != root:
         message = f"orbit destination escapes cache directory: {destination}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return destination
 
 
@@ -205,8 +180,7 @@ def _eof_asset(key: str) -> RemoteAsset:
     parsed = parse_eof_filename(key)
     if parsed is None:
         message = f"invalid S1 orbit object key: {key}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     href = f"{S1_ORBITS_ORIGIN}/{parsed.key}"
     return RemoteAsset(
         provider="s1-orbits",
@@ -225,18 +199,13 @@ def _eof_asset(key: str) -> RemoteAsset:
 def _raise_download_error(date_id: str, error: BaseException) -> None:
     """Convert a remote HTTP failure into a dated orbit download error."""
     if isinstance(error, S1OrbitsHttpError):
-        raise S1OrbitDownloadError(
-            dates=(date_id,),
-            host=error.host,
-            status=error.status,
-        ) from error
-    host = S1_ORBITS_ORIGIN.removeprefix("https://")
-    status = int(getattr(error, "status", 0) or 0)
-    raise S1OrbitDownloadError(
-        dates=(date_id,),
-        host=host,
-        status=status,
-    ) from error
+        host = error.host
+        status = error.status
+    else:
+        host = S1_ORBITS_ORIGIN.removeprefix("https://")
+        status = int(getattr(error, "status", 0) or 0)
+    message = f"orbit download failed for {date_id} from {host} (HTTP {status})"
+    reject(message, RuntimeError, cause=error, logger=logger)
 
 
 def _adapter() -> S1OrbitsAdapter:
@@ -278,7 +247,7 @@ def ensure_covering_orbit_paths(
 
     Raises
     ------
-    S1OrbitDownloadError
+    RuntimeError
         If a covering list or object GET fails. A catalog miss is not an
         error; it leaves that date unbound.
 
@@ -395,7 +364,6 @@ __all__ = [
     "S1_ORBITS_CATALOG",
     "S1_ORBITS_ORIGIN",
     "EofFilename",
-    "S1OrbitDownloadError",
     "ensure_covering_orbit_paths",
     "ensure_s1_orbits_catalog",
     "parse_eof_filename",

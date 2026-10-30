@@ -4,22 +4,11 @@ from __future__ import annotations
 
 from typing import Never
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 class ProcessingContractError(RuntimeError):
     """Base error for invalid processing metadata or state transitions."""
-
-
-class PairConfigurationMigrationError(ProcessingContractError):
-    """Raised when a removed pair configuration reaches a Stack boundary.
-
-    Pair-shaped execution is retained only as an internal implementation
-    detail.  Public callers must provide a Stack configuration containing all
-    source scenes under ``paths`` or ``sources``.
-    """
 
 
 class InvalidProcessingStateError(ProcessingContractError):
@@ -28,42 +17,6 @@ class InvalidProcessingStateError(ProcessingContractError):
 
 class GridMismatchError(ProcessingContractError):
     """Raised when products do not share the required coordinate grid."""
-
-
-class StageError(ProcessingContractError):
-    """Stage failure with stage name, pair identity, and recovery hint.
-
-    Attributes
-    ----------
-    stage : str
-        Name of the failing stage.
-    pair : str or None
-        Pair identifier when applicable.
-    hint : str
-        Human-readable recovery or diagnostic hint.
-
-    """
-
-    def __init__(
-        self,
-        message: str | None = None,
-        *,
-        stage: str | None = None,
-        pair: str | None = None,
-        hint: str | None = None,
-    ) -> None:
-        """Build a StageError, chaining ``__cause__`` when raised from ``except``."""
-        self.stage = stage or "unknown"
-        self.pair = pair
-        self.hint = hint or ""
-        parts = [f"stage={self.stage}"]
-        if pair:
-            parts.append(f"pair={pair}")
-        if hint:
-            parts.append(hint)
-        if message:
-            parts.insert(0, message)
-        super().__init__(": ".join(parts))
 
 
 def reject_invalid_state(message: str) -> Never:
@@ -80,8 +33,7 @@ def reject_invalid_state(message: str) -> Never:
         Always raised after the rejection is logged.
 
     """
-    logger.error("processing state rejected: %s", message)
-    raise InvalidProcessingStateError(message)
+    reject(f"processing state rejected: {message}", InvalidProcessingStateError)
 
 
 def reject_grid_mismatch(message: str) -> Never:
@@ -98,8 +50,7 @@ def reject_grid_mismatch(message: str) -> Never:
         Always raised after the rejection is logged.
 
     """
-    logger.error("processing grid rejected: %s", message)
-    raise GridMismatchError(message)
+    reject(f"processing grid rejected: {message}", GridMismatchError)
 
 
 def reject_pair_configuration(message: str) -> Never:
@@ -112,9 +63,8 @@ def reject_pair_configuration(message: str) -> Never:
 
     Raises
     ------
-    PairConfigurationMigrationError
+    RuntimeError
         Always raised after the rejection is logged.
 
     """
-    logger.error("legacy pair configuration rejected: %s", message)
-    raise PairConfigurationMigrationError(message)
+    reject(f"legacy pair configuration rejected: {message}", RuntimeError)

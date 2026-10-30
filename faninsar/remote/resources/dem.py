@@ -1,4 +1,5 @@
 # ruff: noqa: EM101, EM102, TRY003
+# ruff: noqa: EM101, EM102, TRY003, TRY004
 """Bounded provider transport at the DEM I/O boundary.
 
 The transport deliberately uses ordinary writes.  A destination is useful only
@@ -21,10 +22,6 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
-
-
-class BoundedTransferError(ValueError):
-    """Raised for malformed protocol metadata or a stream over its bound."""
 
 
 def resolve_cache_path(root: str | Path, relative: str | Path) -> Path:
@@ -112,7 +109,7 @@ def _response_metadata(
     try:
         length_value = int(length) if length is not None else None
     except (TypeError, ValueError) as error:
-        raise BoundedTransferError("invalid Content-Length") from error
+        raise ValueError("invalid Content-Length") from error
     return status, length_value, headers
 
 
@@ -132,26 +129,26 @@ def stream_to_cache(
     ``expected_length``.
     """
     if type(max_bytes) is not int or max_bytes <= 0:
-        raise BoundedTransferError("maximum transfer bytes must be positive")
+        raise ValueError("maximum transfer bytes must be positive")
     if expected_length is not None:
         preflight_transfer(
             expected_length, budget=ResourceBudget(max_fetch_bytes=max_bytes)
         )
     if status_code not in (None, 200, 206):
-        raise BoundedTransferError(f"unsupported transfer status {status_code}")
+        raise ValueError(f"unsupported transfer status {status_code}")
     if status_code == 206:
         if not content_range:
-            raise BoundedTransferError("HTTP 206 requires Content-Range")
+            raise ValueError("HTTP 206 requires Content-Range")
         match = _CONTENT_RANGE.fullmatch(content_range.strip())
         if match is None:
-            raise BoundedTransferError("invalid Content-Range")
+            raise ValueError("invalid Content-Range")
         start, end, total = (int(match.group(1)), int(match.group(2)), match.group(3))
         if expected_length is None:
             expected_length = end - start + 1
         if end < start or expected_length != end - start + 1:
-            raise BoundedTransferError("HTTP range length does not match Content-Range")
+            raise ValueError("HTTP range length does not match Content-Range")
         if total != "*" and int(total) < end + 1:
-            raise BoundedTransferError("Content-Range exceeds resource length")
+            raise ValueError("Content-Range exceeds resource length")
         preflight_transfer(
             expected_length,
             budget=ResourceBudget(max_fetch_bytes=max_bytes),
@@ -162,13 +159,13 @@ def stream_to_cache(
     with target.open("wb") as output:
         for chunk in chunks:
             if not isinstance(chunk, bytes):
-                raise BoundedTransferError("transport yielded a non-bytes chunk")
+                raise ValueError("transport yielded a non-bytes chunk")
             written += len(chunk)
             if written > max_bytes:
-                raise BoundedTransferError("stream exceeded maximum transfer bytes")
+                raise ValueError("stream exceeded maximum transfer bytes")
             output.write(chunk)
     if expected_length is not None and written != expected_length:
-        raise BoundedTransferError(
+        raise ValueError(
             f"transfer length mismatch: expected {expected_length}, got {written}"
         )
     return written
@@ -226,7 +223,7 @@ def download(
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
                 if not location:
-                    raise BoundedTransferError("redirect response has no Location")
+                    raise ValueError("redirect response has no Location")
                 current = validate_redirect(
                     current, location, allowed_hosts=allowed_hosts
                 )
@@ -241,7 +238,7 @@ def download(
             return Path(destination)
         finally:
             response.close()
-    raise BoundedTransferError("too many redirects for DEM resource")
+    raise ValueError("too many redirects for DEM resource")
 
 
 def download_ftp(
@@ -273,7 +270,6 @@ def download_ftp(
 
 
 __all__ = [
-    "BoundedTransferError",
     "download",
     "download_ftp",
     "resolve_cache_path",

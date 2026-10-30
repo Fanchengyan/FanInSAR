@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry import GridSpec, RasterDEM
@@ -131,8 +131,7 @@ def _execute_plan(
             path = target if target.is_file() else by_name.get(target.name)
             if path is None:
                 message = f"P0030 fetch did not produce {target}"
-                logger.error(message)
-                raise RuntimeError(message)
+                reject(message, RuntimeError)
             if path not in resolved:
                 resolved.append(path)
         return resolved
@@ -172,8 +171,7 @@ def _execute_remote_granules(
     discover = getattr(entry, "discover", None)
     if not callable(discover):
         message = f"DEM source {entry.name!r} cannot resolve deferred granules"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     try:
         if isinstance(plan, DeferredStacPlan):
             discover = entry.discover_remote_assets
@@ -330,8 +328,7 @@ def _sample_paths(paths: list[Path], entry: DemSource, grid: GridSpec) -> np.nda
             overlap = np.isfinite(output) & np.isfinite(sampled)
             if np.any(overlap & ~np.isclose(output, sampled, atol=1e-3, rtol=1e-6)):
                 message = f"overlapping DEM source files disagree: {path.name}"
-                logger.error(message)
-                raise RuntimeError(message)
+                reject(message, RuntimeError)
             fill = np.isnan(output) & np.isfinite(sampled)
             output[fill] = sampled[fill]
     return output.astype(np.float32)
@@ -384,16 +381,14 @@ def _resolve_entry(source: _P0030Source) -> DemSource:
         entry = get_dem_source(source.collection_id)
     except (KeyError, TypeError, ValueError) as error:
         message = f"DEM provider selection is unavailable: {source.collection_id!r}"
-        logger.exception(message)
-        raise RuntimeError(message) from error
+        reject(message, RuntimeError, cause=error)
     if entry.product != source.product or entry.provider != source.provider:
         message = (
             "DEM provider selection resolved to a different product/provider: "
             f"requested {source.collection_id!r}, got {entry.product!r}:"
             f"{entry.provider!r}"
         )
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     return entry
 
 
@@ -446,8 +441,7 @@ def _materialize_auto(
             "automatic DEM fetch found no published GLO-30/GLO-90 tiles "
             f"(unpublished={unpublished!r}); refusing to mint an all-zero DEM"
         )
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     primary_paths = (
         _execute_plan(
             replace(primary_plan, tiles=tuple(primary_tiles)),

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import dem_sources as ds
 from faninsar.processing.geometry.dem_sources import (
     MosaicRecipe,
@@ -71,7 +72,7 @@ class TestShapeClasses:
                 continue
             try:
                 source.plan(_bounds(10.0, 40.0, 10.5, 40.5))
-            except ds.DemSourceUnavailableError:
+            except InvalidProcessingStateError:
                 continue  # fail-closed coverage/auth gating is fine
 
 
@@ -338,7 +339,7 @@ class TestPgcQuadSource:
                 "arcticdem/mosaics/v4.1/32m/07_42/07_42_32m_v4.1_dem.tif",
             ]
         )
-        with pytest.raises(ds.DemSourceUnavailableError, match="gap|missing|quad"):
+        with pytest.raises(InvalidProcessingStateError, match="gap|missing|quad"):
             source._expected_quads(_bounds(-70.0, 75.0, -60.0, 80.0))
 
     def test_2m_tier_uses_row_col_subtiles(self) -> None:
@@ -528,7 +529,7 @@ class TestPcStacSource:
         source = get_dem_source("nasadem")
         assert isinstance(source, ds.PcStacSource)
         plan = source.plan(_bounds(10.0, 40.0, 11.0, 41.0))
-        with pytest.raises(ds.DemSourceUnavailableError, match="pip install|\\[pc\\]"):
+        with pytest.raises(InvalidProcessingStateError, match="pip install|\\[pc\\]"):
             source.discover(plan)
 
     def test_pc_sign_inplace_modifier_flow(

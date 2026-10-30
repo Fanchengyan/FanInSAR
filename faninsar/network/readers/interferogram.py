@@ -13,11 +13,6 @@ from faninsar.core import Pairs
 from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
-from .exceptions import (
-    GridMismatchError,
-    MissingInterferogramAssetError,
-    PairNotFoundError,
-)
 from .metadata import (
     CATEGORICAL_ASSETS,
     INTERFEROGRAM_ASSETS,
@@ -269,7 +264,8 @@ class InterferogramCollection:
         name = _pair_name(pair)
         d = self._root / name
         if not d.is_dir():
-            raise PairNotFoundError(name)
+            msg = f"Pair '{name}' not found in the interferogram collection."
+            raise LookupError(msg)
         return d
 
     def path(self, pair: str, name: InterferogramAssetName) -> Path:
@@ -287,7 +283,8 @@ class InterferogramCollection:
         """Load and return the item.json for a pair."""
         item_path = self.pair_dir(pair) / "item.json"
         if not item_path.exists():
-            raise PairNotFoundError(pair)
+            msg = f"Pair '{pair}' not found in the interferogram collection."
+            raise LookupError(msg)
         return load_json(item_path)
 
     def summary(self) -> dict[str, Any]:
@@ -805,7 +802,8 @@ class InterferogramCollection:
 
         asset_path = self.path(pair, name)
         if not asset_path.exists():
-            raise MissingInterferogramAssetError(pair, name)
+            msg = f"Interferogram asset '{name}' not found for pair '{pair}'."
+            raise FileNotFoundError(msg)
 
         da = rioxarray.open_rasterio(
             asset_path,
@@ -852,7 +850,7 @@ class InterferogramCollection:
 
         Raises
         ------
-        GridMismatchError
+        ValueError
             If the selected rasters do not share the same grid and no Zarr cube
             exists.
 
@@ -898,7 +896,7 @@ class InterferogramCollection:
                     f"the first pair's grid. Use a common reference when "
                     f"standardizing, or call from_dataset() with a geometry."
                 )
-                raise GridMismatchError(msg)
+                raise ValueError(msg)
 
             da = da.expand_dims(pair=[pname])
             arrays.append(da)
@@ -952,10 +950,9 @@ class InterferogramCollection:
         ------
         FileExistsError
             If the store exists and *overwrite* is False.
-        GridMismatchError
-            If per-pair grids differ.
         ValueError
-            If no valid pairs are found for the asset.
+            If per-pair grids differ, or if no valid pairs are found for the
+            asset.
 
         """
         out = Path(zarr_path) if zarr_path is not None else self.zarr_stack_path(name)
@@ -988,7 +985,7 @@ class InterferogramCollection:
                     f"Pair '{pname}' asset '{name}' grid does not match the "
                     f"first pair's grid. Cannot build a single Zarr cube."
                 )
-                raise GridMismatchError(msg)
+                raise ValueError(msg)
             da = da.expand_dims(pair=[pname])
             arrays.append(da)
 

@@ -16,14 +16,6 @@ if TYPE_CHECKING:
 _DEFAULT_NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent
 
 
-class NativePreparationError(RuntimeError):
-    """Raised when a candidate cannot be dispatched."""
-
-    def __init__(self) -> None:
-        """Create the fixed missing-entry-point error."""
-        super().__init__("prepared native candidate has no entry point")
-
-
 class NativeOperation(StrEnum):
     """Exact operation identities supported by the native v2 builder."""
 
@@ -130,7 +122,8 @@ class PreparedNativeCandidate:
         if self.status is not PreparationStatus.PREPARED:
             raise RuntimeError(self.reason or "native candidate is not prepared")
         if self._entry_point is None:
-            raise NativePreparationError
+            message = "prepared native candidate has no entry point"
+            raise RuntimeError(message)
         return self._entry_point(*args, **kwargs)
 
 

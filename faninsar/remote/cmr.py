@@ -31,7 +31,6 @@ from .catalog import _register_adapter
 from .errors import (
     RemoteAccessError,
     RemoteLimitError,
-    RemoteQueryError,
     _fail,
 )
 from .fetch.complete import _RedirectHandler
@@ -47,13 +46,8 @@ class CMRDiscoveryError(RemoteAccessError):
     """A registered CMR collection could not be decoded safely."""
 
 
-class CMRRegistrationError(RemoteQueryError):
-    """A CMR adapter registration is incomplete or ambiguous."""
-
-
 def _error(error_type: type[RemoteAccessError], reason: str, message: str) -> None:
-    """Log and raise a typed CMR error."""
-    logger.error("CMR discovery failed: %s (%s)", message, reason)
+    """Log and raise a typed CMR error via the shared remote helper."""
     _fail(error_type, reason, message)
 
 
@@ -606,18 +600,16 @@ class CMRCollectionAdapter:
         if self.search_url is not None:
             object.__setattr__(self, "endpoint", self.search_url)
         if not isinstance(self.provider, str) or not self.provider.strip():
-            _error(
-                CMRRegistrationError, "invalid_provider", "provider must be non-empty"
-            )
+            _error(CMRDiscoveryError, "invalid_provider", "provider must be non-empty")
         if not isinstance(self.collection, str) or not self.collection.strip():
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_collection",
                 "collection must be non-empty",
             )
         if self.page_size <= 0 or self.max_pages <= 0:
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_pagination",
                 "page_size and max_pages must be positive",
             )
@@ -626,7 +618,7 @@ class CMRCollectionAdapter:
             for profile in self.profiles
         ):
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_auth_profiles",
                 "auth profiles must contain non-empty names",
             )
@@ -640,7 +632,7 @@ class CMRCollectionAdapter:
             valid_endpoint = False
         if not valid_endpoint:
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_endpoint",
                 "endpoint must be an HTTPS URL",
             )
@@ -659,13 +651,13 @@ class CMRCollectionAdapter:
                     break
         except (TypeError, ValueError):
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_data_origin",
                 "data origins must be valid HTTPS URLs",
             )
         if not origins:
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "invalid_data_origin",
                 "data origins must be valid HTTPS URLs",
             )
@@ -714,7 +706,7 @@ class CMRCollectionAdapter:
         """
         if profile not in self.profiles:
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "unknown_auth_profile",
                 "unknown CMR auth profile",
             )
@@ -1128,12 +1120,12 @@ class CMRCollectionAdapter:
             # adapter call may provide only a ledger or only a budget, but a
             # mismatched pair would make accounting ambiguous.
             _error(
-                CMRRegistrationError,
+                CMRDiscoveryError,
                 "budget_mismatch",
                 "budget must match the supplied operation ledger",
             )
         if limit <= 0:
-            _error(CMRRegistrationError, "invalid_limit", "limit must be positive")
+            _error(CMRDiscoveryError, "invalid_limit", "limit must be positive")
         request_headers = self._auth_headers(auth_profile)
         for entry in self._pages(
             ledger,
@@ -1196,7 +1188,7 @@ def discover_cmr(
     """
     if not isinstance(adapter, CMRCollectionAdapter):
         _error(
-            CMRRegistrationError,
+            CMRDiscoveryError,
             "invalid_adapter",
             "adapter must be a CMRCollectionAdapter",
         )
@@ -1255,7 +1247,6 @@ __all__ = [
     "CMRAdapter",
     "CMRCollectionAdapter",
     "CMRDiscoveryError",
-    "CMRRegistrationError",
     "RegisteredCMRCollection",
     "discover_cmr",
     "iter_cmr_records",

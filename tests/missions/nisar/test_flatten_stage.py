@@ -47,7 +47,6 @@ def test_stack_config_rejects_unknown_flatten_stage(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="flatten_stage"):
         StackConfig(
             work_dir=tmp_path,
-            activation_mode="reference",
             flatten_stage="unknown",  # type: ignore[arg-type]
         )
 

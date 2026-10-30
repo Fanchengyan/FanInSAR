@@ -18,20 +18,12 @@ from .products import (
 )
 
 _NETWORK_EXPORTS = {
-    "IncompleteNetworkProductError",
     "Network",
-    "NetworkAnalysisError",
-    "NetworkConstructionError",
-    "NetworkPathError",
 }
 _READER_EXPORTS = {
     "InterferogramCollection",
     "NetworkReader",
-    "DuplicateReaderError",
-    "InvalidReaderError",
-    "ReaderNotFoundError",
     "ReaderRegistry",
-    "ReaderRegistryError",
     "ENTRY_POINT_GROUP",
 }
 
@@ -53,11 +45,7 @@ def __getattr__(name: str) -> Any:
             return NetworkReader
         from .registry import (
             ENTRY_POINT_GROUP,
-            DuplicateReaderError,
-            InvalidReaderError,
-            ReaderNotFoundError,
             ReaderRegistry,
-            ReaderRegistryError,
         )
 
         return locals()[name]
@@ -70,22 +58,14 @@ __all__ = [
     "AssetKind",
     "AssetTransform",
     "AssetTransformOperation",
-    "DuplicateReaderError",
-    "IncompleteNetworkProductError",
     "Interferogram",
     "InterferogramCollection",
-    "InvalidReaderError",
     "Network",
-    "NetworkAnalysisError",
-    "NetworkConstructionError",
-    "NetworkPathError",
     "NetworkProduct",
     "NetworkProductIndex",
     "NetworkProductKey",
     "NetworkProductRecord",
     "NetworkReader",
     "PhaseConvention",
-    "ReaderNotFoundError",
     "ReaderRegistry",
-    "ReaderRegistryError",
 ]

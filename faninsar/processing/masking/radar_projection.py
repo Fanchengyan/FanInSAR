@@ -38,14 +38,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from affine import Affine
 
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-
-logger = setup_logger(__name__)
 
 __all__ = [
     "project_mask_to_radar",
@@ -183,20 +181,17 @@ def _load_mask_plane(mask: object) -> tuple[np.ndarray, object | None, object | 
         source_identity = _identity(plane)
     if plane.ndim != 2:
         message = "mask plane must be two-dimensional"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if plane.dtype == np.bool_:
         result = plane.astype(np.uint8)
     elif plane.dtype != np.uint8:
         message = f"mask plane must be bool or uint8, got {plane.dtype}"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     else:
         result = np.ascontiguousarray(plane)
     if np.any(~np.isin(result, np.array([0, 1, 255], dtype=np.uint8))):
         message = "mask plane may contain only canonical labels 0, 1, and 255"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return result, source_grid, source_identity
 
 
@@ -205,8 +200,7 @@ def _nearest_label_view(plane: np.ndarray, multilook: tuple[int, int]) -> np.nda
     az_looks, rg_looks = (int(multilook[0]), int(multilook[1]))
     if az_looks < 1 or rg_looks < 1:
         message = f"multilook factors must be >= 1, got {multilook}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if az_looks == 1 and rg_looks == 1:
         return np.ascontiguousarray(plane, dtype=np.uint8)
     height, width = plane.shape
@@ -269,8 +263,7 @@ def _scatter_lut_mask(
             f"mask plane shape {labels_geo.shape} does not match the LUT "
             f"geographic grid {lut.valid.shape}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = (int(full_radar_shape[0]), int(full_radar_shape[1]))
     output = np.full((height, width), INVALID, dtype=np.uint8)
     best_distance = np.full((height, width), np.inf, dtype=np.float64)
@@ -349,16 +342,14 @@ def _cache_path(cache_dir: str | Path | None, cache_key: str | None) -> Path | N
         return None
     if cache_key is None or cache_dir is None:
         message = "radar-projection cache requires both cache_key and cache_dir"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     key = str(cache_key)
     if len(key) != 64 or any(character not in "0123456789abcdef" for character in key):
         message = (
             "radar-projection cache_key must be a lowercase SHA-256 hexdigest "
             f"(see radar_projection_cache_key); got {cache_key!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return Path(cache_dir) / f"{key}.npy"
 
 
@@ -440,16 +431,14 @@ def project_mask_to_radar(
     """
     if (lut is None) == (geometry is None):
         message = "project_mask_to_radar requires exactly one projection source"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     labels, source_grid, source_identity = _load_mask_plane(mask)
     if (
         master_grid is not None
         and tuple(getattr(master_grid, "shape", labels.shape)) != labels.shape
     ):
         message = f"mask plane shape {labels.shape} does not match master grid"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if mask_transform is None and source_grid is not None:
         mask_transform = getattr(source_grid, "transform", None)
         if mask_transform is None and isinstance(source_grid, dict):
@@ -459,8 +448,7 @@ def project_mask_to_radar(
     ):
         # Defensive: the LUT planes must agree before any scatter.
         message = "Geo2RdrLUT planes disagree on the geographic grid shape"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     if full_radar_shape is None:
         if target_grid is not None and hasattr(target_grid, "shape"):
@@ -469,21 +457,17 @@ def project_mask_to_radar(
             full_radar_shape = tuple(int(size) for size in lut.full_radar_shape)
         else:
             message = "full_radar_shape or target_grid is required"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
     height, width = (int(full_radar_shape[0]), int(full_radar_shape[1]))
     if height < 1 or width < 1:
         message = f"full_radar_shape must be positive, got {full_radar_shape!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if geometry is not None and mask_transform is None:
         message = "radar mode requires the mask grid transform"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if chunk_size < 1:
         message = f"chunk_size must be >= 1, got {chunk_size}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     validity = target_validity
     if validity is None and target_grid is not None:
@@ -498,8 +482,7 @@ def project_mask_to_radar(
             f"target validity shape {validity_array.shape} does not match "
             f"{(height, width)}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if cache_key is None and cache_dir is not None:
         cache_key = radar_projection_cache_key(
             source_mask_identity=source_identity,
@@ -517,14 +500,12 @@ def project_mask_to_radar(
         full_plane = np.asarray(np.load(cache_file))
         if full_plane.shape != (height, width) or full_plane.dtype != np.uint8:
             message = f"radar-projection cache {cache_file} is not canonical uint8"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if np.any(~np.isin(full_plane, np.array([0, 1, 255], dtype=np.uint8))):
             message = (
                 f"radar-projection cache {cache_file} contains non-canonical labels"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
     elif lut is not None:
         full_plane = _scatter_lut_mask(labels, lut, (height, width))
     else:

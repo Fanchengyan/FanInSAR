@@ -1,4 +1,4 @@
-# ruff: noqa: TRY003, EM101, EM102, TRY300, TRY400, D107, SIM105
+# ruff: noqa: TRY003, EM101, EM102, TRY300, TRY301, TRY400, D107, SIM105
 """Lazy fetching of the pinned geoid model resources."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 from .cache import (
     ArtifactValidationError,
@@ -24,15 +24,7 @@ logger = setup_logger(__name__)
 
 
 class GeoidResourceError(RuntimeError):
-    """Base error for unavailable or invalid geoid resources."""
-
-
-class GeoidOfflineError(GeoidResourceError):
-    """Raised when a required resource is absent while offline."""
-
-
-class GeoidArtifactError(GeoidResourceError):
-    """Raised when a resource cannot satisfy its pinned identity."""
+    """Raised when a geoid resource is unavailable or invalid."""
 
 
 class ChunkTransport(Protocol):
@@ -97,7 +89,7 @@ def _requests_transport(url: str) -> Iterable[bytes]:
     response = requests.get(url, stream=True, timeout=60, allow_redirects=False)
     if 300 <= response.status_code < 400:
         response.close()
-        raise GeoidArtifactError("geoid resource redirects are not accepted")
+        raise GeoidResourceError("geoid resource redirects are not accepted")
     try:
         response.raise_for_status()
         yield from response.iter_content(chunk_size=1024 * 1024)
@@ -178,8 +170,7 @@ class Fetch:
         except ArtifactValidationError as cache_error:
             if _offline():
                 message = f"required geoid {model} is not valid in offline cache"
-                logger.error(message)
-                raise GeoidOfflineError(message) from cache_error
+                reject(message, GeoidResourceError, cause=cache_error)
         return self._download(resource, target)
 
     def _discover_local(self, resource: GeoidResource) -> Path:
@@ -216,8 +207,7 @@ class Fetch:
                         "ignoring invalid local %s artifact: %s", resource.name, error
                     )
         message = "EGM96 coefficient file not found; set FANINSAR_EGM96_FILE"
-        logger.error(message)
-        raise GeoidOfflineError(message)
+        return reject(message, GeoidResourceError)
 
     def _download(self, resource: GeoidResource, target: Path) -> Path:
         """Download, validate, and cache one fixed resource."""
@@ -232,12 +222,12 @@ class Fetch:
             with target.open("wb") as stream:
                 for chunk in self.transport(resource.url):
                     if not isinstance(chunk, bytes):
-                        raise GeoidArtifactError(
+                        raise GeoidResourceError(
                             "geoid transport returned a non-bytes chunk"
                         )
                     received += len(chunk)
                     if received > budget:
-                        raise GeoidArtifactError(
+                        raise GeoidResourceError(
                             "geoid transport exceeded its finite byte budget"
                         )
                     stream.write(chunk)
@@ -255,7 +245,7 @@ class Fetch:
             logger.error("%s: %s", message, error)
             if isinstance(error, GeoidResourceError):
                 raise
-            raise GeoidArtifactError(message) from error
+            raise GeoidResourceError(message) from error
         return target
 
 
@@ -264,8 +254,6 @@ __all__ = [
     "EGM96",
     "EGM2008_2_5",
     "Fetch",
-    "GeoidArtifactError",
-    "GeoidOfflineError",
     "GeoidResource",
     "GeoidResourceError",
 ]
