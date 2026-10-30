@@ -485,3 +485,35 @@ def read_stack_identity(work_dir: str | Path) -> dict[str, object]:
         )
         reject_invalid_state(message)
     return document
+
+
+def read_stack_identity_lenient(work_dir: str | Path) -> dict[str, object] | None:
+    """Read ``stack.json`` without enforcing the schema contract.
+
+    This is the recovery-path reader used by :meth:`Stack.rescan`,
+    :meth:`Stack.repair`, and the tolerant branch of :meth:`Stack.open`
+    (PROPOSAL-0069).  Unlike :func:`read_stack_identity` it never rejects on
+    schema/field drift: the JSON is parsed and returned verbatim so the
+    caller can decide which sections are recoverable.  ``None`` signals that
+    there is no document to recover — the file is absent or not JSON.
+
+    Parameters
+    ----------
+    work_dir : str or pathlib.Path
+        Work directory that may hold ``stack.json``.
+
+    Returns
+    -------
+    dict or None
+        The parsed document, or ``None`` when ``stack.json`` is missing or
+        cannot be decoded as a JSON object.
+
+    """
+    path = Path(work_dir) / STACK_JSON_NAME
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None

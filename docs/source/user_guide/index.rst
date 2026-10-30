@@ -18,3 +18,4 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    sampler
    dem
    remote
+   workspace_recovery

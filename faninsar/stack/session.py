@@ -960,6 +960,7 @@ class Stack(NetworkContract):
     )
     _dem_source: SourceDEM | None = field(default=None, repr=False)
     _dem_wgs84: RasterDEM | None = field(default=None, repr=False)
+    repair_report: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -1215,6 +1216,16 @@ class Stack(NetworkContract):
                 if not any(entry.startswith(f"{name}/") for entry in masks_committed)
             ],
             "stale": masks_stale,
+        }
+
+        # PROPOSAL-0069: surface the identity layer.  ``schema`` is the value
+        # recorded in stack.json at open time; ``repair`` carries the
+        # RepairReport when this Stack was recovered from a drifted document.
+        report["identity"] = {
+            "schema": _stack_json_schema(work),
+            "repair": (
+                None if self.repair_report is None else self.repair_report.as_dict()
+            ),
         }
         report["analysis_ready"] = self.analysis_ready
         return report
@@ -2272,12 +2283,10 @@ class Stack(NetworkContract):
             UNSAVED_FIELDS,
             decode_value,
             read_stack_identity,
+            read_stack_identity_lenient,
         )
 
         root = Path(work_dir)
-        document = read_stack_identity(root)
-        mission = str(document["mission"])
-        stack_cls = cls if mission == cls.__name__ else _mission_class(mission)
         runtime_fields = UNSAVED_FIELDS - {"extra"}
         unknown = set(runtime) - runtime_fields - {"scene_provider"}
         if unknown:
@@ -2286,6 +2295,25 @@ class Stack(NetworkContract):
                 "fixed by stack.json: " + ", ".join(sorted(unknown))
             )
             reject(message, TypeError, logger=logger)
+
+        document: dict[str, object] | None
+        try:
+            document = read_stack_identity(root)
+        except InvalidProcessingStateError:
+            # Tolerant open (PROPOSAL-0069): a missing stack.json has nothing
+            # to recover and re-raises; a readable-but-drifted document is
+            # decoded field-by-field so a degraded-but-usable Stack still
+            # opens and the dropped/defaulted pieces are reported.
+            document = read_stack_identity_lenient(root)
+            if document is None:
+                raise
+            recovered = _recover_document(root, document, runtime, cls)
+            stack = recovered._stack
+            stack.repair_report = recovered._report
+            return stack
+
+        mission = str(document["mission"])
+        stack_cls = cls if mission == cls.__name__ else _mission_class(mission)
 
         sources: dict[str, list[Path]] = {}
         for date, entries in document["inputs"]["sources"].items():
@@ -2348,6 +2376,48 @@ class Stack(NetworkContract):
         stack._prepared = True
         stack._refresh_network()
         return stack
+
+    @classmethod
+    def rescan(cls, work_dir: str | Path) -> Any:
+        """Diagnose a work directory without writing anything (PROPOSAL-0069).
+
+        Returns the :class:`~faninsar.stack.repair.RepairReport` describing
+        what a subsequent :meth:`repair` would recover versus leave
+        defaulted.  Read-only.
+        """
+        from faninsar.stack.repair import rescan
+
+        return rescan(work_dir)
+
+    @classmethod
+    def repair(
+        cls,
+        work_dir: str | Path,
+        *,
+        pairs: Pairs | None = None,
+        misreg_pairs: Pairs | None = None,
+        overwrite_science: dict[str, Any] | None = None,
+        **runtime: Any,
+    ) -> Stack:
+        """Rebuild ``stack.json`` and reopen the Stack (PROPOSAL-0069).
+
+        Recovers the identity layer from a drifted ``stack.json`` plus the
+        committed products, rewrites ``stack.json`` at schema
+        ``faninsar.stack.v1``, and returns the reopened Stack with
+        ``stack.repair_report`` attached.  Committed product payloads and
+        ``write_id`` lineage are never edited; stale products must be
+        reprocessed through the normal ``overwrite=True`` stages.
+        """
+        from faninsar.stack.repair import repair
+
+        return repair(
+            cls,
+            work_dir,
+            pairs=pairs,
+            misreg_pairs=misreg_pairs,
+            overwrite_science=overwrite_science,
+            **runtime,
+        )
 
     @classmethod
     def _from_safes(
@@ -4864,6 +4934,110 @@ def _optional_shift(value: object) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _stack_json_schema(work_dir: Path) -> str | None:
+    """Return the ``schema`` recorded in ``stack.json``, or ``None``."""
+    from faninsar.stack.identity import read_stack_identity_lenient
+
+    document = read_stack_identity_lenient(work_dir)
+    if document is None:
+        return None
+    schema = document.get("schema")
+    return None if schema is None else str(schema)
+
+
+class _RecoveredOpen:
+    """Internal carrier for a tolerant-``open`` result (PROPOSAL-0069)."""
+
+    __slots__ = ("_report", "_stack")
+
+    def __init__(self, stack: Stack, report: object) -> None:
+        self._stack = stack
+        self._report = report
+
+
+def _recover_document(
+    root: Path,
+    document: dict[str, object],
+    runtime: dict[str, Any],
+    cls: type[Stack],
+) -> _RecoveredOpen:
+    """Build a degraded-but-usable Stack from a drifted ``stack.json``.
+
+    Each section is decoded independently: decodable science fields are
+    recovered, unrecoverable ones are left at their defaults, and the
+    planned networks fall back to whatever the committed products imply.
+    The returned Stack never has ``stack.json`` rewritten — persistence is
+    only through :meth:`Stack.repair`.
+    """
+    from faninsar import Pairs
+    from faninsar.stack.catalog import SceneCatalog
+    from faninsar.stack.identity import decode_value
+    from faninsar.stack.repair import rescan
+
+    report = rescan(root)
+    mission = document.get("mission")
+    if mission:
+        recorded = _mission_class(str(mission))
+        stack_cls = cls if cls is not Stack else recorded
+    else:
+        stack_cls = cls
+
+    science = dict(report.science_recovered)
+    science["work_dir"] = root
+    science.update({n: v for n, v in runtime.items() if n != "scene_provider"})
+    science["extra"] = {
+        key: decode_value(value)
+        for key, value in (document.get("science_extra") or {}).items()
+    }
+    config = StackConfig(**science)
+
+    inputs = document.get("inputs", {})
+    sources = inputs.get("sources") if isinstance(inputs, dict) else None
+    paths: list[Path] = []
+    if isinstance(sources, dict):
+        for date in sorted(sources):
+            paths.extend(
+                Path(str(entry["path"]))
+                for entry in sources[date]
+                if isinstance(entry, dict) and "path" in entry
+            )
+    if not paths:
+        try:
+            from faninsar.io.storage.product import discover_products
+            from faninsar.io.storage.scene_store import SCENE_KIND
+
+            paths = [
+                product.path
+                for product in discover_products(root / "coreg", kind=SCENE_KIND)
+            ]
+        except InvalidProcessingStateError:
+            paths = []
+
+    catalog = SceneCatalog.from_paths(paths)
+    reference = document.get("reference") or report.inferred_reference
+    if reference is None:
+        dates = sorted(catalog.paths)
+        reference = dates[0] if dates else ""
+    stack = stack_cls(
+        catalog=catalog,
+        config=config,
+        pairs=Pairs.from_names(document.get("pairs") or report.inferred_pairs),
+        misreg_pairs=Pairs.from_names(
+            document.get("misreg_pairs") or report.inferred_misreg_pairs
+        ),
+        reference=str(reference),
+    )
+    stack.scene_provider = (
+        runtime.get("scene_provider") or stack_cls._default_scene_provider()
+    )
+    stack.prepare_scenes()
+    stack._capture_dem_source()
+    stack._ensure_raster_dem()
+    stack._prepared = True
+    stack._refresh_network()
+    return _RecoveredOpen(stack, report)
 
 
 def _check_input(entry: object) -> Path:
