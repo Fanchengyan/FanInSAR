@@ -44,14 +44,19 @@ Contract (PROPOSAL-0061):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
+import json
 import math
 import re
+import shutil
 import struct
 import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -72,11 +77,15 @@ from faninsar.missions.s1.io.canvas import (
 from faninsar.missions.s1.overlap import burst_overlap_windows
 from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.remote.errors import RemoteAccessError
-from faninsar.remote.fetch import RangeSpan, fetch_ranges_async
+from faninsar.remote.fetch import RangeFetcher, RangeSpan, fetch_ranges_async
+
+try:
+    from faninsar.remote.providers.cdse import cdse_range_fetcher as _cdse_range_fetcher
+except ImportError:  # remote-side seam may lag behind this slice
+    _cdse_range_fetcher = None
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Mapping, Sequence
-    from datetime import datetime
+    from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
     from typing import TypeAlias
 
     from faninsar.missions.s1.io.canvas import RoiSafeCanvas
@@ -116,6 +125,24 @@ NARROW_ROI_BANDWIDTH_BPS = 1.3 * 1024 * 1024
 
 NARROW_ROI_MAX_WIDTH_FRACTION = 0.30
 """ROI column width below this fraction of the row is "narrow"."""
+
+_PLANNER_VERSION = (
+    f"pv1/span-{MAX_SPAN_BYTES}/header-{HEADER_PROBE_BYTES}/"
+    f"narrow-{NARROW_ROI_BANDWIDTH_BPS}-{NARROW_ROI_MAX_WIDTH_FRACTION}"
+)
+"""Planner identity baked into the canvas fingerprint (PROPOSAL-0070).
+
+Cross-version caches cannot collide: the token covers the span cap, the
+header probe length, and the exact-column narrow-ROI regime constants, so a
+bandwidth-regime or planner-constant change produces a different
+fingerprint and forces re-materialization.
+"""
+
+_CANVAS_MANIFEST_NAME = ".canvas_manifest.json"
+"""Completion record inside each materialized item SAFE dir."""
+
+_SPAN_CACHE_DIRNAME = ".span-cache"
+"""Per-item span cache root inside each materialized item SAFE dir."""
 
 _TIFF_TYPE_SIZE = {
     1: 1,  # BYTE
@@ -1223,9 +1250,35 @@ def materialize_cdse_roi_safes(
         reject(message, ValueError, logger=logger)
     out_dir = Path(work_dir) / "inputs"
     out_dir.mkdir(parents=True, exist_ok=True)
+    dem_id = _canvas_dem_id(roi, granularity=granularity, dem=dem)
     paths: list[Path] = []
     for item in items:
-        fetch_context = _RoiFetchContext()
+        product_id = str(item.get("product_id", "S1_ROI"))
+        swath_name = str(item.get("swath", "IW1"))
+        polarization = str(item.get("polarization", "VV"))
+        safe_dir = out_dir / f"{product_id}-{swath_name}-{polarization}.SAFE"
+        fingerprint = _canvas_fingerprint(
+            item,
+            roi,
+            coreg_mode=coreg_mode,
+            granularity=granularity,
+            dem_id=dem_id,
+        )
+        manifest_path = safe_dir / _CANVAS_MANIFEST_NAME
+        if _canvas_manifest_complete(
+            manifest_path, fingerprint
+        ) and _safe_canvas_intact(safe_dir):
+            logger.info(
+                "Skipping CDSE measurement %s %s %s: complete canvas manifest",
+                product_id,
+                swath_name,
+                polarization,
+            )
+            paths.append(safe_dir)
+            continue
+        fetch_context = _RoiFetchContext(
+            span_cache=_SpanCache(safe_dir / _SPAN_CACHE_DIRNAME, fingerprint)
+        )
         xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
         if not _roi_overlaps_geolocation(xml_text, roi):
             logger.warning(
@@ -1246,9 +1299,6 @@ def materialize_cdse_roi_safes(
         )
         if not windows:
             continue
-        product_id = str(item.get("product_id", "S1_ROI"))
-        swath_name = str(item.get("swath", "IW1"))
-        polarization = str(item.get("polarization", "VV"))
         listed_indices = (
             tuple(int(burst.index) for burst in swath.bursts)
             if coreg_mode == "nesd"
@@ -1282,11 +1332,185 @@ def materialize_cdse_roi_safes(
                 splice_overlap_into_canvas(
                     canvas, overlap, role="bottom", samples=bottom
                 )
+        _atomic_write_json(
+            manifest_path,
+            {
+                "fingerprint": fingerprint,
+                "complete": True,
+                "item": {
+                    "product": product_id,
+                    "swath": swath_name,
+                    "pol": polarization,
+                    "n_bursts": len(canvas.kept_indices),
+                },
+                "created": datetime.now(UTC).isoformat(),
+            },
+        )
+        if fetch_context.span_cache is not None:
+            fetch_context.span_cache.finalize()
         paths.append(canvas.safe_root)
     if not paths:
         message = "Sentinel-1 CDSE search returned no products intersecting the ROI"
         reject(message, ValueError, logger=logger)
     return paths
+
+
+def _canvas_manifest_complete(manifest_path: Path, fingerprint: str) -> bool:
+    """Return True when a manifest records ``complete`` for ``fingerprint``."""
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(raw, dict)
+        and raw.get("fingerprint") == fingerprint
+        and raw.get("complete") is True
+    )
+
+
+def _safe_canvas_intact(safe_dir: Path) -> bool:
+    """Re-verify a completed SAFE canvas before skipping the item.
+
+    Mirrors the ``_open_safe_directory`` globs: every ``annotation/*.xml``
+    (calibration excluded) must pair with a ``measurement/<stem>.*`` that
+    rasterio can open and decode — a truncated-but-present TIFF fails.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    annotation_dir = safe_dir / "annotation"
+    measurement_dir = safe_dir / "measurement"
+    if not annotation_dir.is_dir() or not measurement_dir.is_dir():
+        return False
+    annotation_files = sorted(
+        path
+        for path in annotation_dir.glob("*.xml")
+        if path.is_file() and "calibration" not in path.parts
+    )
+    if not annotation_files:
+        return False
+    for annotation in annotation_files:
+        stem = annotation.stem
+        matches = [path for path in measurement_dir.glob(f"{stem}.*") if path.is_file()]
+        if not matches:
+            return False
+        try:
+            with rasterio.open(matches[0]) as dataset:
+                if dataset.width <= 0 or dataset.height <= 0:
+                    return False
+                # Decoding the last pixel forces the trailing tile to be
+                # readable, so a tail-truncated TIFF fails the check.
+                tail = Window(dataset.width - 1, dataset.height - 1, 1, 1)
+                dataset.read(1, window=tail)
+        except Exception:
+            return False
+    return True
+
+
+def _roi_canonical(roi: BoundingBox | Points | Polygons) -> str:
+    """Return a deterministic canonical form of a WGS84-normalized ROI."""
+    if isinstance(roi, BoundingBox):
+        return (
+            f"bbox:{float(roi.left)!r}:{float(roi.bottom)!r}:"
+            f"{float(roi.right)!r}:{float(roi.top)!r}"
+        )
+    if isinstance(roi, Points):
+        values = ",".join(f"{float(x)!r}:{float(y)!r}" for x, y in roi.values)
+        return f"points:{values}"
+    geometry = roi.to_desired().geodataframe.to_crs(4326)
+    members = sorted(geom.wkb.hex() for geom in geometry.geometry if geom is not None)
+    return f"polygons:{','.join(members)}"
+
+
+def _canvas_dem_id(
+    roi: BoundingBox | Points | Polygons,
+    *,
+    granularity: str,
+    dem: RasterDEM | None,
+) -> str:
+    """Return the DEM identity folded into the canvas fingerprint.
+
+    ``dem:file:<path>:<sha256>`` when the multi-polygon ``run_geo2rdr``
+    branch is active and the DEM is backed by a real file;
+    ``dem:grid:<sha256>`` when a caller-supplied sampler has no readable
+    path (the hash covers the sampled height grid actually fed to
+    ``run_geo2rdr``); ``dem:none`` when no DEM participates.
+    """
+    active = (
+        isinstance(roi, Polygons)
+        and granularity == "roi"
+        and len(roi.to_desired().geodataframe) > 1
+    )
+    if not active or dem is None:
+        return "dem:none"
+    path = getattr(dem, "path", None)
+    if path is not None:
+        candidate = Path(path)
+        if candidate.is_file():
+            digest = hashlib.sha256()
+            with candidate.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            resolved = candidate.expanduser().resolve(strict=False)
+            return f"dem:file:{resolved}:{digest.hexdigest()}"
+    heights = _polygon_dem_samples(roi, dem)
+    digest = hashlib.sha256(heights.tobytes()).hexdigest()
+    return f"dem:grid:{digest}"
+
+
+def _polygon_dem_samples(polygons: Polygons, dem: RasterDEM) -> np.ndarray:
+    """Return the DEM height samples ``_polygon_envelopes`` feeds geo2rdr.
+
+    The concatenated per-polygon grids mirror the sampling in
+    :func:`_polygon_envelopes` (same adaptive ``n``, same meshgrid,
+    NaN-to-zero) so the fingerprint covers the exact heights the planner
+    consumed, not just a DEM file identity.
+    """
+    gdf = polygons.to_desired().geodataframe.to_crs(4326)
+    parts: list[np.ndarray] = []
+    for geom in gdf.geometry:
+        minx, miny, maxx, maxy = geom.bounds
+        n = _geo2rdr_grid_size(maxx - minx, maxy - miny)
+        xs = np.linspace(minx, maxx, n)
+        ys = np.linspace(miny, maxy, n)
+        lons, lats = np.meshgrid(xs, ys)
+        heights = np.asarray(dem.sample(lats.ravel(), lons.ravel()), dtype=np.float64)
+        parts.append(np.where(np.isnan(heights), 0.0, heights))
+    if not parts:
+        return np.zeros(0, dtype=np.float64)
+    return np.concatenate(parts)
+
+
+def _canvas_fingerprint(
+    item: Mapping[str, Any],
+    roi: BoundingBox | Points | Polygons,
+    *,
+    coreg_mode: str,
+    granularity: str,
+    dem_id: str,
+) -> str:
+    """Return the planner fingerprint ``F`` for one CDSE item.
+
+    Covers every planner input — annotation/measurement URLs, pol/swath,
+    coreg mode, granularity, the canonical ROI, DEM identity, the
+    catalog-reported byte sizes (a regenerated product under a stable URL
+    trips the wire), and :data:`_PLANNER_VERSION` — so a stale cache can
+    never poison a resumed canvas.
+    """
+    parts = (
+        str(item.get("annotation_url", "")),
+        str(item.get("measurement_url", "")),
+        str(item.get("polarization", "")),
+        str(item.get("swath", "")),
+        coreg_mode,
+        granularity,
+        _roi_canonical(roi),
+        dem_id,
+        str(int(item.get("measurement_size") or 0)),
+        str(int(item.get("annotation_size") or 0)),
+        _PLANNER_VERSION,
+    )
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
 def _fetch_dem_for_polygons(
@@ -1641,18 +1865,22 @@ class _RoiFetchContext:
       reused, whichever label asked for them;
     - the observed fetch bandwidth (bytes per second across every range
       batch issued through the context) feeds the probe-based narrow-ROI
-      rule in :func:`_fetch_measurement_bodies`.
+      rule in :func:`_fetch_measurement_bodies`;
+    - when ``span_cache`` is set, measurement spans persist durable
+      progress under ``.span-cache/<fingerprint>/`` so an interrupted item
+      resumes unfinished spans instead of restarting them (PROPOSAL-0070).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, span_cache: _SpanCache | None = None) -> None:
         self.strip_tables: dict[
             tuple[str, int, int], tuple[list[int], list[int], int]
         ] = {}
         self.bodies: dict[tuple[str, int, int], bytes] = {}
         self.probed_bytes = 0
         self.probed_seconds = 0.0
-        # NESD overlap rectangles fetch in a bounded thread pool; every
-        # cache/counter mutation goes through this lock.
+        self.span_cache = span_cache
+        # Cache/counter mutations (probes, dedup bodies, bandwidth) share
+        # this lock; the shared async loop keeps writes single-threaded.
         self.lock = threading.Lock()
 
     @property
@@ -1989,26 +2217,15 @@ def _fetch_measurement_bodies(
     """
     if not url:
         reject_product("CDSE measurement fetch requires a non-empty object URL")
-    cached = _strip_tables_for(
-        url, file_size=file_size, samples=samples, fetch_context=fetch_context
-    )
-    offsets, counts, rows_per_strip = cached
-    spans = plan_measurement_spans(
-        url=url,
-        strip_offsets=offsets,
-        strip_byte_counts=counts,
-        rows_per_strip=rows_per_strip,
-        samples=samples,
-        bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
+    spans = _plan_measurement_spans(
+        url,
+        file_size=file_size,
         line0=line0,
         line1=line1,
         col0=col0,
         col1=col1,
-        exact_columns=_use_exact_columns(
-            fetch_context,
-            n_cols=col1 - col0,
-            samples=samples,
-        ),
+        samples=samples,
+        fetch_context=fetch_context,
     )
     return _fetch_deduped(spans, fetch_context)
 
@@ -2138,7 +2355,10 @@ def _fetch_deduped(
             pending[key] = [span.label]
             missing.append(span)
     if missing:
-        fetched = _fetch_cdse_ranges(missing)
+        if fetch_context.span_cache is not None:
+            fetched = fetch_context.span_cache.fetch(missing)
+        else:
+            fetched = _fetch_cdse_ranges(missing)
         with fetch_context.lock:
             for span in missing:
                 key = (span.url, span.start, span.end)
@@ -2171,6 +2391,296 @@ def _fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     from faninsar.remote.providers.cdse import fetch_cdse_ranges
 
     return run_sync(fetch_cdse_ranges(span_tuple))
+
+
+def _scrub_url(url: str) -> str:
+    """Strip query/fragment so persisted span records stay OData-canonical."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _span_fetcher_cm(spans: Sequence[RangeSpan]) -> Any:
+    """Return an async context manager yielding an open span fetcher.
+
+    CDSE OData spans use ``cdse_range_fetcher`` (token + 401-refresh
+    inside); until the remote seam lands, an inline
+    ``RangeFetcher(token=..., refresh=...)`` keeps the same credential
+    contract.  Fixture/test URLs take a plain ``RangeFetcher``.
+    """
+    span_tuple = tuple(spans)
+    if _cdse_range_host(span_tuple[0].url):
+        if _cdse_range_fetcher is not None:
+            return _cdse_range_fetcher(span_tuple)
+        from faninsar.remote.providers.cdse import (
+            refresh_cdse_token,
+            request_cdse_token,
+        )
+
+        @asynccontextmanager
+        async def _inline_fetcher() -> AsyncIterator[RangeFetcher]:
+            token = request_cdse_token()
+            async with RangeFetcher(
+                token=token,
+                refresh=refresh_cdse_token,
+            ) as fetcher:
+                yield fetcher
+
+        return _inline_fetcher()
+    return RangeFetcher()
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write JSON through a tmp sibling + rename so readers never see halves."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+class _SpanCache:
+    """Durable per-item span cache under ``<item SAFE>/.span-cache/<F>/``.
+
+    ``manifest.json`` records ``{fingerprint, spans: [{key, url, start,
+    end, label, state, part_size, sha1}]}``; ``key`` is
+    ``sha1(url|start|end)`` of the scrubbed URL so manifest ``url`` fields
+    never carry signed query parameters.  Each span body streams into an
+    append-only ``<key>.part`` via ``RangeFetcher.fetch_into``, which
+    already resumes from the sink's file size — a crash mid-span leaves a
+    partial ``.part`` the next run resumes from ``start + received``.
+
+    A ``state="complete"`` record is honored only when
+    ``part_size == actual .part size == end-start+1``; any drift refetches
+    the span from byte 0.  The optional ``sha1`` is verified on read-back
+    so a same-size corrupted ``.part`` is never mistaken for a clean span.
+    """
+
+    def __init__(self, root: Path, fingerprint: str) -> None:
+        """Open the cache rooted at ``root / fingerprint``.
+
+        Parameters
+        ----------
+        root : pathlib.Path
+            ``<item SAFE>/.span-cache`` directory.
+        fingerprint : str
+            Planner fingerprint ``F`` naming this plan's subdirectory.
+
+        """
+        self.root = Path(root)
+        self.fingerprint = fingerprint
+        self.dir = self.root / fingerprint
+        self._records: dict[str, dict[str, Any]] = {}
+        self._gc_done = False
+        self._load_manifest()
+
+    @staticmethod
+    def span_key(span: RangeSpan) -> str:
+        """Return ``sha1(url|start|end)`` of the query-scrubbed span URL."""
+        material = f"{_scrub_url(span.url)}|{span.start}|{span.end}"
+        return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+    def _load_manifest(self) -> None:
+        """Load span records, tolerating a missing or torn manifest."""
+        manifest_path = self.dir / "manifest.json"
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict) or raw.get("fingerprint") != self.fingerprint:
+            return
+        spans = raw.get("spans")
+        if not isinstance(spans, list):
+            return
+        for record in spans:
+            if isinstance(record, dict) and isinstance(record.get("key"), str):
+                self._records[record["key"]] = dict(record)
+
+    def _save_manifest(self) -> None:
+        """Atomically persist the current span records."""
+        payload = {
+            "fingerprint": self.fingerprint,
+            "spans": list(self._records.values()),
+        }
+        _atomic_write_json(self.dir / "manifest.json", payload)
+
+    def _part_path(self, key: str) -> Path:
+        """Return the ``.part`` path for one span key."""
+        return self.dir / f"{key}.part"
+
+    def _record_for(self, span: RangeSpan) -> dict[str, Any]:
+        """Return the reconciled record for ``span``, honoring resume rules."""
+        key = self.span_key(span)
+        expected = span.end - span.start + 1
+        part = self._part_path(key)
+        part_size = part.stat().st_size if part.exists() else 0
+        record = self._records.get(key)
+        if record is not None:
+            if record.get("state") == "complete":
+                honored = record.get(
+                    "part_size"
+                ) == part_size == expected and self._sha1_ok(record, part)
+                if honored:
+                    return record
+                # Drift or corruption: a recorded-complete span whose bytes
+                # no longer verify is refetched from byte 0.
+                part.unlink(missing_ok=True)
+                part_size = 0
+                record = None
+            else:
+                # Pending record: the .part file size is the progress record.
+                if part_size > expected:
+                    part.unlink(missing_ok=True)
+                    part_size = 0
+                record["part_size"] = part_size
+                record["state"] = "pending"
+                return record
+        if part_size > expected:
+            part.unlink(missing_ok=True)
+            part_size = 0
+        record = {
+            "key": key,
+            "url": _scrub_url(span.url),
+            "start": span.start,
+            "end": span.end,
+            "label": span.label,
+            "state": "pending",
+            "part_size": part_size,
+        }
+        self._records[key] = record
+        return record
+
+    def _sha1_ok(self, record: Mapping[str, Any], part: Path) -> bool:
+        """Verify a recorded sha1 against the current ``.part`` bytes."""
+        recorded = record.get("sha1")
+        if not isinstance(recorded, str) or not recorded:
+            return True
+        try:
+            digest = hashlib.sha1(part.read_bytes()).hexdigest()
+        except OSError:
+            return False
+        return digest == recorded
+
+    def _mark_complete(self, record: dict[str, Any], part: Path) -> None:
+        """Record one span complete after ``fetch_into`` returned."""
+        record["part_size"] = part.stat().st_size
+        record["sha1"] = hashlib.sha1(part.read_bytes()).hexdigest()
+        record["state"] = "complete"
+        self._save_manifest()
+
+    async def _fetch_pending(self, pending: Sequence[RangeSpan]) -> None:
+        """Fetch pending spans sequentially inside one shared fetcher."""
+        async with _span_fetcher_cm(pending) as fetcher:
+            for span in pending:
+                record = self._records[self.span_key(span)]
+                part = self._part_path(record["key"])
+                await fetcher.fetch_into(span, part)
+                self._mark_complete(record, part)
+
+    def _read_part(self, span: RangeSpan, record: Mapping[str, Any]) -> bytes:
+        """Read back one completed span's ``.part`` bytes."""
+        del span
+        part = self._part_path(record["key"])
+        try:
+            return part.read_bytes()
+        except OSError:
+            return reject_product(f"span cache part file unreadable: {part}")
+
+    def _gc_orphans_once(self, planned: Sequence[RangeSpan]) -> None:
+        """Remove orphan ``<F'>`` dirs, keeping plan-overlapping partials.
+
+        A pending partial whose span overlaps the current plan's
+        ``(url, start, end)`` set still carries usable bytes and is kept;
+        every other orphan tree is removed so bandwidth-regime flips and
+        planner-version bumps cannot grow the disk unboundedly.
+        """
+        if self._gc_done or not self.root.is_dir():
+            self._gc_done = True
+            return
+        planned_keys = {self.span_key(span) for span in planned}
+        planned_ranges = [(_scrub_url(s.url), s.start, s.end) for s in planned]
+        for child in self.root.iterdir():
+            if not child.is_dir() or child.name == self.fingerprint:
+                continue
+            if self._orphan_overlaps(child, planned_keys, planned_ranges):
+                logger.info(
+                    "keeping orphan span cache %s: pending partial overlaps "
+                    "the current plan",
+                    child,
+                )
+                continue
+            logger.info("removing orphan span cache %s", child)
+            shutil.rmtree(child, ignore_errors=True)
+        self._gc_done = True
+
+    @staticmethod
+    def _orphan_overlaps(
+        orphan: Path,
+        planned_keys: set[str],
+        planned_ranges: Sequence[tuple[str, int, int]],
+    ) -> bool:
+        """Return True when ``orphan`` holds a pending partial in the plan."""
+        try:
+            raw = json.loads((orphan / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict) and isinstance(raw.get("spans"), list):
+            for record in raw["spans"]:
+                if not isinstance(record, dict) or record.get("state") == "complete":
+                    continue
+                if record.get("key") in planned_keys:
+                    return True
+                url = str(record.get("url", ""))
+                try:
+                    start = int(record.get("start", -1))
+                    end = int(record.get("end", -2))
+                except (TypeError, ValueError):
+                    continue
+                for p_url, p_start, p_end in planned_ranges:
+                    if url == p_url and start <= p_end and end >= p_start:
+                        return True
+        # Manifest missing/torn: a .part whose filename key is in the plan
+        # still carries resumable bytes.
+        return any(part.stem in planned_keys for part in orphan.glob("*.part"))
+
+    def fetch(self, spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+        """Return ``{label: bytes}`` for every span, resuming partials.
+
+        Pending spans fetch sequentially through
+        ``RangeFetcher.fetch_into`` on one shared async loop (the AIMD
+        window still parallelizes a span's own chunk stream); completed
+        records read back from their ``.part`` files.
+        """
+        span_tuple = tuple(spans)
+        if not span_tuple:
+            return {}
+        self._gc_orphans_once(span_tuple)
+        records = [self._record_for(span) for span in span_tuple]
+        pending = [
+            span
+            for span, record in zip(span_tuple, records, strict=True)
+            if record["state"] != "complete"
+        ]
+        if pending:
+            run_sync(self._fetch_pending(pending))
+        bodies: dict[str, bytes] = {}
+        for span, record in zip(span_tuple, records, strict=True):
+            payload = self._read_part(span, record)
+            if not self._sha1_ok(record, self._part_path(record["key"])):
+                # Same-size corruption slipped past the honor check: refetch
+                # the span from byte 0 and verify once more.
+                part = self._part_path(record["key"])
+                part.unlink(missing_ok=True)
+                record["state"] = "pending"
+                record["part_size"] = 0
+                record.pop("sha1", None)
+                run_sync(self._fetch_pending((span,)))
+                payload = self._read_part(span, record)
+            bodies[span.label] = payload
+        return bodies
+
+    def finalize(self) -> None:
+        """Delete ``.part`` payloads; the kept manifest is the audit record."""
+        for part in self.dir.glob("*.part"):
+            part.unlink(missing_ok=True)
 
 
 def _strip_tables_from_probes(
@@ -2297,10 +2807,6 @@ def _bytes_to_complex_column(
     return (real + 1j * imag).astype(np.complex64)
 
 
-_MAX_OVERLAP_FETCH_WORKERS = 8
-"""Bounded fan-out for independent overlap-rectangle range fetches."""
-
-
 def _fetch_overlap_rectangles(
     item: Mapping[str, Any],
     swath: S1Swath,
@@ -2309,107 +2815,149 @@ def _fetch_overlap_rectangles(
     by_index: Mapping[int, BurstFetchedWindow],
     fetch_context: _RoiFetchContext | None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Fetch every ``(top, bottom)`` overlap rectangle, parallel across bursts.
+    """Fetch every ``(top, bottom)`` overlap rectangle on one shared batch.
 
     Rectangles already covered by a fetched window are sliced without I/O.
-    The remainder are independent ``(url, start, end)`` batches on the same
-    measurement, so they are fetched concurrently in a bounded thread pool
-    — each worker owns its ``run_sync`` event loop while the shared
-    ``fetch_context`` deduplicates byte ranges under a lock.  Splice order
-    is preserved by returning results aligned with ``overlaps``.
+    The remainder are planned synchronously into ``(url, start, end)``
+    spans, deduplicated at plan-merge time through the shared
+    ``fetch_context`` (identical byte ranges collapse to one request), and
+    fetched in a single ``run_sync`` batch dispatched through
+    :func:`_fetch_cdse_ranges` — live CDSE OData spans keep the
+    credential-header path while fixture/test URLs route through
+    ``fetch_ranges_async``.  Byte ranges are disjoint by construction
+    (different bursts -> disjoint parent rows -> disjoint strip byte
+    ranges), so no write leases are needed and splice order is preserved
+    by assembling results aligned with ``overlaps``.
     """
-    pending: list[tuple[int, BurstOverlapWindow]] = []
+    lpb = int(swath.lines_per_burst)
+    samples_per_burst = int(swath.samples_per_burst)
+    url = str(item.get("measurement_url", ""))
+    file_size = int(item.get("measurement_size") or 0)
+
     results: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    # (overlap_index, role) -> (parent_line0, planned spans)
+    plans: dict[tuple[int, str], tuple[int, tuple[RangeSpan, ...]]] = {}
+    pending_spans: list[RangeSpan] = []
     for index, overlap in enumerate(overlaps):
         top_window = by_index.get(int(overlap.top_index))
         bottom_window = by_index.get(int(overlap.bottom_index))
-        top_covered = top_window is not None and _window_covers_rectangle(
-            top_window,
-            row0=int(overlap.top_row0),
-            col0=int(overlap.col0),
-            n_lines=int(overlap.n_lines),
-            n_cols=int(overlap.n_samples),
+        roles = (
+            ("top", int(overlap.top_index), int(overlap.top_row0), top_window),
+            (
+                "bottom",
+                int(overlap.bottom_index),
+                int(overlap.bottom_row0),
+                bottom_window,
+            ),
         )
-        bottom_covered = bottom_window is not None and _window_covers_rectangle(
-            bottom_window,
-            row0=int(overlap.bottom_row0),
-            col0=int(overlap.col0),
-            n_lines=int(overlap.n_lines),
-            n_cols=int(overlap.n_samples),
-        )
-        if top_covered and bottom_covered:
-            results[index] = (
-                _overlap_rectangle_samples(
-                    item,
-                    swath,
-                    overlap,
-                    role="top",
-                    window=top_window,
-                    fetch_context=fetch_context,
-                ),
-                _overlap_rectangle_samples(
-                    item,
-                    swath,
-                    overlap,
-                    role="bottom",
-                    window=bottom_window,
-                    fetch_context=fetch_context,
-                ),
+        for role, burst_index, burst_row0, window in roles:
+            n_lines = int(overlap.n_lines)
+            n_samples = int(overlap.n_samples)
+            burst_col0 = int(overlap.col0)
+            if window is not None and _window_covers_rectangle(
+                window,
+                row0=burst_row0,
+                col0=burst_col0,
+                n_lines=n_lines,
+                n_cols=n_samples,
+            ):
+                continue
+            parent_line0 = burst_index * lpb + burst_row0
+            planned = _plan_measurement_spans(
+                url,
+                file_size=file_size,
+                line0=parent_line0,
+                line1=parent_line0 + n_lines,
+                col0=burst_col0,
+                col1=burst_col0 + n_samples,
+                samples=samples_per_burst,
+                fetch_context=fetch_context,
             )
-        else:
-            pending.append((index, overlap))
-    if pending:
-        workers = min(_MAX_OVERLAP_FETCH_WORKERS, len(pending))
-        if workers == 1:
-            for index, overlap in pending:
-                results[index] = (
-                    _overlap_rectangle_samples(
-                        item,
-                        swath,
-                        overlap,
-                        role="top",
-                        window=by_index.get(int(overlap.top_index)),
-                        fetch_context=fetch_context,
-                    ),
-                    _overlap_rectangle_samples(
-                        item,
-                        swath,
-                        overlap,
-                        role="bottom",
-                        window=by_index.get(int(overlap.bottom_index)),
-                        fetch_context=fetch_context,
-                    ),
-                )
-        else:
-            from concurrent.futures import ThreadPoolExecutor
+            plans[(index, role)] = (parent_line0, planned)
+            pending_spans.extend(planned)
 
-            def _job(overlap: BurstOverlapWindow) -> tuple[np.ndarray, np.ndarray]:
-                return (
-                    _overlap_rectangle_samples(
-                        item,
-                        swath,
-                        overlap,
-                        role="top",
-                        window=by_index.get(int(overlap.top_index)),
-                        fetch_context=fetch_context,
-                    ),
-                    _overlap_rectangle_samples(
-                        item,
-                        swath,
-                        overlap,
-                        role="bottom",
-                        window=by_index.get(int(overlap.bottom_index)),
-                        fetch_context=fetch_context,
-                    ),
-                )
+    bodies: dict[str, bytes] = {}
+    if pending_spans:
+        bodies = _fetch_deduped(tuple(pending_spans), fetch_context)
 
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="s1-overlap-fetch"
-            ) as pool:
-                fetched = list(pool.map(lambda pair: _job(pair[1]), pending))
-            for (index, _overlap), rectangle in zip(pending, fetched, strict=True):
-                results[index] = rectangle
+    for index, overlap in enumerate(overlaps):
+        pair: dict[str, np.ndarray] = {}
+        for role in ("top", "bottom"):
+            n_lines = int(overlap.n_lines)
+            n_samples = int(overlap.n_samples)
+            burst_col0 = int(overlap.col0)
+            plan = plans.get((index, role))
+            if plan is None:
+                # Covered by a fetched window: slice without I/O.
+                burst_index = int(
+                    overlap.top_index if role == "top" else overlap.bottom_index
+                )
+                pair[role] = _overlap_rectangle_samples(
+                    item,
+                    swath,
+                    overlap,
+                    role=role,
+                    window=by_index.get(burst_index),
+                    fetch_context=fetch_context,
+                )
+                continue
+            parent_line0, spans = plan
+            rect_bodies = {span.label: bodies[span.label] for span in spans}
+            pair[role] = _assemble_window_samples(
+                rect_bodies,
+                parent_line0=parent_line0,
+                n_lines=n_lines,
+                col0=burst_col0,
+                n_cols=n_samples,
+                samples_per_burst=samples_per_burst,
+            )
+        results[index] = (pair["top"], pair["bottom"])
     return [results[index] for index in range(len(overlaps))]
+
+
+def _plan_measurement_spans(
+    url: str,
+    *,
+    file_size: int,
+    line0: int,
+    line1: int,
+    col0: int,
+    col1: int,
+    samples: int,
+    fetch_context: _RoiFetchContext | None,
+) -> tuple[RangeSpan, ...]:
+    """Plan bounded measurement spans for one parent-line rectangle.
+
+    Shares the probe/strip-table stage with
+    :func:`_fetch_measurement_bodies` so overlap rectangles reuse cached
+    tables and the narrow-ROI bandwidth regime; only the ``RangeSpan``
+    planning is returned — callers own the fetch and assembly.
+    """
+    if not url:
+        reject_product("CDSE measurement fetch requires a non-empty object URL")
+    offsets, counts, rows_per_strip = _strip_tables_for(
+        url,
+        file_size=file_size,
+        samples=samples,
+        fetch_context=fetch_context,
+    )
+    return plan_measurement_spans(
+        url=url,
+        strip_offsets=offsets,
+        strip_byte_counts=counts,
+        rows_per_strip=rows_per_strip,
+        samples=samples,
+        bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
+        line0=line0,
+        line1=line1,
+        col0=col0,
+        col1=col1,
+        exact_columns=_use_exact_columns(
+            fetch_context,
+            n_cols=col1 - col0,
+            samples=samples,
+        ),
+    )
 
 
 def _overlap_rectangle_samples(

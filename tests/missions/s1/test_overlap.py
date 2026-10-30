@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.missions.protocols import DopplerCentroidPolynomial
+from faninsar.missions.s1 import acquisition as acquisition_mod
 from faninsar.missions.s1.overlap import (
+    BurstOverlapWindow,
     OverlapArrayEnvelope,
     burst_overlap_windows,
     intersect_overlap_window,
@@ -16,6 +21,8 @@ from faninsar.missions.s1.types import S1Burst, S1Swath
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    import pytest
 
 
 _ORIGIN = datetime(2020, 1, 1, tzinfo=UTC)
@@ -354,3 +361,182 @@ def test_intersect_overlap_window_none_when_secondary_overlap_is_all_invalid() -
     )
 
     assert clipped is None
+
+
+# ---------------------------------------------------------------------------
+# PROPOSAL-0070 S2: overlap rectangles fetch on ONE shared async batch.
+# ---------------------------------------------------------------------------
+
+_OVERLAP_MEASUREMENT_URL = (
+    "https://catalogue.dataspace.copernicus.eu/odata/v1/"
+    "Products(S1A_TEST)/Nodes(measurement.tiff)/$value"
+)
+_OVERLAP_CDSE_URL = (
+    "https://zipper.dataspace.copernicus.eu/odata/v1/"
+    "Products(S1A_TEST)/Nodes(measurement.tiff)/$value"
+)
+
+
+def _overlap_item(url: str, size: int) -> dict[str, Any]:
+    """Return a minimal item dict for overlap rectangle fetches."""
+    return {"measurement_url": url, "measurement_size": size}
+
+
+def _two_overlap_rectangles() -> tuple[BurstOverlapWindow, BurstOverlapWindow]:
+    """Return two pending overlaps on the synthetic 3-burst swath."""
+    swath = _swath(
+        _burst(0, start_line=0),
+        _burst(1, start_line=80),
+        _burst(2, start_line=160),
+    )
+    return swath, burst_overlap_windows(swath, min_lines=1)
+
+
+def _fake_strip_tables(
+    monkeypatch: pytest.MonkeyPatch,
+    samples: int = _SAMPLES,
+) -> None:
+    """Patch strip-table probing: one row per strip, one strip per row."""
+    n_rows = _LINES * 3
+    row_stride = samples * 4
+    offsets = [1000 + index * row_stride for index in range(n_rows)]
+
+    def fake_tables(
+        _url: str,
+        *,
+        file_size: int,
+        samples: int,
+        fetch_context: Any,
+    ) -> tuple[list[int], list[int], int]:
+        del file_size, samples, fetch_context
+        return offsets, [row_stride] * n_rows, 1
+
+    monkeypatch.setattr(acquisition_mod, "_strip_tables_for", fake_tables)
+
+
+class TestOverlapSharedBatch:
+    """N>1 pending overlaps issue one shared range batch, not N run_sync loops."""
+
+    def test_pending_overlays_fetch_in_one_shared_batch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two pending overlaps produce one _fetch_cdse_ranges call."""
+        swath, overlaps = _two_overlap_rectangles()
+        assert len(overlaps) == 2
+        _fake_strip_tables(monkeypatch)
+        batches: list[list[Any]] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            batches.append(list(spans))
+            return {span.label: b"\x01" * (span.end - span.start + 1) for span in spans}
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        item = _overlap_item(_OVERLAP_MEASUREMENT_URL, size=10**6)
+        context = acquisition_mod._RoiFetchContext()
+        results = acquisition_mod._fetch_overlap_rectangles(
+            item,
+            swath,
+            overlaps,
+            by_index={},
+            fetch_context=context,
+        )
+        assert len(results) == 2
+        # One batch carried every rectangle span of both pending overlaps.
+        row_batches = [
+            batch
+            for batch in batches
+            if any(re.match(r"(row|col)-", span.label) for span in batch)
+        ]
+        assert len(row_batches) == 1
+        labels = {span.label for span in row_batches[0]}
+        # Each pending overlap fetched top+bottom -> 4 distinct span labels.
+        assert len(labels) == 4
+        for top, bottom in results:
+            assert top.shape == bottom.shape
+
+    def test_cdse_overlap_spans_keep_credential_route(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CDSE OData spans still route through fetch_cdse_ranges (Bearer)."""
+        swath, overlaps = _two_overlap_rectangles()
+        _fake_strip_tables(monkeypatch)
+        cdse_calls: list[list[Any]] = []
+        plain_calls: list[list[Any]] = []
+
+        async def fake_cdse_fetch(spans: Any) -> dict[str, bytes]:
+            cdse_calls.append(list(spans))
+            return {span.label: b"\x02" * (span.end - span.start + 1) for span in spans}
+
+        async def fake_plain_fetch(
+            spans: Any, *, fetcher: Any = None
+        ) -> dict[str, bytes]:
+            del fetcher
+            plain_calls.append(list(spans))
+            return {span.label: b"\x00" for span in spans}
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_plain_fetch)
+        import faninsar.remote.providers.cdse as cdse_mod
+
+        monkeypatch.setattr(cdse_mod, "fetch_cdse_ranges", fake_cdse_fetch)
+        item = _overlap_item(_OVERLAP_CDSE_URL, size=10**6)
+        results = acquisition_mod._fetch_overlap_rectangles(
+            item,
+            swath,
+            overlaps,
+            by_index={},
+            fetch_context=acquisition_mod._RoiFetchContext(),
+        )
+        assert len(results) == 2
+        row_batches = [
+            batch
+            for batch in cdse_calls
+            if any(re.match(r"(row|col)-", span.label) for span in batch)
+        ]
+        assert len(row_batches) == 1
+        assert not any(
+            re.match(r"(row|col)-", span.label)
+            for batch in plain_calls
+            for span in batch
+        )
+
+    def test_covered_rectangles_skip_the_shared_batch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rectangles inside fetched windows are sliced without any fetch."""
+        swath, overlaps = _two_overlap_rectangles()
+        _fake_strip_tables(monkeypatch)
+        data = np.zeros((_LINES * 3, _SAMPLES), dtype=np.complex64)
+        windows = {}
+        for index in (0, 1, 2):
+            windows[index] = acquisition_mod.BurstFetchedWindow(
+                burst_index=index,
+                row0=0,
+                col0=0,
+                samples=np.ascontiguousarray(
+                    data[index * _LINES : (index + 1) * _LINES]
+                ),
+            )
+
+        def boom(spans: Any, **kwargs: Any) -> dict[str, bytes]:
+            del spans, kwargs
+            message = "covered overlap rectangles must not fetch"
+            raise AssertionError(message)
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", boom)
+        monkeypatch.setattr(acquisition_mod, "_fetch_cdse_ranges", boom)
+        item = _overlap_item(_OVERLAP_MEASUREMENT_URL, size=10**6)
+        results = acquisition_mod._fetch_overlap_rectangles(
+            item,
+            swath,
+            overlaps,
+            by_index=windows,
+            fetch_context=acquisition_mod._RoiFetchContext(),
+        )
+        assert len(results) == 2
+        for top, bottom in results:
+            assert not np.any(top)
+            assert not np.any(bottom)

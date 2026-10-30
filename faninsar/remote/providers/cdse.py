@@ -17,7 +17,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -255,6 +256,55 @@ def _needs_cdse_bearer(url: str) -> bool:
     }
 
 
+@asynccontextmanager
+async def cdse_range_fetcher(
+    spans: Sequence[RangeSpan],
+) -> AsyncIterator[RangeFetcher]:
+    """Validate OData range URLs and yield a credential RangeFetcher.
+
+    Ensures the CDSE catalog adapter, validates every ``span.url`` with
+    ``_validate_url`` + ``_is_odata_value`` + ``_needs_cdse_bearer`` (same rules
+    as ``fetch_cdse_ranges``), obtains the CDSE access token, and yields an
+    open ``RangeFetcher`` with 401-refresh wired to ``refresh_cdse_token``.
+    The token never leaves this module's scope — callers only see the fetcher.
+    Empty ``spans`` still validates nothing and yields a working fetcher.
+
+    Parameters
+    ----------
+    spans : sequence of RangeSpan
+        Already-sized inclusive byte intervals on CDSE OData ``$value`` URLs.
+
+    Yields
+    ------
+    RangeFetcher
+        An open ``RangeFetcher`` whose ``Authorization: Bearer`` header is
+        managed inside this module; callers drive ``fetch``/``fetch_into``
+        without seeing the token.
+
+    Raises
+    ------
+    RemoteAccessError
+        If a span URL is not a registered OData origin, or the token grant
+        fails.
+
+    """
+    span_tuple = tuple(spans)
+    ensure_cdse_catalog()
+    with _REGISTRY_LOCK:
+        adapter = _ADAPTERS.get(CDSE_CATALOG)
+    if adapter is None:
+        message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
+        _fail(RemoteAccessError, "unknown_catalog", message)
+    for span in span_tuple:
+        _validate_url(span.url, adapter)
+        if not _is_odata_value(span.url) or not _needs_cdse_bearer(span.url):
+            message = "CDSE range URL is not an OData Nodes(...)/$value href"
+            _fail(RemoteAccessError, "invalid_endpoint", message)
+    token = request_cdse_token()
+    async with RangeFetcher(token=token, refresh=refresh_cdse_token) as fetcher:
+        yield fetcher
+
+
 async def fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     """Fetch OData byte ranges after validating each URL, then attach Bearer.
 
@@ -277,19 +327,7 @@ async def fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     span_tuple = tuple(spans)
     if not span_tuple:
         return {}
-    ensure_cdse_catalog()
-    with _REGISTRY_LOCK:
-        adapter = _ADAPTERS.get(CDSE_CATALOG)
-    if adapter is None:
-        message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
-        _fail(RemoteAccessError, "unknown_catalog", message)
-    for span in span_tuple:
-        _validate_url(span.url, adapter)
-        if not _is_odata_value(span.url) or not _needs_cdse_bearer(span.url):
-            message = "CDSE range URL is not an OData Nodes(...)/$value href"
-            _fail(RemoteAccessError, "invalid_endpoint", message)
-    token = request_cdse_token()
-    async with RangeFetcher(token=token, refresh=refresh_cdse_token) as fetcher:
+    async with cdse_range_fetcher(span_tuple) as fetcher:
         return await fetch_ranges_async(span_tuple, fetcher=fetcher)
 
 
@@ -680,6 +718,7 @@ __all__ = [
     "CDSE_COLLECTION",
     "CDSE_STAC_ENDPOINT",
     "CDSESearchAdapter",
+    "cdse_range_fetcher",
     "ensure_cdse_catalog",
     "fetch_cdse_ranges",
     "refresh_cdse_token",

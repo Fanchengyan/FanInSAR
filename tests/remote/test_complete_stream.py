@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import urllib.request
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 import requests
@@ -20,8 +21,18 @@ from faninsar.remote.access import (
     _validate_representation,
 )
 from faninsar.remote.auth import _asf_request, _no_auth
+from faninsar.remote.cache import _identity
 from faninsar.remote.catalog import _register_adapter
-from faninsar.remote.fetch.complete import _RedirectHandler, _stream_download
+from faninsar.remote.fetch.complete import (
+    _part_path,
+    _part_state_path,
+    _PartState,
+    _read_part_state,
+    _RedirectHandler,
+    _stream_download,
+    _write_part_state,
+    read_verification,
+)
 from faninsar.remote.protocols import _CallLedger
 
 if TYPE_CHECKING:
@@ -826,3 +837,454 @@ def test_transfer_failure_does_not_surface_signed_url(
     assert "fixture-secret" not in str(error.value)
     assert "fixture-secret" not in caplog.text
     assert "objects.example" not in caplog.text
+
+
+class _AnonymousRangeAdapter:
+    """Anonymous fixture adapter with no ``fetch`` (urllib transport path)."""
+
+    provider = "ranged"
+    origins = ("https://ranged.invalid",)
+    path_prefixes = ("/",)
+    redirect_origins = ()
+    profiles = ("anonymous",)
+
+
+def _ranged_asset(
+    catalog: str,
+    *,
+    size_bytes: int | None = 64,
+    checksum: str | None = None,
+    href: str = "https://ranged.invalid/data.bin",
+) -> remote.RemoteAsset:
+    """Build one anonymous asset for the registered ranged catalog."""
+    return remote.RemoteAsset(
+        "ranged",
+        catalog,
+        None,
+        "item",
+        "data",
+        href,
+        size_bytes=size_bytes,
+        checksum=checksum,
+    )
+
+
+class _ResumeOpener:
+    """Opener double that honors Range and can drop the first stream."""
+
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        drop_first_after: int | None = None,
+        answer_206_as_200: bool = False,
+        content_range_total: int | None = None,
+    ) -> None:
+        self.payload = payload
+        self.drop_first_after = drop_first_after
+        self.answer_206_as_200 = answer_206_as_200
+        self.content_range_total = content_range_total
+        self.requests: list[dict[str, str]] = []
+        self._dropped = False
+
+    def open(self, request: urllib.request.Request, timeout: float) -> Any:
+        del timeout
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.requests.append(headers)
+        range_header = headers.get("range")
+        total = self.content_range_total or len(self.payload)
+        if range_header is None:
+            body = self.payload
+            if self.drop_first_after is not None and not self._dropped:
+                self._dropped = True
+                return _UrllibStreamResponse(
+                    200, body[: self.drop_first_after], headers={}
+                )
+            return _UrllibStreamResponse(200, body, headers={})
+        start_text = range_header.removeprefix("bytes=").split("-", 1)[0]
+        start = int(start_text)
+        if self.answer_206_as_200:
+            # A server that ignores Range returns the whole object with 200.
+            return _UrllibStreamResponse(200, self.payload, headers={})
+        return _UrllibStreamResponse(
+            206,
+            self.payload[start:],
+            headers={"Content-Range": f"bytes {start}-{total - 1}/{total}"},
+        )
+
+
+class _UrllibStreamResponse:
+    """Minimal context-managed response for the urllib transport branch."""
+
+    def __init__(self, status: int, body: bytes, *, headers: dict[str, str]) -> None:
+        self.status = status
+        self._body = body
+        self.headers = headers
+
+    def read(self, size: int) -> bytes:
+        chunk, self._body = self._body[:size], self._body[size:]
+        return chunk
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+
+def _stub_urllib_opener(monkeypatch: pytest.MonkeyPatch, opener: _ResumeOpener) -> None:
+    """Route the module's opener construction through the fixture opener."""
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete.urllib.request.build_opener",
+        lambda *_handlers: opener,
+    )
+
+
+def test_resume_completes_with_one_range_request_after_mid_stream_kill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A killed download resumes with exactly one ``Range: bytes=<k>-`` GET.
+
+    The retained ``.part`` prefix is re-streamed through the digest, the 206
+    answer is accepted via the resume gate, and the published file plus its
+    identity manifest verify byte-identically to a single-pass download.
+    """
+    payload = b"pk\x03\x04".join([bytes([i]) * 8 for i in range(16)])
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-resume", adapter)
+    asset = _ranged_asset("ranged-resume", size_bytes=len(payload))
+    destination = tmp_path / "data.bin"
+    opener = _ResumeOpener(payload, drop_first_after=24)
+    _stub_urllib_opener(monkeypatch, opener)
+
+    with pytest.raises(remote.RemoteIntegrityError):
+        remote.download(asset, destination)
+    identity = _identity(asset)
+    part = _part_path(destination, identity)
+    part_state = _part_state_path(destination, identity)
+    assert part.read_bytes() == payload[:24]
+    state = _read_part_state(part_state)
+    assert state is not None
+    assert state.identity == identity
+    assert state.expected_size == len(payload)
+    # The persisted URL is the _safe_url-scrubbed canonical href.
+    assert state.url == "https://ranged.invalid/data.bin"
+    assert "?" not in state.url
+    assert len(opener.requests) == 1  # truncated body fails the size gate
+
+    # Second invocation resumes instead of restarting.
+    resume_opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, resume_opener)
+    result = remote.download(asset, destination)
+
+    assert result == destination
+    range_requests = [h["range"] for h in resume_opener.requests if "range" in h]
+    assert range_requests == ["bytes=24-"]
+    assert destination.read_bytes() == payload
+    assert not part.exists()
+    assert not part_state.exists()
+    manifest = json.loads(
+        (tmp_path / f"data.bin.faninsar.remote.{identity}.json").read_text()
+    )
+    assert manifest["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert manifest["size"] == len(payload)
+
+
+def test_resume_false_performs_a_full_get(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``resume=False`` ignores a retained ``.part`` and refetches byte 0."""
+    payload = b"pk\x03\x04" + bytes(range(48))
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-noresume", adapter)
+    asset = _ranged_asset("ranged-noresume", size_bytes=len(payload))
+    destination = tmp_path / "data.bin"
+    identity = _identity(asset)
+
+    # Pre-seed a partial download.
+    _part_path(destination, identity).write_bytes(payload[:16])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity=identity,
+            expected_size=len(payload),
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+        ),
+    )
+
+    opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, opener)
+    remote.download(asset, destination, resume=False)
+
+    assert all("range" not in h for h in opener.requests)
+    assert destination.read_bytes() == payload
+
+
+def test_identity_mismatch_part_state_restarts_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.part-state`` naming another identity is ignored: clean restart."""
+    payload = b"pk\x03\x04" + bytes(range(48))
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-mismatch", adapter)
+    asset = _ranged_asset("ranged-mismatch", size_bytes=len(payload))
+    destination = tmp_path / "data.bin"
+    identity = _identity(asset)
+
+    _part_path(destination, identity).write_bytes(payload[:16])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity="different-identity",
+            expected_size=len(payload),
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+        ),
+    )
+
+    opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, opener)
+    remote.download(asset, destination)
+
+    assert all("range" not in h for h in opener.requests)
+    assert destination.read_bytes() == payload
+
+
+def test_resume_with_unknown_expected_size_uses_final_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``asset.size_bytes=None`` resumes unbounded; the size gate stays final."""
+    payload = b"pk\x03\x04" + bytes(range(48))
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-unknown-size", adapter)
+    asset = _ranged_asset("ranged-unknown-size", size_bytes=None)
+    destination = tmp_path / "data.bin"
+    identity = _identity(asset)
+
+    _part_path(destination, identity).write_bytes(payload[:16])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity=identity,
+            expected_size=None,
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+        ),
+    )
+
+    opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, opener)
+    remote.download(asset, destination)
+
+    range_requests = [h["range"] for h in opener.requests if "range" in h]
+    assert range_requests == ["bytes=16-"]
+    assert destination.read_bytes() == payload
+    # The observed Content-Range total is persisted on the first 206.
+    state_after = _read_part_state(_part_state_path(destination, identity))
+    assert state_after is None  # cleaned after publish
+
+
+def test_200_answer_to_range_request_restarts_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 200 response to a resume GET means the server ignored Range."""
+    payload = b"pk\x03\x04" + bytes(range(48))
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-range-ignored", adapter)
+    asset = _ranged_asset("ranged-range-ignored", size_bytes=len(payload))
+    destination = tmp_path / "data.bin"
+    identity = _identity(asset)
+
+    _part_path(destination, identity).write_bytes(payload[:16])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity=identity,
+            expected_size=len(payload),
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+        ),
+    )
+
+    opener = _ResumeOpener(payload, answer_206_as_200=True)
+    _stub_urllib_opener(monkeypatch, opener)
+    remote.download(asset, destination)
+
+    # First request carried the Range header; after the 200 the transfer
+    # restarted and re-GET the whole object.
+    assert opener.requests[0].get("range") == "bytes=16-"
+    assert destination.read_bytes() == payload
+
+
+def test_read_verification_ignores_a_part_state_sibling(tmp_path: Path) -> None:
+    """``.part-state`` sits outside the manifest glob; it is never a manifest."""
+    destination = tmp_path / "data.bin"
+    destination.write_bytes(b"payload")
+    identity = "abc123"
+    part_state = _part_state_path(destination, identity)
+    _write_part_state(
+        part_state,
+        _PartState(
+            identity=identity,
+            expected_size=7,
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+        ),
+    )
+    assert read_verification(destination) is None
+
+
+def test_grown_object_between_resumes_restarts_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A persisted Content-Range total smaller than a later answer restarts."""
+    payload = b"pk\x03\x04" + bytes(range(48))
+    grown = payload + b"GROWN"
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-grown", adapter)
+    asset = _ranged_asset("ranged-grown", size_bytes=None)
+    destination = tmp_path / "data.bin"
+    identity = _identity(asset)
+
+    _part_path(destination, identity).write_bytes(payload[:16])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity=identity,
+            expected_size=None,
+            url="https://ranged.invalid/data.bin",
+            planner_version="p70.1",
+            # Recorded during an earlier resume of the pre-growth object.
+            content_range_total=len(payload),
+        ),
+    )
+
+    opener = _ResumeOpener(grown)
+    _stub_urllib_opener(monkeypatch, opener)
+    remote.download(asset, destination)
+
+    assert opener.requests[0].get("range") == "bytes=16-"
+    assert destination.read_bytes() == grown
+
+
+def test_asf_resume_prefix_is_rehashed_before_range_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ASF transport sends ``Range: bytes=<k>-`` and re-hashes the prefix."""
+    payload = b"PK\x03\x04" + bytes(range(96))
+
+    class _RangeASFSession:
+        def __init__(self) -> None:
+            self.cookies = requests.cookies.RequestsCookieJar()
+            self.requests: list[tuple[str, str, dict[str, str]]] = []
+            self.closed = False
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            data: Any = None,
+            auth: Any = None,
+            allow_redirects: bool,
+            stream: bool,
+            timeout: tuple[float, float],
+        ) -> _ASFResponse:
+            del data, auth, allow_redirects, stream, timeout
+            self.requests.append((method, url, dict(headers)))
+            if url.endswith("/api/users/find_or_create_token"):
+                return _ASFResponse(url, 200, b'{"access_token":"fixture-token"}')
+            if "/oauth/authorize" in url:
+                return _ASFResponse(
+                    url,
+                    302,
+                    body=b"oauth-redirect",
+                    headers={"Location": "https://datapool.asf.alaska.edu/item.zip"},
+                )
+            if url == "https://datapool.asf.alaska.edu/item.zip":
+                range_header = headers.get("Range")
+                if range_header is None:
+                    return _ASFResponse(url, 200, payload)
+                start = int(range_header.removeprefix("bytes=").split("-")[0])
+                return _ASFResponse(
+                    url,
+                    206,
+                    payload[start:],
+                    headers={
+                        "Content-Range": (
+                            f"bytes {start}-{len(payload) - 1}/{len(payload)}"
+                        )
+                    },
+                )
+            message = f"unexpected fixture URL: {url}"
+            raise AssertionError(message)
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = _RangeASFSession()
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        lambda *_args: (session, "fixture-token"),
+    )
+    monkeypatch.setattr(
+        "faninsar.remote.auth._netrc_credentials",
+        lambda host: (
+            ("fixture-user", "fixture-password")
+            if host == "urs.earthdata.nasa.gov"
+            else None
+        ),
+    )
+
+    class _ASFAdapter:
+        provider = "ASF"
+        origins = ("https://datapool.asf.alaska.edu",)
+        path_prefixes = ("/",)
+        redirect_origins = (
+            "https://datapool.asf.alaska.edu",
+            "https://urs.earthdata.nasa.gov",
+        )
+        profiles = ("earthdata-asf",)
+
+    adapter = _ASFAdapter()
+    _register_adapter("asf-resume", adapter)
+    asset = remote.RemoteAsset(
+        "ASF",
+        "asf-resume",
+        "sentinel-1",
+        "S1_RESUME",
+        "data",
+        "https://datapool.asf.alaska.edu/item.zip",
+        size_bytes=len(payload),
+        auth_profile="earthdata-asf",
+    )
+    identity = _identity(asset)
+    destination = tmp_path / "item.zip"
+    _part_path(destination, identity).write_bytes(payload[:32])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(
+            identity=identity,
+            expected_size=len(payload),
+            url="https://datapool.asf.alaska.edu/item.zip",
+            planner_version="p70.1",
+        ),
+    )
+
+    remote.download(asset, destination)
+
+    data_requests = [
+        headers
+        for _method, url, headers in session.requests
+        if url == "https://datapool.asf.alaska.edu/item.zip"
+    ]
+    assert data_requests
+    assert data_requests[-1].get("Range") == "bytes=32-"
+    assert destination.read_bytes() == payload
+    manifest = json.loads(
+        (tmp_path / f"item.zip.faninsar.remote.{identity}.json").read_text()
+    )
+    assert manifest["sha256"] == hashlib.sha256(payload).hexdigest()

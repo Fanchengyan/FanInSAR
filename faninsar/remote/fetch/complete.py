@@ -28,6 +28,7 @@ from faninsar.remote.access import (
     _redirect_headers,
     _registered_origin,
     _response_is_complete,
+    _response_is_resumed_at,
     _safe_url,
     _strip_redirect_credentials,
     _url_origin,
@@ -63,6 +64,128 @@ from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
 logger = setup_logger(__name__)
 
 _POLL_INTERVAL_CAP_SECONDS = 10.0
+
+_PART_PLANNER_VERSION = "p70.1"
+"""Resume-layout version stamped into ``.part-state`` sidecars (PROPOSAL-0070)."""
+
+
+@dataclass(slots=True)
+class _PartState:
+    """Persisted resume sidecar for one deterministic ``.part`` staging file.
+
+    The record is written once at fetch start and stays immutable except for
+    ``content_range_total``, which is filled the first time a 206 (or a 200
+    ``Content-Length``) reveals the object size and the catalog did not.
+    """
+
+    identity: str
+    expected_size: int | None
+    url: str
+    planner_version: str
+    content_range_total: int | None = None
+
+
+def _part_path(destination: Path, identity: str) -> Path:
+    """Return the deterministic partial-download staging path."""
+    return destination.with_name(f"{destination.name}.faninsar.remote.{identity}.part")
+
+
+def _part_state_path(destination: Path, identity: str) -> Path:
+    """Return the resume sidecar path for one ``.part`` staging file.
+
+    The ``.part-state`` suffix deliberately sits outside the
+    ``*.faninsar.remote.*.json`` glob so :func:`read_verification` never
+    confuses it with the published identity manifest.
+    """
+    return destination.with_name(
+        f"{destination.name}.faninsar.remote.{identity}.part-state"
+    )
+
+
+def _write_part_state(destination: Path, state: _PartState) -> None:
+    """Atomically write one ``.part-state`` sidecar."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            mode="w",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(
+                {
+                    "identity": state.identity,
+                    "expected_size": state.expected_size,
+                    "url": state.url,
+                    "planner_version": state.planner_version,
+                    "content_range_total": state.content_range_total,
+                },
+                stream,
+                separators=(",", ":"),
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_part_state(path: Path) -> _PartState | None:
+    """Parse one ``.part-state`` sidecar, or None when absent/unusable."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    identity = record.get("identity")
+    url = record.get("url")
+    planner_version = record.get("planner_version")
+    if not (
+        isinstance(identity, str)
+        and isinstance(url, str)
+        and isinstance(planner_version, str)
+    ):
+        return None
+    expected_size = record.get("expected_size")
+    total = record.get("content_range_total")
+    return _PartState(
+        identity=identity,
+        expected_size=expected_size if isinstance(expected_size, int) else None,
+        url=url,
+        planner_version=planner_version,
+        content_range_total=total if isinstance(total, int) else None,
+    )
+
+
+class _ResumeRejectedError(Exception):
+    """A resume Range answer failed the strict gate; restart cleanly."""
+
+
+def _resume_gate(
+    response: Any,
+    *,
+    start: int,
+    expected_size: int | None,
+) -> int | None:
+    """Gate one resume answer; integrity mismatches restart the download.
+
+    A strict ``206``/``Content-Range`` match returns the observed total; a
+    ``200`` returns ``None`` (server ignored Range → clean re-GET); a
+    malformed or mismatched ``Content-Range`` raises
+    :class:`_ResumeRejectedError` so the retry loop falls back to a clean
+    restart instead of surfacing a mid-resume integrity failure.  Other
+    statuses keep their :class:`RemoteAccessError` semantics.
+    """
+    try:
+        return _response_is_resumed_at(
+            response, start=start, expected_size=expected_size
+        )
+    except RemoteIntegrityError as error:
+        raise _ResumeRejectedError from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +390,29 @@ def _facade_hook(name: str, fallback: Any) -> Any:
     return getattr(remote, name, fallback)
 
 
+class _RangeInjectingSession:
+    """Wrap a requests-style session to attach a resume ``Range`` header.
+
+    ``_lpdaac_request`` owns its per-hop header dict and offers no caller
+    header seam, so the resume offset is injected at the session boundary
+    for every request the transport issues.  Redirect hops answer 3xx
+    regardless, so the header only takes effect on the final object GET.
+    """
+
+    def __init__(self, session: requests.Session, start: int) -> None:
+        self._session = session
+        self._range = f"bytes={start}-"
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        headers = dict(kwargs.get("headers") or {})
+        headers.setdefault("Range", self._range)
+        kwargs["headers"] = headers
+        return self._session.request(method, url, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow only redirects admitted by a registered adapter policy."""
 
@@ -363,6 +509,9 @@ def _stream_and_verify(
     poll_scheduler: _BurstPollScheduler | None = None,
     poll_token: _BurstPollToken | None = None,
     transfer_url_override: str | None = None,
+    resume_from: int | None = None,
+    resume_total: int | None = None,
+    observe_total: Callable[[int], None] | None = None,
 ) -> tuple[int, str, dict[str, object]]:
     """Stream one asset into ``staging`` and return size/digest/verification.
 
@@ -372,6 +521,20 @@ def _stream_and_verify(
     is returned with ``status: failed`` instead of being raised here so the
     caller can persist the failed attempt in the per-destination manifest
     before raising :class:`RemoteIntegrityError`.
+
+    When ``resume_from`` is a positive byte offset, the already-received
+    ``staging`` prefix is re-read through both hashers before the HTTP
+    request, and every transport issues ``Range: bytes=<resume_from>-``
+    against the resolved transfer URL.  A strict ``206``/``Content-Range``
+    answer appends the suffix; a ``200`` means the server ignored the Range
+    header and falls back to a clean restart of the whole object.  The
+    ``observe_total`` callback, when supplied, receives the
+    ``Content-Range`` total reported by the first valid 206 (or the
+    ``Content-Length`` of a clean-path 200) so the caller can persist the
+    observed object size.  ``resume_total`` is the previously recorded
+    object size (from an earlier ``.part-state``) enforced by the
+    Content-Range gate when the catalog supplied none — a grown object is
+    rejected so the caller restarts cleanly.
     """
     fetcher = getattr(adapter, "fetch", None)
     supplied_ledger = fetcher is not None and _accepts_ledger(fetcher)
@@ -434,6 +597,46 @@ def _stream_and_verify(
             os.fsync(stream.fileno())
         return response_bytes
 
+    def rehash_prefix(offset: int) -> None:
+        """Re-read the retained ``.part`` prefix through both hashers.
+
+        On resume the retained prefix bytes are digested (and counted by
+        ``hasher``) before the HTTP suffix request so the final digest is
+        identical to a single-pass download (PROPOSAL-0070 §1b).
+        """
+        hashed = 0
+        with staging.open("rb") as stream:
+            while hashed < offset:
+                chunk = stream.read(min(1024 * 1024, offset - hashed))
+                if not chunk:
+                    break
+                hashed += len(chunk)
+                hasher.update(chunk)
+                if checksum_hasher is not None:
+                    checksum_hasher.update(chunk)
+        if hashed != offset:
+            logger.warning(
+                "Retained .part prefix shrank to %d bytes during resume "
+                "(expected %d); restarting",
+                hashed,
+                offset,
+            )
+            _fail(RemoteIntegrityError, "part_prefix_short")
+
+    def observed_content_length(response: Any) -> int | None:
+        """Return a positive ``Content-Length`` header value, when present."""
+        headers = getattr(response, "headers", {})
+        if not isinstance(headers, Mapping):
+            return None
+        for name, value in headers.items():
+            if str(name).lower() == "content-length" and value:
+                try:
+                    length = int(str(value))
+                except ValueError:
+                    return None
+                return length if length > 0 else None
+        return None
+
     def result_chunks(result: Any) -> Iterable[bytes]:
         """Adapt provider result forms to a one-pass chunk iterable."""
         if isinstance(result, _FetchedPayload):
@@ -452,13 +655,35 @@ def _stream_and_verify(
             return result
         return ()
 
+    resume_offset = resume_from
+    # The Content-Range gate enforces the catalog size first, else the size
+    # recorded on an earlier resume — a grown object fails the gate and the
+    # caller restarts cleanly (PROPOSAL-0070 watch item).
+    gate_expected = asset.size_bytes if asset.size_bytes is not None else resume_total
     for attempt in range(budget.max_retries + 1):
         if attempt:
             ledger.retry()
-        staging.write_bytes(b"")
         hasher = hashlib.sha256()
         if checksum_algorithm is not None:
             checksum_hasher = hashlib.new(checksum_algorithm)
+        range_start: int | None = None
+        if attempt == 0 and resume_offset:
+            actual = staging.stat().st_size if staging.is_file() else 0
+            if actual != resume_offset:
+                logger.warning(
+                    "Retained .part size %d does not match the recorded "
+                    "resume offset %d; restarting",
+                    actual,
+                    resume_offset,
+                )
+                staging.write_bytes(b"")
+            else:
+                rehash_prefix(resume_offset)
+                range_start = resume_offset
+        else:
+            staging.write_bytes(b"")
+        # A clean (re)start must not inherit an earlier checkpoint.
+        resume_offset = None
         try:
             if fetcher is None:
                 result = None
@@ -494,6 +719,12 @@ def _stream_and_verify(
                     request_url = transfer_url
                     if poll_scheduler is not None:
                         poll_scheduler.set_state(poll_token, "submitted")
+                    request_headers = {
+                        "Accept-Encoding": "identity",
+                        "Authorization": f"Bearer {token}",
+                    }
+                    if range_start:
+                        request_headers["Range"] = f"bytes={range_start}-"
                     response = asf_request(
                         session,
                         "GET",
@@ -502,10 +733,7 @@ def _stream_and_verify(
                         asset=asset,
                         budget=budget,
                         ledger=ledger,
-                        headers={
-                            "Accept-Encoding": "identity",
-                            "Authorization": f"Bearer {token}",
-                        },
+                        headers=request_headers,
                     )
                     if response.status_code == 202:
                         ledger.begin_response()
@@ -531,7 +759,28 @@ def _stream_and_verify(
                         )
                     if poll_scheduler is not None:
                         poll_scheduler.set_state(poll_token, "ready")
-                    _response_is_complete(response)
+                    if range_start is not None:
+                        total = _resume_gate(
+                            response,
+                            start=range_start,
+                            expected_size=gate_expected,
+                        )
+                        if total is None:
+                            # The server ignored the Range header: truncate
+                            # the retained prefix and fall through to a clean
+                            # re-GET of the whole object.
+                            staging.write_bytes(b"")
+                            hasher = hashlib.sha256()
+                            if checksum_algorithm is not None:
+                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            range_start = None
+                        elif observe_total is not None:
+                            observe_total(total)
+                    if range_start is None:
+                        _response_is_complete(response)
+                        length = observed_content_length(response)
+                        if length is not None and observe_total is not None:
+                            observe_total(length)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -549,6 +798,11 @@ def _stream_and_verify(
                 response: requests.Response | None = None
                 try:
                     lpdaac_request = _facade_hook("_lpdaac_request", _lpdaac_request)
+                    if range_start:
+                        # _lpdaac_request builds its own per-hop headers, so
+                        # the resume Range header is injected at the session
+                        # seam for every hop of the redirect chain.
+                        session = _RangeInjectingSession(session, range_start)
                     response = lpdaac_request(
                         session,
                         "GET",
@@ -558,7 +812,25 @@ def _stream_and_verify(
                         budget=budget,
                         ledger=ledger,
                     )
-                    _response_is_complete(response)
+                    if range_start is not None:
+                        total = _resume_gate(
+                            response,
+                            start=range_start,
+                            expected_size=gate_expected,
+                        )
+                        if total is None:
+                            staging.write_bytes(b"")
+                            hasher = hashlib.sha256()
+                            if checksum_algorithm is not None:
+                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            range_start = None
+                        elif observe_total is not None:
+                            observe_total(total)
+                    if range_start is None:
+                        _response_is_complete(response)
+                        length = observed_content_length(response)
+                        if length is not None and observe_total is not None:
+                            observe_total(length)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -582,12 +854,33 @@ def _stream_and_verify(
                             and (auth := _netrc_authorization(asset.href))
                             else {}
                         ),
+                        **({"Range": f"bytes={range_start}-"} if range_start else {}),
                     },
                 )
                 with opener.open(
                     request, timeout=budget.read_timeout_seconds
                 ) as response:
-                    _response_is_complete(response)
+                    if range_start is not None:
+                        total = _resume_gate(
+                            response,
+                            start=range_start,
+                            expected_size=gate_expected,
+                        )
+                        if total is None:
+                            # Server ignored Range: truncate and fall through
+                            # to the clean full-object path.
+                            staging.write_bytes(b"")
+                            hasher = hashlib.sha256()
+                            if checksum_algorithm is not None:
+                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            range_start = None
+                        elif observe_total is not None:
+                            observe_total(total)
+                    if range_start is None:
+                        _response_is_complete(response)
+                        length = observed_content_length(response)
+                        if length is not None and observe_total is not None:
+                            observe_total(length)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -600,6 +893,14 @@ def _stream_and_verify(
                         meter=True,
                     )
             else:
+                if range_start:
+                    # Adapter fetch() has no byte-range seam: the retained
+                    # prefix cannot be honored, so restart the object.
+                    staging.write_bytes(b"")
+                    hasher = hashlib.sha256()
+                    if checksum_algorithm is not None:
+                        checksum_hasher = hashlib.new(checksum_algorithm)
+                    range_start = None
                 if not supplied_ledger:
                     ledger.begin_response()
                 if poll_scheduler is not None:
@@ -608,6 +909,13 @@ def _stream_and_verify(
             break
         except RemoteError:
             raise
+        except _ResumeRejectedError:
+            # A mismatched/grown-object 206 restarts cleanly: the next
+            # attempt truncates the staging file and issues a full GET.
+            logger.warning("Range resume answer rejected; restarting cleanly")
+            if attempt >= budget.max_retries:
+                _fail(RemoteIntegrityError, "content_range_mismatch")
+            continue
         except Exception as error:
             if attempt >= budget.max_retries:
                 logger.warning("Remote transfer failed (%s)", type(error).__name__)
@@ -1055,6 +1363,7 @@ def download(
     poll_token: _BurstPollToken | None = None,
     transfer_url: str | None = None,
     ledger: _CallLedger | None = None,
+    resume: bool = True,
 ) -> Path:
     """Download one complete asset and publish it atomically.
 
@@ -1064,6 +1373,15 @@ def download(
     status, size}``, or ``{status, size}`` when the provider offers no
     checksum) in the private per-destination manifest.  Concurrent publishers
     targeting one destination are serialized by a private process-local guard.
+
+    When ``resume`` is true (the default), the transfer stages bytes in a
+    deterministic ``<destination>.faninsar.remote.<identity>.part`` file
+    plus a static ``.part-state`` sidecar written once at fetch start.
+    An interrupted invocation leaves both behind; the next call with the
+    same asset identity resumes the object with ``Range: bytes=<size>-``
+    instead of re-transferring the prefix.  ``resume=False`` reproduces the
+    previous always-clean behavior for one call.  Resume policy is an
+    operational preference and is never persisted into stack identity.
     """
     if not isinstance(asset, RemoteAsset):
         msg = "asset must be a RemoteAsset"
@@ -1097,15 +1415,56 @@ def download(
             ):
                 return destination
             _fail(RemoteIntegrityError, "destination_conflict")
-        temporary: Path | None = None
+        identity = _identity(asset)
         manifest = _manifest_path(destination, asset)
-        try:
+        part = _part_path(destination, identity)
+        part_state_path = _part_state_path(destination, identity)
+        resume_from: int | None = None
+        state: _PartState | None = None
+        temporary: Path | None = None
+        if resume:
+            staging = part
+            state = _read_part_state(part_state_path)
+            usable = (
+                state is not None
+                and state.identity == identity
+                and state.planner_version == _PART_PLANNER_VERSION
+            )
+            if usable:
+                # ``expected_size`` reflects the catalog (or an earlier
+                # observed Content-Range total persisted on first 206); a
+                # ``.part`` shorter than it resumes, anything else restarts.
+                known_size = (
+                    state.expected_size
+                    if state.expected_size is not None
+                    else state.content_range_total
+                )
+                try:
+                    part_size = part.stat().st_size
+                except OSError:
+                    part_size = 0
+                if part_size > 0 and (known_size is None or part_size < known_size):
+                    resume_from = part_size
+            if state is None or not usable:
+                state = _PartState(
+                    identity=identity,
+                    expected_size=asset.size_bytes,
+                    url=_safe_url(asset.href, adapter),
+                    planner_version=_PART_PLANNER_VERSION,
+                )
+            if resume_from is None:
+                # Clean restart: empty staging + sidecar written once now.
+                part.write_bytes(b"")
+                _write_part_state(part_state_path, state)
+        else:
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,
                 prefix=f".{destination.name}.",
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
+            staging = temporary
+        try:
             prepared_url = transfer_url
             if (
                 prepared_url is None
@@ -1116,38 +1475,56 @@ def download(
                 prepared_url = _prepare_burst_for_standalone_download(
                     asset, budget, ledger
                 )
+
+            def observe_total(total: int) -> None:
+                """Persist the first observed object size into ``.part-state``.
+
+                When the catalog supplied no ``expected_size``, the
+                ``Content-Range`` total (or a clean-path ``Content-Length``)
+                becomes the recorded object size so a later resume detects
+                a grown object and restarts cleanly.
+                """
+                if state is None or not resume:
+                    return
+                if state.expected_size is None and state.content_range_total != total:
+                    state.content_range_total = total
+                    _write_part_state(part_state_path, state)
+
             size, digest, verification = _stream_and_verify(
                 asset,
                 adapter,
                 budget,
                 ledger,
-                temporary,
+                staging,
                 poll_scheduler,
                 poll_token,
                 prepared_url,
+                resume_from=resume_from,
+                resume_total=(state.content_range_total if state is not None else None),
+                observe_total=observe_total if resume else None,
             )
             if verification["status"] == "failed":
                 # Persist the failed verification before raising so the
                 # failed attempt is recorded and the mission layer can
                 # exclude this acquisition from processing.
-                _publish_manifest(
-                    manifest, _identity(asset), digest, size, verification
-                )
+                _publish_manifest(manifest, identity, digest, size, verification)
                 _fail(RemoteIntegrityError, "checksum_mismatch")
             verification, member_failed = _apply_safe_member_verification(
-                temporary, verification
+                staging, verification
             )
             if member_failed:
                 # A burst SAFE member mismatched its manifest.safe MD5.  Record
                 # status failed (P0055 skip semantics) before raising so the
                 # mission layer excludes this acquisition from processing.
-                _publish_manifest(
-                    manifest, _identity(asset), digest, size, verification
-                )
+                _publish_manifest(manifest, identity, digest, size, verification)
                 _fail(RemoteIntegrityError, "checksum_mismatch")
-            temporary.replace(destination)
-            temporary = None
-            _publish_manifest(manifest, _identity(asset), digest, size, verification)
+            staging.replace(destination)
+            if temporary is not None:
+                temporary = None
+            _publish_manifest(manifest, identity, digest, size, verification)
+            if resume:
+                part.unlink(missing_ok=True)
+                part_state_path.unlink(missing_ok=True)
         except BaseException:
             if poll_scheduler is not None:
                 poll_scheduler.set_state(poll_token, "failed")

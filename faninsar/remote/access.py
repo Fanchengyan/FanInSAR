@@ -7,6 +7,8 @@ import urllib.parse
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from faninsar.logging import setup_logger
+
 from .errors import RemoteAccessError, RemoteIntegrityError, _fail
 
 if TYPE_CHECKING:
@@ -14,6 +16,8 @@ if TYPE_CHECKING:
 
     from .protocols import _Adapter
     from .records import RemoteAsset
+
+logger = setup_logger(__name__)
 
 _SECRET_KEY = re.compile(
     r"(?:authorization|cookie|token|password|passwd|secret|signature|credential|api.?key)",
@@ -245,6 +249,91 @@ def _response_is_complete(response: Any) -> None:
         _fail(RemoteAccessError, "partial_content")
     if status != 200:
         _fail(RemoteAccessError, "unexpected_status")
+
+
+# RFC 9110 single-range Content-Range: ``bytes <first>-<last>/<complete|*>``.
+# Mirrors the strict check in ``fetch/ranges.py::_request_span_once`` for the
+# synchronous complete-file transports.
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+
+
+def _content_range_header(response: Any) -> str:
+    """Return the response ``Content-Range`` value, or an empty string."""
+    headers = getattr(response, "headers", {})
+    if not isinstance(headers, Mapping):
+        return ""
+    for name, value in headers.items():
+        if str(name).lower() == "content-range" and value:
+            return str(value)
+    return ""
+
+
+def _response_status(response: Any) -> int | None:
+    """Return the integer HTTP status across requests/urllib response forms."""
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "status", None)
+    return status
+
+
+def _response_is_resumed_at(
+    response: Any,
+    *,
+    start: int,
+    expected_size: int | None,
+) -> int | None:
+    """Check one response to a ``Range: bytes=<start>-`` resume request.
+
+    Returns the ``Content-Range`` total only when the response is a strict
+    206 partial answer: status 206 and a ``Content-Range`` whose ``start``
+    equals the requested ``start`` and whose ``end`` is the object's last
+    byte (``total - 1``).  When ``expected_size`` is known, ``total`` must
+    equal it.  A ``200`` answer means the server ignored the Range header:
+    the caller treats the response as a clean-restart signal, not a
+    failure.  Any other status is an access error, mirroring the strict
+    gate in ``fetch/ranges.py::_request_span_once``.
+
+    Parameters
+    ----------
+    response : object
+        The HTTP response to a request that carried a ``Range`` header.
+    start : int
+        The requested resume offset (first byte needed).
+    expected_size : int or None
+        Known object size in bytes, or None when the catalog did not
+        supply one; the Content-Range ``total`` is enforced only when set.
+
+    Returns
+    -------
+    int or None
+        The validated ``Content-Range`` total, or ``None`` when the server
+        answered the resume request with a full-object 200 (clean restart).
+
+    """
+    status = _response_status(response)
+    if status == 200:
+        return None
+    if status != 206:
+        _fail(RemoteAccessError, "unexpected_status")
+    parsed = _CONTENT_RANGE_RE.match(_content_range_header(response).strip())
+    if parsed is None:
+        _fail(RemoteIntegrityError, "content_range_mismatch")
+    if int(parsed.group(1)) != start:
+        _fail(RemoteIntegrityError, "content_range_mismatch")
+    total_text = parsed.group(3)
+    if total_text == "*":
+        _fail(RemoteIntegrityError, "content_range_mismatch")
+    total = int(total_text)
+    if int(parsed.group(2)) != total - 1:
+        _fail(RemoteIntegrityError, "content_range_mismatch")
+    if expected_size is not None and total != expected_size:
+        logger.warning(
+            "Range resume answer reports total %d, expected %d; restarting",
+            total,
+            expected_size,
+        )
+        _fail(RemoteIntegrityError, "content_range_mismatch")
+    return total
 
 
 def _representation_kind(asset: RemoteAsset) -> str | None:
