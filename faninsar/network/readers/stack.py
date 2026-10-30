@@ -26,6 +26,7 @@ from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
     from faninsar.core.acquisition import Acquisition
+    from faninsar.core.baseline import Baselines
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
     from faninsar.io.storage.scene_store import (
         CoregisteredSceneStore,
@@ -371,6 +372,39 @@ class StackInterferogramCollection(InterferogramCollection):
         if self._selection.pairs is not None:
             return self._selection.pairs
         return self._planned_pairs()
+
+    @property
+    def baseline(self) -> Baselines:
+        """Return the signed perpendicular baseline of this view's network.
+
+        Each acquisition's value is the scene baseline persisted on its
+        coreg product at coregistration (``faninsar:baseline_perpendicular_m``,
+        relative to the Stack Reference — signed via the ``velocity x look``
+        cross-track convention, PROPOSAL-0065). Because the values are already
+        reference-relative, :class:`~faninsar.core.baseline.Baselines` is
+        populated directly per date rather than by ``from_pair_wise``
+        inversion; per-pair values come from
+        :meth:`Baselines.to_pair_wise` on the view's :attr:`pairs`.
+
+        Scenes committed before the field existed read ``NaN``; a Reference
+        product without the field reads ``0.0``.
+
+        Returns
+        -------
+        Baselines
+            Signed perpendicular baseline per acquisition date of this
+            view's Pair network.
+
+        """
+        from faninsar.core.baseline import Baselines
+
+        scenes = self._stack.scenes
+        dates = list(self.pairs.dates)
+        values = [
+            scenes[date.strftime("%Y%m%d")].baseline["perpendicular_m"]
+            for date in dates
+        ]
+        return Baselines(dates, np.asarray(values, dtype=np.float32))
 
     def _stores(self) -> list[InterferogramArtifactStore]:
         """Open the exact planned IFG product set of this view's multilook.

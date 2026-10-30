@@ -681,3 +681,69 @@ def test_merged_scene_interferogram_rejects_different_references(
             CoregisteredSceneStore.open(first),
             CoregisteredSceneStore.open(second),
         )
+
+
+def test_scene_baseline_reads_persisted_signed_components(tmp_path: Path) -> None:
+    """A committed secondary exposes its persisted baseline record."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    _, second = _write_pair(
+        tmp_path,
+        data,
+        data,
+        properties={
+            "faninsar:baseline_parallel_m": -12.5,
+            "faninsar:baseline_perpendicular_m": 87.25,
+        },
+    )
+    store = CoregisteredSceneStore.open(second)
+    assert store.baseline == {"parallel_m": -12.5, "perpendicular_m": 87.25}
+
+
+def test_scene_baseline_reference_without_fields_reads_zero(tmp_path: Path) -> None:
+    """A Reference without persisted fields is its own origin: 0.0."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    first, _ = _write_pair(tmp_path, data, data)
+    store = CoregisteredSceneStore.open(first)
+    assert store.is_reference
+    assert store.baseline == {"parallel_m": 0.0, "perpendicular_m": 0.0}
+
+
+def test_scene_baseline_secondary_without_fields_reads_nan(tmp_path: Path) -> None:
+    """A pre-change secondary with no fields reads NaN, not an error."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    _, second = _write_pair(tmp_path, data, data)
+    store = CoregisteredSceneStore.open(second)
+    assert not store.is_reference
+    assert np.isnan(store.baseline["parallel_m"])
+    assert np.isnan(store.baseline["perpendicular_m"])
+
+
+def test_scene_baseline_rejects_non_numeric_field(tmp_path: Path) -> None:
+    """Strings/bools in the baseline fields fall back, never coerce."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    _, second = _write_pair(
+        tmp_path / "s",
+        data,
+        data,
+        secondary_id="20240113",
+        properties={
+            "faninsar:baseline_parallel_m": "12.5",
+            "faninsar:baseline_perpendicular_m": True,
+        },
+    )
+    store = CoregisteredSceneStore.open(second)
+    assert np.isnan(store.baseline["parallel_m"])
+    assert np.isnan(store.baseline["perpendicular_m"])
+
+    _, second_i = _write_pair(
+        tmp_path / "i",
+        data,
+        data,
+        secondary_id="20240113",
+        properties={
+            "faninsar:baseline_parallel_m": 0,
+            "faninsar:baseline_perpendicular_m": 87,
+        },
+    )
+    store_i = CoregisteredSceneStore.open(second_i)
+    assert store_i.baseline == {"parallel_m": 0.0, "perpendicular_m": 87.0}

@@ -411,6 +411,42 @@ class CoregisteredSceneStore:
         """Return whether this product holds the Stack Reference acquisition."""
         return self.date_id == self.reference_id
 
+    @property
+    def baseline(self) -> dict[str, float]:
+        """Return the scene's baseline relative to the Stack Reference.
+
+        Reads the persisted ``faninsar:baseline_parallel_m`` and
+        ``faninsar:baseline_perpendicular_m`` product properties written at
+        coregistration (signed perpendicular, metres). The Reference is its
+        own baseline origin, so a product with ``is_reference`` and absent
+        fields reads ``0.0``; a secondary committed before the fields existed
+        reads ``NaN``. Only real ``int``/``float`` values are accepted —
+        ``bool``, strings, and other types read as ``NaN``/``0.0`` under the
+        same absent-field rules.
+
+        Returns
+        -------
+        dict
+            ``{"parallel_m": float, "perpendicular_m": float}``.
+
+        """
+        fallback = 0.0 if self.is_reference else float("nan")
+        parallel = self.properties.get("faninsar:baseline_parallel_m")
+        perpendicular = self.properties.get("faninsar:baseline_perpendicular_m")
+        return {
+            "parallel_m": (
+                float(parallel)
+                if isinstance(parallel, int | float) and not isinstance(parallel, bool)
+                else fallback
+            ),
+            "perpendicular_m": (
+                float(perpendicular)
+                if isinstance(perpendicular, int | float)
+                and not isinstance(perpendicular, bool)
+                else fallback
+            ),
+        }
+
     def __repr__(self) -> str:
         """Return a concise one-line scene-product summary."""
         return (

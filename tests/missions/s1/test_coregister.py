@@ -194,6 +194,12 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     scene.burst.azimuth_time = _ORIGIN
     scene.swath = _product(path).swaths[0]
     scene.geometry.wavelength_m = 0.05546576
+    # Real azimuth_time so the baseline orbit interpolator gets a tz-aware
+    # datetime inside the fake orbit's coverage (PROPOSAL-0065).
+    scene.geometry.azimuth_time = (
+        lambda line, _burst=scene.swath.bursts[0], _dt=scene.swath.azimuth_time_interval_s: _burst.azimuth_time
+        + timedelta(seconds=float(line) * _dt)
+    )
     scene.array.samples = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
     scene.array.valid_mask = np.ones((_LINES, _SAMPLES), dtype=bool)
     scene.array.row0 = 0
@@ -305,6 +311,31 @@ def test_reference_is_read_and_deramped_once_across_dates(
         assert "amplitude_refinement_enabled" not in kwargs
         assert kwargs["misreg_az_px"] == pytest.approx(0.05)
         assert kwargs["misreg_rg_px"] == pytest.approx(-0.02)
+
+
+def test_secondary_persists_signed_scene_baseline(
+    tmp_path: Path, fake_s1: _Recorder
+) -> None:
+    """A coregistered secondary carries its baseline-vs-Reference record."""
+    context = _prepare(tmp_path)
+    product = coregister_s1_secondary(
+        context,
+        tmp_path / SECONDARIES[0],
+        output_scene=tmp_path / "coreg" / SECONDARIES[0].split("_")[5][:8],
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    baseline = product.baseline
+    # The fake orbit drifts +y with along-track velocity: a nonzero signed
+    # parallel component and a finite signed perpendicular component.
+    assert np.isfinite(baseline["parallel_m"])
+    assert np.isfinite(baseline["perpendicular_m"])
+    assert baseline["parallel_m"] == pytest.approx(0.0, abs=1e-3)
+    # Reference is its own origin.
+    assert context.product.baseline == {
+        "parallel_m": 0.0,
+        "perpendicular_m": 0.0,
+    }
 
 
 def test_reopened_reference_is_reused_without_reading_pixels(

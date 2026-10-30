@@ -328,6 +328,9 @@ def prepare_s1_reference(
                     grid_shape,
                     orbit=next(iter(units.values())).scene.swath.orbit,
                 )
+            # The Reference is its own baseline origin (PROPOSAL-0065).
+            properties["faninsar:baseline_parallel_m"] = 0.0
+            properties["faninsar:baseline_perpendicular_m"] = 0.0
             product = writer.commit(properties=properties)
         else:
             product = CoregisteredSceneStore.open(output_scene)
@@ -568,6 +571,7 @@ def coregister_s1_secondary(
     output_scene = Path(output_scene)
     work_root = output_scene.parent / f".{output_scene.name}.work"
     wrote = 0
+    unit_baselines: list[tuple[float, float]] = []
     try:
         with SceneWriter(
             output_scene,
@@ -612,6 +616,7 @@ def coregister_s1_secondary(
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )
+                unit_baselines.append(_unit_scene_baseline(state))
                 del payload, state
                 shutil.rmtree(work_root / tag, ignore_errors=True)
                 wrote += 1
@@ -626,6 +631,14 @@ def coregister_s1_secondary(
                 },
                 **dict(properties or {}),
             }
+            # Signed per-scene baseline against the Reference; the mean across
+            # the scene's units (PROPOSAL-0065). Written after the caller
+            # properties merge so a ``properties=`` value cannot shadow it.
+            parallel_m, perpendicular_m = np.mean(
+                np.asarray(unit_baselines, dtype=np.float64), axis=0
+            )
+            record["faninsar:baseline_parallel_m"] = float(parallel_m)
+            record["faninsar:baseline_perpendicular_m"] = float(perpendicular_m)
             product = writer.commit(inputs=bindings, properties=record)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
@@ -637,6 +650,49 @@ def coregister_s1_secondary(
         len(context.units),
     )
     return product
+
+
+def _unit_scene_baseline(state: ProductionPairState) -> tuple[float, float]:
+    """Compute the scene baseline of one unit against the Reference.
+
+    Mirrors :func:`stage_baseline`'s geocentric convention — each orbit is
+    evaluated at *its own* scene's burst mid-azimuth time, and ``b =
+    sec_pos - ref_pos`` is decomposed onto ``look = -ref_pos/|ref_pos|``.
+    The perpendicular component is signed: projected onto the cross-track
+    direction ``normalize(ref_velocity x look)`` (asf_search/ISCE2 sign
+    convention), so it can be negative.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(parallel_m, perpendicular_m)`` of this unit's scene, metres.
+
+    """
+    from faninsar.processing.geometry.orbit import OrbitInterpolator
+
+    mid_az = 0.5 * (state.primary.array.samples.shape[0] - 1)
+    ref_time = state.primary.geometry.azimuth_time(mid_az)
+    sec_time = state.secondary.geometry.azimuth_time(mid_az)
+    state_ref = OrbitInterpolator.from_orbit(state.primary.swath.orbit).evaluate(
+        ref_time
+    )
+    state_sec = OrbitInterpolator.from_orbit(state.secondary.swath.orbit).evaluate(
+        sec_time
+    )
+    sat = np.asarray(state_ref.position_m, dtype=np.float64)
+    look = -sat / np.linalg.norm(sat)
+    baseline_vec = np.asarray(state_sec.position_m, dtype=np.float64) - sat
+    parallel = float(np.dot(baseline_vec, look))
+    perp_vec = baseline_vec - parallel * look
+    velocity = np.asarray(state_ref.velocity_m_s, dtype=np.float64)
+    cross_track = np.cross(velocity, look)
+    cross_norm = np.linalg.norm(cross_track)
+    if cross_norm > 0.0:
+        cross_track = cross_track / cross_norm
+        perpendicular = float(np.dot(perp_vec, cross_track))
+    else:
+        perpendicular = float(np.linalg.norm(perp_vec))
+    return parallel, perpendicular
 
 
 def _secondary_burst_index(
