@@ -9,11 +9,14 @@ from typing import Any
 import pytest
 
 from faninsar import remote
+from faninsar.remote.access import _validate_url
+from faninsar.remote.catalog import _normalize_record, _query_geometry
 from faninsar.remote.cmr import (
     CMRCollectionAdapter,
     _compact_size_bytes,
     normalize_cmr_granule,
 )
+from faninsar.remote.protocols import _CallLedger
 
 
 class _ResponseFixture:
@@ -46,7 +49,7 @@ def test_cmr_items_builds_server_side_query_from_normalized_values(
         return {"feed": {"entry": []}}, {}
 
     monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
-    spatial = remote._query_geometry(remote.BoundingBox(-2, 3, 4, 5, crs=4326))[0]
+    spatial = _query_geometry(remote.BoundingBox(-2, 3, 4, 5, crs=4326))[0]
     records = list(
         adapter.items(
             spatial=spatial,
@@ -57,7 +60,7 @@ def test_cmr_items_builds_server_side_query_from_normalized_values(
             ),
             collections=("S1_GRD",),
             limit=7,
-            ledger=remote._CallLedger(remote.RemoteResourceBudget()),
+            ledger=_CallLedger(remote.RemoteResourceBudget()),
         )
     )
 
@@ -98,7 +101,7 @@ def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
         "https://cumulus.asf.alaska.edu/login",
         "https://cumulus.asf.alaska.edu/",
     ):
-        assert remote._validate_url(url, adapter, redirect=True) == url
+        assert _validate_url(url, adapter, redirect=True) == url
     for url in (
         "https://urs.earthdata.nasa.gov/api/users/other",
         "https://urs.earthdata.nasa.gov/api/account",
@@ -107,7 +110,7 @@ def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
         "https://cumulus.asf.alaska.edu/login/other",
     ):
         with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
-            remote._validate_url(url, adapter, redirect=True)
+            _validate_url(url, adapter, redirect=True)
 
 
 def test_cmr_json_pagination_uses_search_after_and_collection_identity(
@@ -184,9 +187,7 @@ def test_cmr_json_pagination_uses_search_after_and_collection_identity(
         return fixture.body, fixture.headers
 
     monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
-    records = list(
-        adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget()))
-    )
+    records = list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
 
     assert [record["id"] for record in records] == ["G1", "G2"]
     assert all(record["collection"] == "C123" for record in records)
@@ -498,9 +499,7 @@ def test_provider_candidate_filter_skips_mismatch_and_continues_pages(
         return {"feed": {"entry": [entry]}}, headers
 
     monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
-    records = list(
-        adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget()))
-    )
+    records = list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
     assert [record["id"] for record in records] == ["TIFF"]
 
 
@@ -587,7 +586,7 @@ def test_compact_granule_size_preserves_exact_binary_mib_value() -> None:
     record = adapter._normalize(entry)
 
     assert record["assets"]["data"]["size"] == 156_585_594
-    item = remote._normalize_record(record, "fixture", adapter, "anonymous")
+    item = _normalize_record(record, "fixture", adapter, "anonymous")
     assert item.assets["data"].size_bytes == 156_585_594
 
 
@@ -681,7 +680,7 @@ def test_auth_profile_resolver_is_operation_scoped(
     list(
         adapter.items(
             auth_profile="earthdata-asf",
-            ledger=remote._CallLedger(remote.RemoteResourceBudget()),
+            ledger=_CallLedger(remote.RemoteResourceBudget()),
         )
     )
     assert seen == [{"Authorization": "Bearer transient"}]

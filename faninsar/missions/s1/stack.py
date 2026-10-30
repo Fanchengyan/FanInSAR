@@ -9,7 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_pair_configuration
 from faninsar.stack.provider import StackSceneProvider
 from faninsar.stack.search import (
@@ -183,8 +183,7 @@ def _configure_s1_bindings(
             "Sentinel-1 IPF 002.36 requires AUX_CAL EAP correction, which the "
             "FanInSAR SAFE reader does not yet implement"
         )
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError, logger=logger)
     if selected:
         stack.config.extra["orbit_paths"] = selected
     else:
@@ -332,8 +331,7 @@ class S1Stack(Stack):
                 "Sentinel-1 SAFE does not support non-default flatten_stage; "
                 "use 'coregistration'"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if reference is not None:
             kwargs["reference"] = reference
 
@@ -432,8 +430,7 @@ class S1Stack(Stack):
             raise TypeError(message)
         if not search.items:
             message = "from_search received an empty S1Search; nothing to download"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         selected_polarizations = normalize_polarizations(polarizations)
         catalog = search.catalog
         effective_roi = roi if roi is not None else search.spatial
@@ -456,8 +453,7 @@ class S1Stack(Stack):
                     "CDSE from_search needs a spatial bound for byte-range "
                     "windows; pass roi=... or use a spatial-scoped search"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             dem = kwargs.pop("dem", None)
             local_paths = materialize_cdse_roi_safes(
                 effective_roi,
@@ -502,8 +498,7 @@ class S1Stack(Stack):
                 "from_search needs a spatial bound for the ASF path; the "
                 "search was not spatial-scoped and roi= was not given"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return cls._from_asf_complete(
             spatial_arg,
             work_dir=work_dir,
@@ -613,6 +608,8 @@ class S1Stack(Stack):
         if catalog_name == "sentinel1-asf":
             ensure_asf_catalog(catalog_name, product_type=product_type)
         from faninsar import remote
+        from faninsar.remote.errors import _fail
+        from faninsar.remote.protocols import _CallLedger
 
         budget = budget or remote.RemoteResourceBudget()
         if items is None:
@@ -632,8 +629,7 @@ class S1Stack(Stack):
         selected_items = canonical_items(items)
         if not selected_items:
             message = "Sentinel-1 search returned no products"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         root = Path(work_dir)
         poll_scheduler = None
         poll_tokens: list[Any | None] = [None] * len(selected_items)
@@ -663,7 +659,7 @@ class S1Stack(Stack):
             )
         worker_limit = getattr(budget, "max_workers", _DEFAULT_S1_DOWNLOAD_WORKERS)
         worker_count = min(len(download_plans), max(1, worker_limit))
-        operation_ledger = remote._CallLedger(budget)
+        operation_ledger = _CallLedger(budget)
         downloaded_paths: list[Path | None] = [None] * len(download_plans)
         excluded_indices: set[int] = set()
         excluded_acquisitions: list[dict[str, str]] = []
@@ -733,9 +729,7 @@ class S1Stack(Stack):
                             assert token is not None
                             observations = poll_scheduler.observe(token)
                             if observations >= getattr(budget, "max_poll_attempts", 50):
-                                remote._fail(
-                                    remote.RemoteLimitError, "max_poll_attempts"
-                                )
+                                _fail(remote.RemoteLimitError, "max_poll_attempts")
                             probe_urls[index] = pending_error.location
                             poll_scheduler.mark_waiting(
                                 token, pending_error.delay_seconds
@@ -783,7 +777,7 @@ class S1Stack(Stack):
                         futures[download_future] = ("download", index)
                     else:
                         if observations >= getattr(budget, "max_poll_attempts", 50):
-                            remote._fail(remote.RemoteLimitError, "max_poll_attempts")
+                            _fail(remote.RemoteLimitError, "max_poll_attempts")
                         probe_urls[index] = observation.url
                         poll_scheduler.mark_waiting(token, observation.delay_seconds)
                         waiting.add(index)
@@ -806,16 +800,14 @@ class S1Stack(Stack):
                 continue
             if path is None:  # pragma: no cover - executor invariant
                 message = "Sentinel-1 download completed without a local path"
-                logger.error(message)
-                raise RuntimeError(message)
+                reject(message, RuntimeError, logger=logger)
             local_paths.append(path)
         if not local_paths:
             message = (
                 "every Sentinel-1 input failed download verification; delete "
                 "the recorded files and re-download them before preparing"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         extra = dict(kwargs.pop("extra", {}) or {})
         if excluded_acquisitions:
             extra["excluded_acquisitions"] = tuple(excluded_acquisitions)

@@ -17,15 +17,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ASFSearchAdapter": (".asf_search", "ASFSearchAdapter"),
     "ASFSearchEngineAdapter": (".asf_search", "ASFSearchEngineAdapter"),
     "ASFSearchError": (".asf_search", "ASFSearchError"),
-    "ASFSearchUnavailableError": (".asf_search", "ASFSearchUnavailableError"),
-    "ASFSearchVersionError": (".asf_search", "ASFSearchVersionError"),
     "AsfSearchAdapter": (".asf_search", "AsfSearchAdapter"),
-    "EngineUnavailableError": (".asf_search", "EngineUnavailableError"),
-    "UnobservableASFSearchError": (".asf_search", "UnobservableASFSearchError"),
-    "UnsupportedASFSearchVersionError": (
-        ".asf_search",
-        "UnsupportedASFSearchVersionError",
-    ),
     "register_asf_catalog": (".asf_search", "register_asf_catalog"),
     "register_asf_search_catalog": (".asf_search", "register_asf_search_catalog"),
     "COP_DEM_GLO30_COLLECTION": (

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
+
 
 class RemoteError(Exception):
     """Base class for errors raised by the remote boundary."""
@@ -17,7 +21,8 @@ class RemoteError(Exception):
 def _fail(
     error_type: type[RemoteError], reason: str, message: str | None = None
 ) -> NoReturn:
-    """Raise a remote error while keeping reason construction centralized."""
+    """Log and raise a remote error; reason construction stays centralized."""
+    logger.error("%s: %s", reason, message or reason)
     raise error_type(reason, message)
 
 

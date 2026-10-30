@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import urllib.request
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -12,6 +13,16 @@ import requests
 
 from faninsar import remote
 from faninsar.data.query import Points
+from faninsar.remote.access import (
+    _asf_redirect_url,
+    _lpdaac_redirect_url,
+    _response_is_complete,
+    _validate_representation,
+)
+from faninsar.remote.auth import _asf_request, _no_auth
+from faninsar.remote.catalog import _register_adapter
+from faninsar.remote.fetch.complete import _RedirectHandler, _stream_download
+from faninsar.remote.protocols import _CallLedger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -70,7 +81,7 @@ def test_complete_download_streams_chunks_and_publishes_atomically(
 ) -> None:
     """A chunk stream is written, checked, and atomically published."""
     adapter = _ChunkAdapter((b"first-", b"second-", b"third"))
-    remote._register_adapter("chunks", adapter)
+    _register_adapter("chunks", adapter)
     destination = tmp_path / "nested" / "data.bin"
 
     path = remote.download(_asset("chunks"), destination)
@@ -84,7 +95,7 @@ def test_complete_download_streams_chunks_and_publishes_atomically(
 def test_stream_length_failure_leaves_destination_unchanged(tmp_path: Path) -> None:
     """Length validation happens before replacing an existing destination."""
     adapter = _ChunkAdapter((b"short",))
-    remote._register_adapter("short", adapter)
+    _register_adapter("short", adapter)
     asset = _asset("short")
     destination = tmp_path / "data.bin"
     destination.write_bytes(b"old content")
@@ -189,10 +200,9 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     """ASF transfer gets a bearer/cookie before the complete SAFE GET."""
     payload = b"PK\x03\x04complete-safe-zip"
     session = _ASFSession(payload)
-    monkeypatch.setattr(remote.requests, "Session", lambda: session)
+    monkeypatch.setattr(requests, "Session", lambda: session)
     monkeypatch.setattr(
-        remote,
-        "_netrc_credentials",
+        "faninsar.remote.auth._netrc_credentials",
         lambda host: (
             ("fixture-user", "fixture-password")
             if host == "urs.earthdata.nasa.gov"
@@ -224,11 +234,9 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
         auth_profile="earthdata-asf",
     )
     staging = tmp_path / "staging.zip"
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_redirects=4))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_redirects=4))
 
-    size, digest = remote._stream_download(
-        asset, adapter, ledger.budget, ledger, staging
-    )
+    size, digest = _stream_download(asset, adapter, ledger.budget, ledger, staging)
 
     assert size == len(payload)
     assert digest == hashlib.sha256(payload).hexdigest()
@@ -302,8 +310,11 @@ def test_asf_burst_download_returns_pending_without_sleep(
         ledger.begin_response()
         return next(responses)
 
-    monkeypatch.setattr(remote, "_asf_authenticated_session", authenticated_session)
-    monkeypatch.setattr(remote, "_asf_request", asf_request)
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        authenticated_session,
+    )
+    monkeypatch.setattr("faninsar.remote.fetch.complete._asf_request", asf_request)
     delays: list[float] = []
     monkeypatch.setattr("faninsar.remote.fetch.complete.time.sleep", delays.append)
 
@@ -323,11 +334,11 @@ def test_asf_burst_download_returns_pending_without_sleep(
         "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
         auth_profile="earthdata-asf",
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_retries=2))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_retries=2))
     staging = tmp_path / "burst.zip"
 
     with pytest.raises(remote.BurstPendingError) as raised:
-        remote._stream_download(asset, _ASFAdapter(), ledger.budget, ledger, staging)
+        _stream_download(asset, _ASFAdapter(), ledger.budget, ledger, staging)
 
     assert raised.value.location.endswith("/jobs/result.zip")
     assert calls == [
@@ -436,10 +447,9 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
     """LPDAAC auth credentials stop at URS and never reach CloudFront."""
     payload = b"PK\x03\x04nasadem-zip"
     session = _LPDAACSession(payload)
-    monkeypatch.setattr(remote.requests, "Session", lambda: session)
+    monkeypatch.setattr(requests, "Session", lambda: session)
     monkeypatch.setattr(
-        remote,
-        "_netrc_credentials",
+        "faninsar.remote.auth._netrc_credentials",
         lambda host: (
             ("fixture-user", "fixture-password")
             if host == "urs.earthdata.nasa.gov"
@@ -472,12 +482,10 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
         auth_profile="earthdata-lpdaac",
     )
     adapter = _LPDAACAdapter()
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_redirects=5))
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_redirects=5))
     staging = tmp_path / "NASADEM_HGT_n36w121.zip"
 
-    size, digest = remote._stream_download(
-        asset, adapter, ledger.budget, ledger, staging
-    )
+    size, digest = _stream_download(asset, adapter, ledger.budget, ledger, staging)
 
     assert size == len(payload)
     assert digest == hashlib.sha256(payload).hexdigest()
@@ -562,8 +570,8 @@ def test_asf_anonymous_delivery_stays_sticky_across_unknown_hosts() -> None:
         "https://datapool.asf.alaska.edu/item.zip",
         auth_profile="earthdata-asf",
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_redirects=3))
-    response = remote._asf_request(
+    ledger = _CallLedger(remote.RemoteResourceBudget(max_redirects=3))
+    response = _asf_request(
         session,
         "GET",
         asset.href,
@@ -579,7 +587,7 @@ def test_asf_anonymous_delivery_stays_sticky_across_unknown_hosts() -> None:
     for _method, _url, headers, auth in session.requests[1:]:
         assert "Authorization" not in headers
         assert "Cookie" not in headers
-        assert auth is remote._no_auth
+        assert auth is _no_auth
 
 
 def test_lpdaac_anonymous_handoff_admits_changed_delivery_origins() -> None:
@@ -612,14 +620,14 @@ def test_lpdaac_anonymous_handoff_admits_changed_delivery_origins() -> None:
         "lp-prod-protected.s3.us-west-2.amazonaws.com/"
         "NASADEM_HGT.001/NASADEM_HGT_n36w121/NASADEM_HGT_n36w121.zip"
     )
-    assert remote._lpdaac_redirect_url(source, valid, asset, _LPDAACAdapter()) == valid
+    assert _lpdaac_redirect_url(source, valid, asset, _LPDAACAdapter()) == valid
     for invalid in (
         valid.replace("https://d123example.cloudfront.net", "http://evil.example"),
         valid.replace("/s3-012", "/../"),
         valid.replace("d123example", "evil.example") + "#fragment",
     ):
         with pytest.raises(remote.RemoteAccessError):
-            remote._lpdaac_redirect_url(source, invalid, asset, _LPDAACAdapter())
+            _lpdaac_redirect_url(source, invalid, asset, _LPDAACAdapter())
 
 
 def test_asf_anonymous_handoff_admits_changed_delivery_origins() -> None:
@@ -645,7 +653,7 @@ def test_asf_anonymous_handoff_admits_changed_delivery_origins() -> None:
     )
 
     assert (
-        remote._asf_redirect_url(
+        _asf_redirect_url(
             "https://sentinel1.asf.alaska.edu/SLC/item.zip",
             valid,
             asset,
@@ -654,7 +662,7 @@ def test_asf_anonymous_handoff_admits_changed_delivery_origins() -> None:
         == valid
     )
     with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
-        remote._asf_redirect_url(
+        _asf_redirect_url(
             "https://datapool.asf.alaska.edu/SLC/item.zip",
             valid,
             asset,
@@ -662,7 +670,7 @@ def test_asf_anonymous_handoff_admits_changed_delivery_origins() -> None:
         )
     changed = "https://objects.example/new-layout/other.zip"
     assert (
-        remote._asf_redirect_url(
+        _asf_redirect_url(
             "https://sentinel1.asf.alaska.edu/SLC/item.zip",
             changed,
             asset,
@@ -698,9 +706,9 @@ def test_asf_nisar_anonymous_handoff_admits_changed_delivery_origins() -> None:
         "sds-n-cumulus-prod-nisar-products.s3.us-west-2.amazonaws.com/"
         "DEM/v1.2/EPSG4326/S90/S90_W180/DEM_S90_00_W180_00_C01.tif"
     )
-    assert remote._asf_redirect_url(source, valid, asset, _ASFAdapter()) == valid
+    assert _asf_redirect_url(source, valid, asset, _ASFAdapter()) == valid
     changed = "https://objects.example/new-layout/dem.tif"
-    assert remote._asf_redirect_url(source, changed, asset, _ASFAdapter()) == changed
+    assert _asf_redirect_url(source, changed, asset, _ASFAdapter()) == changed
 
 
 @pytest.mark.parametrize(
@@ -717,7 +725,7 @@ def test_complete_download_rejects_partial_or_non_success_responses(
     """Complete-file publication admits only an un-ranged HTTP 200."""
     response = type("Response", (), {"status_code": status, "headers": headers})()
     with pytest.raises(remote.RemoteAccessError, match=reason):
-        remote._response_is_complete(response)
+        _response_is_complete(response)
 
 
 @pytest.mark.parametrize(
@@ -747,21 +755,21 @@ def test_representation_magic_is_checked_before_publication(
         f"https://fixture.invalid/asset.{suffix}",
     )
     staging.write_bytes(payload)
-    remote._validate_representation(staging, asset)
+    _validate_representation(staging, asset)
 
     staging.write_bytes(b"\xef\xbb\xbf  <HTML>login</HTML>")
     with pytest.raises(remote.RemoteIntegrityError, match="representation_mismatch"):
-        remote._validate_representation(staging, asset)
+        _validate_representation(staging, asset)
 
 
 def test_signed_query_redirect_is_terminal() -> None:
     """A request carrying a delivery capability cannot follow a 3xx."""
     adapter = _ChunkAdapter((b"payload",))
-    handler = remote._RedirectHandler(
+    handler = _RedirectHandler(
         adapter,
         remote.RemoteResourceBudget(max_redirects=1),
     )
-    request = remote.urllib.request.Request(
+    request = urllib.request.Request(
         "https://chunks.invalid/data.bin?x-random-signature=fixture-secret"
     )
     response = io.BytesIO(b"redirect")
@@ -797,7 +805,7 @@ def test_transfer_failure_does_not_surface_signed_url(
             )
             raise OSError(message)
 
-    remote._register_adapter("failing-complete-stream", _FailingAdapter())
+    _register_adapter("failing-complete-stream", _FailingAdapter())
     asset = remote.RemoteAsset(
         "failing",
         "failing-complete-stream",

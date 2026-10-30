@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.remote.errors import (
     RemoteAccessError,
     RemoteIntegrityError,
@@ -141,8 +141,7 @@ class RangeFetcher:
         session = self._session
         if session is None:
             msg = "RangeFetcher must be used as an async context manager"
-            logger.error(msg)
-            raise RuntimeError(msg)
+            reject(msg, RuntimeError, logger=logger)
         span_list = tuple(spans)
         bodies = await asyncio.gather(*(_get_span(self, span) for span in span_list))
         return {span.label: body for span, body in zip(span_list, bodies, strict=True)}
@@ -196,8 +195,7 @@ class RangeFetcher:
         session = self._session
         if session is None:
             msg = "RangeFetcher must be used as an async context manager"
-            logger.error(msg)
-            raise RuntimeError(msg)
+            reject(msg, RuntimeError, logger=logger)
         write, received, close = _open_sink(span, sink)
         try:
             await _attempt_span_stream(self, span, write, received, allow_refresh=True)
@@ -256,8 +254,7 @@ def _open_sink(
     tell = getattr(sink, "tell", None)
     if not callable(write) or not callable(tell):
         msg = "sink must be a path or a binary stream supporting write() and tell()"
-        logger.error(msg)
-        raise TypeError(msg)
+        reject(msg, TypeError, logger=logger)
     if tell() > expected:
         logger.error(
             "range sink position is past the requested span",

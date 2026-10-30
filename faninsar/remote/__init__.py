@@ -9,45 +9,10 @@ facade used by existing FanInSAR adapters.
 from __future__ import annotations
 
 import importlib
-import time
-import urllib
-
-import requests
 
 from faninsar.data.query import BoundingBox, Points, Polygons
 
-from .access import (
-    _asf_redirect_url,
-    _canonicalize_url,
-    _lpdaac_redirect_url,
-    _registered_origin,
-    _representation_kind,
-    _response_is_complete,
-    _safe_url,
-    _validate_anonymous_delivery_url,
-    _validate_representation,
-    _validate_url,
-)
-from .auth import (
-    _asf_authenticated_session,
-    _asf_request,
-    _asf_response_body,
-    _drain_asf_response,
-    _lpdaac_request,
-    _netrc_authorization,
-    _netrc_credentials,
-    _no_auth,
-)
-from .cache import _identity, _is_qualified, _manifest_path, _matching_manifest
-from .catalog import (
-    AcquisitionMetadata,
-    CatalogItem,
-    _normalize_record,
-    _query_geometry,
-    _register_adapter,
-    _register_fixture,
-    search,
-)
+from .catalog import AcquisitionMetadata, CatalogItem, search
 from .errors import (
     BurstPendingError,
     RemoteAccessError,
@@ -55,18 +20,15 @@ from .errors import (
     RemoteIntegrityError,
     RemoteLimitError,
     RemoteQueryError,
-    _fail,
 )
-from .fetch.complete import _RedirectHandler, _stream_download, download, probe
-from .protocols import _accepts_ledger, _Adapter, _adapter_items, _CallLedger
-from .records import RemoteAsset, RemoteResourceBudget, _normalize_checksum, _sanitize
+from .fetch.complete import download, probe
+from .records import RemoteAsset, RemoteResourceBudget
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_CMR_ENDPOINT": ("faninsar.remote.cmr", "DEFAULT_CMR_ENDPOINT"),
     "CMRAdapter": ("faninsar.remote.cmr", "CMRAdapter"),
     "CMRCollectionAdapter": ("faninsar.remote.cmr", "CMRCollectionAdapter"),
     "CMRDiscoveryError": ("faninsar.remote.cmr", "CMRDiscoveryError"),
-    "CMRRegistrationError": ("faninsar.remote.cmr", "CMRRegistrationError"),
     "RegisteredCMRCollection": ("faninsar.remote.cmr", "RegisteredCMRCollection"),
     "discover_cmr": ("faninsar.remote.cmr", "discover_cmr"),
     "iter_cmr_records": ("faninsar.remote.cmr", "iter_cmr_records"),
@@ -85,12 +47,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "faninsar.remote.standards",
         "SUPPORTED_STAC_PROFILES",
     ),
-    "MalformedSTACItemError": ("faninsar.remote.standards", "MalformedSTACItemError"),
     "STACProfileError": ("faninsar.remote.standards", "STACProfileError"),
-    "UnknownSTACProfileError": (
-        "faninsar.remote.standards",
-        "UnknownSTACProfileError",
-    ),
     "map_stac_item": ("faninsar.remote.standards", "map_stac_item"),
     "normalize_stac_item": ("faninsar.remote.standards", "normalize_stac_item"),
     "stac_item_to_record": ("faninsar.remote.standards", "stac_item_to_record"),
@@ -109,27 +66,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "ASFSearchEngineAdapter",
     ),
     "ASFSearchError": ("faninsar.remote.providers.asf_search", "ASFSearchError"),
-    "ASFSearchUnavailableError": (
-        "faninsar.remote.providers.asf_search",
-        "ASFSearchUnavailableError",
-    ),
-    "ASFSearchVersionError": (
-        "faninsar.remote.providers.asf_search",
-        "ASFSearchVersionError",
-    ),
     "AsfSearchAdapter": ("faninsar.remote.providers.asf_search", "AsfSearchAdapter"),
-    "EngineUnavailableError": (
-        "faninsar.remote.providers.asf_search",
-        "EngineUnavailableError",
-    ),
-    "UnobservableASFSearchError": (
-        "faninsar.remote.providers.asf_search",
-        "UnobservableASFSearchError",
-    ),
-    "UnsupportedASFSearchVersionError": (
-        "faninsar.remote.providers.asf_search",
-        "UnsupportedASFSearchVersionError",
-    ),
     "register_asf_catalog": (
         "faninsar.remote.providers.asf_search",
         "register_asf_catalog",

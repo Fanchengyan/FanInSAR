@@ -13,6 +13,7 @@ import json
 import os
 import time
 import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,9 @@ import requests
 
 from faninsar import remote
 from faninsar.data.query import BoundingBox
+from faninsar.remote.catalog import _normalize_record
+from faninsar.remote.errors import _fail
+from faninsar.remote.protocols import _CallLedger
 
 _LIVE_ENABLED = os.environ.get("FANINSAR_RUN_LIVE_REMOTE_TESTS") == "1"
 _ASF_GRANULE = "G4297731264-ASF"
@@ -109,32 +113,32 @@ class _LiveRecorder:
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Install process-local hooks at prepared request boundaries."""
-        original_init = remote._CallLedger.__post_init__
-        original_request = remote._CallLedger.request
-        original_retry = remote._CallLedger.retry
-        original_redirect = remote._CallLedger.redirect
-        original_response_bytes = remote._CallLedger.response_bytes
+        original_init = _CallLedger.__post_init__
+        original_request = _CallLedger.request
+        original_retry = _CallLedger.retry
+        original_redirect = _CallLedger.redirect
+        original_response_bytes = _CallLedger.response_bytes
         original_send = requests.sessions.Session.send
-        original_open = remote.urllib.request.OpenerDirector.open
+        original_open = urllib.request.OpenerDirector.open
 
-        def ledger_init(ledger: remote._CallLedger) -> None:
+        def ledger_init(ledger: _CallLedger) -> None:
             original_init(ledger)
             if self.current is not None:
                 self.ledger_operations[id(ledger)] = self.current
 
-        def ledger_request(ledger: remote._CallLedger) -> None:
+        def ledger_request(ledger: _CallLedger) -> None:
             self._counter(ledger, "requests_count")
             original_request(ledger)
 
-        def ledger_retry(ledger: remote._CallLedger) -> None:
+        def ledger_retry(ledger: _CallLedger) -> None:
             self._counter(ledger, "retries")
             original_retry(ledger)
 
-        def ledger_redirect(ledger: remote._CallLedger) -> None:
+        def ledger_redirect(ledger: _CallLedger) -> None:
             self._counter(ledger, "redirects")
             original_redirect(ledger)
 
-        def ledger_response_bytes(ledger: remote._CallLedger, count: int) -> None:
+        def ledger_response_bytes(ledger: _CallLedger, count: int) -> None:
             original_response_bytes(ledger, count)
             operation = self.ledger_operations.get(id(ledger))
             if operation is not None:
@@ -152,7 +156,7 @@ class _LiveRecorder:
             return response
 
         def open_request(
-            opener: remote.urllib.request.OpenerDirector,
+            opener: urllib.request.OpenerDirector,
             request: Any,
             *args: Any,
             **kwargs: Any,
@@ -163,13 +167,13 @@ class _LiveRecorder:
             self._response(response)
             return response
 
-        monkeypatch.setattr(remote._CallLedger, "__post_init__", ledger_init)
-        monkeypatch.setattr(remote._CallLedger, "request", ledger_request)
-        monkeypatch.setattr(remote._CallLedger, "retry", ledger_retry)
-        monkeypatch.setattr(remote._CallLedger, "redirect", ledger_redirect)
-        monkeypatch.setattr(remote._CallLedger, "response_bytes", ledger_response_bytes)
+        monkeypatch.setattr(_CallLedger, "__post_init__", ledger_init)
+        monkeypatch.setattr(_CallLedger, "request", ledger_request)
+        monkeypatch.setattr(_CallLedger, "retry", ledger_retry)
+        monkeypatch.setattr(_CallLedger, "redirect", ledger_redirect)
+        monkeypatch.setattr(_CallLedger, "response_bytes", ledger_response_bytes)
         monkeypatch.setattr(requests.sessions.Session, "send", send)
-        monkeypatch.setattr(remote.urllib.request.OpenerDirector, "open", open_request)
+        monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_request)
 
     def operation(self, name: str, callback: Any) -> Any:
         """Run one public operation while associating all private evidence."""
@@ -189,7 +193,7 @@ class _LiveRecorder:
             operation["elapsed_seconds"] = time.monotonic() - operation["started"]
             self.current = None
 
-    def _counter(self, ledger: remote._CallLedger, name: str) -> None:
+    def _counter(self, ledger: _CallLedger, name: str) -> None:
         operation = self.ledger_operations.get(id(ledger))
         if operation is not None:
             operation[name] = operation.get(name, 0) + 1
@@ -284,7 +288,7 @@ def _lane_result(
         or terminal_request.get("has_account_headers", True)
         or _representation(destination) != "valid"
     ):
-        remote._fail(remote.RemoteAccessError, "live_transfer_invariant")
+        _fail(remote.RemoteAccessError, "live_transfer_invariant")
     return {
         "lane": lane,
         "status": "PASS",
@@ -403,7 +407,7 @@ def test_pinned_item_selector_requires_both_identities() -> None:
             ],
         }
     )
-    item = remote._normalize_record(record, "fixture", adapter, "anonymous")
+    item = _normalize_record(record, "fixture", adapter, "anonymous")
 
     assert _select_pinned_item([item], _ASF_GRANULE, "wrong-item") is None
     assert _select_pinned_item([item], _ASF_GRANULE, _ASF_ITEM) is not None
@@ -434,7 +438,7 @@ def test_cmr_granule_pin_is_merged_with_public_query(
         return {"feed": {"entry": []}}, {}
 
     monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
-    list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+    list(adapter.items(ledger=_CallLedger(remote.RemoteResourceBudget())))
     params = urllib.parse.parse_qs(urllib.parse.urlsplit(seen_urls[0]).query)
     assert params["concept_id"] == [_ASF_GRANULE]
 
@@ -510,7 +514,7 @@ def test_asf_cmr_selection_uses_authenticated_download_path(
         selected_asset: remote.RemoteAsset,
         _adapter: Any,
         _budget: remote.RemoteResourceBudget,
-        _ledger: remote._CallLedger,
+        _ledger: _CallLedger,
     ) -> tuple[_Session, str]:
         assert selected_asset.auth_profile == "earthdata-asf"
         return _Session(), "fixture-token"
@@ -524,10 +528,13 @@ def test_asf_cmr_selection_uses_authenticated_download_path(
         calls.append(method)
         return _Response()
 
-    monkeypatch.setattr(remote, "_asf_authenticated_session", authenticated_session)
-    monkeypatch.setattr(remote, "_asf_request", asf_request)
     monkeypatch.setattr(
-        remote.urllib.request.OpenerDirector,
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        authenticated_session,
+    )
+    monkeypatch.setattr("faninsar.remote.fetch.complete._asf_request", asf_request)
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector,
         "open",
         lambda *_args, **_kwargs: pytest.fail("ASF download used urllib"),
     )
@@ -580,7 +587,7 @@ def test_live_remote_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> No
             )
             selected = _select_pinned_item(items, concept_id, item_id)
             if selected is None:
-                remote._fail(remote.RemoteAccessError, "identity_mismatch")
+                _fail(remote.RemoteAccessError, "identity_mismatch")
             lanes.append(_lane_result(lane, item_id, selected, destination, recorder))
         except Exception as error:
             reason = getattr(error, "reason", "")

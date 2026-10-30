@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import urllib.request
 from typing import TYPE_CHECKING, Any
 
 from faninsar import remote
 from faninsar.data.query import Points
+from faninsar.remote.catalog import _register_adapter
+from faninsar.remote.fetch.complete import _RedirectHandler
+from faninsar.remote.records import _sanitize
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -98,7 +102,7 @@ def test_search_and_download_receive_fresh_ledgers(
     """Search and its later download do not share accounting state."""
     payload = b"metered payload"
     adapter = _MeteredAdapter(payload)
-    remote._register_adapter("metered-ledger", adapter)
+    _register_adapter("metered-ledger", adapter)
 
     items = remote.search(
         Points([(0.5, 0.5)], crs=4326),
@@ -121,7 +125,7 @@ def test_persisted_metadata_scrubs_the_complete_azure_sas_query() -> None:
         "se=2024-01-02T00%3A00%3A00Z&sv=2023-11-03&sr=b&spr=https&sip=127.0.0.1&"
         "si=policy&sig=secret&x-request-context=also-signed"
     )
-    clean = remote._sanitize(
+    clean = _sanitize(
         {
             "href": signed,
             "sp": "r",
@@ -141,11 +145,11 @@ def test_redirect_preserves_signed_query_and_strips_cross_origin_headers() -> No
     adapter = _MeteredAdapter(b"payload")
     adapter.origins = ("https://source.invalid",)
     adapter.redirect_origins = ("https://cdn.invalid",)
-    handler = remote._RedirectHandler(
+    handler = _RedirectHandler(
         adapter,
         remote.RemoteResourceBudget(max_redirects=1),
     )
-    request = remote.urllib.request.Request(
+    request = urllib.request.Request(
         "https://source.invalid/data/file.tif",
         headers={"Authorization": "Bearer secret", "Cookie": "session=secret"},
     )
@@ -170,7 +174,7 @@ def test_redirect_preserves_signed_query_and_strips_cross_origin_headers() -> No
 def test_search_propagates_normalized_query_to_capable_adapter() -> None:
     """Adapters receive the same normalized values used by public filtering."""
     adapter = _QueryAdapter(b"payload")
-    remote._register_adapter("query-contract", adapter)
+    _register_adapter("query-contract", adapter)
     start = "2024-01-01T00:00:00+00:00"
     end = "2024-01-02T00:00:00+00:00"
 

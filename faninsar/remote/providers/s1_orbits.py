@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.remote.access import _response_is_complete, _url_origin, _validate_url
 from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK
 from faninsar.remote.errors import RemoteAccessError, _fail
@@ -198,7 +198,6 @@ class S1OrbitsAdapter:
         """Return AUX_POEORB/AUX_RESORB keys under one mission prefix."""
         if _LIST_PREFIX.fullmatch(prefix) is None:
             message = f"unsupported s1-orbits listing prefix: {prefix}"
-            logger.error(message)
             _fail(RemoteAccessError, "invalid_listing_prefix", message)
         keys: list[str] = []
         operation = ledger or _CallLedger(budget)
@@ -291,8 +290,7 @@ def get_s1_orbits_adapter() -> S1OrbitsAdapter:
         adapter = _ADAPTERS.get(S1_ORBITS_CATALOG)
     if not isinstance(adapter, S1OrbitsAdapter):
         message = "catalog 's1-orbits' has an incompatible registration"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError, logger=logger)
     return adapter
 
 
@@ -303,8 +301,7 @@ def ensure_s1_orbits_catalog(name: str | None = None) -> str:
         message = (
             f"s1-orbits must use the stable registration name {S1_ORBITS_CATALOG!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     expected = S1OrbitsAdapter()
     identity_fields = (
         "provider",
@@ -323,8 +320,7 @@ def ensure_s1_orbits_catalog(name: str | None = None) -> str:
                 message = (
                     f"catalog {catalog!r} has an incompatible s1-orbits registration"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             return catalog
         _ADAPTERS[catalog] = expected
     return catalog

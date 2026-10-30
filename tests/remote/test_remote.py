@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import time
+import urllib.request
 from typing import TYPE_CHECKING
 
 import geopandas as gpd
@@ -12,6 +14,8 @@ from shapely.geometry import Polygon
 
 from faninsar import remote
 from faninsar.data.query import Points, Polygons
+from faninsar.remote.catalog import _register_adapter, _register_fixture
+from faninsar.remote.fetch.complete import _RedirectHandler
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -20,7 +24,7 @@ if TYPE_CHECKING:
 def _register(name: str = "contract") -> str:
     """Register a deterministic fixture catalog for one test."""
     payload = b"fixture bytes"
-    remote._register_fixture(
+    _register_fixture(
         [
             {
                 "id": "item-1",
@@ -88,7 +92,7 @@ def test_download_is_atomic_and_reuses_verified_destination(tmp_path: Path) -> N
 def test_unqualified_download_requires_explicit_overwrite(tmp_path: Path) -> None:
     """An unqualified asset is fresh but cannot silently replace a destination."""
     name = "download-unqualified"
-    remote._register_fixture(
+    _register_fixture(
         [
             {
                 "id": "item-1",
@@ -183,7 +187,7 @@ def test_operation_bytes_accumulate_across_failed_retries(tmp_path: Path) -> Non
         raise OSError(message)
 
     name = "operation-budget"
-    remote._register_adapter(
+    _register_adapter(
         name,
         _RetryAdapter(
             [
@@ -208,9 +212,9 @@ def test_elapsed_limit_applies_when_retry_attempt_fails(
 ) -> None:
     """A failed attempt that crosses the deadline returns a typed limit error."""
     name = "elapsed-budget"
-    remote._register_adapter(name, _RetryAdapter([OSError("unavailable")]))
+    _register_adapter(name, _RetryAdapter([OSError("unavailable")]))
     clock = iter([0.0, 10.0])
-    monkeypatch.setattr(remote.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
 
     with pytest.raises(remote.RemoteLimitError, match="max_elapsed_seconds"):
         remote.download(
@@ -225,10 +229,8 @@ def test_elapsed_limit_applies_when_retry_attempt_fails(
 def test_redirect_handler_validates_allowlist_and_counts_hops() -> None:
     """Each redirect is checked against registered origins and the hop budget."""
     adapter = _RetryAdapter([])
-    handler = remote._RedirectHandler(
-        adapter, remote.RemoteResourceBudget(max_redirects=4)
-    )
-    request = remote.urllib.request.Request("https://source.invalid/assets/data")
+    handler = _RedirectHandler(adapter, remote.RemoteResourceBudget(max_redirects=4))
+    request = urllib.request.Request("https://source.invalid/assets/data")
     response = io.BytesIO()
     response.headers = {"Location": "https://cdn.invalid/assets/data"}  # type: ignore[attr-defined]
     redirected = handler.redirect_request(
@@ -259,7 +261,7 @@ def test_redirect_handler_validates_allowlist_and_counts_hops() -> None:
             response.headers["Location"],
         )
 
-    limit_handler = remote._RedirectHandler(
+    limit_handler = _RedirectHandler(
         adapter, remote.RemoteResourceBudget(max_redirects=1)
     )
     response.headers["Location"] = "https://cdn.invalid/assets/data"

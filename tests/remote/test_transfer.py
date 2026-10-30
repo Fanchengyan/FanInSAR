@@ -17,6 +17,9 @@ from shapely.geometry import Polygon
 
 from faninsar import remote
 from faninsar.data.query import Points
+from faninsar.remote.cache import _identity, _manifest_path
+from faninsar.remote.catalog import _register_adapter, _register_fixture
+from faninsar.remote.protocols import _CallLedger
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,7 +36,7 @@ def _register(name: str, checksum: str | None) -> None:
     }
     if checksum is not None:
         asset["checksum"] = checksum
-    remote._register_fixture(
+    _register_fixture(
         [
             {
                 "id": "item-1",
@@ -54,7 +57,7 @@ def _asset(name: str) -> remote.RemoteAsset:
 
 def _manifest(destination: Path, asset: remote.RemoteAsset) -> dict[object, object]:
     """Read the private per-destination transfer manifest."""
-    return json.loads(remote._manifest_path(destination, asset).read_text())
+    return json.loads(_manifest_path(destination, asset).read_text())
 
 
 def test_verified_provider_checksum_is_recorded(tmp_path: Path) -> None:
@@ -70,7 +73,7 @@ def test_verified_provider_checksum_is_recorded(tmp_path: Path) -> None:
     assert result == destination
     assert destination.read_bytes() == PAYLOAD
     manifest = _manifest(destination, asset)
-    assert manifest["identity"] == remote._identity(asset)
+    assert manifest["identity"] == _identity(asset)
     assert manifest["sha256"] == hashlib.sha256(PAYLOAD).hexdigest()
     assert manifest["verification"] == {
         "algorithm": "md5",
@@ -130,7 +133,7 @@ def test_extended_manifest_keeps_destination_reuse(tmp_path: Path) -> None:
     remote.download(asset, destination)
     assert remote.download(asset, destination) == destination
 
-    manifest_path = remote._manifest_path(destination, asset)
+    manifest_path = _manifest_path(destination, asset)
     manifest = json.loads(manifest_path.read_text())
     manifest.pop("verification")
     manifest_path.write_text(json.dumps(manifest))
@@ -165,7 +168,7 @@ def test_stream_download_keeps_pair_contract_on_mismatch(tmp_path: Path) -> None
     from faninsar.remote.fetch.complete import _stream_download
 
     name = "p0055-stream-contract"
-    remote._register_adapter(name, _ChecksumAdapter())
+    _register_adapter(name, _ChecksumAdapter())
     asset = remote.RemoteAsset(
         provider="checksum-provider",
         catalog=name,
@@ -175,7 +178,7 @@ def test_stream_download_keeps_pair_contract_on_mismatch(tmp_path: Path) -> None
         href="https://source.invalid/assets/data",
         checksum=f"md5:{'00' * 16}",
     )
-    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+    ledger = _CallLedger(remote.RemoteResourceBudget())
     staging = tmp_path / "staging.bin"
 
     with pytest.raises(remote.RemoteIntegrityError) as raised:
@@ -317,7 +320,7 @@ def _register_safe(name: str, payload: bytes, checksum: str | None = None) -> No
     }
     if checksum is not None:
         asset["checksum"] = checksum
-    remote._register_fixture(
+    _register_fixture(
         [
             {
                 "id": "burst-1",
@@ -346,7 +349,7 @@ def test_safe_all_match_gains_members_fact_container_unverifiable(
 
     remote.download(asset, destination)
 
-    manifest = json.loads(remote._manifest_path(destination, asset).read_text())
+    manifest = json.loads(_manifest_path(destination, asset).read_text())
     verification = manifest["verification"]
     assert verification["status"] == "unverifiable"
     assert verification["size"] == len(payload)
@@ -377,7 +380,7 @@ def test_safe_corrupted_member_records_failed_and_excludes(tmp_path: Path) -> No
 
     assert raised.value.reason == "checksum_mismatch"
     assert not destination.exists()
-    manifest_record = json.loads(remote._manifest_path(destination, asset).read_text())
+    manifest_record = json.loads(_manifest_path(destination, asset).read_text())
     verification = manifest_record["verification"]
     assert verification["status"] == "failed"
     assert verification["members"] == {"checked": 2, "matched": 1, "status": "failed"}
@@ -407,7 +410,7 @@ def test_safe_without_manifest_checksums_has_no_members_record(
 
     remote.download(asset, destination)
 
-    manifest_record = json.loads(remote._manifest_path(destination, asset).read_text())
+    manifest_record = json.loads(_manifest_path(destination, asset).read_text())
     verification = manifest_record["verification"]
     assert verification["status"] == "unverifiable"
     assert verification["size"] == len(payload)

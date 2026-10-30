@@ -24,7 +24,7 @@ from typing import Any
 
 import requests
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.remote.access import _safe_url, _validate_url
 from faninsar.remote.auth import _netrc_credentials, _no_auth
 from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK, _register_adapter
@@ -121,7 +121,7 @@ def _bounds(spatial: Any) -> tuple[float, float, float, float]:
         return (-180.0, -90.0, 180.0, 90.0)
     if hasattr(spatial, "bounds") and not hasattr(spatial, "crs"):
         return tuple(spatial.bounds)  # type: ignore[return-value]
-    from faninsar.remote import _query_geometry
+    from faninsar.remote.catalog import _query_geometry
 
     geometry, _kind, _points = _query_geometry(spatial)
     return tuple(geometry.bounds)  # type: ignore[return-value]
@@ -183,7 +183,6 @@ def request_cdse_token(*, force: bool = False) -> str:
             "CDSE OAuth2 requires netrc authenticators for "
             f"{CDSE_TOKEN_HOST}; cannot obtain a range-fetch Bearer token"
         )
-        logger.error(message)
         _fail(RemoteAccessError, "missing_cdse_credentials", message)
     username, password = credentials
     ensure_cdse_catalog()
@@ -191,7 +190,6 @@ def request_cdse_token(*, force: bool = False) -> str:
         adapter = _ADAPTERS.get(CDSE_CATALOG)
     if adapter is None:
         message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
-        logger.error(message)
         _fail(RemoteAccessError, "unknown_catalog", message)
     _validate_url(CDSE_TOKEN_URL, adapter)
     try:
@@ -223,7 +221,6 @@ def request_cdse_token(*, force: bool = False) -> str:
         _fail(RemoteAccessError, "request_failed", "CDSE token response was not JSON")
     token = payload.get("access_token")
     if not isinstance(token, str) or not token:
-        logger.error("CDSE token response omitted access_token")
         _fail(
             RemoteAccessError,
             "request_failed",
@@ -285,13 +282,11 @@ async def fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
         adapter = _ADAPTERS.get(CDSE_CATALOG)
     if adapter is None:
         message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
-        logger.error(message)
         _fail(RemoteAccessError, "unknown_catalog", message)
     for span in span_tuple:
         _validate_url(span.url, adapter)
         if not _is_odata_value(span.url) or not _needs_cdse_bearer(span.url):
             message = "CDSE range URL is not an OData Nodes(...)/$value href"
-            logger.error(message)
             _fail(RemoteAccessError, "invalid_endpoint", message)
     token = request_cdse_token()
     async with RangeFetcher(token=token, refresh=refresh_cdse_token) as fetcher:
@@ -326,12 +321,10 @@ class CDSESearchAdapter:
         """Validate the STAC endpoint and configure origin allow-lists."""
         if _origin(self.endpoint) != CDSE_STAC_ORIGIN:
             message = "CDSE STAC endpoint is not approved"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if self.collection != CDSE_COLLECTION:
             message = "CDSE Sentinel-1 collection is registry-owned"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         object.__setattr__(
             self,
             "origins",
@@ -375,7 +368,6 @@ class CDSESearchAdapter:
             "CDSE ROI materialization uses byte range transfer, "
             "not complete-object fetch"
         )
-        logger.error(message)
         _fail(RemoteAccessError, "unsupported_representation", message)
 
     def items(
@@ -397,7 +389,6 @@ class CDSESearchAdapter:
                 "CDSE Sentinel-1 collection is registry-owned; "
                 f"expected {(self.collection,)!r}, got {tuple(collections)!r}"
             )
-            logger.error(message)
             _fail(RemoteAccessError, "invalid_collection", message)
         bounds = _bounds(spatial)
         features = self._search_features(
@@ -433,7 +424,6 @@ class CDSESearchAdapter:
             search = getattr(self.client, "search", None)
             if not callable(search):
                 message = "injected CDSE client has no callable search"
-                logger.error(message)
                 _fail(RemoteAccessError, "unobservable_discovery", message)
             kwargs: dict[str, Any] = {
                 "collections": [collection],
@@ -500,7 +490,6 @@ class CDSESearchAdapter:
             ) as response:
                 if response.headers.get("Content-Encoding", "identity") != "identity":
                     message = "CDSE STAC response used a compressed Content-Encoding"
-                    logger.error(message)
                     _fail(RemoteAccessError, "unexpected_content_encoding", message)
                 ledger.begin_response()
                 chunks: list[bytes] = []
@@ -632,8 +621,7 @@ def register_cdse_catalog(name: str = CDSE_CATALOG, **kwargs: Any) -> CDSESearch
         message = (
             f"CDSE Sentinel-1 must use the stable registration name {CDSE_CATALOG!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return CDSESearchAdapter(**kwargs).register(name)
 
 
@@ -662,8 +650,7 @@ def ensure_cdse_catalog(name: str | None = None) -> str:
         message = (
             f"CDSE Sentinel-1 must use the stable registration name {CDSE_CATALOG!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     expected = CDSESearchAdapter()
     identity_fields = (
         "provider",
@@ -682,8 +669,7 @@ def ensure_cdse_catalog(name: str | None = None) -> str:
                 for field_name in identity_fields
             ):
                 message = f"catalog {catalog!r} has an incompatible CDSE registration"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             return catalog
         _ADAPTERS[catalog] = expected
     return catalog

@@ -18,14 +18,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.remote.access import _safe_url
 from faninsar.remote.catalog import _register_adapter
 from faninsar.remote.errors import RemoteAccessError, _fail
 from faninsar.remote.fetch.complete import _RedirectHandler
 from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.records import RemoteResourceBudget
-from faninsar.remote.standards import MalformedSTACItemError, normalize_stac_item
+from faninsar.remote.standards import STACProfileError, normalize_stac_item
 
 logger = setup_logger(__name__)
 
@@ -133,7 +133,6 @@ def _instrument_session(
     send = getattr(session, "send", None)
     if not callable(send):
         message = "Planetary Computer STAC session cannot be instrumented"
-        logger.error(message)
         _fail(RemoteAccessError, "unobservable_discovery", message)
     previous_send = send
     headers = getattr(session, "headers", None)
@@ -230,8 +229,7 @@ class PlanetaryComputerAdapter:
         parts = urllib.parse.urlsplit(self.endpoint)
         if parts.scheme.lower() != "https" or parts.hostname != PC_STAC_HOST:
             message = "Planetary Computer endpoint is not approved"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         object.__setattr__(
             self,
             "origins",
@@ -246,8 +244,7 @@ class PlanetaryComputerAdapter:
             message = (
                 "Planetary Computer GLO-30 collection and asset are registry-owned"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
 
     def register(self, name: str = "pc") -> PlanetaryComputerAdapter:
         """Register this adapter in the provider-neutral remote registry."""
@@ -321,7 +318,7 @@ class PlanetaryComputerAdapter:
         try:
             if _origin(signed_href) != _origin(href):
                 _fail(RemoteAccessError, "unregistered_endpoint")
-            from faninsar.remote import _validate_url
+            from faninsar.remote.access import _validate_url
 
             _validate_url(signed_href, self)
         except RemoteAccessError:
@@ -352,7 +349,6 @@ class PlanetaryComputerAdapter:
                     "injected Planetary Computer client has no observable "
                     "STAC transport"
                 )
-                logger.error(message)
                 _fail(RemoteAccessError, "unobservable_discovery", message)
             return self.client, _instrument_session(session, ledger, self)
         try:
@@ -411,7 +407,6 @@ class PlanetaryComputerAdapter:
             if restore is not None:
                 restore()
             message = "Planetary Computer client exposes no search method"
-            logger.error(message)
             _fail(RemoteAccessError, "unobservable_discovery", message)
 
         parameters: dict[str, Any] = {
@@ -433,7 +428,6 @@ class PlanetaryComputerAdapter:
             values = items() if callable(items) else result
             if values is None or isinstance(values, (str, bytes, Mapping)):
                 message = "Planetary Computer search returned no item iterator"
-                logger.error(message)
                 _fail(RemoteAccessError, "unobservable_discovery", message)
             try:
                 yield from values
@@ -506,7 +500,7 @@ class PlanetaryComputerAdapter:
         elif hasattr(spatial, "bounds") and not hasattr(spatial, "crs"):
             bounds = spatial.bounds
         else:
-            from faninsar.remote import _query_geometry
+            from faninsar.remote.catalog import _query_geometry
 
             geometry, _kind, _points = _query_geometry(spatial)
             bounds = geometry.bounds
@@ -556,7 +550,7 @@ class PlanetaryComputerAdapter:
                 assets = item_mapping.get("assets")
                 if not isinstance(assets, Mapping):
                     _fail(
-                        MalformedSTACItemError,
+                        STACProfileError,
                         "missing_assets",
                         "Planetary Computer STAC Item must contain assets",
                     )
@@ -564,13 +558,13 @@ class PlanetaryComputerAdapter:
                 href = str(asset.get("href", "")) if isinstance(asset, Mapping) else ""
                 if not isinstance(item_id, str) or not item_id:
                     _fail(
-                        MalformedSTACItemError,
+                        STACProfileError,
                         "invalid_item_id",
                         "Planetary Computer STAC Item id must be non-empty",
                     )
                 if not isinstance(asset, Mapping) or not href:
                     _fail(
-                        MalformedSTACItemError,
+                        STACProfileError,
                         "missing_data_asset",
                         f"STAC Item {item_id!r} has no {self.asset_key!r} asset",
                     )
