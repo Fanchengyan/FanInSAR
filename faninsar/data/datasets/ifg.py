@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from faninsar.core import Pairs
 from faninsar.data.query import BoundingBox, GeoQuery, Points
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 
 from . import PairDataset, RasterDataset
@@ -113,16 +113,15 @@ class StackInterferogramDataset:
         read = getattr(store, "read", None)
         if not isinstance(product_root, Path) or not callable(read):
             message = "Stack IFG Dataset requires an opened artifact store"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         try:
             artifact = read()
         except InvalidProcessingStateError as error:
-            message = f"Stack IFG Dataset layers cannot be read: {error}"
-            logger.exception(
-                "Stack IFG Dataset layers cannot be read: %s", product_root
+            message = (
+                f"Stack IFG Dataset layers cannot be read: {error} "
+                f"(product root: {product_root})"
             )
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
 
         complex_ifg = artifact.complex_ifg
         coherence = artifact.coherence
@@ -509,8 +508,7 @@ class InterferogramDataset(PairDataset):
                     "YYYYMMDD, YYYYMMDDTHHMMSS, YYYY-MM-DD, or "
                     "YYYYMMDDTHHMMSS.sss format."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
         return Pairs.from_names(pair_names)
 
     @property
@@ -769,8 +767,7 @@ class InterferogramDataset(PairDataset):
             los_ratio = np.sin(arr_theta)
         else:
             msg = f"angle_type must be 'incidence' or 'look', got {angle_type!r}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         return los_ratio
 
     def get_nan_count(
@@ -1121,7 +1118,6 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             paths = [f"hdf5:{path}:{group}" for path in file_paths]
         else:
             msg = f"Invalid file type: {self.file_type}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         return paths

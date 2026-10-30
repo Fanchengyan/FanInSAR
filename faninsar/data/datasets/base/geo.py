@@ -15,7 +15,7 @@ from shapely import ops
 from torch.utils.data import Dataset
 
 from faninsar.data.query import BoundingBox, Points, Polygons
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry.profiles import Profile
@@ -146,8 +146,7 @@ class GeoDataset(Dataset):
         """Set whether to print verbose messages."""
         if not isinstance(value, bool):
             msg = f"verbose must be a boolean value, got {value} instead."
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         self._verbose = value
 
     @property

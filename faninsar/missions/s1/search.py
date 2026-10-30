@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from xml.etree.ElementTree import ParseError
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from faninsar.remote.records import CatalogItem, RemoteAsset
@@ -71,8 +71,7 @@ def normalize_polarizations(
         values = tuple(str(item).upper() for item in value)
     if not values:
         message = "polarizations must contain at least one value"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     if len(values) == 1 and values[0] == "ALL":
         return "all"
     invalid = set(values).difference(_POLARIZATIONS)
@@ -82,8 +81,7 @@ def normalize_polarizations(
             "unsupported Sentinel-1 polarization(s): "
             f"{sorted(invalid)}; allowed={allowed}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     expanded: list[str] = []
     for item in values:
         channels = item.split("+")
@@ -127,8 +125,7 @@ def product_filters(
     """Compose ASF defaults and explicit advanced filters."""
     if product_type not in ("burst", "scene"):
         message = "product_type must be 'burst' or 'scene'"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     defaults: dict[str, Any]
     if product_type == "burst":
         defaults = {"dataset": "SLC-BURST", "processingLevel": "BURST"}
@@ -160,8 +157,7 @@ def complete_safe_asset(item: CatalogItem) -> RemoteAsset:
             f"catalog item {item.item_id!r} must expose exactly one complete SAFE ZIP; "
             f"found {len(candidates)}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return candidates[0]
 
 
@@ -198,8 +194,7 @@ def filter_burst_polarizations(
             message = (
                 f"burst catalog item {item.item_id!r} has no unambiguous polarization"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if values.intersection(expected) and values.issubset(expected):
             selected.append(item)
     return selected
@@ -330,8 +325,7 @@ def select_orbit_bindings(
             message = (
                 f"configured S1 orbit candidates do not cover acquisition {date_id}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         selected[date_id] = min(qualified)[3]
     return selected
 
@@ -371,8 +365,7 @@ def _as_paths(value: object) -> tuple[Path, ...]:
     if isinstance(value, Sequence):
         return tuple(Path(item) for item in value)
     message = f"unsupported S1 orbit candidate binding: {value!r}"
-    logger.error(message)
-    raise TypeError(message)
+    return reject(message, TypeError, logger=logger)
 
 
 def validate_calibration_paths(
@@ -385,8 +378,7 @@ def validate_calibration_paths(
     missing = [path for path in result if not path.is_file()]
     if missing:
         message = f"configured S1 calibration file is missing: {missing[0]}"
-        logger.error(message)
-        raise FileNotFoundError(message)
+        reject(message, FileNotFoundError, logger=logger)
     return result
 
 
@@ -394,8 +386,7 @@ def catalog_for_product(product_type: S1ProductType) -> str:
     """Return the stable ASF registration shared by S1 product families."""
     if product_type not in ("burst", "scene"):
         message = "product_type must be 'burst' or 'scene'"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return "sentinel1-asf"
 
 
@@ -413,8 +404,7 @@ def ensure_asf_catalog(
         message = (
             f"Sentinel-1 ASF must use the stable registration name {stable_name!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     name = stable_name
     collection = "sentinel-1"
 
@@ -438,8 +428,7 @@ def ensure_asf_catalog(
                 for field in identity_fields
             ):
                 message = f"catalog {name!r} has an incompatible ASF registration"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             return name
         _ADAPTERS[name] = expected
     return name

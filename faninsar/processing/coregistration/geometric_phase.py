@@ -10,7 +10,7 @@ from typing import Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.interferometry.flatten import remove_topographic_phase
 
@@ -132,5 +132,4 @@ def stage_topo(*_args: object, **_kwargs: object) -> None:
         "during coregistration via apply_geometric_phase_from_range_offset; "
         "interferogram formation must not re-apply flat/topo."
     )
-    logger.error(message)
-    raise RuntimeError(message)
+    reject(message, RuntimeError)

@@ -11,7 +11,7 @@ from torch.utils.data import Sampler
 
 from faninsar.data.query import BoundingBox
 from faninsar.data.samplers._collate import identity_collate, tensor_collate
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -233,8 +233,7 @@ class RowSampler(GridSampler):
         else:
             if row_num is None:
                 msg = "Either height or row_num must be provided."
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             if row_num > ds_height:
                 msg = (
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
@@ -332,8 +331,7 @@ class ColSampler(GridSampler):
         else:
             if col_num is None:
                 msg = "Either width or col_num must be provided."
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             if col_num > ds_width:
                 msg = (
                     f"col_num ({col_num}) is larger than the width ({ds_width})\n"
@@ -439,8 +437,7 @@ class RowColSampler(GridSampler):
         else:
             if row_num is None:
                 msg = "Either height or row_num must be provided."
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             if row_num > ds_height:
                 msg = (
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
@@ -460,8 +457,7 @@ class RowColSampler(GridSampler):
         else:
             if col_num is None:
                 msg = "Either width or col_num must be provided."
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             if col_num > ds_width:
                 msg = (
                     f"col_num ({col_num}) is larger than the width ({ds_width})\n"

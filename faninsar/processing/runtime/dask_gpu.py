@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
@@ -216,8 +216,7 @@ def _reject_unpublished_device(device: str) -> None:
         f"device {device!r} is not a published production backend; "
         "refusing host NumPy fallback"
     )
-    logger.error(message)
-    raise RuntimeError(message)
+    reject(message, RuntimeError)
 
 
 def _cuda_is_admitted(device: str, client: Any | None) -> bool:
@@ -333,8 +332,7 @@ def _scheduled_device(device: str, client: Any | None) -> str:
     """Return the fail-closed device forwarded to scheduled worker tasks."""
     if use_gpu_resources(device, client) and not validate_cuda_worker_binding(client):
         message = "GPU worker-to-CUDA binding preflight failed"
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     if use_gpu_resources(device, client):
         lowered = device.strip().lower()
         if lowered.startswith("cuda:"):
@@ -347,8 +345,7 @@ def _validate_chunk_rows(chunk_rows: int) -> None:
     """Reject invalid chunk sizes before constructing a Dask graph."""
     if chunk_rows < 1:
         message = "chunk_rows must be >= 1"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
 
 def _to_row_chunked(
@@ -806,8 +803,7 @@ def run_carrier_multiply_at_points(
     if _allow_remote_kernel(device, client, "carrier_multiply"):
         if not validate_cuda_worker_binding(client):
             message = "GPU worker-to-CUDA binding preflight failed"
-            logger.error(message)
-            raise RuntimeError(message)
+            reject(message, RuntimeError)
         future = client.submit(
             _carrier_multiply_at_points,
             samples,
@@ -995,8 +991,7 @@ def run_esd_azimuth_shift(
     if client is not None and use_gpu_resources(device, client):
         if not validate_cuda_worker_binding(client):
             message = "GPU worker-to-CUDA binding preflight failed"
-            logger.error(message)
-            raise RuntimeError(message)
+            reject(message, RuntimeError)
         future = client.submit(
             esd_azimuth_shift_torch,
             reference,

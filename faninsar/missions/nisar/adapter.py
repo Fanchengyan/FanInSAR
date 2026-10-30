@@ -2,7 +2,7 @@
 
 # The adapter preserves actionable domain messages at the mission boundary;
 # these exception-style rules are intentionally handled locally.
-# ruff: noqa: E501, EM101, EM102, TRY003, TRY004, TRY400
+# ruff: noqa: E501, EM101, EM102, TRY003, TRY400
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.base import Sensor, register
 from faninsar.missions.protocols import (
     DopplerCentroidPolynomial,
@@ -107,8 +107,7 @@ class NisarAdmissionPolicy:
 
 def _admission_error(message: str) -> None:
     """Log and raise one NISAR pre-open admission failure."""
-    logger.error("NISAR source admission rejected: %s", message)
-    raise InvalidProcessingStateError(message)
+    reject(message, InvalidProcessingStateError, logger=logger)
 
 
 def _inventory_digest(value: object) -> str:
@@ -351,16 +350,14 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
     polarizations = _value(handle, "polarizations")
     if frequencies is None or polarizations is None:
         message = "NISAR RSLC must expose frequency and polarization metadata"
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError, logger=logger)
     if isinstance(frequencies, str):
         frequencies = (frequencies,)
     available = {normalize_channel(item, field="frequency") for item in frequencies}
     selected_frequency = normalize_channel(frequency, field="frequency")
     if selected_frequency not in available:
         message = f"NISAR frequency {selected_frequency!r} is unavailable"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     values = (
         polarizations.get(selected_frequency)
         or polarizations.get(selected_frequency.lower())
@@ -369,8 +366,7 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
     )
     if values is None:
         message = f"NISAR frequency {selected_frequency!r} has no polarizations"
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
+        reject(message, InvalidProcessingStateError, logger=logger)
     if isinstance(values, str):
         values = (values,)
     available_pols = {normalize_channel(item, field="polarization") for item in values}
@@ -380,8 +376,7 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
             f"NISAR polarization {selected_polarization!r} is unavailable for "
             f"frequency {selected_frequency!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return selected_frequency, selected_polarization
 
 
@@ -503,8 +498,7 @@ def normalize_channel(value: str, *, field: str) -> str:
     """
     if not isinstance(value, str) or not value.strip():
         message = f"NISAR {field} must be a non-empty string"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return value.strip().upper()
 
 
@@ -523,8 +517,7 @@ def _reader_factory(readers: Any) -> Any:
         "nisar.products.readers exposes no supported RSLC factory "
         "(expected open_product, RSLC, RslcReader, or RSLCReader)"
     )
-    logger.error(message)
-    raise ImportError(message)
+    return reject(message, ImportError, logger=logger)
 
 
 @register(name="nisar")
@@ -662,8 +655,7 @@ class NisarSensor(Sensor):
                 "NISAR RSLC support requires optional nisar.products.readers; "
                 "install the NISAR/ISCE3 environment before opening an RSLC"
             )
-            logger.error(message)
-            raise ImportError(message) from error
+            reject(message, ImportError, cause=error, logger=logger)
         factory = _reader_factory(readers)
         try:
             try:
@@ -683,8 +675,7 @@ class NisarSensor(Sensor):
                 "NISAR product does not expose getSlcDatasetAsNativeComplex; "
                 "expected an RSLC reader handle"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         _remember_admission(
             handle,
             _AdmissionSnapshot(
@@ -716,8 +707,7 @@ class NisarSensor(Sensor):
             direct = normalize_channel(frequency, field="frequency")
             if direct not in {"B", alias}:
                 message = "NISAR frequency and freq aliases specify different channels"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             frequency = alias
         if "pol" in kwargs:
             alias = normalize_channel(kwargs.pop("pol"), field="polarization")
@@ -726,8 +716,7 @@ class NisarSensor(Sensor):
                 message = (
                     "NISAR polarization and pol aliases specify different channels"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
             polarization = alias
         frequency, polarization = _select_channel(
             handle,
@@ -736,8 +725,7 @@ class NisarSensor(Sensor):
         )
         if kwargs:
             message = f"Unsupported NISAR product options: {tuple(kwargs)}"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
         dataset = handle.getSlcDatasetAsNativeComplex(frequency, polarization)
         shape = tuple(int(item) for item in getattr(dataset, "shape", ()))
         if len(shape) != 2 or min(shape) <= 0:
@@ -831,20 +819,17 @@ class NisarSensor(Sensor):
         )
         if kwargs:
             message = f"Unsupported NISAR window-read options: {tuple(kwargs)}"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
         _validate_admission(handle)
         getter = getattr(handle, "getSlcDatasetAsNativeComplex", None)
         if not callable(getter):
             message = "NISAR handle has no getSlcDatasetAsNativeComplex method"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         dataset = getter(frequency, polarization)
         shape = tuple(int(item) for item in getattr(dataset, "shape", ()))
         if len(shape) != 2 or min(shape) <= 0:
             message = "NISAR RSLC dataset must expose a positive two-dimensional shape"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         for axis, (size, item) in enumerate(zip(shape, window, strict=True)):
             if item.step not in (None, 1):
                 raise ValueError(f"selection step must be 1 on axis {axis}")
@@ -856,12 +841,10 @@ class NisarSensor(Sensor):
         samples = np.asarray(dataset[selection])
         if samples.shape != tuple(item.stop - item.start for item in selection):
             message = "NISAR reader returned a window with an unexpected shape"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if not np.issubdtype(samples.dtype, np.complexfloating):
             message = "NISAR RSLC window must retain complex samples"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return samples
 
 

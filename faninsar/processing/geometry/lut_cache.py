@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry.transforms import TransformResult
@@ -113,8 +113,7 @@ def read_transform_cache(store_path: str | Path) -> tuple[TransformCacheKey, obj
     path = Path(store_path)
     if not path.exists():
         message = f"transform cache not found: {path}"
-        logger.error(message)
-        raise FileNotFoundError(message)
+        reject(message, FileNotFoundError)
     group = zarr.open_group(str(path), mode="r")
     attrs = dict(group.attrs)
     key = TransformCacheKey(

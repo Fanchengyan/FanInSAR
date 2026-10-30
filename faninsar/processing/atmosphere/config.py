@@ -11,9 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 JumpAlignmentStrategy = Literal["isce3_global_jump", "alosstack_pixel_rounded"]
 
@@ -108,49 +106,41 @@ class IonosphereEstimationConfig:
             value = float(getattr(self, name))
             if not value > 0.0:
                 message = f"{name} must be positive, got {value!r}"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
         if not self.freq_low < self.f0 < self.freq_high:
             message = (
                 "frequency roles must satisfy freq_low < f0 < freq_high, got "
                 f"{self.freq_low!r}, {self.f0!r}, {self.freq_high!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.freq_low == self.freq_high:
             message = (
                 "Frequency combination leads to singular matrix (freq_low == freq_high)"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.min_bandwidth_hz <= 0.0:
             message = (
                 f"min_bandwidth_hz must be positive, got {self.min_bandwidth_hz!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         az_looks, rg_looks = self.looks
         if az_looks < 1 or rg_looks < 1:
             message = f"looks must be >= 1, got {self.looks!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if not 0.0 < self.coherence_threshold < 1.0:
             message = (
                 "coherence_threshold must lie in (0, 1), got "
                 f"{self.coherence_threshold!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.solve_core not in ("isce3", "guided_split"):
             message = (
                 f"solve_core must be 'isce3' or 'guided_split', got {self.solve_core!r}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.cor_order_adj < 1:
             message = f"cor_order_adj must be >= 1, got {self.cor_order_adj!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         effective_split_hz = self.freq_high - self.freq_low
         if effective_split_hz < self.min_bandwidth_hz and not self.degraded:
             message = (
@@ -159,12 +149,10 @@ class IonosphereEstimationConfig:
                 "estimation is unreliable. Re-run with degraded=True and a "
                 "degradation_reason to force flagged low-confidence outputs."
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if self.degraded and not self.degradation_reason:
             message = "degraded=True requires an explicit degradation_reason"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     @property
     def effective_split_hz(self) -> float:

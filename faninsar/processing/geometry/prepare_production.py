@@ -1,5 +1,4 @@
 # ruff: noqa: EM102, TRY003, PLR0911
-
 """Ampcor-style production helper for P20/P25/P26 geometry (PROPOSAL-0031).
 
 Callers pass ``device`` only. UUID, native executor, and candidate keys stay
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry import ConstantDEM, RasterDEM
 from faninsar.processing.geometry.backend_dispatch import (
     DispatchError,
@@ -65,12 +64,10 @@ def _require_device(device: DeviceLike) -> object:
             "production geometry supports only cpu and cuda after Newton "
             "deletion; got mps"
         )
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     if resolved.type not in {"cpu", "cuda"}:
         message = f"production geometry supports only cpu and cuda, got {device!r}"
-        logger.error(message)
-        raise DispatchError(message)
+        reject(message, DispatchError)
     return resolved
 
 
@@ -590,8 +587,7 @@ def prepare_production_geometry(
     """
     if device is None:
         message = "prepare_production_geometry requires device"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     resolved = _require_device(device)
     physical_uuid = None
     mig_uuid = None

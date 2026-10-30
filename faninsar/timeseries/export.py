@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.timeseries.io import timeseries_properties, write_timeseries_product
 
 if TYPE_CHECKING:
@@ -48,16 +48,13 @@ class ExporterRegistry:
         """Register one zero-argument exporter class under ``name``."""
         if not isinstance(name, str) or not name or name != name.strip():
             message = "exporter name must be a non-empty string"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if not isinstance(exporter, type) or not callable(exporter):
             message = "registered exporter must be a callable class"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         if name in self._exporters:
             message = f"exporter name already registered: {name}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self._exporters[name] = exporter
 
     def resolve(self, name: str) -> type[TimeSeriesExporter]:
@@ -66,8 +63,7 @@ class ExporterRegistry:
             return self._exporters[name]
         except KeyError as error:
             message = f"no TimeSeries exporter is registered as {name!r}"
-            logger.exception(message)
-            raise KeyError(message) from error
+            reject(message, KeyError, cause=error)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -178,12 +174,10 @@ def _geo_grid(result: TimeSeries) -> tuple[Any, Any]:
     spatial = result.spatial
     if spatial is None or spatial.domain != "geo":
         message = "stac-cog export requires geo spatial metadata"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if spatial.crs is None or spatial.transform is None:
         message = "stac-cog export requires complete geo CRS and transform"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     from rasterio.crs import CRS
     from rasterio.transform import Affine
 
@@ -231,9 +225,8 @@ def _write_multiband_cog(
                 dataset.set_band_description(index, label)
                 dataset.update_tags(index, faninsar_identity=label)
     except Exception as error:
-        logger.exception("could not write Cloud Optimized GeoTIFF: %s", path)
-        message = "stac-cog export could not create a COG"
-        raise RuntimeError(message) from error
+        message = f"stac-cog export could not create a COG: {path}"
+        reject(message, RuntimeError, cause=error)
 
 
 def _write_stac_cog(result: TimeSeries, root: Path, *, overwrite: bool) -> Path:
@@ -340,12 +333,10 @@ def _resolve_exporter(exporter: object | None) -> TimeSeriesExporter:
             selected = selected()
         except TypeError as error:
             message = "exporter classes must have a zero-argument constructor"
-            logger.exception(message)
-            raise TypeError(message) from error
+            reject(message, TypeError, cause=error)
     if not callable(selected):
         message = "exporter must be a registered name, class, or callable"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     return selected  # type: ignore[return-value]
 
 

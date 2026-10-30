@@ -48,7 +48,7 @@ from tqdm import tqdm
 from faninsar.data.datasets.base.geo import GeoDataset
 from faninsar.data.datasets.geogrid import GeoGrid as GeoBox
 from faninsar.data.query.bbox import BoundingBox
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -272,8 +272,7 @@ class XarrayDataset(GeoDataset):
         specs = [self._normalise_open_spec(item) for item in paths]
         if not specs:
             msg = "At least one raster path must be supplied."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         self._open_specs = specs
         # ``lazy_loading`` controls whether xarray should retain dask-backed
@@ -444,8 +443,7 @@ class XarrayDataset(GeoDataset):
                 f"Data variable selected from {spec} does not expose the "
                 "two spatial dimensions required for analysis."
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         # Use configured dimensions if provided
         if self._y_dim is not None and self._x_dim is not None:
@@ -455,15 +453,13 @@ class XarrayDataset(GeoDataset):
                     f"Configured y dimension '{self._y_dim}' "
                     f"not found in variable '{data_var.name}'."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             if self._x_dim not in data_var.dims:
                 msg = (
                     f"Configured x dimension '{self._x_dim}' "
                     f"not found in variable '{data_var.name}'."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             return self._y_dim, self._x_dim
 
         # Automatic inference if not configured
@@ -886,8 +882,7 @@ class XarrayDataset(GeoDataset):
         if isinstance(chunks, tuple):
             if len(chunks) != 2:
                 message = "tuple chunks must contain (y, x) sizes"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             kwargs["chunks"] = {"y": chunks[0], "x": chunks[1]}
         return kwargs
 
@@ -1110,8 +1105,7 @@ def _select_data_variable(
     """
     if not dataset.data_vars:
         msg = f"Dataset {spec} does not expose any data variables."
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     # Priority 1: Use spec-level variable if provided
     target_variable = spec.variable
@@ -1124,8 +1118,7 @@ def _select_data_variable(
                 f"not found in dataset {spec}. "
                 f"Available variables: {list(dataset.data_vars.keys())}"
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         msg = f"Using configured variable '{target_variable}' from dataset {spec}"
         logger.debug(msg)
         return target_variable, dataset[target_variable]

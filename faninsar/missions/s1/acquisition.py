@@ -61,7 +61,7 @@ from pyproj.crs import CRS
 from pyproj.exceptions import CRSError
 
 from faninsar.data.query import BoundingBox, Points, Polygons
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1.annotation import parse_annotation_xml
 from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.canvas import (
@@ -683,12 +683,10 @@ def resolve_roi_acquisition(
     if granularity not in _GRANULARITY_PROVIDERS:
         allowed = ", ".join(sorted(_GRANULARITY_PROVIDERS))
         message = f"granularity must be one of {allowed}; got {granularity!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     if provider is not None and provider not in {"cdse", "asf"}:
         message = f"provider must be 'cdse' or 'asf'; got {provider!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     resolved_provider = _DEFAULT_PROVIDER[granularity] if provider is None else provider
     allowed = _GRANULARITY_PROVIDERS[granularity]
     if resolved_provider not in allowed:
@@ -703,8 +701,7 @@ def resolve_roi_acquisition(
             f"provider={resolved_provider!r}; allowed providers are "
             f"{sorted(allowed)}. See the provider x granularity table:\n{table}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return granularity, resolved_provider
 
 
@@ -985,16 +982,14 @@ def normalize_roi_wgs84(
     crs = getattr(roi, "crs", None)
     if crs is None:
         message = "ROI must declare a CRS; spatial queries cannot assume lon/lat"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     if _is_wgs84(crs):
         return roi
     try:
         return roi.to_crs(_WGS84)
     except (CRSError, TypeError, ValueError) as exc:
         message = "ROI CRS cannot be transformed to EPSG:4326"
-        logger.exception(message)
-        raise ValueError(message) from exc
+        reject(message, ValueError, cause=exc, logger=logger)
 
 
 def _utm_ups_epsg(lon: float, lat: float) -> str:
@@ -1061,8 +1056,7 @@ def inversion_envelope(
         ]
         if not envelopes:
             message = "Points ROI is empty"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         west = min(item[0] for item in envelopes)
         south = min(item[1] for item in envelopes)
         east = max(item[2] for item in envelopes)
@@ -1074,8 +1068,7 @@ def inversion_envelope(
         )
         if len(geometry) == 0:
             message = "Polygons ROI has no desired geometry"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         bounds = geometry.to_geodataframe().total_bounds
         return float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3])
     return (
@@ -1199,8 +1192,7 @@ def materialize_cdse_roi_safes(
     """
     if coreg_mode not in {"geometry", "nesd"}:
         message = f"coreg_mode must be 'geometry' or 'nesd'; got {coreg_mode!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     roi = normalize_roi_wgs84(roi)
     # Multi-polygon ROI needs DEM for per-polygon geo2rdr inversion.
     if (
@@ -1228,8 +1220,7 @@ def materialize_cdse_roi_safes(
         ]
     if not items:
         message = "Sentinel-1 CDSE search returned no products"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     out_dir = Path(work_dir) / "inputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -1294,8 +1285,7 @@ def materialize_cdse_roi_safes(
         paths.append(canvas.safe_root)
     if not paths:
         message = "Sentinel-1 CDSE search returned no products intersecting the ROI"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
     return paths
 
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.dem_sources import (
     DeferredStacPlan,
     _stac_endpoint_identity,
@@ -66,14 +66,6 @@ class _OfflinePcClient:
                 raise
             kwargs.pop("max_items", None)
             return search(**kwargs)  # type: ignore[operator]
-
-
-class ProviderUnavailableError(RuntimeError):
-    """Raised when a registered provider cannot serve a request."""
-
-
-class SourceConflictError(ProviderUnavailableError):
-    """Raised when overlapping source windows disagree at a target pixel."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,8 +178,7 @@ class PcStacSource:
             or plan.allowed_hosts != allowed_hosts
         ):
             message = "deferred STAC plan does not belong to this source"
-            logger.error(message)
-            raise ProviderUnavailableError(message)
+            reject(message, RuntimeError)
 
         # Keep the historical lightweight fixture seam for callers that
         # inject a bare ``search`` object.  Real ``pystac-client`` instances
@@ -203,7 +194,7 @@ class PcStacSource:
                 resources.extend(self._discover_window(window, client, signer))
             unique = {resource.identity: resource for resource in resources}
             if not unique:
-                raise ProviderUnavailableError(
+                raise RuntimeError(
                     f"no {plan.collection}/{plan.asset} coverage for {plan.bounds!r}"
                 )
             return tuple(unique.values())
@@ -217,7 +208,7 @@ class PcStacSource:
                 PlanetaryComputerAdapter,
             )
         except ImportError as error:
-            raise ProviderUnavailableError(
+            raise RuntimeError(
                 "provider 'pc' requires the FanInSAR remote extras"
             ) from error
 
@@ -297,7 +288,7 @@ class PcStacSource:
         for resource in sorted(resources, key=lambda value: value.identity):
             unique.setdefault(resource.identity, resource)
         if not unique:
-            raise ProviderUnavailableError(
+            raise RuntimeError(
                 f"no {plan.collection}/{plan.asset} coverage for {plan.bounds!r}"
             )
         return tuple(unique.values())
@@ -384,7 +375,7 @@ class PcStacSource:
         try:
             validate_https_origin(href, {PC_ASSET_HOST})
         except ValueError as error:
-            raise ProviderUnavailableError(
+            raise RuntimeError(
                 "Planetary Computer asset origin is not approved"
             ) from error
 
@@ -445,7 +436,7 @@ def get_provider(selection: str) -> PcStacSource | _P0030Source:
 
         entry = get_dem_source(key)
     except (KeyError, ValueError) as error:
-        raise ProviderUnavailableError(str(error)) from error
+        raise RuntimeError(str(error)) from error
     return _P0030Source(product, str(provider), entry.name)
 
 
@@ -547,8 +538,7 @@ def _sample_geographic_windows(
         if finite.size > 1 and not np.allclose(finite, finite[0], atol=1e-3, rtol=1e-6):
             identity = loaded[matches[0]][0].identity
             message = f"overlapping DEM source windows disagree; source={identity}"
-            logger.error(message)
-            raise SourceConflictError(message)
+            reject(message, RuntimeError)
         return values[0]
 
     seam_sampler = SeamAwareSourceSampler(
@@ -616,7 +606,7 @@ def materialize_source(
 
         return materialize(source, grid, cache_dir=cache_dir, budget=budget)
     if not isinstance(source, PcStacSource):
-        raise ProviderUnavailableError(f"DEM provider is not wired: {source!r}")
+        raise TypeError(f"DEM provider is not wired: {source!r}")
     height, width = int(grid.height), int(grid.width)
     preflight_grid(height, width, budget=budget)
     # Query in WGS84 regardless of the public target projection.
@@ -703,8 +693,7 @@ def materialize_source(
                     "overlapping DEM source windows disagree; "
                     f"source={resource.identity}"
                 )
-                logger.error(message)
-                raise SourceConflictError(message)
+                reject(message, RuntimeError)
             fill = np.isnan(destination) & np.isfinite(sampled)
             destination[fill] = np.asarray(sampled, dtype=np.float32)[fill]
     from faninsar.processing.geometry.api import RasterDEM
@@ -748,8 +737,7 @@ def fetch_asset(
     # Production resources always carry a RemoteAsset from ``discover``.
     if session is None:
         message = "PC source resource has no provider-neutral remote asset"
-        logger.error(message)
-        raise ProviderUnavailableError(message)
+        reject(message, RuntimeError)
     response = session.get(  # type: ignore[attr-defined]
         resource.href,
         stream=True,
@@ -758,9 +746,7 @@ def fetch_asset(
     )
     try:
         if response.status_code in {301, 302, 303, 307, 308}:
-            raise ProviderUnavailableError(
-                "Planetary Computer asset redirects are rejected"
-            )
+            raise RuntimeError("Planetary Computer asset redirects are rejected")
         response.raise_for_status()
         stream_response_to_cache(
             response,
@@ -779,8 +765,6 @@ __all__ = [
     "PC_REGISTRY",
     "PC_STAC_URL",
     "PcStacSource",
-    "ProviderUnavailableError",
-    "SourceConflictError",
     "SourceResource",
     "get_provider",
     "materialize_source",

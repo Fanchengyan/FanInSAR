@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 import dask.array as da
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.runtime.execution import (
     Backend,
     ChunkLayout,
@@ -60,8 +60,7 @@ def map_elementwise(
     """Apply an elementwise kernel with locality preflight validation."""
     if not arrays:
         message = "map_elementwise requires at least one input array"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     dask_arrays = [_as_dask_array(array) for array in arrays]
     sample = dask_arrays[0]
     plan = OperationPlan(

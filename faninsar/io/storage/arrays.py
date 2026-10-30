@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.missions.protocols import normalize_selection
 from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
@@ -17,8 +17,6 @@ from faninsar.processing.geometry.coordinates import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
-
-logger = setup_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -68,8 +66,7 @@ class InMemoryArrayStore:
         """
         if value.ndim != 2:
             message = "InMemoryArrayStore only accepts 2-D arrays"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         stored = np.array(value, copy=True)
         self.arrays[uri] = stored
         self.metadata[uri] = dict(metadata)
@@ -89,8 +86,7 @@ class InMemoryArrayStore:
         array = self.arrays.get(descriptor.uri)
         if array is None:
             message = f"unknown in-memory array URI: {descriptor.uri}"
-            logger.error(message)
-            raise KeyError(message)
+            reject(message, KeyError)
         row_slice, col_slice = normalize_selection(descriptor.shape, selection)
         return np.array(array[row_slice, col_slice], copy=True)
 
@@ -130,8 +126,7 @@ class ChunkedZarrArrayStore:
 
         if value.ndim != 2:
             message = "ChunkedZarrArrayStore only accepts 2-D arrays"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / uri
         if path.exists():
@@ -177,8 +172,7 @@ class ChunkedZarrArrayStore:
         """Record every chunk index overlapping the normalized selection."""
         if chunks is None or len(chunks) < 2:
             message = "Zarr array must expose two-dimensional chunks"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         row_chunk, col_chunk = int(chunks[0]), int(chunks[1])
         row_start = row_slice.start // row_chunk
         row_stop = (row_slice.stop - 1) // row_chunk

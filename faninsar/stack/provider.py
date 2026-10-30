@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,8 +42,7 @@ class SourceHandle:
         paths = tuple(Path(path) for path in self._paths)
         if not paths:
             message = "source handle requires at least one source path"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         object.__setattr__(self, "_paths", paths)
 
     @classmethod
@@ -81,11 +80,7 @@ class SceneProductionCallback(Protocol):
         """Produce normalized scene artifacts for one acquisition pair."""
 
 
-class StackProviderError(RuntimeError):
-    """Base class for mission-provider dispatch failures."""
-
-
-class UnsupportedStackCapabilityError(StackProviderError, NotImplementedError):
+class UnsupportedStackCapabilityError(NotImplementedError):
     """Raised when a provider has not admitted a requested Stack capability.
 
     Parameters
@@ -220,7 +215,6 @@ def unsupported_stack_capability(
 __all__ = [
     "SceneProductionCallback",
     "SourceHandle",
-    "StackProviderError",
     "StackSceneProvider",
     "UnsupportedStackCapabilityError",
     "unavailable_scene_provider",

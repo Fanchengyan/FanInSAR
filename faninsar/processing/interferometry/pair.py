@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
@@ -54,8 +54,7 @@ def validate_coherence_window(
         or any(axis < 3 or axis % 2 == 0 for axis in value)
     ):
         message = "coherence_window axes must be odd integers >= 3"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return value
 
 
@@ -69,8 +68,7 @@ def _block_reduce(array: np.ndarray, az_looks: int, rg_looks: int) -> np.ndarray
         reshaped = cropped.reshape(h // az_looks, az_looks, w // rg_looks, rg_looks)
         return reshaped.mean(axis=(1, 3))
     message = "block reduce expects a two-dimensional array"
-    logger.error(message)
-    raise ValueError(message)
+    return reject(message, ValueError)
 
 
 def mask_invalid_looks(

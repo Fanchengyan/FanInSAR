@@ -5,9 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from faninsar.io.store import open_store
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 def write_pair(
@@ -43,11 +41,9 @@ def write_pair(
         message = (
             "GeoTIFF/COG write requires raster metadata; use domain product writers"
         )
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError)
     message = f"unsupported format {format!r}"
-    logger.error(message)
-    raise ValueError(message)
+    reject(message, ValueError)
 
 
 __all__ = ["write_pair"]

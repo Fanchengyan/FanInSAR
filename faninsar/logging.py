@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 # Optional imports with fallbacks
 try:
@@ -37,6 +37,7 @@ __all__ = [
     "color_formatter",
     "formatter",
     "get_default_log_level",
+    "reject",
     "setup_logger",
     "stream_handler",
     "tqdm_handler",
@@ -275,3 +276,67 @@ def setup_logger(
             logger.addHandler(h)
 
     return logger  # type: ignore[return-value]
+
+
+def reject(
+    message: str,
+    error_type: type[Exception] = RuntimeError,
+    *,
+    logger: logging.Logger | None = None,
+    cause: BaseException | None = None,
+) -> NoReturn:
+    """Log ``message`` at ERROR and raise ``error_type`` with it.
+
+    This is the single raise-time log site: an error that is about to
+    propagate is always written to the log first, so a crash or a caught
+    failure is never silent. Prefer it over ``logger.error`` + ``raise``.
+
+    Parameters
+    ----------
+    message : str
+        Diagnostic text recorded before the error is raised.
+    error_type : type[Exception], optional
+        Exception class to raise, by default ``RuntimeError``.
+    logger : logging.Logger, optional
+        Logger to write through; defaults to the ``faninsar`` logger.
+    cause : BaseException, optional
+        Underlying exception to chain via ``raise ... from cause``.
+
+    Raises
+    ------
+    Exception
+        ``error_type(message)``, always.
+
+    """
+    log = logger if logger is not None else setup_logger("faninsar")
+    log.error("%s", message)
+    raise error_type(message) from cause
+
+
+def _log_unhandled(
+    exc_type: type[BaseException],
+    exc_value: BaseException,
+    exc_traceback: object,
+) -> None:
+    """Route an uncaught exception to the faninsar logger, then default."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    setup_logger("faninsar").critical(
+        "unhandled %s: %s",
+        exc_type.__name__,
+        exc_value,
+        exc_info=(exc_type, exc_value, exc_traceback),  # type: ignore[arg-type]
+    )
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+def _install_excepthook() -> None:
+    """Ensure uncaught exceptions are recorded in the faninsar log."""
+    if getattr(sys.excepthook, "_faninsar_installed", False):
+        return
+    _log_unhandled._faninsar_installed = True  # type: ignore[attr-defined]
+    sys.excepthook = _log_unhandled
+
+
+_install_excepthook()

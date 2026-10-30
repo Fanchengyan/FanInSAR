@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from scipy.ndimage import map_coordinates
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.coregistration.ampcor_backend import (
     AmpcorBackend,
     AmpcorBackendRegistry,
@@ -103,8 +103,7 @@ def _validate_torch_ampcor_runtime(device: object, torch_module: object) -> None
         return
     if not torch_module.cuda.is_available():
         message = "CUDA requested for Torch Ampcor but is unavailable"
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
 
 
 def _synchronize_torch_device(device: object) -> None:
@@ -143,12 +142,10 @@ def _torch_ampcor_admission_key(device: object, torch_module: object) -> str:
         uuid = str(torch_module.cuda.get_device_properties(resolved).uuid)
     except Exception as error:
         message = "unable to identify the physical CUDA device for admission"
-        logger.exception(message)
-        raise RuntimeError(message) from error
+        reject(message, RuntimeError, cause=error)
     if not uuid or uuid == "None":
         message = "Torch did not expose a physical CUDA device UUID"
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     return f"cuda-uuid:{uuid}"
 
 
@@ -170,13 +167,11 @@ def _admit_torch_ampcor_process(device_key: str) -> Iterator[None]:
         import fcntl
     except ImportError as error:  # pragma: no cover - supported hosts are POSIX
         message = "cross-process CUDA admission requires POSIX file locking"
-        logger.exception(message)
-        raise RuntimeError(message) from error
+        reject(message, RuntimeError, cause=error)
     required_flags = ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC")
     if any(not hasattr(os, flag) for flag in required_flags):
         message = "secure CUDA admission requires POSIX no-follow directory opens"
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
     file_flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
@@ -204,8 +199,7 @@ def _admit_torch_ampcor_process(device_key: str) -> Iterator[None]:
             != (root_path_stat.st_dev, root_path_stat.st_ino)
         ):
             message = "Ampcor admission directory failed ownership or inode checks"
-            logger.error(message)
-            raise RuntimeError(message)
+            reject(message, RuntimeError)
         lock_name = f"{safe_key}.lock"
         try:
             lock_descriptor = os.open(
@@ -238,16 +232,14 @@ def _admit_torch_ampcor_process(device_key: str) -> Iterator[None]:
                 != (path_stat.st_dev, path_stat.st_ino)
             ):
                 message = "Ampcor admission lock failed ownership or inode checks"
-                logger.error(message)
-                raise RuntimeError(message)
+                reject(message, RuntimeError)
 
         validate_lock_entry()
         try:
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             message = f"Ampcor device admission is busy for {device_key}"
-            logger.exception(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
         validate_lock_entry()
         yield
     finally:
@@ -310,8 +302,7 @@ def _admit_ampcor_device(device: str) -> str:
         if device in {"auto", "gpu", "cpu"} or device.startswith("cpu:"):
             return "cpu"
         message = "explicit CUDA Ampcor requires torch"
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
     resolved = parse_device(device)
     if resolved.type == "cpu":
         return "cpu"
@@ -409,8 +400,7 @@ def _validate_ampcor_accelerator(device: str) -> None:
         import torch
     except ImportError as error:
         message = "explicit CUDA Ampcor requires torch"
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
     resolved = _canonical_torch_device(device)
     _validate_torch_ampcor_runtime(resolved, torch)
     _torch_ampcor_admission_key(resolved, torch)
@@ -598,8 +588,7 @@ def _admit_torch_ampcor_workspace(
                 f"{device_key}: reserved={reserved} planned={planned_bytes} "
                 f"limit={limit_bytes}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         _TORCH_AMPCOR_RESERVED_BYTES[device_key] = reserved + planned_bytes
     try:
         if device_key.startswith(("cuda", "mps")) and not process_admitted:
@@ -1283,8 +1272,7 @@ def _torch_ampcor_boundary_workspace_bytes(
     """
     if boundary_count < 1 or boundary_count > batch_size:
         message = "Ampcor boundary count must be within the admitted batch"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     search_height = window_az + 2 * search_az
     search_width = window_rg + 2 * search_rg
     fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
@@ -1558,8 +1546,7 @@ def _torch_cpu_median(chunks: list[object], torch_module: object) -> float:
     """
     if not chunks:
         message = "Torch median requires at least one value"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     values = torch_module.cat(chunks).to(dtype=torch_module.float64)
     ordered = torch_module.sort(values).values
     count = int(ordered.numel())
@@ -1604,8 +1591,7 @@ def _estimate_patch_amplitude_shift_torch(
         import torch
     except ImportError as error:
         message = "Torch Ampcor execution requires torch"
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
     resolved_device = _canonical_torch_device(
         _admit_ampcor_device(device) if device == "auto" else device
     )
@@ -1652,16 +1638,14 @@ def _estimate_patch_amplitude_shift_torch(
         measurement = ncc_candidate.workspace_measurement
         if measurement is None:
             message = "Ampcor native NCC workspace measurement is unavailable"
-            logger.error(message)
-            raise AmpcorCandidateError(message)
+            reject(message, AmpcorCandidateError)
         planned_workspace += measurement.admitted_bytes
     if planned_workspace > max_workspace_bytes:
         message = (
             f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
             f"cooperative estimate limit {max_workspace_bytes} bytes"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     half_az = window_az // 2
     half_rg = window_rg // 2
     margin_a = half_az + search_az + 1 if margin_az is None else int(margin_az)

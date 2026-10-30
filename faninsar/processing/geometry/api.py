@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal, Self
 import numpy as np
 from affine import Affine
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.grids import GridSpec
 
 from .resources import preflight_grid
@@ -69,8 +69,7 @@ def _admit_datum(value: str) -> VerticalDatum:
     datum = str(value).strip().lower()
     if datum not in _DATUMS:
         message = f"unsupported vertical datum {value!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return datum  # type: ignore[return-value]
 
 
@@ -78,8 +77,7 @@ def _admit_grid(grid: GridSpec) -> GridSpec:
     """Validate the shared grid type at a public boundary."""
     if not isinstance(grid, GridSpec):
         message = "grid must be a GridSpec"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     return grid
 
 
@@ -88,8 +86,7 @@ def _readonly_array(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     result = np.array(array, dtype=np.float32, copy=True)
     if result.ndim != 2 or result.shape != shape:
         message = f"DEM array shape {result.shape} does not match grid {shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     result.setflags(write=False)
     return result
 
@@ -109,8 +106,7 @@ def _natural_spline_six(values: np.ndarray, fraction: np.ndarray) -> np.ndarray:
     samples = np.asarray(values, dtype=np.float64)
     if samples.shape[-1] != 6:
         message = "six-sample spline requires a final axis of length 6"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     second = np.zeros_like(samples)
     recurrence = np.zeros(6, dtype=np.float64)
     for index in range(1, 5):
@@ -150,8 +146,7 @@ def _sample_biquintic(
     height, width = source.shape
     if height < 6 or width < 6:
         message = "P0032 biquintic DEM sampling requires a 6x6 source support"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     row_floor = np.floor(rows).astype(np.int64)
     col_floor = np.floor(cols).astype(np.int64)
     valid = (
@@ -392,8 +387,7 @@ class SourceDEM(DEM):
                 message = detail
             else:
                 message = f"unsupported DEM source selection {product!r}"
-            logger.exception(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
         self.product = name
         self.provider = provider
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
@@ -415,8 +409,7 @@ class SourceDEM(DEM):
         target_datum = _admit_datum(vertical_datum)
         if self.cache_dir is None:
             message = "SourceDEM.to_raster requires an explicit cache_dir"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         from .providers import get_provider, materialize_source
 
         selection = (
@@ -432,8 +425,7 @@ class SourceDEM(DEM):
         )
         if not isinstance(result, RasterDEM):
             message = "DEM provider did not return a RasterDEM"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         if target_datum == result.vertical_datum:
             return result
         return result.to_raster(grid, vertical_datum=target_datum, budget=budget)
@@ -453,8 +445,7 @@ class ConstantDEM(DEM):
         """Validate and retain a scalar height without I/O."""
         if not np.isfinite(height):
             message = "constant DEM height must be finite"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self.height = float(height)
         self.vertical_datum = _admit_datum(vertical_datum)
 
@@ -568,8 +559,7 @@ class RasterDEM(DEM):
                             "local raster vertical datum is ambiguous; "
                             "provide vertical_datum"
                         )
-                        logger.error(message)
-                        raise ValueError(message)
+                        reject(message, ValueError)
                     vertical_datum = tag
                 provenance = {
                     **({} if provenance is None else dict(provenance)),
@@ -577,8 +567,7 @@ class RasterDEM(DEM):
                 }
         if array is None or grid is None:
             message = "RasterDEM requires array and grid, or path"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         if vertical_datum is None:
             # Array-backed DEMs have no external metadata and use the public
             # constructor's documented ellipsoidal default. Path-backed DEMs
@@ -829,12 +818,10 @@ class RasterDEM(DEM):
         destination = Path(path)
         if destination.suffix.lower() not in {".tif", ".tiff"}:
             message = "RasterDEM.save requires a .tif or .tiff path"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if destination.exists():
             message = f"refusing to overwrite existing raster: {destination}"
-            logger.error(message)
-            raise FileExistsError(message)
+            reject(message, FileExistsError)
         import rasterio
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -907,8 +894,7 @@ def dem_content_identity(dem: DEM | None) -> str:
         f"{type(dem).__module__}.{type(dem).__qualname__} has no content "
         "identity for cache keys; materialize it with to_raster() first"
     )
-    logger.error(message)
-    raise InvalidProcessingStateError(message)
+    return reject(message, InvalidProcessingStateError)
 
 
 def ensure_dem_covers_grid(
@@ -999,8 +985,7 @@ def ensure_dem_covers_grid(
         f"{required['north']:.{digits}f}] ({sides}); "
         "provide a DEM larger than the SAR extent"
     )
-    logger.error(message)
-    raise InvalidProcessingStateError(message)
+    reject(message, InvalidProcessingStateError)
 
 
 __all__ = [

@@ -9,9 +9,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 def split_group(
@@ -55,8 +53,7 @@ def split_group(
     if group_size is None:
         if group_num is None:
             msg = "Must specify either group_size or group_num"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         # use floor to automatically balance the group size
         return np.arange(total) * group_num // total
     return np.arange(total) // group_size
@@ -341,16 +338,13 @@ def detrend_surface(
             or not 0 <= degree <= 3
         ):
             msg = f"{name} must be an integer in [0, 3], got {degree!r}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
     if not data.dtype.is_floating_point:
         msg = f"data must have a floating dtype, got {data.dtype}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if data.ndim < 2:
         msg = f"data must have at least 2 dimensions, got shape {tuple(data.shape)}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if mask is not None and (
         mask.ndim != 2 or tuple(mask.shape) != tuple(data.shape[-2:])
     ):
@@ -358,20 +352,17 @@ def detrend_surface(
             f"mask must be 2-D with shape {tuple(data.shape[-2:])} to match the "
             f"spatial dimensions of data, got shape {tuple(mask.shape)}"
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if max_num_sample is not None and (
         isinstance(max_num_sample, bool)
         or not isinstance(max_num_sample, int)
         or max_num_sample <= 0
     ):
         msg = f"max_num_sample must be a positive integer, got {max_num_sample!r}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if dtype is not None and not dtype.is_floating_point:
         msg = f"dtype must be a floating dtype, got {dtype}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     basis = [(0, 0)]
     basis.extend((i, 0) for i in range(1, y_degree + 1))
@@ -407,8 +398,7 @@ def detrend_surface(
             f"requested surface, but slice(s) starting at {bad[:5]} have as few "
             f"as {int(n_valid.min().item())} valid pixels."
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     acc = torch.float64
     y_lin = torch.arange(height, dtype=acc, device=target.device)
@@ -456,8 +446,7 @@ def detrend_surface(
             "The detrend surface system is singular for at least one slice; "
             "the valid pixels may not constrain the requested degrees."
         )
-        logger.exception(msg)
-        raise ValueError(msg) from exc
+        reject(msg, ValueError, cause=exc)
     coef = coef_scaled / scale
 
     y_eval = [tensor.to(out_dtype) for tensor in y_pow]

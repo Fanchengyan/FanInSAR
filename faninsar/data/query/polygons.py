@@ -10,7 +10,7 @@ import pandas as pd
 from pyproj.crs.crs import CRS
 from rasterio.errors import CRSError
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,8 +21,6 @@ if TYPE_CHECKING:
     from faninsar.core.types import CrsLike
 
     from .bbox import BoundingBox
-
-logger = setup_logger(__name__)
 
 
 class Polygons:
@@ -139,8 +137,7 @@ class Polygons:
             df = gdf.geodataframe
         else:
             msg = f"gdf must be an instance of GeoDataFrame, GeoSeries. Got {type(gdf)}"
-            logger.error(msg, stacklevel=2)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         return self._ensure_gdf_crs(df, crs)
 
     @staticmethod

@@ -31,7 +31,7 @@ from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.io.export.kmz import array2kmz
 from faninsar.io.lazy_rasterio import LazyMultiFileReader
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.coordinates import bounds_from_xy, xy_from_transform
 from faninsar.processing.geometry.profiles import Profile
 
@@ -374,16 +374,13 @@ class RasterDataset(GeoDataset):
         indexes_array = np.asarray(indexes, dtype=int)
         if indexes_array.size == 0:
             msg = f"No valid files to query. indexes: {indexes_array}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         if np.any(indexes_array < 0):
             msg = f"indexes must be positive integers, got {indexes_array}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         if np.any(indexes_array >= len(self.files)):
             msg = f"indexes must be less than {len(self.files)}, got {indexes_array}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         files_used = self.files.iloc[indexes_array, :]
         valid_mask = files_used.valid.to_numpy(dtype=bool)
@@ -396,8 +393,7 @@ class RasterDataset(GeoDataset):
 
         if files_used.empty:
             msg = "No valid files remain after filtering invalid entries."
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         resolved_indexes = files_used.index.to_numpy(dtype=int)
         paths = files_used.paths.astype(str).tolist()
@@ -545,8 +541,7 @@ class RasterDataset(GeoDataset):
                     f"{self.__class__.__name__} is missing an `all_bands` "
                     "attribute, so `bands` cannot be specified."
                 )
-                logger.error(msg)
-                raise AssertionError(msg)
+                reject(msg, AssertionError)
 
         return files_df
 
@@ -792,8 +787,7 @@ class RasterDataset(GeoDataset):
                 f"query must be GeoQuery, Points, BoundingBox, or Polygons. "
                 f"Got {type(spatial_query)}"
             )
-            logger.error(msg, stacklevel=2)
-            raise TypeError(msg)
+            reject(msg, TypeError)
 
         return self._sample_to_dict(geo_query)
 

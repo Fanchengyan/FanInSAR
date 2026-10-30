@@ -57,12 +57,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pint
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from faninsar.core.types import FrequencyUnit, WavelengthUnit
-
-logger = setup_logger(__name__)
 
 # Valid unit tuples used for runtime validation. These mirror the Literal types
 # defined in faninsar.core.types (which is the canonical source for type checkers).
@@ -136,8 +134,7 @@ class Wavelength:
         """
         if self.unit not in _WAVELENGTH_UNITS:
             msg = f"Invalid unit: {self.unit}. Must be one of {_WAVELENGTH_UNITS}."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
     def _as_quantity(self) -> pint.Quantity:
         """Convert wavelength to Pint Quantity for internal use.
@@ -206,8 +203,7 @@ class Wavelength:
         """
         if unit not in _WAVELENGTH_UNITS:
             msg = f"Invalid unit: {unit}. Must be one of {_WAVELENGTH_UNITS}."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         # Return self for no-op conversions to preserve identity in tests
         if unit == self.unit:
@@ -501,8 +497,7 @@ class Frequency:
         """
         if self.unit not in _FREQUENCY_UNITS:
             msg = f"Invalid unit: {self.unit}. Must be one of {_FREQUENCY_UNITS}."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
     def _as_quantity(self) -> pint.Quantity:
         """Convert frequency to Pint Quantity for internal use.
@@ -571,8 +566,7 @@ class Frequency:
         """
         if unit not in _FREQUENCY_UNITS:
             msg = f"Invalid unit: {unit}. Must be one of {_FREQUENCY_UNITS}."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         # Return self for no-op conversions to preserve identity in tests
         if unit == self.unit:

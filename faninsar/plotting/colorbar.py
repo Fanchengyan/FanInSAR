@@ -30,7 +30,7 @@ from matplotlib.ticker import (
 )
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -460,8 +460,7 @@ class HistColorbar:
         else:
             if cmap is None:
                 msg = "Either mappable or cmap must be provided"
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError, logger=logger)
             self.cmap = plt.get_cmap(cmap) if isinstance(cmap, str) else cmap
 
             # Create normalization
@@ -559,8 +558,7 @@ class HistColorbar:
                     "the Colorbar, provide the *ax* argument to steal space "
                     "from it, or add *mappable* to an Axes."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError, logger=logger)
             fig = (  # Figure of first Axes; logic copied from make_axes.
                 [*ax.flat]
                 if isinstance(ax, np.ndarray)
@@ -821,8 +819,7 @@ class HistColorbar:
             min_count = 0.5 if self.scale == "log" else 0
         if min_count < 0:
             msg = "min_count must be positive"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
         self._min_count = min_count
 
     def set_hist_locator(
@@ -850,8 +847,7 @@ class HistColorbar:
                 self.ax_hist.yaxis.set_minor_locator(locator)
         else:
             msg = f"which must be 'major' or 'minor', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def set_hist_formatter(
         self, formatter: Formatter, which: Literal["major", "minor"] = "major"
@@ -878,8 +874,7 @@ class HistColorbar:
                 self.ax_hist.yaxis.set_minor_formatter(formatter)
         else:
             msg = f"which must be 'major' or 'minor', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def set_cbar_locator(
         self, locator: Locator, which: Literal["major", "minor"] = "major"
@@ -906,8 +901,7 @@ class HistColorbar:
                 self.ax_cbar.yaxis.set_minor_locator(locator)
         else:
             msg = f"which must be 'major' or 'minor', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def set_cbar_formatter(
         self, formatter: Formatter, which: Literal["major", "minor"] = "major"
@@ -934,8 +928,7 @@ class HistColorbar:
                 self.ax_cbar.yaxis.set_minor_formatter(formatter)
         else:
             msg = f"which must be 'major' or 'minor', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def cbar_tick_params(
         self,
@@ -1139,8 +1132,7 @@ class HistColorbar:
             self.set_hist_label(label, **kwargs)
         else:
             msg = f"which must be 'cbar' or 'hist', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def set_cbar_ticks(
         self,
@@ -1232,8 +1224,7 @@ class HistColorbar:
             self.set_hist_ticks(ticks, labels, minor=minor, **kwargs)
         else:
             msg = f"which must be 'cbar' or 'hist', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def set_cbar_ticklabels(self, labels: Iterable[str], **kwargs: Any) -> None:
         """Set tick labels for the colorbar axis.
@@ -1288,8 +1279,7 @@ class HistColorbar:
             self.set_hist_ticklabels(labels, **kwargs)
         else:
             msg = f"which must be 'cbar' or 'hist', got {which}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
     def minorticks_on(self) -> None:
         """Turn on colorbar minor ticks."""
@@ -1549,12 +1539,10 @@ def _determine_location_orientation(
     # validate location and orientation
     if location in {"left", "right"} and orientation == "horizontal":
         msg = "Horizontal colorbar cannot be on left or right side."
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError, logger=logger)
     if location in {"top", "bottom"} and orientation == "vertical":
         msg = "Vertical colorbar cannot be on top or bottom side."
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError, logger=logger)
 
     # default location and orientation
     if location is None and orientation is None:

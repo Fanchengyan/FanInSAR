@@ -23,7 +23,7 @@ from pykml.factory import KML_ElementMaker as KML
 from pyproj.crs import CRS
 from rioxarray.exceptions import MissingSpatialDimensionError
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.coordinates import bounds_from_xy
 
 if TYPE_CHECKING:
@@ -44,16 +44,14 @@ def _ensure_bounds_in_wgs84(
         msg = (
             f"bounds should be a tuple of (west, south, east, north), but got {bounds}"
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     west, south, east, north = bounds
     if west < -180 or east > 180 or south < -90 or north > 90:
         msg = (
             "bounds should be in WGS84 coordinate system, "
             f"but got [{west}, {south}, {east}, {north}]"
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     return west, south, east, north
 
 
@@ -90,8 +88,7 @@ def _normalize_kml_bounds(
             "bounds should be a BoundingBox or an iterable of "
             "(west, south, east, north)"
         )
-        logger.error(msg)
-        raise TypeError(msg)
+        reject(msg, TypeError)
 
     if bounds_wgs84.crs != wgs84:
         bounds_wgs84 = bounds_wgs84.to_crs(wgs84)
@@ -144,16 +141,14 @@ def _validate_render_scale(render_scale: int) -> int:
     """
     if render_scale <= 0:
         msg = f"render_scale should be positive, but got {render_scale}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if not float(render_scale).is_integer():
         msg = (
             "render_scale should be a positive integer value when source pixels "
             f"are repeated, but got {render_scale}"
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     return int(render_scale)
 
@@ -211,8 +206,7 @@ def _get_dataarray_spatial_dimensions(data_array: xr.DataArray) -> tuple[str, st
             "data_array should have rioxarray spatial dimensions set with "
             "data_array.rio.set_spatial_dims(x_dim=..., y_dim=...)."
         )
-        logger.exception(msg)
-        raise ValueError(msg) from exc
+        reject(msg, ValueError, cause=exc)
 
 
 def _dataarray_to_wgs84_array_and_bounds(
@@ -242,15 +236,13 @@ def _dataarray_to_wgs84_array_and_bounds(
     crs = data_array.rio.crs
     if crs is None:
         msg = "data_array should have a CRS set with data_array.rio.write_crs(...)."
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if data_array.ndim < 2:
         msg = (
             "data_array should have at least two spatial dimensions, "
             f"but got shape {data_array.shape}."
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if CRS.from_user_input(crs) != wgs84:
         reproject_kwargs: dict[str, Any] = {}
@@ -302,8 +294,7 @@ def _render_array_to_rgba(
     """
     if arr.ndim < 2:
         msg = f"arr should have at least 2 dimensions, but got shape {arr.shape}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     arr = _repeat_source_pixels(arr, render_scale)
     render_height, render_width = arr.shape[:2]
@@ -924,12 +915,10 @@ def array2kmz(
     """
     if tile_size <= 0:
         msg = f"tile_size should be positive, but got {tile_size}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if min_lod_pixels < 0:
         msg = f"min_lod_pixels should be non-negative, but got {min_lod_pixels}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     bounds_norm = _normalize_kml_bounds(bounds)
     img_kwargs_norm = _normalize_image_kwargs(img_kwargs, interpolation="nearest")

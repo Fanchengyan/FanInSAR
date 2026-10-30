@@ -8,14 +8,12 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from rasterio.io import DatasetReader
-
-logger = setup_logger(__name__)
 
 
 def _natural_spline_six(
@@ -26,8 +24,7 @@ def _natural_spline_six(
     samples = np.asarray(values, dtype=np.float64)
     if samples.shape[-1] != 6:
         message = "six-sample spline requires a final axis of length 6"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     second = np.zeros_like(samples)
     recurrence = np.zeros(6, dtype=np.float64)
     for index in range(1, 5):
@@ -171,8 +168,7 @@ class NetCDFGeoid:
         """Validate that the geoid grid exists."""
         if not self.path.exists():
             message = f"geoid grid does not exist: {self.path}"
-            logger.error(message)
-            raise FileNotFoundError(message)
+            reject(message, FileNotFoundError)
 
     def _open(self) -> Callable[[np.ndarray], np.ndarray]:
         if self._interpolator is None:
@@ -233,16 +229,13 @@ class RasterDEM:
         self.path = Path(self.path)
         if not self.path.exists():
             message = f"DEM path does not exist: {self.path}"
-            logger.error(message)
-            raise FileNotFoundError(message)
+            reject(message, FileNotFoundError)
         if self.interpolation not in {"bilinear", "bicubic", "biquintic"}:
             message = f"unsupported DEM interpolation: {self.interpolation}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if int(self.sample_chunk_points) <= 0:
             message = "sample_chunk_points must be a positive integer"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         self.device = str(self.device)
 
     def __getstate__(self) -> dict[str, object]:
@@ -292,8 +285,7 @@ class RasterDEM:
         dataset = self._dataset
         if dataset is None:
             message = f"failed to open DEM dataset: {self.path}"
-            logger.error(message)
-            raise RuntimeError(message)
+            reject(message, RuntimeError)
         return dataset
 
     def sample(
@@ -325,15 +317,13 @@ class RasterDEM:
         identity = self._resolved_identity()
         if identity != "cpu" and not identity.startswith("cuda"):
             message = f"DEM sampling has no identity on {identity}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if identity != "cpu" and self.interpolation != "biquintic":
             message = (
                 "DEM interpolation "
                 f"{self.interpolation!r} has no identity on {identity}"
             )
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         lat = np.asarray(latitude_deg, dtype=np.float64)
         lon = np.asarray(longitude_deg, dtype=np.float64)
         lat_b, lon_b = np.broadcast_arrays(lat, lon)

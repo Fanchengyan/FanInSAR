@@ -1,5 +1,4 @@
-# ruff: noqa: EM101, EM102, TRY003, TRY301, TRY400
-
+# ruff: noqa: EM101, TRY003, TRY301
 """Prepared native/compile candidate registry and deterministic dispatcher.
 
 The module consumes the foundation candidate/result contracts directly.
@@ -19,7 +18,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkabl
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.v2 import (
     CandidateKey as FoundationCandidateKey,
 )
@@ -259,18 +258,22 @@ def _scientific_profile_key(key: CandidateKeyProtocol) -> tuple[object, ...]:
     try:
         return tuple(_freeze(getattr(key, name)) for name in _SCIENTIFIC_PROFILE_FIELDS)
     except AttributeError as error:
-        logger.error("candidate key is missing required identity field: %s", error)
-        raise DispatchError(
-            "candidate key is missing a required identity field"
-        ) from error
+        reject(
+            "candidate key is missing a required identity field",
+            DispatchError,
+            cause=error,
+        )
 
 
 def _require_prepared_key(key: CandidateKeyProtocol) -> None:
     """Reject eager or malformed keys at the prepared registry boundary."""
     backend = getattr(key, "backend", None)
     if backend not in ("native", "compile"):
-        logger.error("prepared registry received unsupported backend %r", backend)
-        raise DispatchError("prepared candidates must use native or compile backend")
+        reject(
+            f"prepared registry received unsupported backend {backend!r}; "
+            "prepared candidates must use native or compile backend",
+            DispatchError,
+        )
 
 
 def _candidate_budget(key: CandidateKeyProtocol) -> int:
@@ -288,8 +291,11 @@ def _call_eager(
 ) -> object:
     """Invoke a no-argument or key-aware eager callback without masking errors."""
     if not callable(executor):
-        logger.error("no eager executor is available for device %r", key.device)
-        raise DispatchError("eager executor is not callable")
+        reject(
+            f"no eager executor is available for device {key.device!r}; "
+            "eager executor is not callable",
+            DispatchError,
+        )
     try:
         signature = inspect.signature(executor)
     except (TypeError, ValueError):
@@ -334,8 +340,11 @@ class Dispatcher:
     ) -> None:
         """Create a dispatcher with a caller-owned eager implementation."""
         if not callable(eager) and not isinstance(eager, Mapping):
-            logger.error("dispatcher requires a callable or device eager mapping")
-            raise DispatchError("eager executor is required")
+            reject(
+                "dispatcher requires a callable or device eager mapping; "
+                "eager executor is required",
+                DispatchError,
+            )
         self._eager = eager
         self._candidates: dict[tuple[object, ...], _RegisteredCandidate] = {}
         self.records: list[DispatchRecord] = []
@@ -387,11 +396,13 @@ class Dispatcher:
         """
         _require_prepared_key(key)
         if not prepared:
-            logger.error("refusing an unprepared candidate for %s", key.backend)
-            raise DispatchError("dispatcher accepts prepared candidates only")
+            reject(
+                f"refusing an unprepared candidate for {key.backend}; "
+                "dispatcher accepts prepared candidates only",
+                DispatchError,
+            )
         if not callable(executor):
-            logger.error("candidate executor is not callable")
-            raise DispatchError("candidate executor is required")
+            reject("candidate executor is required", DispatchError)
         if eligible is not None:
             performance_eligible = bool(eligible)
         slot = (*_scientific_profile_key(key), key.backend)
@@ -414,8 +425,7 @@ class Dispatcher:
         """Mark an exact active candidate unavailable until re-registration."""
         candidate = self._exact_candidate(key)
         if candidate is None:
-            logger.error("cannot quarantine an inactive candidate")
-            raise KeyError(key)
+            reject(f"cannot quarantine an inactive candidate: {key}", KeyError)
         candidate.quarantined = True
 
     def dispatch(
@@ -434,8 +444,7 @@ class Dispatcher:
         Dispatch only executes; it never invokes a compiler.
         """
         if mode not in ("auto", "native", "compile", "eager"):
-            logger.error("unknown dispatch mode %r", mode)
-            raise DispatchError(f"unknown dispatch mode: {mode}")
+            reject(f"unknown dispatch mode: {mode}", DispatchError)
         if mode == "eager":
             result = self._execute_eager(key, *args, **kwargs)
             result = self._validate_result(result, None, None)
@@ -445,11 +454,9 @@ class Dispatcher:
         if mode in ("native", "compile"):
             candidate = self._exact_candidate(key)
             if candidate is None or candidate.key.backend != mode:
-                logger.error("no exact prepared %s candidate", mode)
-                raise DispatchError(f"no exact prepared {mode} candidate for key")
+                reject(f"no exact prepared {mode} candidate for key", DispatchError)
             if not candidate.correctness_qualified or candidate.quarantined:
-                logger.error("exact prepared %s candidate is unavailable", mode)
-                raise DispatchError(f"prepared {mode} candidate is unavailable")
+                reject(f"prepared {mode} candidate is unavailable", DispatchError)
             result = self._execute_candidate(candidate, *args, **kwargs)
             self.records.append(DispatchRecord(mode, candidate.key))
             return result
@@ -518,8 +525,7 @@ class Dispatcher:
         validated by its own typed boundary after this method returns.
         """
         if mode not in ("auto", "native", "compile", "eager"):
-            logger.error("unknown alternate dispatch mode %r", mode)
-            raise DispatchError(f"unknown dispatch mode: {mode}")
+            reject(f"unknown dispatch mode: {mode}", DispatchError)
 
         def validate_alternate(value: object) -> object:
             """Convert malformed typed alternate payloads into recoverable errors."""
@@ -532,10 +538,11 @@ class Dispatcher:
             ):
                 raise
             except Exception as error:
-                logger.exception("alternate geometry result validation failed")
-                raise IncorrectResultError(
-                    "alternate geometry executor returned a malformed result"
-                ) from error
+                reject(
+                    "alternate geometry executor returned a malformed result",
+                    IncorrectResultError,
+                    cause=error,
+                )
 
         if mode == "eager":
             result = validate_alternate(eager_executor(*args, **kwargs))
@@ -544,8 +551,7 @@ class Dispatcher:
         if mode in ("native", "compile"):
             candidate = self._exact_candidate(key)
             if candidate is None or candidate.key.backend != mode:
-                logger.error("no exact prepared %s alternate candidate", mode)
-                raise DispatchError(f"no exact prepared {mode} candidate for key")
+                reject(f"no exact prepared {mode} candidate for key", DispatchError)
             unavailable_ecef = (
                 mode == "native" and not candidate.ecef_correctness_qualified
             )
@@ -554,16 +560,20 @@ class Dispatcher:
                 or unavailable_ecef
                 or candidate.quarantined
             ):
-                logger.error(
-                    "exact prepared %s alternate candidate is unavailable", mode
-                )
                 if unavailable_ecef and candidate.correctness_qualified:
-                    raise DispatchError("native ECEF candidate is unavailable")
-                raise DispatchError(f"prepared {mode} candidate is unavailable")
+                    reject(
+                        f"exact prepared {mode} alternate candidate is unavailable; "
+                        "native ECEF candidate is unavailable",
+                        DispatchError,
+                    )
+                reject(
+                    f"exact prepared {mode} alternate candidate is unavailable; "
+                    f"prepared {mode} candidate is unavailable",
+                    DispatchError,
+                )
             executor = alternate_executors.get(mode)
             if executor is None:
-                logger.error("no alternate executor is available for %s", mode)
-                raise DispatchError(f"no alternate {mode} executor is available")
+                reject(f"no alternate {mode} executor is available", DispatchError)
             result = self._execute_candidate(
                 candidate,
                 *args,
@@ -699,10 +709,11 @@ class Dispatcher:
             try:
                 executor = self._eager[key.device]
             except KeyError as error:
-                logger.error("no eager implementation for device %r", key.device)
-                raise DispatchError(
-                    "no same-device eager executor is available"
-                ) from error
+                reject(
+                    "no same-device eager executor is available",
+                    DispatchError,
+                    cause=error,
+                )
         return _call_eager(executor, key, *args, **kwargs)
 
     @staticmethod
@@ -713,16 +724,16 @@ class Dispatcher:
     ) -> object:
         """Apply an optional validator and common v2 result checks."""
         if result is None:
-            logger.error("geometry executor returned no result")
-            raise IncorrectResultError("geometry executor returned no result")
+            reject("geometry executor returned no result", IncorrectResultError)
         if isinstance(result, TransformResultV2):
             try:
                 result.validate()
             except Exception as error:
-                logger.exception("geometry result scientific validation failed")
-                raise IncorrectResultError(
-                    "geometry executor returned an invalid v2 result"
-                ) from error
+                reject(
+                    "geometry executor returned an invalid v2 result",
+                    IncorrectResultError,
+                    cause=error,
+                )
             if key is not None:
                 budget = _candidate_budget(key)
                 iterations = result.iterations
@@ -739,10 +750,11 @@ class Dispatcher:
             except RecoverableExecutionError:
                 raise
             except Exception as error:
-                logger.exception("geometry result validation failed")
-                raise IncorrectResultError(
-                    "geometry executor returned a malformed result"
-                ) from error
+                reject(
+                    "geometry executor returned a malformed result",
+                    IncorrectResultError,
+                    cause=error,
+                )
         field_names = getattr(result, "field_names", None)
         if callable(field_names):
             try:
@@ -769,10 +781,11 @@ class Dispatcher:
             except RecoverableExecutionError:
                 raise
             except Exception as error:
-                logger.exception("geometry result scientific validation failed")
-                raise IncorrectResultError(
-                    "geometry executor returned an invalid result"
-                ) from error
+                reject(
+                    "geometry executor returned an invalid result",
+                    IncorrectResultError,
+                    cause=error,
+                )
         if key is not None and hasattr(result, "iterations"):
             iterations = result.iterations
             budget = _candidate_budget(key)
@@ -801,8 +814,10 @@ _PINNED_NATIVE_MODULES: list[object] = []
 def pin_native_module(module: object) -> object:
     """Retain a loaded native module until process exit."""
     if module is None:
-        logger.error("cannot pin a null native module")
-        raise DispatchError("native module cannot be None")
+        reject(
+            "cannot pin a null native module; native module cannot be None",
+            DispatchError,
+        )
     if not any(existing is module for existing in _PINNED_NATIVE_MODULES):
         _PINNED_NATIVE_MODULES.append(module)
     return module

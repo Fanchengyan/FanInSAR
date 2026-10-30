@@ -12,7 +12,7 @@ import torch
 from tqdm import tqdm
 
 from faninsar.core import Loops, Pairs
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.runtime.device import parse_device
 from faninsar.timeseries.coherence_weight import (
     WeightFunc,
@@ -24,9 +24,6 @@ from faninsar.timeseries.models import TimeSeriesModels
 if TYPE_CHECKING:
     from numpy.typing import NDArray
     from torch._tensor import Tensor
-
-
-logger = setup_logger(__name__)
 
 #: Minimum Cholesky pivot ratio accepted by the fast (SPD) solve path.
 #: Floating-point Cholesky can slip through near-zero pivots, so pixels
@@ -383,8 +380,7 @@ class NSBASSolver:
             and not isinstance(unw, InterferogramStack)
         ):
             msg = "pass either stack= or unw/pairs, not both"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
 
         if isinstance(unw, InterferogramStack):
             stack = unw
@@ -392,9 +388,8 @@ class NSBASSolver:
 
         if stack is not None:
             if not isinstance(stack, InterferogramStack):
-                msg = "stack must be an InterferogramStack"
-                logger.error(msg, extra={"stack_type": type(stack).__name__})
-                raise TypeError(msg)
+                msg = f"stack must be an InterferogramStack, got {type(stack).__name__}"
+                reject(msg, TypeError)
             pairs = stack.pairs
             unw = stack.unwrapped_matrix()
             if coh is None and stack.coherence is not None:
@@ -402,17 +397,15 @@ class NSBASSolver:
 
         if pairs is None or unw is None:
             msg = "NSBASSolver requires InterferogramStack or (unw, pairs)"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
 
         if isinstance(pairs, Pairs):
             self._pairs = pairs
         elif isinstance(pairs, Sequence):
             self._pairs = Pairs.from_names(pairs)
         else:
-            msg = "pairs must be either Pairs or Sequence"
-            logger.error(msg, extra={"pairs_type": type(pairs).__name__})
-            raise TypeError(msg)
+            msg = f"pairs must be either Pairs or Sequence, got {type(pairs).__name__}"
+            reject(msg, TypeError)
 
         self._device = parse_device(device)
         self._dtype = dtype
@@ -519,21 +512,24 @@ class NSBASSolver:
 
         """
         if not isinstance(unw, (np.ndarray, torch.Tensor)):
-            msg = "input unw must be a numpy array or torch tensor"
-            logger.error(msg, extra={"unw_type": type(unw).__name__})
-            raise TypeError(msg)
+            msg = (
+                "input unw must be a numpy array or torch tensor, "
+                f"got {type(unw).__name__}"
+            )
+            reject(msg, TypeError)
         unw_np = _to_numpy(unw)
         if len(unw_np.shape) != 2:
-            msg = "input unw must be a 2D array with shape of (n_pair, n_pixel)"
-            logger.error(msg, extra={"shape": getattr(unw_np, "shape", None)})
-            raise ValueError(msg)
-        if unw_np.shape[0] != len(self.pairs):
-            msg = "input unw must have the same rows number as pairs number"
-            logger.error(
-                msg,
-                extra={"rows": unw_np.shape[0], "pairs": len(self.pairs)},
+            msg = (
+                "input unw must be a 2D array with shape of (n_pair, n_pixel), "
+                f"got shape {unw_np.shape}"
             )
-            raise ValueError(msg)
+            reject(msg, ValueError)
+        if unw_np.shape[0] != len(self.pairs):
+            msg = (
+                "input unw must have the same rows number as pairs number, "
+                f"got rows={unw_np.shape[0]} pairs={len(self.pairs)}"
+            )
+            reject(msg, ValueError)
         self._unw = unw_np
         self._rebuild_system()
 
@@ -546,9 +542,8 @@ class NSBASSolver:
     def set_G(self, G: np.ndarray | torch.Tensor) -> None:  # noqa: N802
         """Set ``G`` matrix for NSBAS ``d = Gm``."""
         if not isinstance(G, (np.ndarray, torch.Tensor)):
-            msg = "G must be a numpy array or torch tensor"
-            logger.error(msg, extra={"G_type": type(G).__name__})
-            raise TypeError(msg)
+            msg = f"G must be a numpy array or torch tensor, got {type(G).__name__}"
+            reject(msg, TypeError)
 
         self._G = torch.as_tensor(G, dtype=self.dtype, device=self.device)
 
@@ -597,9 +592,9 @@ class NSBASSolver:
             G_t = np.concat((G_tl, np.zeros((n_pt, len(self._pairs), n_param))), axis=2)  # noqa: N806
             G_b = np.repeat(G_b[None, :, :], n_pt, axis=0)  # noqa: N806
             return np.concat((G_t, G_b), axis=1)
-        msg = "G_tl must be either 2D or 3D array"
-        logger.error(msg, extra={"G_tlshape": getattr(G_tl, "shape", None)})
-        raise ValueError(msg)
+        msg = f"G_tl must be either 2D or 3D array, got shape {G_tl.shape}"
+        reject(msg, ValueError)
+        return None  # unreachable: reject always raises
 
     def _make_sbas_matrix(self) -> np.ndarray:
         """Make SBAS matrix."""
@@ -648,28 +643,28 @@ class NSBASSolver:
         g_sbas = self._make_sbas_matrix().astype(np.float64, copy=False)
         observations = np.array(self._unw, dtype=np.float64, copy=True)
         if observations.shape[0] != len(self.pairs):
-            msg = "unwrapped interferograms must have the same rows as pairs"
-            logger.error(
-                msg,
-                extra={"rows": observations.shape[0], "pairs": len(self.pairs)},
+            msg = (
+                "unwrapped interferograms must have the same rows as pairs, "
+                f"got rows={observations.shape[0]} pairs={len(self.pairs)}"
             )
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         weighted = self._weight_func != "no"
         if weighted and self._coh is None:
-            msg = "coherence is required when weight_func is not 'no'"
-            logger.error(msg, extra={"weight_func": self._weight_func})
-            raise ValueError(msg)
+            msg = (
+                "coherence is required when weight_func is not 'no', "
+                f"got weight_func={self._weight_func!r}"
+            )
+            reject(msg, ValueError)
 
         if self._coh is not None:
             coh_np = np.asarray(self._coh, dtype=np.float64)
             if coh_np.shape != observations.shape:
-                msg = "coh must have the same shape as unwrapped interferograms"
-                logger.error(
-                    msg,
-                    extra={"coh_shape": coh_np.shape, "unw_shape": observations.shape},
+                msg = (
+                    "coh must have the same shape as unwrapped interferograms, "
+                    f"got coh_shape={coh_np.shape} unw_shape={observations.shape}"
                 )
-                raise ValueError(msg)
+                reject(msg, ValueError)
             observations = np.where(
                 coh_np <= self._coh_threshold,
                 np.nan,
@@ -877,33 +872,28 @@ def device_mem_size(device: str | torch.device | None) -> int:
 def _check_model(model: TimeSeriesModels) -> None:
     """Check model is a TimeSeriesModels instance."""
     if not isinstance(model, TimeSeriesModels):
-        msg = "model must be a TimeSeriesModels instance"
-        logger.error(msg, extra={"model_type": type(model).__name__})
-        raise TypeError(msg)
+        msg = f"model must be a TimeSeriesModels instance, got {type(model).__name__}"
+        reject(msg, TypeError)
 
 
 def _check_gamma(gamma: float) -> None:
     """Update gamma and G by input gamma."""
     if not isinstance(gamma, (float, int)):
-        msg = "gamma must be either float or int"
-        logger.error(msg, extra={"gamma_type": type(gamma).__name__})
-        raise TypeError(msg)
+        msg = f"gamma must be either float or int, got {type(gamma).__name__}"
+        reject(msg, TypeError)
     if gamma <= 0:
-        msg = "gamma must be positive"
-        logger.error(msg, extra={"gamma": gamma})
-        raise ValueError(msg)
+        msg = f"gamma must be positive, got {gamma}"
+        reject(msg, ValueError)
 
 
 def _check_rcond(rcond: float) -> None:
     """Validate the relative cutoff for unconstrained directions."""
     if not isinstance(rcond, (float, int)) or isinstance(rcond, bool):
-        msg = "rcond must be either float or int"
-        logger.error(msg, extra={"rcond_type": type(rcond).__name__})
-        raise TypeError(msg)
+        msg = f"rcond must be either float or int, got {type(rcond).__name__}"
+        reject(msg, TypeError)
     if not 0.0 < float(rcond) < 1.0:
-        msg = "rcond must be in (0, 1)"
-        logger.error(msg, extra={"rcond": rcond})
-        raise ValueError(msg)
+        msg = f"rcond must be in (0, 1), got {rcond}"
+        reject(msg, ValueError)
 
 
 def _to_numpy(array: np.ndarray | torch.Tensor) -> np.ndarray:
@@ -912,9 +902,9 @@ def _to_numpy(array: np.ndarray | torch.Tensor) -> np.ndarray:
         return array
     if isinstance(array, torch.Tensor):
         return array.detach().cpu().numpy()
-    msg = "array must be a numpy array or torch tensor"
-    logger.error(msg, extra={"array_type": type(array).__name__})
-    raise TypeError(msg)
+    msg = f"array must be a numpy array or torch tensor, got {type(array).__name__}"
+    reject(msg, TypeError)
+    return None  # unreachable: reject always raises
 
 
 def _get_patch_col(
@@ -947,28 +937,26 @@ def _get_patch_col(
 
     """
     if G.ndim not in {2, 3}:
-        msg = "Dimension of G must be 2 or 3"
-        logger.error(msg, extra={"G_shape": getattr(G, "shape", None)})
-        raise ValueError(msg)
+        msg = f"Dimension of G must be 2 or 3, got shape {G.shape}"
+        reject(msg, ValueError)
     if d.ndim != 2:
-        msg = "d must be a 2D matrix"
-        logger.error(msg, extra={"d_shape": getattr(d, "shape", None)})
-        raise ValueError(msg)
+        msg = f"d must be a 2D matrix, got shape {d.shape}"
+        reject(msg, ValueError)
     if mem_size <= 0:
-        msg = "mem_size must be positive"
-        logger.error(msg, extra={"mem_size": mem_size})
-        raise ValueError(msg)
+        msg = f"mem_size must be positive, got {mem_size}"
+        reject(msg, ValueError)
     if safe_factor <= 0:
-        msg = "safe_factor must be positive"
-        logger.error(msg, extra={"safe_factor": safe_factor})
-        raise ValueError(msg)
+        msg = f"safe_factor must be positive, got {safe_factor}"
+        reject(msg, ValueError)
 
     m, n = d.shape
     r = G.shape[-1]
     if G.ndim == 3 and G.shape[0] != n:
-        msg = "The first dimension of 3D G must match the number of columns in d"
-        logger.error(msg, extra={"G_shape": G.shape, "d_shape": d.shape})
-        raise ValueError(msg)
+        msg = (
+            "The first dimension of 3D G must match the number of columns "
+            f"in d, got G_shape={G.shape} d_shape={d.shape}"
+        )
+        reject(msg, ValueError)
 
     value_size = torch.tensor([], dtype=dtype).element_size()
     bool_size = torch.tensor([], dtype=torch.bool).element_size()
@@ -1021,13 +1009,11 @@ def _calculate_residual(
     """
     device = parse_device(device)
     if G.ndim not in {2, 3}:
-        msg = "Dimension of G must be 2 or 3"
-        logger.error(msg, extra={"G_shape": getattr(G, "shape", None)})
-        raise ValueError(msg)
+        msg = f"Dimension of G must be 2 or 3, got shape {G.shape}"
+        reject(msg, ValueError)
     if d.ndim != 2:
-        msg = "d must be a 2D matrix"
-        logger.error(msg, extra={"d_shape": getattr(d, "shape", None)})
-        raise ValueError(msg)
+        msg = f"d must be a 2D matrix, got shape {d.shape}"
+        reject(msg, ValueError)
 
     residual = torch.empty(d.shape, dtype=dtype, device=device)
     patch_col = _get_patch_col(G, d, device_mem_size(device), dtype)

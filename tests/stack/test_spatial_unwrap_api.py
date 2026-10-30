@@ -66,7 +66,6 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
     stack = S1Stack.from_safes(
         safe_paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         pairs=Pairs.from_names(["20240101_20240113"]),
         multilook=(1, 1),
     ).prepare_scenes()

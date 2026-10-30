@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, ParamSpec, TypeVar
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
@@ -78,8 +78,7 @@ def _import_torch() -> torch:
         message = (
             "torch is required for accelerated kernels; install FanInSAR dependencies"
         )
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
     return torch
 
 
@@ -243,8 +242,7 @@ def carrier_phase_at_points_torch(
         message = (
             f"rows shape {rows64.shape} and cols shape {cols64.shape} must broadcast"
         )
-        logger.exception(message)
-        raise ValueError(message) from error
+        reject(message, ValueError, cause=error)
     torch = _import_torch()
     resolved = resolve_torch_device(device)
     float_dtype = _float_dtype(resolved, "carrier_phase", precision)
@@ -882,8 +880,7 @@ def remove_topographic_phase_torch(
                 f"topo_phase shape {topo.shape} cannot broadcast to "
                 f"ifg shape {ifg.shape}"
             )
-            logger.exception(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
     torch = _import_torch()
     resolved = resolve_torch_device(device)
     complex_dtype = _complex_dtype(

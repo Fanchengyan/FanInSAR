@@ -13,14 +13,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 
 if TYPE_CHECKING:
     from faninsar.core.orbit import OrbitMetadata
     from faninsar.processing.geometry.coordinates import RadarGrid
-
-logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +69,7 @@ class RadarGeometryModel:
         start = self.sensing_start
         if not isinstance(start, datetime):
             message = "sensing_start must be a datetime"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         return start + timedelta(
             seconds=float(azimuth_index) * self.azimuth_time_interval_s
         )
@@ -82,8 +79,7 @@ class RadarGeometryModel:
         start = self.sensing_start
         if not isinstance(start, datetime):
             message = "sensing_start must be a datetime"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         sensing_offset_s = (start - self.orbit.epoch).total_seconds()
         return (
             sensing_offset_s

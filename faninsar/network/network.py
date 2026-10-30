@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.network.products import (
     NetworkProduct,
     NetworkProductIndex,
@@ -32,22 +32,6 @@ if TYPE_CHECKING:
     from faninsar.timeseries.models import TimeSeriesModels
 
 logger = setup_logger(__name__)
-
-
-class NetworkConstructionError(RuntimeError):
-    """Base error raised when a path cannot construct a :class:`Network`."""
-
-
-class NetworkPathError(NetworkConstructionError, FileNotFoundError):
-    """Raised when the requested Network root is missing or not a directory."""
-
-
-class NetworkAnalysisError(NetworkConstructionError):
-    """Base error raised when a Network cannot be analyzed."""
-
-
-class IncompleteNetworkProductError(NetworkAnalysisError):
-    """Raised when a Network has no complete interferogram product set."""
 
 
 class NetworkContract:
@@ -111,9 +95,8 @@ class NetworkContract:
             else NetworkProductIndex(tuple(products))
         )
         if not index.products:
-            logger.error("Network snapshot contains no products")
             message = "Network snapshot requires at least one product"
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         index.homogeneous()
         object.__setattr__(self, "_network_product_index", index)
         object.__setattr__(self, "_network_generation_id", generation_id)
@@ -124,16 +107,14 @@ class NetworkContract:
         index = self.network_product_index
         generation_id = self.network_generation_id
         if generation_id is None or index is None:
-            logger.error("Network analysis requested before a product refresh")
             message = (
                 "Network analysis is unavailable before a complete product refresh"
             )
-            raise RuntimeError(message)
+            reject(message, RuntimeError, logger=logger)
         callback = getattr(self, "_analyze_network_products", None)
         if not callable(callback):
-            logger.error("Network has no concrete analysis implementation")
             message = "concrete Network must implement _analyze_network_products"
-            raise NotImplementedError(message)
+            reject(message, NotImplementedError, logger=logger)
         # Keep a local immutable reference for the whole call.  A concurrent
         # refresh may advance the object for the next call, but cannot alter
         # this invocation's product cohort.
@@ -150,9 +131,9 @@ class Network(NetworkContract):
 
     Raises
     ------
-    NetworkPathError
+    FileNotFoundError
         If ``root`` is not a directory.
-    IncompleteNetworkProductError
+    RuntimeError
         If the planned Pair network has no complete IFG product set.
 
     """
@@ -165,12 +146,10 @@ class Network(NetworkContract):
             resolved_root = Path(root)
         except TypeError as exc:
             message = f"Network root must be path-like, got {root!r}"
-            logger.exception(message)
-            raise NetworkConstructionError(message) from exc
+            reject(message, RuntimeError, cause=exc, logger=logger)
         if not resolved_root.is_dir():
             message = f"Network directory not found: {resolved_root}"
-            logger.error(message)
-            raise NetworkPathError(message)
+            reject(message, FileNotFoundError, logger=logger)
         from faninsar.stack.session import Stack
 
         stack = Stack.open(resolved_root)
@@ -178,8 +157,7 @@ class Network(NetworkContract):
             message = (
                 f"Stack at {resolved_root} has no complete interferogram product set"
             )
-            logger.error(message)
-            raise IncompleteNetworkProductError(message)
+            reject(message, RuntimeError, logger=logger)
         self._bind_stack(stack)
 
     @classmethod
@@ -232,15 +210,14 @@ class Network(NetworkContract):
         ------
         TypeError
             If ``registry`` is supplied without a string reader selector.
-        NetworkConstructionError
+        RuntimeError
             If a selected reader cannot be instantiated or does not expose
             the required ``read`` method.
 
         """
         if registry is not None and not isinstance(reader, str):
             message = "registry is valid only with a registered reader string"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
 
         if reader is None:
             # Canonical mode intentionally does not consult the entry-point
@@ -252,8 +229,7 @@ class Network(NetworkContract):
             resolver = getattr(registry or cls.readers, "resolve", None)
             if not callable(resolver):
                 message = "reader registry must expose a callable resolve method"
-                logger.error(message)
-                raise TypeError(message)
+                reject(message, TypeError, logger=logger)
             selected_class = resolver(reader)
             selected = cls._instantiate_reader(selected_class, reader)
         elif isinstance(reader, type):
@@ -264,8 +240,7 @@ class Network(NetworkContract):
         read = getattr(selected, "read", None)
         if not callable(read):
             message = "selected Network reader must define a callable read method"
-            logger.error(message)
-            raise NetworkConstructionError(message)
+            reject(message, RuntimeError, logger=logger)
         return read(path)
 
     @staticmethod
@@ -273,14 +248,12 @@ class Network(NetworkContract):
         """Construct one zero-argument reader class with typed diagnostics."""
         if not isinstance(reader, type):
             message = f"registered Network reader {name!r} must be a class"
-            logger.error(message)
-            raise NetworkConstructionError(message)
+            reject(message, RuntimeError, logger=logger)
         try:
             return reader()
         except Exception as error:
             message = f"could not instantiate Network reader {name!r}"
-            logger.exception(message)
-            raise NetworkConstructionError(message) from error
+            reject(message, RuntimeError, cause=error, logger=logger)
 
     @property
     def root(self) -> Path:
@@ -333,9 +306,8 @@ class Network(NetworkContract):
             if unwrapped.ndim == 3:
                 unwrapped = unwrapped.reshape(unwrapped.shape[0], -1)
         except Exception as exc:
-            logger.exception("Network unwrapped phase products cannot be read")
             message = "could not load unwrapped phase stack from Network Dataset"
-            raise ValueError(message) from exc
+            reject(message, ValueError, cause=exc, logger=logger)
         try:
             coherence_data = self.interferograms.open_stack("coherence", pairs=pair_obj)
             coherence = np.asarray(coherence_data.values, dtype=np.float64)
@@ -373,8 +345,7 @@ class Network(NetworkContract):
             index = NetworkProductIndex(tuple(products)).homogeneous()
         except (TypeError, ValueError) as exc:
             message = f"Network product registration rejected: {exc}"
-            logger.exception(message)
-            raise NetworkConstructionError(message) from exc
+            reject(message, RuntimeError, cause=exc, logger=logger)
         # Keep the Dataset-facing registration and the shared snapshot
         # contract on one immutable index.  Stack uses the same protected
         # refresh operation directly; external Networks use this public path.
@@ -406,12 +377,10 @@ class Network(NetworkContract):
         """
         if not isinstance(solver, str):
             message = f"Network time-series solver must be text, got {solver!r}"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError, logger=logger)
         if solver.lower() not in {"sbas", "nsbas"}:
             message = f"unknown Network time-series solver {solver!r}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if solver.lower() == "nsbas" and model is None:
             # Preserve the historical compatibility path.  The new ``invert``
             # seam intentionally defines model omission as SBAS, so routing
@@ -458,14 +427,12 @@ class Network(NetworkContract):
         """
         if self.interferograms is None:
             message = "Network has no interferogram products to invert"
-            logger.error(message)
-            raise IncompleteNetworkProductError(message)
+            reject(message, RuntimeError, logger=logger)
         try:
             stack = self.to_ifg_stack(pairs=pairs)
         except Exception as exc:
             message = f"Network products cannot be opened for inversion: {exc}"
-            logger.exception(message)
-            raise IncompleteNetworkProductError(message) from exc
+            reject(message, RuntimeError, cause=exc, logger=logger)
 
         normalized_model = self._normalize_inversion_model(model, stack.pairs.dates)
         if normalized_model is None:
@@ -504,8 +471,7 @@ class Network(NetworkContract):
             increments, _parameters, residual_pairs, _residual_model = raw
         else:
             message = "NSBAS solver returned an invalid result"
-            logger.error(message)
-            raise NetworkAnalysisError(message)
+            reject(message, RuntimeError, logger=logger)
         from faninsar.timeseries.results import TimeSeries
 
         increments_array = np.asarray(increments, dtype=np.float32)
@@ -514,12 +480,10 @@ class Network(NetworkContract):
         n_dates = len(stack.pairs.dates)
         if increments_array.shape != (n_dates - 1, n_pixels):
             message = "NSBAS solver returned increments with an invalid shape"
-            logger.error(message)
-            raise NetworkAnalysisError(message)
+            reject(message, RuntimeError, logger=logger)
         if residual_array.shape != (len(stack.pairs), n_pixels):
             message = "NSBAS solver returned residuals with an invalid shape"
-            logger.error(message)
-            raise NetworkAnalysisError(message)
+            reject(message, RuntimeError, logger=logger)
         cumulative_array = np.concatenate(
             [
                 np.zeros((1, n_pixels), dtype=np.float32),
@@ -563,16 +527,14 @@ class Network(NetworkContract):
                     f"{model.__name__} could not be constructed from dates; "
                     "pass a configured instance instead"
                 )
-                logger.exception(message)
-                raise TypeError(message) from exc
+                reject(message, TypeError, cause=exc, logger=logger)
         if not isinstance(model, TimeSeriesModels):
             message = "model must be a TimeSeriesModels subclass or configured instance"
             logger.error(message, extra={"model_type": type(model).__name__})
             raise TypeError(message)
         if not np.array_equal(np.asarray(model.dates), np.asarray(dates)):
             message = "configured model dates must exactly match selected pairs dates"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         return model
 
     def _spatial_metadata_for_result(self, result: Any) -> Any:
@@ -586,8 +548,7 @@ class Network(NetworkContract):
             raw = source() if callable(source) else source
         except Exception as error:
             message = "Network spatial metadata could not be read"
-            logger.exception(message)
-            raise NetworkAnalysisError(message) from error
+            reject(message, RuntimeError, cause=error, logger=logger)
         if raw is None:
             return getattr(result, "spatial", None)
         if isinstance(raw, SpatialMetadata):
@@ -623,8 +584,7 @@ class Network(NetworkContract):
             )
         except (KeyError, TypeError, ValueError) as error:
             message = "Network spatial metadata is invalid"
-            logger.exception(message)
-            raise NetworkAnalysisError(message) from error
+            reject(message, RuntimeError, cause=error, logger=logger)
         expected_pixels = shape[0] * shape[1]
         for name in (
             "phase_increments_rad",
@@ -645,8 +605,7 @@ class Network(NetworkContract):
                     f"Network spatial shape {shape} does not match "
                     f"TimeSeries {name} shape {array.shape}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError, logger=logger)
         return spatial
 
     def _invert_legacy_nsbas(
@@ -658,14 +617,12 @@ class Network(NetworkContract):
         """Run the historical ``analyze_time_series(solver='nsbas')`` path."""
         if self.interferograms is None:
             message = "Network has no interferogram products to invert"
-            logger.error(message)
-            raise IncompleteNetworkProductError(message)
+            reject(message, RuntimeError, logger=logger)
         try:
             stack = self.to_ifg_stack(pairs=pairs)
         except Exception as exc:
             message = f"Network products cannot be opened for inversion: {exc}"
-            logger.exception(message)
-            raise IncompleteNetworkProductError(message) from exc
+            reject(message, RuntimeError, cause=exc, logger=logger)
 
         return self._run_nsbas(stack, model=None, **kwargs)
 
@@ -713,9 +670,5 @@ Network.readers = ReaderRegistry()
 
 
 __all__ = [
-    "IncompleteNetworkProductError",
     "Network",
-    "NetworkAnalysisError",
-    "NetworkConstructionError",
-    "NetworkPathError",
 ]

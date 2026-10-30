@@ -8,10 +8,8 @@ from typing import Final
 
 import torch
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.runtime.device import cuda_available, mps_available
-
-logger = setup_logger(__name__)
 
 
 class DeviceKind(StrEnum):
@@ -80,8 +78,7 @@ def select_device_for_kernel(
     row = next((item for item in KERNEL_CAPABILITIES if item.name == kernel), None)
     if row is None:
         message = f"unknown kernel: {kernel}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     available = probe_devices()
     order = [preferred_kind]
@@ -99,8 +96,7 @@ def select_device_for_kernel(
         if supported and present:
             return kind
     message = f"no available device supports kernel {kernel!r}"
-    logger.error(message)
-    raise ValueError(message)
+    return reject(message, ValueError)
 
 
 def complex_multiply(

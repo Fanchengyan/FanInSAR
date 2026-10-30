@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import metadata
 from typing import TYPE_CHECKING, Any
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from .protocols import NetworkReader
@@ -13,22 +13,6 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 ENTRY_POINT_GROUP = "faninsar.network_readers"
-
-
-class ReaderRegistryError(RuntimeError):
-    """Base error raised for invalid Network reader registrations."""
-
-
-class DuplicateReaderError(ReaderRegistryError):
-    """Raised when a reader name has more than one registration."""
-
-
-class ReaderNotFoundError(ReaderRegistryError):
-    """Raised when no reader is registered under a requested name."""
-
-
-class InvalidReaderError(ReaderRegistryError):
-    """Raised when a reader does not implement the one-method protocol."""
 
 
 def _validate_name(name: object) -> str:
@@ -46,11 +30,10 @@ def _validate_reader_class(reader: object) -> type[NetworkReader]:
     """Validate a zero-argument reader class without importing an instance."""
     if not isinstance(reader, type):
         logger.error("Network reader registration is not a class: %r", reader)
-        raise InvalidReaderError("registered readers must be classes")  # noqa: EM101, TRY003
+        raise ValueError("registered readers must be classes")  # noqa: EM101, TRY003, TRY004
     if not callable(getattr(reader, "read", None)):
-        logger.error("Network reader class has no callable read method: %r", reader)
         message = "reader class must define a callable read method"
-        raise InvalidReaderError(message)
+        reject(message, ValueError, logger=logger)
     return reader
 
 
@@ -102,20 +85,17 @@ class ReaderRegistry:
 
         Raises
         ------
-        DuplicateReaderError
-            If *name* is already registered in this process.
-        InvalidReaderError
-            If *reader* is not a class with a callable ``read`` method.
         ValueError
-            If *name* is not a stable non-empty selector.
+            If *name* is already registered, if *reader* is not a class with
+            a callable ``read`` method, or if *name* is not a stable non-empty
+            selector.
 
         """
         normalized_name = _validate_name(name)
         reader_class = _validate_reader_class(reader)
         if normalized_name in self._readers:
-            logger.error("Network reader name is already registered: %s", name)
             message = f"reader name already registered: {name}"
-            raise DuplicateReaderError(message)
+            reject(message, ValueError, logger=logger)
         self._readers[normalized_name] = reader_class
 
     @property
@@ -136,15 +116,13 @@ class ReaderRegistry:
             return self._readers[normalized_name]
         entry_point = candidates.get(normalized_name)
         if entry_point is None:
-            logger.error("unknown Network reader name: %s", normalized_name)
             message = f"no Network reader is registered as {normalized_name!r}"
-            raise ReaderNotFoundError(message)
+            reject(message, LookupError, logger=logger)
         try:
             loaded = entry_point.load()
         except Exception as error:
-            logger.exception("could not import Network reader %s", normalized_name)
             message = f"could not load Network reader {normalized_name!r}"
-            raise InvalidReaderError(message) from error
+            reject(message, ValueError, cause=error, logger=logger)
         reader_class = _validate_reader_class(loaded)
         self._readers[normalized_name] = reader_class
         return reader_class
@@ -162,9 +140,8 @@ class ReaderRegistry:
         duplicate_names.update(set(grouped).intersection(self._readers))
         if duplicate_names:
             names = ", ".join(sorted(duplicate_names))
-            logger.error("duplicate Network reader registrations: %s", names)
             message = f"duplicate Network reader names: {names}"
-            raise DuplicateReaderError(message)
+            reject(message, ValueError, logger=logger)
         return {name: entries[0] for name, entries in grouped.items()}
 
 
@@ -184,9 +161,5 @@ def _entry_points_for_group(group: str) -> tuple[Any, ...]:
 
 __all__ = [
     "ENTRY_POINT_GROUP",
-    "DuplicateReaderError",
-    "InvalidReaderError",
-    "ReaderNotFoundError",
     "ReaderRegistry",
-    "ReaderRegistryError",
 ]

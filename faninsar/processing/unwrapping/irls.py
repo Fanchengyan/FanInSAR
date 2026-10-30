@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from scipy import ndimage
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
 from faninsar.processing.unwrapping.errors import NoValidSupportError
@@ -19,8 +19,7 @@ logger = setup_logger(__name__)
 
 def _raise_contract(message: str) -> None:
     """Log and raise a public input contract error."""
-    logger.error("spatial unwrap contract rejected: %s", message)
-    raise ValueError(message)
+    reject(message, ValueError)
 
 
 if TYPE_CHECKING:
@@ -65,8 +64,7 @@ def _resolve_device(device: DeviceName) -> str:
         import torch
     except ImportError:
         message = "IRLS requires PyTorch; install FanInSAR with core dependencies"
-        logger.exception(message)
-        raise ImportError(message) from None
+        reject(message, ImportError, cause=None)
 
     match device:
         case "auto":
@@ -143,8 +141,7 @@ def _torch_irls(
         torch_dct = importlib.import_module("torch_dct")
     except ImportError:
         message = "IRLS requires torch-dct; install FanInSAR with core dependencies"
-        logger.exception(message)
-        raise ImportError(message) from None
+        reject(message, ImportError, cause=None)
 
     torch_device = torch.device(device)
     dct = torch_dct.dct
@@ -497,8 +494,7 @@ class SpatialIRLS(SpatialUnwrapper):
 
         labels, anchors, horizontal, vertical = self._graph(support, coherence)
         if not torch.any(support):
-            logger.error("SpatialIRLS input has no valid support")
-            raise NoValidSupportError
+            reject("SpatialIRLS input has no valid support", NoValidSupportError)
 
         output = torch.full_like(phase, torch.nan)
         output[support] = phase[support]
@@ -775,8 +771,7 @@ class SpatialIRLS(SpatialUnwrapper):
                 "SpatialIRLS requires torch-dct for its DCT-II/DCT-III "
                 "preconditioner; install FanInSAR with core dependencies"
             )
-            logger.exception(message)
-            raise ImportError(message) from None
+            reject(message, ImportError, cause=None)
 
         dct = torch_dct.dct
         idct = torch_dct.idct

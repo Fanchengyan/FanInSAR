@@ -9,9 +9,7 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,19 +35,16 @@ def _validate_input(
     """Validate shared tensor and support-mask preconditions."""
     if interferogram.ndim != 2 or not interferogram.is_complex():
         message = "phase filter input must be a 2-D complex tensor"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     finite = torch.isfinite(interferogram.real) & torch.isfinite(interferogram.imag)
     if valid_mask is None:
         return finite
     if valid_mask.shape != interferogram.shape:
         message = "phase filter valid_mask must match interferogram shape"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if valid_mask.device != interferogram.device or valid_mask.dtype != torch.bool:
         message = "phase filter valid_mask must be bool on the input device"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return valid_mask & finite
 
 

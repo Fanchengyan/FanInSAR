@@ -13,15 +13,13 @@ from pyproj.crs import CRS
 
 from faninsar.data.query.points import Points
 from faninsar.io.export.kmz import dataarray2kmz
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.alg import detrend_surface as _detrend_surface
 
 if TYPE_CHECKING:
     from os import PathLike
 
     from faninsar.core.types import CrsLike
-
-logger = setup_logger(__name__)
 
 _AUTO_DIM_NAME = "auto"
 _SPATIAL_DIM_PAIRS = (
@@ -97,8 +95,7 @@ def _resolve_auto_spatial_dims(
             f"{_SPATIAL_DIM_PAIRS}, but found dimensions {dimension_names}. "
             "Please pass x_dim and y_dim explicitly."
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if x_dim == _AUTO_DIM_NAME:
         for x_candidate, y_candidate in _SPATIAL_DIM_PAIRS:
@@ -114,8 +111,7 @@ def _resolve_auto_spatial_dims(
                 f"Cannot infer x dimension for y_dim={y_dim!r}. "
                 f"Found dimensions {dimension_names}. Please pass x_dim explicitly."
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
     if y_dim == _AUTO_DIM_NAME:
         for x_candidate, y_candidate in _SPATIAL_DIM_PAIRS:
@@ -131,8 +127,7 @@ def _resolve_auto_spatial_dims(
                 f"Cannot infer y dimension for x_dim={x_dim!r}. "
                 f"Found dimensions {dimension_names}. Please pass y_dim explicitly."
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
     missing_dimensions = [
         dimension_name
@@ -144,8 +139,7 @@ def _resolve_auto_spatial_dims(
             f"Spatial dimensions {missing_dimensions} are not present in the "
             f"data array dimensions {dimension_names}."
         )
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     return resolved_x_dim, resolved_y_dim
 
@@ -430,15 +424,13 @@ class FanInSARDataArrayAccessor:
         if mask is not None:
             if not isinstance(mask, xr.DataArray):
                 msg = f"mask must be an xarray.DataArray, got {type(mask).__name__}"
-                logger.error(msg)
-                raise TypeError(msg)
+                reject(msg, TypeError)
             if not set(mask.dims) <= {resolved_y_dim, resolved_x_dim}:
                 msg = (
                     f"mask dims {tuple(mask.dims)} must be a subset of "
                     f"({resolved_y_dim!r}, {resolved_x_dim!r})."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             mask = mask.transpose(resolved_y_dim, resolved_x_dim)
             transposed, mask = xr.align(transposed, mask, join="exact")
             mask_tensor = torch.as_tensor(np.ascontiguousarray(mask.values))
@@ -462,8 +454,7 @@ class FanInSARDataArrayAccessor:
                     "ref_points must be a faninsar.data.query.Points instance, "
                     f"got {type(ref_points).__name__}"
                 )
-                logger.error(msg)
-                raise TypeError(msg)
+                reject(msg, TypeError)
             array_crs = None
             with contextlib.suppress(RuntimeError):
                 array_crs = transposed.rio.crs
@@ -475,8 +466,7 @@ class FanInSARDataArrayAccessor:
                         "CRS cannot be transformed. Call set_spatial_ref first "
                         "or pass points without a CRS."
                     )
-                    logger.error(msg)
-                    raise ValueError(msg)
+                    reject(msg, ValueError)
             elif (
                 points.crs is not None and CRS.from_user_input(array_crs) != points.crs
             ):
@@ -498,8 +488,7 @@ class FanInSARDataArrayAccessor:
                     "All reference points sample NaN values for at least one "
                     "slice; choose reference points on valid pixels."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError)
             detrended = detrended - offset
             surface = surface + offset
 

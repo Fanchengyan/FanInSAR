@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -73,8 +73,7 @@ def force_unwrapped_match_complex_along_range(
     z = np.asarray(complex_ifg)
     if unw.ndim != 2 or z.shape != unw.shape:
         message = f"shape mismatch: {unw.shape} vs {z.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     height, width = unw.shape
     seed = int(np.clip(seed_col, 0, width - 1))
@@ -82,8 +81,7 @@ def force_unwrapped_match_complex_along_range(
     hi = min(width - 1, int(col_hi))
     if lo > hi:
         message = f"invalid column range col_lo={lo} col_hi={hi}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if not (lo <= seed <= hi):
         seed = int(np.clip(seed, lo, hi))
 
@@ -222,8 +220,7 @@ def majority_cycle_align(
     z = np.asarray(complex_ifg)
     if unw.ndim != 2 or z.shape != unw.shape:
         message = f"shape mismatch: {unw.shape} vs {z.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     height, width = unw.shape
     wrap = np.angle(z)
@@ -231,8 +228,7 @@ def majority_cycle_align(
         coh = np.asarray(coherence, dtype=np.float64)
         if coh.shape != unw.shape:
             message = f"coherence shape {coh.shape} != phase shape {unw.shape}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
     else:
         coh = np.ones(unw.shape, dtype=np.float64)
 
@@ -382,8 +378,7 @@ def reintegrate_highcoh_from_seed(
     z = np.asarray(complex_ifg)
     if unw.ndim != 2 or z.shape != unw.shape:
         message = f"shape mismatch: {unw.shape} vs {z.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = unw.shape
     if coherence is not None:
         coh = np.asarray(coherence, dtype=np.float64)
@@ -490,8 +485,7 @@ def reintegrate_unwrapped_along_range(
     z = np.asarray(complex_ifg)
     if unw.ndim != 2 or z.shape != unw.shape:
         message = f"shape mismatch: {unw.shape} vs {z.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = unw.shape
     report: dict[str, Any] = {
         "applied": False,
@@ -649,8 +643,7 @@ def correct_unwrapped_seam_cycles(
             f"unwrapped_phase and complex_ifg must share 2-D shape; "
             f"got {unw.shape} and {z.shape}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     height, width = unw.shape
     report: dict[str, Any] = {
@@ -671,8 +664,7 @@ def correct_unwrapped_seam_cycles(
         coh = np.asarray(coherence, dtype=np.float64)
         if coh.shape != unw.shape:
             message = f"coherence shape {coh.shape} != phase shape {unw.shape}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
     else:
         coh = np.ones(unw.shape, dtype=np.float64)
 

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,14 +20,12 @@ class Sensor:
     def open_product(self, _uri: str, **_kwargs: Any) -> Any:
         """Open a mission product. Override in subclasses."""
         message = f"{type(self).__name__}.open_product"
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError)
 
     def to_slc_product(self, _handle: Any, **_kwargs: Any) -> Any:
         """Convert an open handle to SLCProduct. Override in subclasses."""
         message = f"{type(self).__name__}.to_slc_product"
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError)
 
     def read_slc_window(
         self,
@@ -39,8 +35,7 @@ class Sensor:
     ) -> Any:
         """Read a complex SLC window. Override in subclasses."""
         message = f"{type(self).__name__}.read_slc_window"
-        logger.error(message)
-        raise NotImplementedError(message)
+        reject(message, NotImplementedError)
 
 
 def register(
@@ -54,8 +49,7 @@ def register(
         key = name or getattr(sensor_cls, "name", None) or sensor_cls.__name__.lower()
         if not key:
             message = "mission register requires a non-empty name"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         sensor_cls.name = key  # type: ignore[attr-defined]
         _REGISTRY[key] = sensor_cls
         return sensor_cls
@@ -78,8 +72,7 @@ def get_mission(name: str) -> type:
     list_missions()
     if name not in _REGISTRY:
         message = f"unknown mission {name!r}; known={list(_REGISTRY)}"
-        logger.error(message)
-        raise KeyError(message)
+        reject(message, KeyError)
     return _REGISTRY[name]
 
 

@@ -8,12 +8,10 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
-
-logger = setup_logger(__name__)
 
 WeightFunc = Literal["no", "coh", "fim", "var"]
 
@@ -57,8 +55,7 @@ def normalize_weight_func(weight_func: WeightFunc | str | None) -> WeightFunc:
     name = _WEIGHT_FUNC_ALIASES.get(name, name)
     if name not in _CANONICAL_WEIGHT_FUNCS:
         msg = f"Unrecognized weight_func {weight_func!r}"
-        logger.error(msg, extra={"weight_func": weight_func})
-        raise ValueError(msg)
+        reject(msg, ValueError)
     return name  # type: ignore[return-value]
 
 

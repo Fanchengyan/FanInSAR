@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry import DEM
 from faninsar.processing.geometry.ellipsoid import llh_to_ecef
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
@@ -57,8 +57,7 @@ def compute_geometric_phase_from_geo(
     wavelength = model_ref.wavelength_m if wavelength_m is None else wavelength_m
     if wavelength <= 0:
         message = "wavelength must be positive"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     broadcast_inputs = [
         np.asarray(latitude_deg, dtype=np.float64),
@@ -168,8 +167,7 @@ def compute_topographic_phase(
         wavelength_m = model_ref.wavelength_m
     if wavelength_m <= 0:
         message = "wavelength must be positive"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     geo = run_rdr2geo(
         model_ref,
@@ -253,8 +251,7 @@ def remove_topographic_phase(
                 f"topo_phase shape {topo.shape} cannot broadcast to "
                 f"ifg shape {ifg.shape}"
             )
-            logger.exception(message)
-            raise ValueError(message) from exc
+            reject(message, ValueError, cause=exc)
     return ifg * np.exp(-1j * topo)
 
 
@@ -459,18 +456,15 @@ def estimate_residual_azimuth_ramp(
     """
     if executor not in {"numpy", "torch"}:
         message = f"unsupported azimuth-ramp executor: {executor!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if int(candidate_chunk) < 1:
         message = "candidate_chunk must be a positive integer"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     ifg = np.asarray(complex_ifg)
     ref = np.asarray(reference_phase, dtype=np.float64)
     if ifg.shape != ref.shape:
         message = f"reference_phase shape {ref.shape} must match ifg shape {ifg.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     residual, weights, mask = _azimuth_ramp_weights(ifg, ref, coherence, coh_thr)
     if not np.any(mask):
         return 0.0
@@ -554,8 +548,7 @@ def estimate_residual_topographic_scale(
     topo = np.asarray(topo_phase, dtype=np.float64)
     if ifg.shape != topo.shape:
         message = f"topo_phase shape {topo.shape} must match ifg shape {ifg.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     ph = np.angle(ifg)
     mask = np.isfinite(ph) & np.isfinite(topo) & (np.abs(ifg) > 0)
     if coherence is not None:
@@ -608,8 +601,7 @@ def _largest_connected_component_mask(
             f"connected_components shape {labels.shape} must match mask shape "
             f"{base_mask.shape}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     valid_labels = labels[base_mask & (labels > 0)]
     if valid_labels.size == 0:
         return base_mask
@@ -672,8 +664,7 @@ def estimate_residual_phase_screen_from_unwrapped(
     unw = np.asarray(unwrapped_phase, dtype=np.float64)
     if unw.ndim != 2:
         message = f"unwrapped_phase must be 2-D, got shape {unw.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = unw.shape
     mask = np.isfinite(unw)
     if coherence is not None:
@@ -783,8 +774,7 @@ def estimate_residual_phase_screen(
     ifg = np.asarray(complex_ifg)
     if ifg.ndim != 2:
         message = f"complex_ifg must be 2-D, got shape {ifg.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if unwrapped_phase is not None:
         return estimate_residual_phase_screen_from_unwrapped(
             unwrapped_phase,
@@ -921,8 +911,7 @@ def estimate_residual_height_poly_screen(
     hgt = np.asarray(height_m, dtype=np.float64)
     if unw.shape != hgt.shape:
         message = f"height_m shape {hgt.shape} must match phase shape {unw.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = unw.shape
     mask = np.isfinite(unw) & np.isfinite(hgt)
     if coherence is not None:
@@ -1047,8 +1036,7 @@ def estimate_tiled_residual_height_screen(
     hgt = np.asarray(height_m, dtype=np.float64)
     if unw.shape != hgt.shape:
         message = f"height_m shape {hgt.shape} must match phase shape {unw.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     height, width = unw.shape
     mask = np.isfinite(unw) & np.isfinite(hgt)
     if coherence is not None:
@@ -1177,8 +1165,7 @@ def remove_residual_phase_screen(
     screen = np.asarray(phase_screen, dtype=np.float64)
     if ifg.shape != screen.shape:
         message = f"phase_screen shape {screen.shape} must match ifg shape {ifg.shape}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return (ifg * np.exp(-1j * screen)).astype(ifg.dtype, copy=False)
 
 
@@ -1361,7 +1348,6 @@ def copernicus_glo30_dem(
     path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:
         message = f"Copernicus GLO-30 tile not found for {filename} under {base}"
-        logger.error(message)
-        raise FileNotFoundError(message)
+        reject(message, FileNotFoundError)
     del device
     return DEM.from_raster(path, vertical_datum="egm2008")

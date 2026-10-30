@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 from .orbit import OrbitInterpolator, OrbitState
 
@@ -15,8 +15,6 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from faninsar.core.orbit import OrbitMetadata
-
-logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,8 +50,7 @@ def zero_doppler_residual_hz(
     """
     if wavelength_m <= 0:
         message = "wavelength must be positive"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     position = np.asarray(state.position_m, dtype=np.float64)
     velocity = np.asarray(state.velocity_m_s, dtype=np.float64)
     target = np.asarray(target_ecef_m, dtype=np.float64)
@@ -61,8 +58,7 @@ def zero_doppler_residual_hz(
     range_m = float(np.linalg.norm(look))
     if range_m <= 0:
         message = "target coincides with platform position"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     unit_look = look / range_m
     radial_velocity = float(np.dot(velocity, unit_look))
     return 2.0 * radial_velocity / wavelength_m
@@ -86,8 +82,7 @@ def geometric_baseline(
     look_norm = float(np.linalg.norm(look))
     if look_norm <= 0:
         message = "look unit vector must be non-zero"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     look = look / look_norm
     parallel = float(np.dot(baseline, look))
     perpendicular_vec = baseline - parallel * look

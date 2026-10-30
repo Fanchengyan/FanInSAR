@@ -7,12 +7,10 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-logger = setup_logger(__name__)
 
 VerticalDatum = Literal["ellipsoidal", "egm96", "egm2008"]
 
@@ -107,8 +105,7 @@ def convert_heights(
     )
     if np.any(~np.isfinite(longitudes)) or np.any(~np.isfinite(latitudes)):
         message = "datum conversion coordinates must be finite"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if source_datum == target_datum:
         return np.array(values, dtype=np.float64, copy=True)
 
@@ -123,8 +120,7 @@ def convert_heights(
         sample_method = getattr(sampler, "sample", None)
         if not callable(sample_method):
             message = f"geoid sampler for {model!r} has no sample method"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         undulation = np.asarray(sample_method(latitudes, longitudes), dtype=np.float64)
         if undulation.shape != values.shape:
             undulation = np.broadcast_to(undulation, values.shape)

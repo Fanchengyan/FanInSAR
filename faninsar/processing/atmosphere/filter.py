@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 __all__ = [
     "gaussian_kernel_1d",
@@ -68,12 +66,10 @@ def remove_small_components(
     """
     if not isinstance(valid_mask, torch.Tensor) or valid_mask.dtype != torch.bool:
         message = "valid_mask must be a boolean tensor"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if min_cluster_pixels < 0:
         message = f"min_cluster_pixels must be >= 0, got {min_cluster_pixels!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     cleaned = valid_mask.clone()
     if min_cluster_pixels == 0 or not bool(cleaned.any()):

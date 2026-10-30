@@ -1,5 +1,4 @@
 # ruff: noqa: EM101, EM102, TRY003, SIM105
-
 """Public contracts for the v2 radar/geographic geometry backend.
 
 This module contains the value objects shared by preparation, native ABI
@@ -18,9 +17,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 INT32_MAX = np.iinfo(np.int32).max
 
@@ -44,8 +41,7 @@ def _operation(value: Operation | str) -> Operation:
         return value if isinstance(value, Operation) else Operation(value)
     except (TypeError, ValueError) as error:
         message = "operation must be 'geo2rdr' or 'rdr2geo'"
-        logger.exception(message)
-        raise GeometryValidationError(message) from error
+        reject(message, GeometryValidationError, cause=error)
 
 
 def _finite_positive(value: float, name: str) -> float:
@@ -54,13 +50,11 @@ def _finite_positive(value: float, name: str) -> float:
         value, (int, float, np.number)
     ):
         message = f"{name} must be a finite positive number"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     result = float(value)
     if not np.isfinite(result) or result <= 0.0:
         message = f"{name} must be a finite positive number"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     return result
 
 
@@ -68,13 +62,11 @@ def _nonnegative_int(value: int, name: str) -> int:
     """Validate a Python integer without accepting booleans or truncation."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
         message = f"{name} must be an integer"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     result = int(value)
     if result < 0:
         message = f"{name} must be non-negative"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     return result
 
 
@@ -108,13 +100,11 @@ class SolverSettings:
         max_iter = _nonnegative_int(self.max_iter, "max_iter")
         if max_iter < 1:
             message = "max_iter must be at least 1"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         extra_iter = _nonnegative_int(self.extra_iter, "extra_iter")
         if max_iter + extra_iter > INT32_MAX:
             message = "max_iter + extra_iter exceeds int32 iteration capacity"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         object.__setattr__(self, "max_iter", max_iter)
         object.__setattr__(self, "extra_iter", extra_iter)
         for name in (
@@ -156,8 +146,7 @@ class OperationSettings:
         object.__setattr__(self, "operation", _operation(self.operation))
         if not isinstance(self.solver, SolverSettings):
             message = "solver must be a SolverSettings instance"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
 
     @property
     def max_iter(self) -> int:
@@ -230,18 +219,15 @@ class DeviceKey:
         """Enforce CPU/CUDA tags and their identity fields."""
         if self.kind not in ("cpu", "cuda"):
             message = "device kind must be 'cpu' or 'cuda'"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if self.kind == "cpu" and (
             self.physical_uuid is not None or self.mig_uuid is not None
         ):
             message = "CPU device identity cannot contain CUDA UUIDs"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if self.kind == "cuda" and not self.physical_uuid:
             message = "CUDA device identity requires a physical UUID"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
 
     @classmethod
     def cpu(cls) -> DeviceKey:
@@ -286,14 +272,12 @@ class ExecutionProfile:
         """Validate profile fields and keep them immutable."""
         if not isinstance(self.device, DeviceKey):
             message = "execution profile device must be a DeviceKey"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if self.thread_count is not None:
             count = _nonnegative_int(self.thread_count, "thread_count")
             if count < 1:
                 message = "thread_count must be at least 1"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             object.__setattr__(self, "thread_count", count)
         if self.launch_config is not None:
             config = tuple(
@@ -301,13 +285,11 @@ class ExecutionProfile:
             )
             if not config:
                 message = "launch_config must not be empty"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             object.__setattr__(self, "launch_config", config)
         if self.device.kind == "cuda" and self.openmp_runtime is not None:
             message = "CUDA execution profiles cannot declare an OpenMP runtime"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
 
     @classmethod
     def cpu(
@@ -396,28 +378,24 @@ class CandidateKey:
         object.__setattr__(self, "operation", _operation(self.operation))
         if self.backend not in ("native", "compile"):
             message = "prepared backend must be 'native' or 'compile'"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if not isinstance(self.device, DeviceKey) or not isinstance(
             self.solver, SolverSettings
         ):
             message = "candidate device and solver must use v2 value objects"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         normalized_shape = tuple(
             _nonnegative_int(v, "shape dimension") for v in self.shape
         )
         if any(v == 0 for v in normalized_shape):
             message = "candidate request shape dimensions must be positive"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         object.__setattr__(self, "shape", normalized_shape)
         if self.profile is None:
             object.__setattr__(self, "profile", ExecutionProfile(self.device))
         elif self.profile.device != self.device:
             message = "candidate device and execution profile device must match"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
 
     def canonical(self) -> dict[str, Any]:
         """Return the full key as deterministic JSON-compatible data."""
@@ -522,26 +500,21 @@ class TransformResultV2:
             value = getattr(self, name)
             if not isinstance(value, np.ndarray):
                 message = f"{name} must be a NumPy array"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             if name in _FLOAT_RESULT_FIELDS and value.dtype != np.dtype(np.float64):
                 message = f"{name} must have dtype float64"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             if name == "iterations" and value.dtype != np.dtype(np.int32):
                 message = "iterations must have dtype int32"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             if name in _BOOL_RESULT_FIELDS and value.dtype != np.dtype(bool):
                 message = f"{name} must have dtype bool"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             if shape is None:
                 shape = value.shape
             elif value.shape != shape:
                 message = "all TransformResultV2 fields must have the same shape"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
 
     @classmethod
     def invalid(
@@ -560,8 +533,7 @@ class TransformResultV2:
             for dim in normalized_shape
         ):
             message = "result shape must contain non-negative integer dimensions"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         shape_tuple = tuple(int(dim) for dim in normalized_shape)
 
         def nan() -> np.ndarray:
@@ -603,8 +575,7 @@ class TransformResultV2:
         extra = [name for name in fields if name not in _RESULT_FIELDS]
         if missing or extra:
             message = f"result fields mismatch; missing={missing}, extra={extra}"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         values = {name: fields[name] for name in _RESULT_FIELDS}
         result = cls(**values)
         op = _operation(operation)
@@ -618,19 +589,16 @@ class TransformResultV2:
                 or mask.shape != result.latitude_deg.shape
             ):
                 message = "invalid_mask must be a bool array matching result shape"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             valid_mask = ~mask
         if op is Operation.GEO2RDR and np.any(valid_mask & (result.tolerance != 1.0)):
             message = "valid geo2rdr lanes must publish tolerance=1.0"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if op is Operation.RDR2GEO and np.any(
             valid_mask & (~np.isfinite(result.tolerance) | (result.tolerance <= 0.0))
         ):
             message = "valid rdr2geo lanes must publish a positive finite tolerance"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if invalid_mask is None:
             return result
         if not np.any(mask):
@@ -794,82 +762,66 @@ def validate_array_span(
         dtype = expected_dtype
     elif expected_dtype is not None and np.dtype(dtype) != np.dtype(expected_dtype):
         message = f"{name} received conflicting dtype expectations"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if dtype is None:
         message = f"{name} requires an expected dtype"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     expected_dtype = np.dtype(dtype)
     if shape is None:
         shape = expected_shape
     elif expected_shape is not None and tuple(shape) != tuple(expected_shape):
         message = f"{name} received conflicting shape expectations"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if device is None:
         device = expected_device
     elif expected_device is not None and device != expected_device:
         message = f"{name} received conflicting device expectations"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if not isinstance(array, np.ndarray):
         message = f"{name} must be a NumPy array"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if array.dtype != expected_dtype:
         message = f"{name} must have dtype {expected_dtype}"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if array.ndim != len(array.shape) or array.ndim != len(array.strides):
         message = f"{name} rank/shape/strides metadata is inconsistent"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if any(d <= 0 for d in array.shape):
         message = f"{name} dimensions must be positive"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if shape is not None and tuple(array.shape) != tuple(shape):
         message = f"{name} has shape {array.shape}, expected {tuple(shape)}"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     expected_strides = tuple(
         array.itemsize * int(np.prod(array.shape[index + 1 :]))
         for index in range(array.ndim)
     )
     if not array.flags.c_contiguous or tuple(array.strides) != expected_strides:
         message = f"{name} must use exact C-order strides"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if strides is not None and tuple(strides) != tuple(array.strides):
         message = f"{name} has unexpected strides"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if byte_length is not None:
         if isinstance(byte_length, (bool, np.bool_)) or int(byte_length) != byte_length:
             message = f"{name} byte_length must be an integer"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
         if int(byte_length) != int(array.nbytes):
             message = f"{name} has an unexpected byte length"
-            logger.error(message)
-            raise GeometryValidationError(message)
+            reject(message, GeometryValidationError)
     if require_finite and not np.all(np.isfinite(array)):
         message = f"{name} must contain only finite values"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     actual_device = device or DeviceKey.cpu()
     if actual_device.kind != "cpu":
         message = f"{name} NumPy owner cannot prove CUDA allocation"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     owner = array
     while isinstance(owner.base, np.ndarray):
         owner = owner.base
     if not owner.flags.c_contiguous:
         message = f"{name} owner must be contiguous host memory"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     # Pointer and extent are deliberately read only after every structural check.
     address = int(array.__array_interface__["data"][0])
     owner_address = int(owner.__array_interface__["data"][0])
@@ -877,12 +829,10 @@ def validate_array_span(
     owner_end = owner_address + int(owner.nbytes)
     if address % expected_dtype.itemsize != 0:
         message = f"{name} address is not dtype aligned"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     if address <= 0 or end < address or address < owner_address or end > owner_end:
         message = f"{name} span is outside its owner allocation"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     return RawSpan(
         owner,
         array,
@@ -913,8 +863,7 @@ def validate_spans(
         elif isinstance(dtype, Mapping):
             if name not in dtype:
                 message = f"missing expected dtype for span {name}"
-                logger.error(message)
-                raise GeometryValidationError(message)
+                reject(message, GeometryValidationError)
             item_dtype = dtype[name]
         else:
             item_dtype = dtype
@@ -930,8 +879,7 @@ def validate_spans(
         span.device != selected_device for span in validated.values()
     ):
         message = "all spans must share the expected device"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     return validated
 
 

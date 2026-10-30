@@ -7,10 +7,8 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.missions.s1.errors import reject_product
-
-logger = setup_logger(__name__)
 
 __all__ = ["read_eof_orbit"]
 
@@ -57,8 +55,7 @@ def read_eof_orbit(path: str | Path) -> OrbitMetadata:
             )
         except (TypeError, ValueError) as exc:
             message = f"invalid orbit state vector in {orbit_path}"
-            logger.exception(message)
-            raise ValueError(message) from exc
+            reject(message, ValueError, cause=exc)
     if not vectors:
         reject_product(f"orbit file contains no state vectors: {orbit_path}")
     return OrbitMetadata(

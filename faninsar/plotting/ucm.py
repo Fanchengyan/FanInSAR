@@ -19,7 +19,7 @@ import numpy as np
 from matplotlib.colors import Colormap
 from matplotlib.ticker import MaxNLocator, NullFormatter
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 from .colorbar import HistColorbar
 from .colormaps import cmaps
@@ -41,8 +41,6 @@ if TYPE_CHECKING:
         temporal: Axes
         surface_3d: Axes3D
 
-
-logger = setup_logger(__name__)
 
 _PanelName: TypeAlias = Literal["heatmap", "spatial", "temporal", "surface_3d"]
 _MosaicLayout: TypeAlias = list[list[_PanelName]]
@@ -170,9 +168,8 @@ def _resolve_ucm_axes(
         _, created_ax = plt.subplots(subplot_kw=subplot_kw, **subplot_kwargs)
         return ds_ucm, cast("Axes3D", created_ax)
 
-    logger.error("Unsupported UCM axes projection: %s.", projection)
     msg = f"projection must be 'rectilinear' or '3d', got {projection!r}."
-    raise ValueError(msg)
+    return reject(msg, ValueError)
 
 
 def _default_ucm_labels(
@@ -271,10 +268,9 @@ def _resolve_ucm_origin(
     """
     canonical_origin = _UCM_ORIGIN_ALIASES.get(origin)
     if canonical_origin is None:
-        logger.error("Unsupported UCM origin: %s.", origin)
         accepted_origins = ", ".join(f"'{value}'" for value in _UCM_ORIGIN_ALIASES)
         msg = f"origin must be one of {accepted_origins}, got {origin!r}."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     invert_x = canonical_origin in {"upper_right", "lower_right"}
     invert_y = canonical_origin in {"upper_left", "upper_right"}
@@ -391,9 +387,8 @@ def _validate_profile_x_axis(x_axis: str) -> _ProfileXAxis:
     if x_axis in {"variable", "quantity"}:
         return cast("_ProfileXAxis", x_axis)
 
-    logger.error("Invalid UCM profile x_axis value: %s.", x_axis)
     msg = "x_axis must be 'variable' or 'quantity'."
-    raise ValueError(msg)
+    return reject(msg, ValueError)
 
 
 def _resolve_profile_x_axis(
@@ -454,12 +449,8 @@ def _resolve_surface_axis_ticks(
     """
     coord_values = np.asarray(coords)
     if coord_values.ndim != 1:
-        logger.error(
-            "Surface axis coordinates must be one-dimensional, got shape %s.",
-            coord_values.shape,
-        )
         msg = "Surface axis coordinates must be one-dimensional."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if coord_values.size == 0:
         return coord_values, np.array([], dtype=coord_values.dtype)
@@ -484,21 +475,13 @@ def _resolve_surface_axis_ticks(
             major_tick_count,
             (int, np.integer),
         ):
-            logger.error(
-                "Invalid surface major tick count: %r.",
-                major_tick_count,
-            )
             msg = "major_tick_count must be 'auto', 'all', or an integer >= 2."
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         resolved_major_tick_count = int(major_tick_count)
         if resolved_major_tick_count < 2:
-            logger.error(
-                "Surface major tick count must be at least 2, got %s.",
-                resolved_major_tick_count,
-            )
             msg = "major_tick_count must be 'auto', 'all', or an integer >= 2."
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         if coord_values.size <= resolved_major_tick_count:
             return coord_values, np.array([], dtype=coord_values.dtype)
@@ -552,33 +535,21 @@ def _prepare_ucm_data(
 
     """
     if spatial_dim == temporal_dim:
-        logger.error(
-            "UCM spatial and temporal dimensions must differ: %s.",
-            spatial_dim,
-        )
         msg = "spatial_dim and temporal_dim must be different."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     required_dimensions = {spatial_dim, temporal_dim}
     missing_dimensions = required_dimensions.difference(ds_ucm.dims)
     if missing_dimensions:
-        logger.error(
-            "UCM data is missing required dimensions: %s.",
-            sorted(missing_dimensions),
-        )
         msg = (
             "ds_ucm must contain the spatial and temporal dimensions "
             f"{spatial_dim!r} and {temporal_dim!r}."
         )
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if len(ds_ucm.dims) != 2:
-        logger.error(
-            "UCM data must be two-dimensional, got dimensions: %s.",
-            ds_ucm.dims,
-        )
         msg = "ds_ucm must be two-dimensional."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     dimension_mapping = {
         old_dimension: new_dimension
@@ -624,14 +595,8 @@ def _resolve_array_coords(
 
     resolved_coords = np.asarray(coords)
     if resolved_coords.ndim == 0 or len(resolved_coords) != length:
-        logger.error(
-            "Invalid %s coordinate length for UCM array input: expected %s, got %s.",
-            coord_name,
-            length,
-            resolved_coords.shape,
-        )
         msg = f"{coord_name}_coords must have length {length}."
-        raise ValueError(msg)
+        reject(msg, ValueError)
     return resolved_coords
 
 
@@ -668,28 +633,17 @@ def _resolve_color_limits(
     finite_values = np.asarray(ds_ucm.values, dtype=float)
     finite_values = finite_values[np.isfinite(finite_values)]
     if finite_values.size == 0 and (vmin is None or vmax is None):
-        logger.error("Cannot resolve UCM color limits because no finite values exist.")
         msg = "Cannot resolve color limits from all-NaN or non-finite UCM values."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     lower_limit = float(np.nanmin(finite_values)) if vmin is None else float(vmin)
     upper_limit = float(np.nanmax(finite_values)) if vmax is None else float(vmax)
     if not np.isfinite(lower_limit) or not np.isfinite(upper_limit):
-        logger.error(
-            "Invalid non-finite UCM color limits received: vmin=%s, vmax=%s.",
-            lower_limit,
-            upper_limit,
-        )
         msg = "vmin and vmax must be finite values."
-        raise ValueError(msg)
+        reject(msg, ValueError)
     if lower_limit > upper_limit:
-        logger.error(
-            "Invalid UCM color limits received: vmin=%s is greater than vmax=%s.",
-            lower_limit,
-            upper_limit,
-        )
         msg = "vmin must be less than or equal to vmax."
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     value_range = upper_limit - lower_limit
     if value_range == 0.0:
@@ -718,12 +672,11 @@ def _validate_mosaic(mosaic: _MosaicLayout) -> None:
         if panel_name != "." and panel_name not in _UCM_PANEL_NAMES
     }
     if invalid_panel_names:
-        logger.error("Unknown UCM mosaic panel names: %s.", sorted(invalid_panel_names))
         msg = (
             "mosaic contains unknown panel names. Expected labels are "
             f"{sorted(_UCM_PANEL_NAMES)} or '.'."
         )
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
 
 def _profile_palette(
@@ -963,17 +916,12 @@ class UCM:
 
         """
         if array.ndim != 2:
-            logger.error(
-                "UCM array input must be two-dimensional, got shape: %s.",
-                array.shape,
-            )
             msg = "array must be two-dimensional."
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         if input_dims not in {"st", "ts"}:
-            logger.error("Invalid UCM array input_dims value: %s.", input_dims)
             msg = "input_dims must be 'st' or 'ts'."
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         if input_dims == "st":
             dims = ("spatial", "temporal")

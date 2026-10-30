@@ -103,7 +103,6 @@ def stack(tmp_path: Path) -> Stack:
         catalog=SceneCatalog.from_paths(paths),
         config=StackConfig(
             work_dir=tmp_path / "work",
-            activation_mode="reference",
             grid=_scene_grid(model),
             multilook=(1, 1),
             dem=ConstantDEM(0.0),
@@ -724,7 +723,6 @@ def test_layer_rejects_a_different_stack_reference(
         catalog=stack.catalog,
         config=StackConfig(
             work_dir=tmp_path / "other",
-            activation_mode="reference",
             grid=stack.grid,
             dem=ConstantDEM(0.0),
             device="cpu",
@@ -1115,7 +1113,6 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
         catalog=SceneCatalog.from_paths(paths),
         config=StackConfig(
             work_dir=work,
-            activation_mode="reference",
             grid=_scene_grid(model),
             multilook=(1, 1),
             dem=ConstantDEM(0.0),

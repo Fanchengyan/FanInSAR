@@ -15,9 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NoReturn, Self, TypeAlias
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from faninsar.processing.masking.mask import Mask
@@ -43,8 +41,7 @@ _LEGACY_KEYS = frozenset(
 
 def _fail(message: str, error_type: type[Exception] = ValueError) -> NoReturn:
     """Log and raise a configuration error."""
-    logger.error(message)
-    raise error_type(message)
+    reject(message, error_type)
 
 
 @dataclass(frozen=True, slots=True)

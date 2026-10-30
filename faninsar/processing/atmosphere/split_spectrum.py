@@ -13,9 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 __all__ = ["SubBandResult", "split_range_spectrum"]
 
@@ -58,13 +56,11 @@ def _bandpass_window(
     """Return complex passband weights over absolute frequency offsets."""
     if window_function not in _WINDOW_FUNCTIONS:
         message = f"unsupported window_function {window_function!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     width = edge_high - edge_low
     if width <= 0:
         message = "subband requires high_edge_hz > low_edge_hz"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     inside = (offsets_hz >= edge_low) & (offsets_hz <= edge_high)
     x = ((offsets_hz - edge_low) / width).clamp(0.0, 1.0)
@@ -132,12 +128,10 @@ def split_range_spectrum(
         message = (
             f"range_sampling_rate_hz must be positive, got {range_sampling_rate_hz!r}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if not torch.is_complex(slc):
         message = "slc must be a complex tensor"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     cols = int(slc.shape[-1])
     fft_len = 1 << (cols - 1).bit_length()  # zero-pad to power of two

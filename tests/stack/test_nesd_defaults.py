@@ -30,7 +30,7 @@ def test_stack_config_defaults_are_geometry_all_swaths_all_bursts(
     tmp_path: Path,
 ) -> None:
     """StackConfig defaults to geometry with every sub-swath and burst selected."""
-    cfg = StackConfig(work_dir=tmp_path, activation_mode="reference")
+    cfg = StackConfig(work_dir=tmp_path)
     assert cfg.coreg_mode == "geometry"
     assert cfg.swaths is None
     assert cfg.bursts is None
@@ -44,7 +44,6 @@ def test_stack_config_rejects_pair_and_network_coreg_mode(tmp_path: Path) -> Non
         with pytest.raises(ValueError, match="geometry.*nesd"):
             StackConfig(
                 work_dir=tmp_path,
-                activation_mode="reference",
                 coreg_mode=mode,  # type: ignore[arg-type]
             )
 
@@ -76,7 +75,6 @@ def test_from_safes_keyword_defaults_are_geometry_all_swaths_all_bursts(
     stack = S1Stack.from_safes(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
     assert stack.config.coreg_mode == "geometry"
     assert stack.config.swaths is None
@@ -90,7 +88,6 @@ def test_burst_kwargs_pass_none_bursts_through(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
     kwargs = stack._burst_kwargs()
     assert kwargs["swaths"] is None
@@ -102,7 +99,6 @@ def test_coreg_resume_identity_serializes_none_swaths(tmp_path: Path) -> None:
     stack = S1Stack.from_safes(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
-        activation_mode="reference",
     )
     digest_all = stack._coreg_resume_identity(
         "20160113",

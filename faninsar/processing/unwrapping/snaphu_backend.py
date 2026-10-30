@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import ProcessingContractError, reject_invalid_state
 from faninsar.processing.runtime.capabilities import snaphu_capability
 from faninsar.processing.unwrapping.common import (
@@ -106,8 +106,7 @@ class Snaphu(SpatialUnwrapper):
         else:
             backend_coherence = torch.ones_like(wrapped_phase)
         if not bool(torch.any(support)):
-            logger.error("SNAPHU input has no valid support")
-            raise NoValidSupportError
+            reject("SNAPHU input has no valid support", NoValidSupportError)
 
         phase = torch.remainder(wrapped_phase + torch.pi, 2 * torch.pi) - torch.pi
         if coherence is None:
@@ -282,8 +281,7 @@ def require_snaphu() -> Any:
             "`pip install faninsar` "
             f"and review the license caveat: {capability.license_caveat}"
         )
-        logger.error(message)
-        raise SnaphuNotAvailableError(message)
+        reject(message, SnaphuNotAvailableError)
     return import_module("snaphu")
 
 

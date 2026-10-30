@@ -48,7 +48,7 @@ from rasterio.vrt import WarpedVRT
 from faninsar.core import Baselines, Pairs
 from faninsar.data.datasets import CoherenceDataset, PairDataset
 from faninsar.data.datasets.ifg import HierarchicalInterferogramDataset
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -437,8 +437,7 @@ class NisarH5Mixin:
                     "The file name does not contain the NISAR granule "
                     "_SH_YYYYMMDDThhmmss_..._YYYYMMDDThhmmss_... pattern."
                 )
-                logger.error(msg)
-                raise ValueError(msg)
+                reject(msg, ValueError, logger=logger)
             pair_names.append(f"{dates[0]}_{dates[2]}")
         return Pairs.from_names(pair_names)
 
@@ -594,8 +593,7 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
                     f"No NISAR GUNW granules (pattern={self.pattern_files!r}) were "
                     f"found in root_dir='{root_dir}'"
                 )
-                logger.error(msg)
-                raise FileNotFoundError(msg)
+                reject(msg, FileNotFoundError, logger=logger)
         else:
             h5_files = self._h5_files_from(paths_unw)
 
@@ -738,8 +736,7 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
                 "No common pairs between the unwrapped interferogram dataset "
                 "and the ionosphere dataset."
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError, logger=logger)
 
         corrected = unw_da - iono_da
         corrected.name = "unw_corrected"
@@ -899,8 +896,7 @@ class NISARIonosphere(NisarH5Mixin, PairDataset):
                     f"No NISAR GUNW granules (pattern={self.pattern_files!r}) were "
                     f"found in root_dir='{root_dir}'"
                 )
-                logger.error(msg)
-                raise FileNotFoundError(msg)
+                reject(msg, FileNotFoundError, logger=logger)
         else:
             h5_files = self._h5_files_from(paths)
 

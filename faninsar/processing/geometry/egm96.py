@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -125,21 +125,18 @@ def load_egm96_coefficients(path: str | Path) -> _EGM96Coefficients:
     path = Path(path)
     if not path.exists():
         message = f"EGM96 coefficient file does not exist: {path}"
-        logger.error(message)
-        raise FileNotFoundError(message)
+        reject(message, FileNotFoundError)
     raw = path.read_bytes()
     if len(raw) % 24 != 0:
         message = f"EGM96 coefficient file size not a multiple of 24: {path}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     record_count = len(raw) // 24
     if record_count < 2 * _COEFFICIENT_COUNT:
         message = (
             f"EGM96 coefficient file {path} has {record_count} records, "
             f"expected at least {2 * _COEFFICIENT_COUNT}"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     cc = np.zeros(_COEFFICIENT_COUNT, dtype=np.float64)
     cs = np.zeros(_COEFFICIENT_COUNT, dtype=np.float64)
@@ -355,8 +352,7 @@ class EGM96Geoid:
                     "EGM96 coefficient file not found; set FANINSAR_EGM96_FILE "
                     "or install the bundled egm96geoid.dat"
                 )
-                logger.error(message)
-                raise FileNotFoundError(message)
+                reject(message, FileNotFoundError)
             coefficient_path = resolved
         self.coefficient_path = Path(coefficient_path)
         self.sample_degree = float(sample_degree)

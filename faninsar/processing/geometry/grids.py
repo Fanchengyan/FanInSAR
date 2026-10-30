@@ -11,7 +11,7 @@ from rasterio import Affine, transform
 from rasterio.transform import array_bounds, rowcol, xy
 from rasterio.warp import calculate_default_transform
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 from .coordinates import geoinfo_from_xy, xy_from_transform
 
@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 
     from faninsar.core.types import CrsLike
     from faninsar.data.query.bbox import BoundingBox
-
-logger = setup_logger(__name__)
 
 
 class GridSpec:
@@ -104,20 +102,17 @@ class GridSpec:
         if shape is not None:
             if height is not None or width is not None or len(shape) != 2:
                 message = "pass either shape or height/width, not both"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             height, width = int(shape[0]), int(shape[1])
         if height is None or width is None:
             message = "GridSpec requires shape or both height and width"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         legacy_row_down = False
         try:
             canonical_crs = CRS.from_user_input(crs).to_string()
         except Exception as error:
             message = f"unresolvable grid CRS: {crs!r}"
-            logger.exception(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
         try:
             if (
                 not isinstance(transform, Affine)
@@ -150,21 +145,17 @@ class GridSpec:
                 )
         except (TypeError, ValueError) as error:
             message = "transform must be an Affine or six coefficients"
-            logger.exception(message)
-            raise TypeError(message) from error
+            reject(message, TypeError, cause=error)
         if not isinstance(affine, Affine):
             message = "transform must be an Affine or six coefficients"
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         rows, columns = int(height), int(width)
         if rows <= 0 or columns <= 0:
             message = f"grid dimensions must be positive, got {(rows, columns)}"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if not all(np.isfinite(value) for value in affine):
             message = "grid transform must contain finite values"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if (
             affine.b != 0
             or affine.d != 0
@@ -172,12 +163,10 @@ class GridSpec:
             or (affine.e >= 0 and not legacy_row_down)
         ):
             message = "GridSpec requires a finite north-up affine transform"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if bounds is not None and bbox is not None:
             message = "pass either bounds or bbox, not both"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if bbox is not None:
             bounds = bbox
         if resolution_m is not None:
@@ -185,14 +174,12 @@ class GridSpec:
                 not np.isfinite(value) or value <= 0 for value in resolution_m
             ):
                 message = "resolution_m must contain two positive finite values"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             if not np.isclose(abs(affine.a), resolution_m[0]) or not np.isclose(
                 abs(affine.e), resolution_m[1]
             ):
                 message = "resolution_m does not match transform"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
         if bounds is None:
             left, top = affine.c, affine.f
             right = left + affine.a * columns
@@ -203,12 +190,10 @@ class GridSpec:
                 values = tuple(float(value) for value in bounds)
             except (TypeError, ValueError) as error:
                 message = "bounds must contain four finite values"
-                logger.exception(message)
-                raise ValueError(message) from error
+                reject(message, ValueError, cause=error)
             if len(values) != 4 or not all(np.isfinite(value) for value in values):
                 message = "bounds must contain four finite values"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             bounds_value = values
             expected = (
                 affine.c,
@@ -222,23 +207,20 @@ class GridSpec:
                 for actual, wanted in zip(values, expected, strict=True)
             ):
                 message = "bounds do not match transform and dimensions"
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
         if (
             not bounds_value[0] < bounds_value[2]
             or not bounds_value[1] < bounds_value[3]
         ):
             message = "bounds must be ordered as min_x, min_y, max_x, max_y"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         valid = None if validity is None else np.array(validity, dtype=bool, copy=True)
         if valid is not None:
             if valid.shape != (rows, columns):
                 message = (
                     f"validity shape {valid.shape} does not match {(rows, columns)}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             valid.setflags(write=False)
         object.__setattr__(self, "crs", canonical_crs)
         object.__setattr__(self, "transform", tuple(float(value) for value in affine))
@@ -350,8 +332,7 @@ class GeoGridMixin:
         """Set the shape of raster image in (height, width) order."""
         if len(value) != 2:
             msg = "shape must be a tuple of (height, width)"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         self._shape = (int(value[0]), int(value[1]))
         self._refresh_bounds()
 
@@ -503,8 +484,7 @@ class GeoGrid(GeoGridMixin):
             ysize = (top - bottom) / height
         else:
             msg = "either res or shape must be provided"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         tf = transform.from_origin(left, top, xsize, ysize)
 
         return cls(tf, shape, crs)

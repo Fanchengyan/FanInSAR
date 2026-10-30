@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
@@ -123,8 +123,7 @@ class TimeSeries:
             self.canonical_path, Path
         ):
             message = "canonical_path must be a pathlib.Path or None"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
     def export(
         self,

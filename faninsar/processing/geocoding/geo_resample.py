@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from scipy.ndimage import map_coordinates
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.coregistration.resampling import lanczos_resample
 from faninsar.processing.errors import reject_invalid_state
 
@@ -34,8 +34,6 @@ __all__ = [
     "resample_complex_at_coordinates",
     "sample",
 ]
-
-logger = setup_logger(__name__)
 
 GeocodeKind = Literal["complex", "phase", "continuous", "label"]
 
@@ -56,8 +54,7 @@ def _resample_complex_opencv(
             "the OpenCV geocode executor requires opencv-python; "
             "install FanInSAR with the 'opencv' extra"
         )
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
 
     azimuth_map = np.where(valid, azimuth, -1.0).astype(np.float32)
     range_map = np.where(valid, range_index, -1.0).astype(np.float32)

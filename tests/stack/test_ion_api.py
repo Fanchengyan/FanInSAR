@@ -67,7 +67,6 @@ def _stack_with_scene_units(tmp_path: Path) -> Stack:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         pairs=Pairs.from_names(
             ["20240101_20240113", "20240113_20240125", "20240101_20240125"]
         ),

@@ -12,7 +12,7 @@ import pandas as pd
 from pyproj.crs import CRS
 from rasterio.warp import transform as warp_transform
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -131,8 +131,7 @@ class Points:
             self._values = self._values.reshape(1, -1)
         if self._values.ndim != 2 or self._values.shape[1] != 2:
             msg = f"points must be a 2D array with 2 columns. Got {self._values}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
     def __len__(self) -> int:
         """Return the number of points."""
@@ -155,12 +154,10 @@ class Points:
             item_val = np.array(item, dtype=np.float64)
         else:
             msg = f"item must be an Points or Sequence. Got {type(item)}"
-            logger.error(msg)
-            raise TypeError(msg, stacklevel=2)
+            reject(msg, TypeError)
         if item_val.ndim > 2 or item_val.shape[1] != 2:
             msg = f"item must be a 2D array with shape (n, 2). Got {item_val.shape()}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         return np.any(np.all(self._values == item_val, axis=1))
 
@@ -188,8 +185,7 @@ class Points:
         """Return the union of two Points."""
         if not isinstance(other, Points):
             msg = f"other must be an instance of Points. Got {type(other)}"
-            logger.error(msg, stacklevel=2)
-            raise TypeError(msg)
+            reject(msg, TypeError)
 
         other, crs_new = self._ensure_points_crs(other)
         return Points(np.vstack([self.values, other.values]), crs=crs_new)
@@ -198,8 +194,7 @@ class Points:
         """Return the set difference of two Points."""
         if not isinstance(other, Points):
             msg = f"other must be an instance of Points. Got {type(other)}"
-            logger.error(msg, stacklevel=2)
-            raise TypeError(msg)
+            reject(msg, TypeError)
 
         other, crs_new = self._ensure_points_crs(other)
 
@@ -289,8 +284,7 @@ class Points:
                     "Cannot find the field name of the x coordinate. "
                     "Please provide the field name manually."
                 )
-                logger.error(msg, stacklevel=2)
-                raise ValueError(msg)
+                reject(msg, ValueError)
         if y_field is None:
             y_field = cls._find_field(
                 gdf,
@@ -301,8 +295,7 @@ class Points:
                     "Cannot find the field name of the y coordinate. "
                     "Please provide the field name manually."
                 )
-                logger.error(msg, stacklevel=2)
-                raise ValueError(msg)
+                reject(msg, ValueError)
         return x_field, y_field
 
     @property

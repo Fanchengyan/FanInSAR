@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.coregistration.offsets import (
     OffsetFieldResult,
     _torch_ampcor_admission_key,
@@ -36,8 +36,7 @@ def _validate_ampcor_accelerator(device: str) -> None:
             import torch
         except ImportError as error:
             message = "explicit CUDA Ampcor requires torch"
-            logger.exception(message)
-            raise ImportError(message) from error
+            reject(message, ImportError, cause=error)
         _validate_torch_ampcor_runtime(torch.device(device), torch)
         _torch_ampcor_admission_key(torch.device(device), torch)
 
@@ -63,8 +62,7 @@ def geometry_coarse_shift(
         sec_state = sec_orbit.evaluate(sec_time)
     except Exception as exc:
         message = f"orbit evaluation failed for geometry coarse shift: {exc}"
-        logger.exception(message)
-        raise ValueError(message) from exc
+        reject(message, ValueError, cause=exc)
 
     baseline = np.asarray(sec_state.position_m, dtype=np.float64) - np.asarray(
         ref_state.position_m,

@@ -11,14 +11,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.geometry.v2 import (
     GeometryValidationError,
     Operation,
     TransformResultV2,
 )
 
-logger = setup_logger(__name__)
 _BOUNDARY_ULPS = 32.0 * np.finfo(np.float64).eps
 
 
@@ -38,16 +37,14 @@ def _op(operation: Operation | str) -> Operation:
         return operation if isinstance(operation, Operation) else Operation(operation)
     except (TypeError, ValueError) as error:
         message = "operation must be 'geo2rdr' or 'rdr2geo'"
-        logger.exception(message)
-        raise GeometryValidationError(message) from error
+        reject(message, GeometryValidationError, cause=error)
 
 
 def _snapshot(value: np.ndarray, name: str) -> np.ndarray:
     """Create a private, read-only float64 snapshot for the callback."""
     if not isinstance(value, np.ndarray) or value.dtype != np.dtype(np.float64):
         message = f"{name} must be a float64 NumPy array"
-        logger.error(message)
-        raise GeometryValidationError(message)
+        reject(message, GeometryValidationError)
     snapshot = np.array(value, dtype=np.float64, copy=True, order="C")
     snapshot.setflags(write=False)
     return snapshot

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import psutil
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -270,8 +270,7 @@ class MemoryWatchdog:
                 f"available={snap.available_mib:.0f} MiB, "
                 f"minimum_available={self.minimum_available_mib:.0f} MiB"
             )
-            logger.error(msg)
-            raise MemoryError(msg)
+            reject(msg, MemoryError)
         return snap
 
     def format_table(self) -> str:

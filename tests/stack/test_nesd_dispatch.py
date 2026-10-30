@@ -30,7 +30,6 @@ def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
     stack = S1Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
-        activation_mode="reference",
         coreg_mode=coreg_mode,  # type: ignore[arg-type]
         pair_max_interval=2,
         pair_max_days=60,

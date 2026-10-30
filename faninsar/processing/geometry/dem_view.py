@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from affine import Affine
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.grids import GridSpec
 
 if TYPE_CHECKING:
@@ -130,8 +130,7 @@ def geodetic_crop_grid(
     spacing = float(spacing_deg)
     if not np.isfinite(spacing) or spacing <= 0.0:
         message = "geographic DEM spacing must be a finite positive number"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     west, south, east, north = _geodetic_bounds(coverage)
     if extra_bounds is not None:
         try:
@@ -140,17 +139,14 @@ def geodetic_crop_grid(
             )
         except (TypeError, ValueError) as error:
             message = "extra_bounds must contain four finite WGS84 values"
-            logger.exception(message)
-            raise ValueError(message) from error
+            reject(message, ValueError, cause=error)
         extra = (extra_west, extra_south, extra_east, extra_north)
         if len(extra_bounds) != 4 or not np.all(np.isfinite(extra)):
             message = "extra_bounds must contain four finite WGS84 values"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if extra_west >= extra_east or extra_south >= extra_north:
             message = "extra_bounds must be ordered west, south, east, north"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         west = min(west, extra_west)
         south = min(south, extra_south)
         east = max(east, extra_east)
@@ -204,8 +200,7 @@ def lonlat_dem_view(dem: DEM | None) -> LonLatDEMView:
         view = _raster_view(sampler)
     else:
         message = f"unsupported DEM type for rdr2geo: {type(sampler).__name__}"
-        logger.error(message)
-        raise TypeError(message)
+        reject(message, TypeError)
     if len(_VIEW_TABLE) >= _VIEW_TABLE_LIMIT:
         oldest = next(iter(_VIEW_TABLE))
         _VIEW_TABLE.pop(oldest, None)
@@ -274,13 +269,11 @@ def _raster_view(dem: RasterDEM) -> LonLatDEMView:
     values = np.asarray(source.array, dtype=np.float64)
     if values.ndim != 2 or min(values.shape) < 6:
         message = "rdr2geo DEM must be at least 6x6"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     finite = np.isfinite(values)
     if not np.any(finite):
         message = "rdr2geo DEM has no finite samples"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     affine = Affine(*source.grid.transform)
     return LonLatDEMView(
         values=values,

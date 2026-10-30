@@ -6,15 +6,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 def _raise_contract(message: str) -> None:
     """Log and raise a public contract error."""
-    logger.error("spatial unwrap contract rejected: %s", message)
-    raise ValueError(message)
+    reject(message, ValueError)
 
 
 if TYPE_CHECKING:

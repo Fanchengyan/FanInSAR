@@ -13,12 +13,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 if TYPE_CHECKING:
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
-
-logger = setup_logger(__name__)
 
 __all__ = [
     "align_absolute_jumps",
@@ -38,8 +36,7 @@ def _nanmean_guarded(values: torch.Tensor) -> float:
             "subband interferograms are entirely invalid; cannot align "
             "absolute phase jumps"
         )
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return float(finite.mean())
 
 
@@ -91,8 +88,7 @@ def solve_2x2_low_high(
     det = a * d - b * c
     if det == 0:
         message = "Frequency combination leads to singular matrix"
-        logger.error(message)
-        raise ZeroDivisionError(message)
+        reject(message, ZeroDivisionError)
 
     m11 = d / det
     m12 = -b / det
@@ -238,8 +234,7 @@ def align_absolute_jumps(
         "alosstack_pixel_rounded",
     ):
         message = f"unknown alignment strategy {config.alignment_strategy!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     low = phi_sub_low.clone()
     high = phi_sub_high.clone()
@@ -269,8 +264,7 @@ def align_absolute_jumps(
     # alosstack_pixel_rounded
     if finite_diff.numel() == 0:
         message = "no valid pixels for pixel-rounded jump alignment"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     rows, cols = low.shape[-2], low.shape[-1]
     gy, gx = torch.meshgrid(
@@ -331,8 +325,7 @@ def estimate_disp_nondisp(
     """
     if phi_sub_low_unwrapped.shape != phi_sub_high_unwrapped.shape:
         message = "phi_sub_low and phi_sub_high shapes differ"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     low = phi_sub_low_unwrapped.clone()
     high = phi_sub_high_unwrapped.clone()
@@ -356,12 +349,10 @@ def estimate_disp_nondisp(
     if config.solve_core == "guided_split":
         if coherence is None:
             message = "solve_core='guided_split' requires a coherence weight field"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if coherence.shape != low.shape:
             message = "coherence shape must match the subband phases"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         dispersive, non_dispersive = solve_guided_split(
             low, high, coherence.to(low.device), config
         )

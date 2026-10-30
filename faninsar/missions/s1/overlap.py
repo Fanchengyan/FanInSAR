@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1.errors import reject_product
 
 if TYPE_CHECKING:
@@ -308,8 +308,7 @@ def _reject_negative_threshold(name: str, value: int) -> None:
     """Log and raise when a size threshold is negative."""
     if value < 0:
         message = f"{name} must be >= 0, got {value}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError, logger=logger)
 
 
 def _selected_indices(

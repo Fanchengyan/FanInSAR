@@ -15,7 +15,7 @@ from rasterio.enums import Resampling
 from faninsar.core.pair import Pairs
 from faninsar.data.datasets.base import PairDataset, TimeSeriesDataset
 from faninsar.data.query import BoundingBox, Points
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -44,12 +44,10 @@ class ApsDataset(TimeSeriesDataset, ABC):
         requested = pd.DatetimeIndex(pd.to_datetime(dates)).sort_values()
         if requested.has_duplicates:
             msg = "dates must be unique"
-            logger.error(msg, extra={"dates": requested.strftime("%Y%m%d").tolist()})
-            raise ValueError(msg)
+            reject(msg, ValueError)
         if len(requested) < 2:
             msg = "dates must contain at least two acquisitions"
-            logger.error(msg, extra={"n_date": len(requested)})
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         available = pd.DatetimeIndex(pd.to_datetime(self.dates))
         missing = requested.difference(available)
@@ -59,8 +57,7 @@ class ApsDataset(TimeSeriesDataset, ABC):
                 f"Following dates are missing in the {ds_name} dataset: "
                 f"{missing.strftime('%Y%m%d').tolist()}"
             )
-            logger.error(msg, extra={"missing": missing.strftime("%Y%m%d").tolist()})
-            raise ValueError(msg)
+            reject(msg, ValueError)
         return requested
 
     def _drop_band(self, data: DataArray) -> DataArray:
@@ -84,9 +81,8 @@ class ApsDataset(TimeSeriesDataset, ABC):
             data = self._drop_band(tree.dataset["data"]).sel(date=dates.to_numpy())
             values = np.asarray(data, dtype=np.float64)
         else:
-            msg = "query must be Points or BoundingBox"
-            logger.error(msg, extra={"query_type": type(query).__name__})
-            raise TypeError(msg)
+            msg = f"query must be Points or BoundingBox, got {type(query).__name__}"
+            reject(msg, TypeError)
 
         if values.ndim == 1:
             return values.reshape(values.shape[0], 1)
@@ -237,21 +233,13 @@ class ApsDataset(TimeSeriesDataset, ABC):
                 f"incs has {incs_arr.shape[0]} rows, APS has {increments.shape[0]}; "
                 "incs must be (n_date - 1, n_pt), not cumulative with a leading zero."
             )
-            logger.error(
-                msg,
-                extra={"incs_rows": incs_arr.shape[0], "aps_rows": increments.shape[0]},
-            )
-            raise ValueError(msg)
+            reject(msg, ValueError)
         if incs_arr.shape != increments.shape:
             msg = (
                 f"incs shape {incs_arr.shape} does not match APS increments "
                 f"{increments.shape}"
             )
-            logger.error(
-                msg,
-                extra={"incs_shape": incs_arr.shape, "aps_shape": increments.shape},
-            )
-            raise ValueError(msg)
+            reject(msg, ValueError)
         return incs_arr - increments
 
     def to_pair_files(

@@ -1,5 +1,4 @@
 # ruff: noqa: EM101, EM102, TRY003, TRY004
-
 """Torch eager and explicitly prepared geometry adapters.
 
 The adapter keeps the public preparation lifecycle separate from execution.
@@ -20,7 +19,7 @@ from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.geometry.torch_kernels import (
     _geo2rdr_active,
     _geo2rdr_finalize,
@@ -193,13 +192,11 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
             message = (
                 f"unsupported device ordinal {int(requested.removeprefix('cuda:'))}"
             )
-            logger.exception(message)
-            raise RuntimeError(message) from error
+            reject(message, RuntimeError, cause=error)
         raise
     if resolved.type == "mps" and not torch.backends.mps.is_available():
         message = "MPS geometry adapter requested but MPS is unavailable"
-        logger.error(message)
-        raise RuntimeError(message)
+        reject(message, RuntimeError)
     return resolved
 
 
@@ -496,13 +493,11 @@ class PreparedTorchGeometry:
         import torch
 
         if self.operation is not Operation.RDR2GEO:
-            logger.error("execute_ecef is only available for rdr2geo")
-            raise ValueError("execute_ecef is only available for rdr2geo")
+            reject("execute_ecef is only available for rdr2geo", ValueError)
         arrays = _check_inputs(self, inputs)
         kernel = self._compiled_kernel if self.compiled else self._kernel
         if kernel is None:
-            logger.error("prepared Torch geometry kernel is missing")
-            raise RuntimeError("prepared Torch geometry kernel is missing")
+            reject("prepared Torch geometry kernel is missing", RuntimeError)
         with torch.no_grad():
             output = kernel(*arrays)
         try:
@@ -510,10 +505,11 @@ class PreparedTorchGeometry:
                 output[name] for name in ("ecef_x_m", "ecef_y_m", "ecef_z_m")
             )
         except (AttributeError, KeyError) as error:
-            logger.exception("prepared Rdr2Geo kernel did not publish ECEF outputs")
-            raise RuntimeError(
-                "prepared Rdr2Geo kernel did not publish ECEF outputs"
-            ) from error
+            reject(
+                "prepared Rdr2Geo kernel did not publish ECEF outputs",
+                RuntimeError,
+                cause=error,
+            )
         # Keep the three published fields separate.  Stacking first creates a
         # transient device allocation and then copies it back as one larger
         # buffer, even though the public ECEF ABI is already three arrays.
@@ -623,11 +619,9 @@ def prepare_torch_geometry(
                 "datum-adjusted DEM requires a raster-plus-constant or "
                 "constant-plus-constant composition for Torch geometry"
             )
-            logger.error(message)
-            raise TypeError(message)
+            reject(message, TypeError)
         message = f"unsupported DEM type: {kind}"
-        logger.error(message)
-        raise TypeError(message)
+        return reject(message, TypeError)
 
     payload = dem_payload(dem) if dem is not None else ("none",)
     constant_dem_height = payload[1] if payload[0] == "constant" else None
@@ -805,10 +799,11 @@ def prepare_torch_geometry(
                 )
                 compiled_kernel = torch.compile(state_step, **compile_kwargs)
             except Exception as error:
-                logger.exception("failed to prepare compiled Torch geometry adapter")
-                raise RuntimeError(
-                    "Torch geometry compilation failed during preparation"
-                ) from error
+                reject(
+                    "Torch geometry compilation failed during preparation",
+                    RuntimeError,
+                    cause=error,
+                )
 
         else:
             try:
@@ -826,10 +821,11 @@ def prepare_torch_geometry(
                 )
                 compiled_kernel(sample, sample, sample)
             except Exception as error:
-                logger.exception("failed to prepare compiled Torch geometry adapter")
-                raise RuntimeError(
-                    "Torch geometry compilation failed during preparation"
-                ) from error
+                return reject(
+                    "Torch geometry compilation failed during preparation",
+                    RuntimeError,
+                    cause=error,
+                )
     return PreparedTorchGeometry(
         operation=operation,
         model=model,

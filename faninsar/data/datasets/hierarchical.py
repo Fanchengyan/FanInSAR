@@ -30,7 +30,7 @@ from faninsar.data.datasets.base.hierarchical import HierarchicalMixin
 from faninsar.data.datasets.base.pair import PairDataset
 from faninsar.data.datasets.base.timeseries import TimeSeriesDataset
 from faninsar.data.datasets.xarray_dataset import XarrayDataset, XarrayDataSpec
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -160,8 +160,7 @@ class HierarchicalDataset(XarrayDataset, HierarchicalMixin):
 
         if not specs:
             msg = "No container files found or provided."
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
 
         logger.debug(
             "Initialising %s with %d containers", self.__class__.__name__, len(specs)

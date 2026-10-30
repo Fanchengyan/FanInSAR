@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.core.acquisition import Acquisition
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.missions.nisar import NisarSensor, normalize_channel
 from faninsar.missions.nisar.provider import (
     make_nisar_scene_provider,
 )
 from faninsar.stack.catalog import SceneCatalog
-from faninsar.stack.config import ActivationMode, StackConfig
+from faninsar.stack.config import StackConfig
 from faninsar.stack.provider import (
     StackSceneProvider,
 )
@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from faninsar.missions.protocols import SLCReadResult
     from faninsar.processing.slc.products import SLCProduct
 
-logger = setup_logger(__name__)
 _DATE_RE = re.compile(r"(?<!\d)(\d{8})(?:T\d{6}(?:\.\d+)?)?")
 
 
@@ -61,8 +60,7 @@ def _acquisition_id(result: SLCReadResult, path: Path) -> str:
     if product_id is not None:
         return product_id
     message = f"cannot discover NISAR acquisition date from {path}"
-    logger.error(message)
-    raise ValueError(message)
+    return reject(message, ValueError)
 
 
 def _reference_id(value: object, dates: Sequence[str]) -> str:
@@ -70,8 +68,7 @@ def _reference_id(value: object, dates: Sequence[str]) -> str:
     result = _date_id(value)
     if result is None or result not in dates:
         message = f"NISAR reference {value!r} is not an acquisition"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     return result
 
 
@@ -99,7 +96,6 @@ class NISARStack(Stack):
         pair_max_days: int = 72,
         misreg_max_interval: int = 2,
         misreg_max_days: int = 36,
-        activation_mode: ActivationMode = "reference",
         **config_kwargs: Any,
     ) -> Self:
         """Construct a mission-neutral Stack from admitted NISAR RSLCs.
@@ -124,9 +120,6 @@ class NISARStack(Stack):
             Maximum temporal graph interval and baseline for the IFG pairs.
         misreg_max_interval, misreg_max_days : int, optional
             Maximum temporal graph interval and baseline for misregistration.
-        activation_mode : {"reference", "qualified"}, default="reference"
-            Shared Stack activation namespace.  Qualified mode still requires
-            its normal binding, token, and authority configuration.
         **config_kwargs : Any
             Additional :class:`StackConfig` options.
 
@@ -153,12 +146,10 @@ class NISARStack(Stack):
         )
         if len(source_paths) < 2:
             message = "NISARStack requires at least two RSLC paths"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
         if len(set(source_paths)) != len(source_paths):
             message = "NISARStack RSLC paths must be unique"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError)
 
         extra = dict(config_kwargs.pop("extra", {}) or {})
         configured_admission = config_kwargs.pop("nisar_admission", None)
@@ -204,15 +195,13 @@ class NISARStack(Stack):
                     f"{admitted_frequency}/{admitted_polarization}: "
                     f"{native_frequency}/{native_polarization}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             if result.source_path != str(path):
                 message = (
                     "NISAR reader source lineage does not match the admitted RSLC "
                     f"path {path}: {result.source_path}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             acquisition_id = _acquisition_id(result, path)
             if acquisition_id in results:
                 message = (
@@ -220,8 +209,7 @@ class NISARStack(Stack):
                     f"date {acquisition_id} appears in {path} and "
                     f"{lineage[acquisition_id]}"
                 )
-                logger.error(message)
-                raise ValueError(message)
+                reject(message, ValueError)
             # Keep the normalized product's acquisition identity aligned with
             # the Stack catalog, while preserving every other reader field.
             result = replace(
@@ -273,7 +261,6 @@ class NISARStack(Stack):
         )
         config = StackConfig(
             work_dir=Path(work_dir),
-            activation_mode=activation_mode,
             swaths=(),
             extra=extra,
             **config_kwargs,

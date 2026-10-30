@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -233,8 +233,7 @@ class AssetTransform:
         """
         if asset_kind is AssetKind.LABEL:
             message = "label assets do not carry a phase convention"
-            logger.error(message)
-            raise ValueError(message)
+            reject(message, ValueError, logger=logger)
         if phase_convention is PhaseConvention.PRIMARY_MINUS_SECONDARY:
             return AssetTransformOperation.IDENTITY
         if asset_kind in {AssetKind.AMPLITUDE, AssetKind.COHERENCE}:

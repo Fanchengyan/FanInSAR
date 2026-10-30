@@ -13,7 +13,7 @@ from rasterio import Affine, transform
 from rasterio.profiles import Profile as RasterioProfile
 
 from faninsar.io.file_tools import load_metas
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 
 from .coordinates import xy_from_transform
 from .grids import GeoGrid, GeoGridMixin
@@ -25,8 +25,6 @@ if TYPE_CHECKING:
 
     from faninsar.core.types import CrsLike
     from faninsar.data.query.bbox import BoundingBox
-
-logger = setup_logger(__name__)
 
 DEFAULT_KEYS_Profile = [
     "height",
@@ -113,12 +111,10 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
         """Delete a non-default profile item."""
         if key in DEFAULT_KEYS_Profile:
             msg = f"Cannot delete required profile key: {key}"
-            logger.error(msg)
-            raise KeyError(msg)
+            reject(msg, KeyError)
         if key not in self.kwargs:
             msg = f"{key!r} is not a stored profile metadata key"
-            logger.error(msg)
-            raise KeyError(msg)
+            reject(msg, KeyError)
         self.kwargs.pop(key)
         if hasattr(self, key):
             delattr(self, key)
@@ -156,8 +152,7 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
             return
         if not isinstance(value, (int, float, np.integer, np.floating)):
             msg = f"nodata must be a numeric value or None, but got {value!r}"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         self._nodata = float(value)
 
     @property
@@ -172,12 +167,10 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
             count = int(value)
         except (TypeError, ValueError) as exc:
             msg = f"count must be an integer, but got {value!r}"
-            logger.exception(msg)
-            raise TypeError(msg) from exc
+            reject(msg, TypeError, cause=exc)
         if count < 1:
             msg = f"count must be greater than 0, but got {count}"
-            logger.error(msg)
-            raise ValueError(msg)
+            reject(msg, ValueError)
         self._count = count
 
     @property
@@ -190,8 +183,7 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
         """Set the driver of the raster image."""
         if not isinstance(value, str):
             msg = f"driver must be a string, but got {value!r}"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         self._driver = value
 
     @property
@@ -204,8 +196,7 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
         """Set the dtype of the raster image."""
         if value is not None and not isinstance(value, (str, np.dtype)):
             msg = f"dtype must be a string, numpy.dtype, or None, but got {value!r}"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         self._dtype = value
 
     @property
@@ -218,8 +209,7 @@ class Profile(GeoGridMixin, MutableMapping[str, Any]):
         """Set other keyword arguments for rasterio profile metadata."""
         if not isinstance(value, dict):
             msg = f"kwargs must be a dictionary, but got {value!r}"
-            logger.error(msg)
-            raise TypeError(msg)
+            reject(msg, TypeError)
         self._kwargs = dict(value)
 
     @staticmethod

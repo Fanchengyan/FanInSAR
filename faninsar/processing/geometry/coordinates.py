@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 import numpy as np
 from rasterio import Affine, transform
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject
 from faninsar.processing.errors import (
     GridMismatchError,
     reject_grid_mismatch,
@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 
     from faninsar.core.types import CrsLike
     from faninsar.data.query.bbox import BoundingBox
-
-logger = setup_logger(__name__)
 
 OFFSET_LOCATIONS: dict[
     Literal["center", "ul", "ur", "ll", "lr"], tuple[float, float]
@@ -44,8 +42,7 @@ def _offset_from_loc(
     """Get the offset from pixel location."""
     if loc not in OFFSET_LOCATIONS:
         msg = f"loc should be one of {tuple(OFFSET_LOCATIONS.keys())}, but got {loc}"
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
     return OFFSET_LOCATIONS[loc]
 
 

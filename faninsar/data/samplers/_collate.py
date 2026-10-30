@@ -7,9 +7,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-from faninsar.logging import setup_logger
-
-logger = setup_logger(__name__)
+from faninsar.logging import reject
 
 
 def identity_collate(batch: list[Any]) -> Any | list[Any]:
@@ -123,8 +121,7 @@ def tensor_collate(
         converter = _to_tensor_all
     else:
         msg = f"tensor_scope must be 'data' or 'all'. Got {tensor_scope!r}."
-        logger.error(msg)
-        raise ValueError(msg)
+        reject(msg, ValueError)
 
     if len(batch) == 1:
         return converter(batch[0])

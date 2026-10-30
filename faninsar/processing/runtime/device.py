@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -83,8 +83,7 @@ def parse_device(device: DeviceLike | None) -> torch.device:
         return _admit_constructed_device(device, requested=str(device))
     if device is not None and not isinstance(device, str):
         msg = "device must be a string or torch.device"
-        logger.error(msg, stacklevel=2)
-        raise TypeError(msg)
+        reject(msg, TypeError)
     if device is None or device.strip().lower() in _AUTO_ALIASES:
         return _select_published_device()
     requested = device.strip()
@@ -118,8 +117,7 @@ def _admit_cuda(index: int | None, *, requested: str) -> torch.device:
             f"CUDA requested but is not available ({requested!r}). "
             "Pass device='auto' for graceful CPU fallback."
         )
-        logger.error(msg, stacklevel=2)
-        raise RuntimeError(msg)
+        reject(msg, RuntimeError)
     count = torch.cuda.device_count()
     if index is not None and index not in range(count):
         msg = (
@@ -127,8 +125,7 @@ def _admit_cuda(index: int | None, *, requested: str) -> torch.device:
             f"device={requested!r} is not admitted. "
             "Construction wrapping such as cuda:256 -> cuda:0 is forbidden."
         )
-        logger.error(msg, stacklevel=2)
-        raise RuntimeError(msg)
+        reject(msg, RuntimeError)
     if index is None:
         return torch.device("cuda")
     return torch.device("cuda", index)
@@ -147,8 +144,7 @@ def _construct_device(
         return torch.device(type_name, index)
     except (RuntimeError, ValueError) as error:
         msg = f"unsupported torch device: {requested!r}"
-        logger.exception(msg)
-        raise RuntimeError(msg) from error
+        reject(msg, RuntimeError, cause=error)
 
 
 def _admit_torch_construction(requested: str) -> torch.device:
@@ -157,8 +153,7 @@ def _admit_torch_construction(requested: str) -> torch.device:
         constructed = torch.device(requested)
     except (RuntimeError, ValueError) as error:
         msg = f"unsupported torch device: {requested!r}"
-        logger.exception(msg)
-        raise RuntimeError(msg) from error
+        reject(msg, RuntimeError, cause=error)
     return _admit_constructed_device(constructed, requested=requested)
 
 
@@ -174,8 +169,7 @@ def _admit_constructed_device(
         return _admit_cuda(device.index, requested=requested)
     if device.type == "mps" and not mps_available():
         msg = f"MPS requested but is not available ({requested!r})."
-        logger.error(msg, stacklevel=2)
-        raise RuntimeError(msg)
+        reject(msg, RuntimeError)
     if device.type not in PUBLISHED_DEVICE_TYPES:
         logger.warning(
             "device=%r is an unpublished Torch backend; this release "
@@ -324,12 +318,10 @@ def reclaim_checkpoint(
     """
     if policy not in _RECLAIM_POLICIES:
         message = f"unsupported gpu_memory_reclaim policy: {policy!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if kind not in _RECLAIM_KINDS:
         message = f"unsupported reclaim checkpoint kind: {kind!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     resolved = device if isinstance(device, torch.device) else parse_device(device)
     if resolved.type not in {"cuda", "mps"}:
         return False

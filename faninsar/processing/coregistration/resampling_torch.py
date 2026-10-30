@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.processing.coregistration.resampling import (
     DEFAULT_LANCZOS_CHUNK,
     DeviceName,
@@ -27,8 +27,7 @@ def _resolve_torch_device(device: DeviceName) -> torch.device:
         from faninsar.processing.runtime.device import parse_device
     except ImportError as error:
         message = "Lanczos resampling requires torch; install FanInSAR dependencies"
-        logger.exception(message)
-        raise ImportError(message) from error
+        reject(message, ImportError, cause=error)
     return parse_device(device)
 
 
@@ -198,20 +197,16 @@ def lanczos_resample_torch(
     coordinates = np.asarray(coords)
     if source.ndim != 2:
         message = "lanczos_resample_torch requires a two-dimensional source"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if coordinates.ndim != 2 or coordinates.shape[0] != 2:
         message = "coords must have shape (2, N)"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if mode not in {"constant", "nearest"}:
         message = f"unsupported boundary mode: {mode!r}"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
     if a < 1:
         message = "Lanczos half-width must be positive"
-        logger.error(message)
-        raise ValueError(message)
+        reject(message, ValueError)
 
     rows = np.asarray(coordinates[0], dtype=np.float64).reshape(-1)
     columns = np.asarray(coordinates[1], dtype=np.float64).reshape(-1)
