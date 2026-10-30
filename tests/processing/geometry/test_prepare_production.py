@@ -14,7 +14,7 @@ from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import prepare_production as prepare_mod
 from faninsar.processing.geometry.backend_dispatch import DispatchError
-from faninsar.processing.geometry.native_v2.builder import (
+from faninsar.processing.geometry.native.builder import (
     NativeBackend,
     NativeBuilder,
     NativeBuildRequest,
@@ -30,7 +30,7 @@ from faninsar.processing.geometry.prepare_production import (
     run_rdr2geo,
 )
 from faninsar.processing.geometry.transforms import RadarGeometryModel
-from faninsar.processing.geometry.v2 import Operation
+from faninsar.processing.geometry.transforms import Operation
 
 
 @pytest.fixture(autouse=True)
@@ -453,7 +453,7 @@ def test_gpu_dem_table_aliases_across_prepared_shapes(monkeypatch) -> None:
     def fake_manifest(**kwargs):
         import torch
 
-        from faninsar.processing.geometry.torch_backends_v2 import _dem_digest
+        from faninsar.processing.geometry.torch_backends import _dem_digest
 
         dem = kwargs["dem"]
         resident = prepare_mod._resident_gpu_dem(
@@ -551,7 +551,7 @@ def test_native_rdr2geo_registers_dem_once_per_digest(monkeypatch) -> None:
     def fake_manifest(**kwargs):
         import torch
 
-        from faninsar.processing.geometry.torch_backends_v2 import _dem_digest
+        from faninsar.processing.geometry.torch_backends import _dem_digest
 
         manifest_calls.append(1)
         dem = kwargs["dem"]

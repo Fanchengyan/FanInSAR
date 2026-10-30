@@ -134,10 +134,10 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 faninsar = [
-  "processing/geometry/native_v2/**/*.cpp",
-  "processing/geometry/native_v2/**/*.h",
-  "processing/geometry/native_v2/**/*.cu",
-  "processing/geometry/native_v2/**/*.cuh",
+  "processing/geometry/native/**/*.cpp",
+  "processing/geometry/native/**/*.h",
+  "processing/geometry/native/**/*.cu",
+  "processing/geometry/native/**/*.cuh",
   "**/*.csv",
   "**/*.cpt",
   "**/*.pdf",

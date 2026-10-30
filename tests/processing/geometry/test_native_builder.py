@@ -1,4 +1,4 @@
-"""Tests for the operation-aware native-v2 preparation slice."""
+"""Tests for the operation-aware native preparation slice."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from faninsar.processing.geometry.native_v2 import (
+from faninsar.processing.geometry.native import (
     GeometryOperation,
     NativeBackend,
     NativeBuilder,
@@ -22,8 +22,8 @@ from faninsar.processing.geometry.native_v2 import (
 @pytest.mark.parametrize(
     ("operation", "backend", "symbol"),
     [
-        (GeometryOperation.GEO2RDR, NativeBackend.CPU, "faninsar_geo2rdr_v2_cpu"),
-        (GeometryOperation.RDR2GEO, NativeBackend.CUDA, "faninsar_rdr2geo_v2_cuda"),
+        (GeometryOperation.GEO2RDR, NativeBackend.CPU, "faninsar_geo2rdr_cpu"),
+        (GeometryOperation.RDR2GEO, NativeBackend.CUDA, "faninsar_rdr2geo_cuda"),
     ],
 )
 def test_operation_and_source_selection_is_exact(
@@ -48,7 +48,7 @@ def test_default_source_root_is_package_local_after_cwd_change(
     """Default CPU and CUDA plans resolve sources independently of cwd."""
     monkeypatch.chdir(tmp_path)
     expected_root = (
-        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native"
     )
 
     for backend in (NativeBackend.CPU, NativeBackend.CUDA):
@@ -69,7 +69,7 @@ def test_default_source_root_is_package_local_after_cwd_change(
 def test_native_plans_include_both_operation_sources_and_shared_binding() -> None:
     """CPU and CUDA plans carry both operation units behind one binding module."""
     source_root = (
-        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native"
     )
     for backend in (NativeBackend.CPU, NativeBackend.CUDA):
         plan = NativeBuilder().plan(
@@ -209,8 +209,8 @@ def test_unqualified_native_candidate_cannot_compile_or_dispatch() -> None:
 def test_qualification_binds_exact_extension_and_geometry_symbol() -> None:
     """Telemetry from another operation or artifact cannot qualify a candidate."""
     telemetry = OpenMPTelemetry(
-        extension_name="faninsar_geo2rdr_v2_cpu",
-        geometry_symbol="faninsar_geo2rdr_v2_cpu",
+        extension_name="faninsar_geo2rdr_cpu",
+        geometry_symbol="faninsar_geo2rdr_cpu",
         openmp_defined=True,
         runtime_name="libgomp",
         observed_thread_ids=(1, 2),
@@ -221,8 +221,8 @@ def test_qualification_binds_exact_extension_and_geometry_symbol() -> None:
     )
     result = qualify_openmp_telemetry(
         telemetry,
-        expected_extension="faninsar_rdr2geo_v2_cpu",
-        expected_geometry_symbol="faninsar_rdr2geo_v2_cpu",
+        expected_extension="faninsar_rdr2geo_cpu",
+        expected_geometry_symbol="faninsar_rdr2geo_cpu",
         expected_runtime="libgomp",
         requested_threads=2,
         expected_affinity=(0, 1),
@@ -235,8 +235,8 @@ def test_qualification_binds_exact_extension_and_geometry_symbol() -> None:
 def test_qualification_requires_exact_coverage_and_thread_profile() -> None:
     """A serial or partial loop is never reported as qualified OpenMP."""
     telemetry = OpenMPTelemetry(
-        extension_name="faninsar_geo2rdr_v2_cpu",
-        geometry_symbol="faninsar_geo2rdr_v2_cpu",
+        extension_name="faninsar_geo2rdr_cpu",
+        geometry_symbol="faninsar_geo2rdr_cpu",
         openmp_defined=True,
         runtime_name="libgomp",
         observed_thread_ids=(1,),
@@ -246,8 +246,8 @@ def test_qualification_requires_exact_coverage_and_thread_profile() -> None:
     )
     result = qualify_openmp_telemetry(
         telemetry,
-        expected_extension="faninsar_geo2rdr_v2_cpu",
-        expected_geometry_symbol="faninsar_geo2rdr_v2_cpu",
+        expected_extension="faninsar_geo2rdr_cpu",
+        expected_geometry_symbol="faninsar_geo2rdr_cpu",
         expected_runtime="libgomp",
         requested_threads=2,
     )

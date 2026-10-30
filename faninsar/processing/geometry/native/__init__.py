@@ -1,6 +1,6 @@
 """Operation-aware native geometry preparation contracts.
 
-The v2 builder deliberately owns preparation metadata only.  Numerical
+The builder deliberately owns preparation metadata only.  Numerical
 transforms and the native ABI adapters are separate layers; dispatch consumes
 an already prepared candidate and never invokes a compiler.
 """

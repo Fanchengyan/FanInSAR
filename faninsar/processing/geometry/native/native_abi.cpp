@@ -1,4 +1,4 @@
-#include "native_v2_abi.h"
+#include "native_abi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,7 +13,7 @@
 #include <sched.h>
 #endif
 
-namespace faninsar_native_v2 {
+namespace faninsar_native {
 namespace {
 
 std::mutex telemetry_mutex;
@@ -231,4 +231,4 @@ std::vector<Tensor> invalid_result(int64_t count, bool geo2rdr,
           nan.clone()};
 }
 
-}  // namespace faninsar_native_v2
+}  // namespace faninsar_native

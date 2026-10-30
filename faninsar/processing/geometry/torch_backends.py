@@ -29,11 +29,12 @@ from faninsar.processing.geometry.torch_kernels import (
     prepared_orbit_tensors,
     rdr2geo_kernel,
 )
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     Operation,
     OperationSettings,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
+    look_angles_deg,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 GeometryOperation: TypeAlias = Operation
-GeometryResultProtocol: TypeAlias = TransformResultV2
+GeometryResultProtocol: TypeAlias = TransformResult
 
 
 def _digest(value: object) -> str:
@@ -325,7 +326,7 @@ class TorchGeometryIdentity:
 class TorchGeometryResult:
     """Foundation result plus Torch execution provenance."""
 
-    transform: TransformResultV2
+    transform: TransformResult
     operation: GeometryOperation
     backend: str
     device: str
@@ -369,6 +370,7 @@ class TorchGeometryResult:
         dtype: str,
         identity: str,
         backend: str,
+        model: RadarGeometryModel | None = None,
         range_tolerance: float = 0.01,
         doppler_tolerance: float = 0.1,
         slant_range_tolerance: float = 0.01,
@@ -387,6 +389,21 @@ class TorchGeometryResult:
             values.get("max_iter_exhausted", (~converged) & ~invalid_mask),
             dtype=bool,
         )
+        if "incidence_deg" in values and "look_azimuth_deg" in values:
+            incidence_deg = np.asarray(values["incidence_deg"], dtype=np.float64)
+            look_azimuth_deg = np.asarray(values["look_azimuth_deg"], dtype=np.float64)
+        elif model is not None:
+            incidence_deg, look_azimuth_deg = look_angles_deg(
+                model,
+                np.asarray(values["azimuth_index"], dtype=np.float64),
+                np.asarray(values["latitude_deg"], dtype=np.float64),
+                np.asarray(values["longitude_deg"], dtype=np.float64),
+                np.asarray(values["height_m"], dtype=np.float64),
+                converged,
+            )
+        else:
+            incidence_deg = np.full(shape, np.nan, dtype=np.float64)
+            look_azimuth_deg = np.full(shape, np.nan, dtype=np.float64)
         if operation is Operation.GEO2RDR:
             decision = np.maximum(
                 np.abs(residual_range) / range_tolerance,
@@ -396,11 +413,13 @@ class TorchGeometryResult:
         else:
             decision = residual_range
             tolerance_array = np.full(shape, slant_range_tolerance, dtype=np.float64)
-        foundation = TransformResultV2.from_arrays(
+        foundation = TransformResult.from_arrays(
             {
                 "latitude_deg": np.asarray(values["latitude_deg"], dtype=np.float64),
                 "longitude_deg": np.asarray(values["longitude_deg"], dtype=np.float64),
                 "height_m": np.asarray(values["height_m"], dtype=np.float64),
+                "incidence_deg": incidence_deg,
+                "look_azimuth_deg": look_azimuth_deg,
                 "range_index": np.asarray(values["range_index"], dtype=np.float64),
                 "azimuth_index": np.asarray(values["azimuth_index"], dtype=np.float64),
                 "converged": converged,
@@ -938,6 +957,7 @@ def execute_torch_geometry(
         device=prepared.device,
         dtype=prepared.dtype,
         identity=prepared.identity.digest,
+        model=prepared.model,
         range_tolerance=prepared.settings.range_tol_m,
         doppler_tolerance=prepared.settings.doppler_tol_hz,
         slant_range_tolerance=prepared.settings.range_tol_m,

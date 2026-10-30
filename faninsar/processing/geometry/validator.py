@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .v2 import (
+from .transforms import (
     ArraySpan,
     GeometryValidationError,
     NativeSpan,

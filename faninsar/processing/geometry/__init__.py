@@ -84,8 +84,7 @@ from .seam import (
     SeamAwareSourceSampler,
     plan_query_windows,
 )
-from .transforms import RadarGeometryModel, TransformResult
-from .v2 import (
+from .transforms import (
     INT32_MAX,
     ArraySpan,
     CandidateKey,
@@ -95,9 +94,10 @@ from .v2 import (
     NativeSpan,
     Operation,
     OperationSettings,
+    RadarGeometryModel,
     RawSpan,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
     validate_array_span,
     validate_input_span,
     validate_native_spans,
@@ -186,7 +186,6 @@ __all__ = [
     "SourceResource",
     "TransformCacheKey",
     "TransformResult",
-    "TransformResultV2",
     "VerticalDatum",
     "bounds_from_xy",
     "conversion_models",

@@ -11,7 +11,7 @@
 #include <limits>
 #include <vector>
 
-namespace faninsar::geometry::cuda_v2 {
+namespace faninsar::geometry::cuda_native {
 
 using torch::Tensor;
 
@@ -236,11 +236,11 @@ inline void check_solver_scalars(int64_t max_iter, int64_t extra_iter,
               tolerance_name, " must be finite and positive");
 }
 
-}  // namespace faninsar::geometry::cuda_v2
+}  // namespace faninsar::geometry::cuda_native
 
-namespace faninsar::geometry::cuda_v2 {
+namespace faninsar::geometry::cuda_native {
 
-std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
+std::vector<Tensor> geo2rdr_cuda_native_with_visit_counts(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -249,7 +249,7 @@ std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
     double wavelength_m, int64_t max_iter, int64_t extra_iter,
     double time_tol_s, double range_tolerance_m, double doppler_tolerance_hz);
 
-std::vector<Tensor> geo2rdr_cuda_v2(
+std::vector<Tensor> geo2rdr_cuda_native(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -258,7 +258,7 @@ std::vector<Tensor> geo2rdr_cuda_v2(
     double wavelength_m, int64_t max_iter, int64_t extra_iter,
     double time_tol_s, double range_tolerance_m, double doppler_tolerance_hz);
 
-Tensor geo2rdr_cuda_v2_visit_counts(
+Tensor geo2rdr_cuda_native_visit_counts(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -267,7 +267,7 @@ Tensor geo2rdr_cuda_v2_visit_counts(
     double wavelength_m, int64_t max_iter, int64_t extra_iter,
     double time_tol_s, double range_tolerance_m, double doppler_tolerance_hz);
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_visit_counts(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -279,7 +279,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_visit_counts_row_width(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -291,7 +291,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking, int64_t row_width);
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_ecef(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -303,7 +303,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2(
+std::vector<Tensor> rdr2geo_tcn_cuda_native(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -315,7 +315,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
-Tensor rdr2geo_tcn_cuda_v2_visit_counts(
+Tensor rdr2geo_tcn_cuda_native_visit_counts(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -327,8 +327,8 @@ Tensor rdr2geo_tcn_cuda_v2_visit_counts(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
-/// Operation-level alias retained for the later native-v2 binding adapter.
-std::vector<Tensor> rdr2geo_cuda_v2(
+/// Operation-level alias retained for the native binding adapter.
+std::vector<Tensor> rdr2geo_cuda_native(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -340,4 +340,4 @@ std::vector<Tensor> rdr2geo_cuda_v2(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
-}  // namespace faninsar::geometry::cuda_v2
+}  // namespace faninsar::geometry::cuda_native

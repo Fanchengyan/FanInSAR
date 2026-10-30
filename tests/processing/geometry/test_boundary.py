@@ -1,4 +1,4 @@
-"""Tests for canonical v2 convergence-boundary evaluation."""
+"""Tests for canonical convergence-boundary evaluation."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 
 from faninsar.processing.geometry import (
     BoundaryDecision,
-    TransformResultV2,
+    TransformResult,
     evaluate_canonical_boundary,
     normalize_result_boundary,
 )
@@ -99,7 +99,7 @@ def test_invalid_boundary_and_result_normalization_keep_sentinels() -> None:
     assert not decision.boundary_rechecked
     assert np.isnan(decision.decision_residual)
     assert np.isnan(decision.normalized_q)
-    result = TransformResultV2.invalid(1)
+    result = TransformResult.invalid(1)
     normalized = normalize_result_boundary(
         result,
         BoundaryDecision(True, True, 0.0, 0.0),

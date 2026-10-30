@@ -1,4 +1,4 @@
-"""Verify that wheels retain the native-v2 preparation source set."""
+"""Verify that wheels retain the native preparation source set."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from os import environ
 from pathlib import Path, PurePosixPath
 
 NATIVE_SOURCE_SUFFIXES = frozenset({".cpp", ".h", ".cu", ".cuh"})
-NATIVE_PACKAGE_PATH = PurePosixPath("faninsar", "processing", "geometry", "native_v2")
+NATIVE_PACKAGE_PATH = PurePosixPath("faninsar", "processing", "geometry", "native")
 REQUIRED_NATIVE_V2_SOURCES = frozenset(
     {
         NATIVE_PACKAGE_PATH / "bindings.cpp",
-        NATIVE_PACKAGE_PATH / "native_v2_abi.cpp",
-        NATIVE_PACKAGE_PATH / "native_v2_abi.h",
+        NATIVE_PACKAGE_PATH / "native_abi.cpp",
+        NATIVE_PACKAGE_PATH / "native_abi.h",
         NATIVE_PACKAGE_PATH / "geo2rdr.cpp",
         NATIVE_PACKAGE_PATH / "rdr2geo.cpp",
         NATIVE_PACKAGE_PATH / "cuda" / "geo2rdr_cuda.cu",
@@ -34,7 +34,7 @@ REQUIRED_NATIVE_V2_SOURCES = frozenset(
 
 
 def _native_source_paths(repository_root: Path) -> set[PurePosixPath]:
-    """Return the native-v2 source paths expected in a wheel.
+    """Return the native source paths expected in a wheel.
 
     Parameters
     ----------
@@ -55,10 +55,10 @@ def _native_source_paths(repository_root: Path) -> set[PurePosixPath]:
     }
 
 
-def test_wheel_contains_exact_native_v2_preparation_source_set(
+def test_wheel_contains_exact_native_preparation_source_set(
     tmp_path: Path,
 ) -> None:
-    """Built distributions preserve native-v2 sources and installed resolution."""
+    """Built distributions preserve native sources and installed resolution."""
     repository_root = Path(__file__).parents[2]
     distribution_directory = tmp_path / "dist"
     distribution_directory.mkdir()
@@ -144,13 +144,13 @@ def test_wheel_contains_exact_native_v2_preparation_source_set(
 from pathlib import Path
 import os
 
-from faninsar.processing.geometry.native_v2 import (
+from faninsar.processing.geometry.native import (
     GeometryOperation,
     NativeBackend,
     NativeBuildRequest,
     NativeBuilder,
 )
-import faninsar.processing.geometry.native_v2.builder as builder
+import faninsar.processing.geometry.native.builder as builder
 
 assert Path(builder.__file__).resolve().is_relative_to(
     Path(os.environ["FANINSAR_WHEEL_VENV"]).resolve()
@@ -161,7 +161,7 @@ for backend in (NativeBackend.CPU, NativeBackend.CUDA):
         NativeBuildRequest(GeometryOperation.GEO2RDR, backend, platform="windows")
     )
     assert all(path.is_absolute() and path.exists() for path in plan.sources)
-    assert all("native_v2" in Path(path).parts for path in plan.sources)
+    assert all("native" in Path(path).parts for path in plan.sources)
 """,
         ],
         cwd=tmp_path,

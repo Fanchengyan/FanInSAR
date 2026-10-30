@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace faninsar::geometry::cuda_v2 {
+namespace faninsar::geometry::cuda_native {
 
 namespace {
 
@@ -11,10 +11,10 @@ namespace {
 // uses row_width=1.  Keeping contexts reusable avoids repeating orbit
 // interpolation and local-frame construction in every persistent worker.
 constexpr int kContextStride = 21;
-#ifndef FANINSAR_NATIVE_V2_BLOCKS_PER_SM
-#define FANINSAR_NATIVE_V2_BLOCKS_PER_SM 4
+#ifndef FANINSAR_NATIVE_BLOCKS_PER_SM
+#define FANINSAR_NATIVE_BLOCKS_PER_SM 4
 #endif
-constexpr int kBlocksPerSm = FANINSAR_NATIVE_V2_BLOCKS_PER_SM;
+constexpr int kBlocksPerSm = FANINSAR_NATIVE_BLOCKS_PER_SM;
 static_assert(kBlocksPerSm > 0, "blocks_per_sm must be positive");
 
 __device__ inline double safe_denominator(double value) {
@@ -389,7 +389,7 @@ __global__ void rdr2geo_tcn_kernel(
 
 }  // namespace
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_visit_counts_row_width_impl(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -553,7 +553,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
   return result;
 }
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_visit_counts_row_width(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -564,7 +564,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking, int64_t row_width) {
-  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
+  return rdr2geo_tcn_cuda_native_with_visit_counts_row_width_impl(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -574,7 +574,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
       right_looking, row_width, false);
 }
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_ecef_row_width(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -585,7 +585,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking, int64_t row_width) {
-  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
+  return rdr2geo_tcn_cuda_native_with_visit_counts_row_width_impl(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -595,7 +595,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
       right_looking, row_width, true);
 }
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_visit_counts(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -606,7 +606,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+  return rdr2geo_tcn_cuda_native_with_visit_counts_row_width(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -616,7 +616,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
       right_looking, 1);
 }
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
+std::vector<Tensor> rdr2geo_tcn_cuda_native_with_ecef(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -627,7 +627,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  return rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+  return rdr2geo_tcn_cuda_native_with_ecef_row_width(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -637,7 +637,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
       right_looking, 1);
 }
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2(
+std::vector<Tensor> rdr2geo_tcn_cuda_native(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -648,7 +648,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  auto result = rdr2geo_tcn_cuda_v2_with_visit_counts(
+  auto result = rdr2geo_tcn_cuda_native_with_visit_counts(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -660,7 +660,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2(
   return result;
 }
 
-Tensor rdr2geo_tcn_cuda_v2_visit_counts(
+Tensor rdr2geo_tcn_cuda_native_visit_counts(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -671,7 +671,7 @@ Tensor rdr2geo_tcn_cuda_v2_visit_counts(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  return rdr2geo_tcn_cuda_v2_with_visit_counts(
+  return rdr2geo_tcn_cuda_native_with_visit_counts(
              azimuth_index, range_index, height_seed_m, orbit_times_s,
              orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
              azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -682,7 +682,7 @@ Tensor rdr2geo_tcn_cuda_v2_visit_counts(
       .back();
 }
 
-std::vector<Tensor> rdr2geo_cuda_v2(
+std::vector<Tensor> rdr2geo_cuda_native(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -693,7 +693,7 @@ std::vector<Tensor> rdr2geo_cuda_v2(
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  return rdr2geo_tcn_cuda_v2(
+  return rdr2geo_tcn_cuda_native(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -703,4 +703,4 @@ std::vector<Tensor> rdr2geo_cuda_v2(
       right_looking);
 }
 
-}  // namespace faninsar::geometry::cuda_v2
+}  // namespace faninsar::geometry::cuda_native

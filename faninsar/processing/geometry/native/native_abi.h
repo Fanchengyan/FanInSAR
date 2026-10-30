@@ -8,7 +8,7 @@
 #include <tuple>
 #include <vector>
 
-namespace faninsar_native_v2 {
+namespace faninsar_native {
 
 using Vec3 = std::array<double, 3>;
 using Tensor = torch::Tensor;
@@ -51,4 +51,4 @@ TelemetrySnapshot telemetry_snapshot();
 std::vector<Tensor> invalid_result(int64_t count, bool geo2rdr,
                                    double tolerance);
 
-}  // namespace faninsar_native_v2
+}  // namespace faninsar_native

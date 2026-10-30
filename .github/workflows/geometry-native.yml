@@ -10,9 +10,9 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "tests/packaging/**"
-      - "tests/processing/geometry/test_native_v2_cpu_sources.py"
-      - "tests/processing/geometry/test_public_geometry_v2.py"
-      - "tests/processing/geometry/test_public_geometry_v2_p1.py"
+      - "tests/processing/geometry/test_native_cpu_sources.py"
+      - "tests/processing/geometry/test_public_geometry.py"
+      - "tests/processing/geometry/test_public_geometry_p1.py"
   push:
     paths:
       - ".github/workflows/geometry-native.yml"
@@ -22,9 +22,9 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "tests/packaging/**"
-      - "tests/processing/geometry/test_native_v2_cpu_sources.py"
-      - "tests/processing/geometry/test_public_geometry_v2.py"
-      - "tests/processing/geometry/test_public_geometry_v2_p1.py"
+      - "tests/processing/geometry/test_native_cpu_sources.py"
+      - "tests/processing/geometry/test_public_geometry.py"
+      - "tests/processing/geometry/test_public_geometry_p1.py"
 
 permissions:
   contents: read
@@ -69,7 +69,7 @@ jobs:
       - name: Run serial native ABI and public dispatch tests
         run: >-
           uv run pytest -q --no-cov
-          tests/processing/geometry/test_native_v2_cpu_sources.py::test_serial_cpu_extension_returns_validated_fourteen_field_result
-          tests/processing/geometry/test_public_geometry_v2.py::test_public_selectors_execute_prepared_eager_and_native
-          tests/processing/geometry/test_public_geometry_v2.py::test_public_auto_requires_both_native_qualification_gates
-          tests/processing/geometry/test_public_geometry_v2_p1.py::test_auto_eager_fallback_preserves_cuda_device_identity
+          tests/processing/geometry/test_native_cpu_sources.py::test_serial_cpu_extension_returns_validated_fourteen_field_result
+          tests/processing/geometry/test_public_geometry.py::test_public_selectors_execute_prepared_eager_and_native
+          tests/processing/geometry/test_public_geometry.py::test_public_auto_requires_both_native_qualification_gates
+          tests/processing/geometry/test_public_geometry_p1.py::test_auto_eager_fallback_preserves_cuda_device_identity

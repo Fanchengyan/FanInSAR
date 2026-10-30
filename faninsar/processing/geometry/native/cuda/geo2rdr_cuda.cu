@@ -1,6 +1,6 @@
 #include "geometry_cuda.cuh"
 
-namespace faninsar::geometry::cuda_v2 {
+namespace faninsar::geometry::cuda_native {
 
 namespace {
 
@@ -160,7 +160,7 @@ __global__ void geo2rdr_kernel(
 
 }  // namespace
 
-std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
+std::vector<Tensor> geo2rdr_cuda_native_with_visit_counts(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -251,7 +251,7 @@ std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
           doppler_residual, visit_counts};
 }
 
-std::vector<Tensor> geo2rdr_cuda_v2(
+std::vector<Tensor> geo2rdr_cuda_native(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -259,7 +259,7 @@ std::vector<Tensor> geo2rdr_cuda_v2(
     double starting_slant_range_m, double range_spacing_m, double wavelength_m,
     int64_t max_iter, int64_t extra_iter, double time_tol_s,
     double range_tolerance_m, double doppler_tolerance_hz) {
-  auto result = geo2rdr_cuda_v2_with_visit_counts(
+  auto result = geo2rdr_cuda_native_with_visit_counts(
       latitude_deg, longitude_deg, height_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -269,7 +269,7 @@ std::vector<Tensor> geo2rdr_cuda_v2(
   return result;
 }
 
-Tensor geo2rdr_cuda_v2_visit_counts(
+Tensor geo2rdr_cuda_native_visit_counts(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -277,7 +277,7 @@ Tensor geo2rdr_cuda_v2_visit_counts(
     double starting_slant_range_m, double range_spacing_m, double wavelength_m,
     int64_t max_iter, int64_t extra_iter, double time_tol_s,
     double range_tolerance_m, double doppler_tolerance_hz) {
-  return geo2rdr_cuda_v2_with_visit_counts(
+  return geo2rdr_cuda_native_with_visit_counts(
              latitude_deg, longitude_deg, height_m, orbit_times_s,
              orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
              azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
@@ -286,4 +286,4 @@ Tensor geo2rdr_cuda_v2_visit_counts(
       .back();
 }
 
-}  // namespace faninsar::geometry::cuda_v2
+}  // namespace faninsar::geometry::cuda_native

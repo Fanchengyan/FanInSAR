@@ -1,4 +1,4 @@
-"""Focused regression tests for the public geometry v2 P1 contracts."""
+"""Focused regression tests for the public geometry P1 contracts."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from faninsar.processing.geometry import (
     Operation,
     execute_geometry,
     prepare_geometry,
-    torch_backends_v2,
+    torch_backends,
     torch_kernels,
 )
 from faninsar.processing.geometry import public as geometry_public
@@ -28,32 +28,32 @@ from faninsar.processing.geometry.backend_dispatch import (
     RecoverableExecutionError,
 )
 from faninsar.processing.geometry.grids import GridSpec
-from faninsar.processing.geometry.native_v2.bindings import (
+from faninsar.processing.geometry.native.bindings import (
     ecef_from_native_outputs,
     result_from_native_outputs,
 )
-from faninsar.processing.geometry.native_v2.builder import (
+from faninsar.processing.geometry.native.builder import (
     BuildPlan,
     GeometryOperation,
     NativeBackend,
     PreparationStatus,
     PreparedNativeCandidate,
 )
-from faninsar.processing.geometry.torch_backends_v2 import (
+from faninsar.processing.geometry.torch_backends import (
     TorchGeometryResult,
     prepare_torch_geometry,
 )
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     CandidateKey,
     DeviceKey,
     ExecutionProfile,
     GeometryValidationError,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
     validate_tensor_span,
 )
 
-from .test_public_geometry_v2 import (
+from .test_public_geometry import (
     _model,
     _native_context,
     _native_key,
@@ -426,7 +426,7 @@ def _capture_rdr2geo_height_seed(
             "residual_doppler_hz": zeros,
         }
 
-    monkeypatch.setattr(torch_backends_v2, "rdr2geo_kernel", fake_kernel)
+    monkeypatch.setattr(torch_backends, "rdr2geo_kernel", fake_kernel)
     return captured
 
 
@@ -459,7 +459,7 @@ def test_torch_rdr2geo_wrapper_reuses_prepared_default_height_seed(
     """The convenience wrapper leaves omitted height for prepared validation."""
     captured = _capture_rdr2geo_height_seed(monkeypatch)
 
-    torch_backends_v2.torch_rdr2geo(
+    torch_backends.torch_rdr2geo(
         _model(),
         np.zeros(2, dtype=np.float64),
         np.zeros(2, dtype=np.float64),
@@ -937,8 +937,8 @@ def test_cuda_aliases_canonicalize_to_the_current_ordinal(
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
-    assert torch_backends_v2._canonical_torch_device("cuda") == torch.device("cuda:0")
-    assert torch_backends_v2._canonical_torch_device("cuda:0") == torch.device("cuda:0")
+    assert torch_backends._canonical_torch_device("cuda") == torch.device("cuda:0")
+    assert torch_backends._canonical_torch_device("cuda:0") == torch.device("cuda:0")
 
 
 def test_cuda_unsupported_ordinal_fails_during_resolution(
@@ -951,7 +951,7 @@ def test_cuda_unsupported_ordinal_fails_during_resolution(
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
 
     with pytest.raises(RuntimeError, match="unsupported device ordinal 1"):
-        torch_backends_v2._resolve_device("cuda:1")
+        torch_backends._resolve_device("cuda:1")
 
 
 def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
@@ -960,7 +960,7 @@ def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
     assert "step_small" not in source
     assert "newly = active & valid & in_bounds" in source
     assert "metric < 1.0" in source
-    native_root = Path(torch_kernels.__file__).parent / "native_v2"
+    native_root = Path(torch_kernels.__file__).parent / "native"
     assert (
         "fabs(step) < time_tolerance"
         not in (native_root / "cuda" / "geo2rdr_cuda.cu").read_text()
@@ -1170,8 +1170,8 @@ def test_native_rdr2geo_candidate_path_is_rejected() -> None:
     plan = BuildPlan(
         GeometryOperation.RDR2GEO,
         NativeBackend.CPU,
-        "faninsar_rdr2geo_v2_cpu",
-        "faninsar_rdr2geo_v2_cpu",
+        "faninsar_rdr2geo_cpu",
+        "faninsar_rdr2geo_cpu",
         (),
         (),
         (),
@@ -1371,6 +1371,8 @@ def test_native_public_no_callback_uses_array_normalization_fast_path(
         "latitude_deg": np.ones(shape, dtype=np.float64),
         "longitude_deg": np.ones(shape, dtype=np.float64),
         "height_m": np.ones(shape, dtype=np.float64),
+        "incidence_deg": np.ones(shape, dtype=np.float64),
+        "look_azimuth_deg": np.ones(shape, dtype=np.float64),
         "range_index": np.ones(shape, dtype=np.float64),
         "azimuth_index": np.ones(shape, dtype=np.float64),
         "converged": np.ones(shape, dtype=bool),
@@ -1383,7 +1385,7 @@ def test_native_public_no_callback_uses_array_normalization_fast_path(
         "residual_range_m": np.full(shape, 0.002, dtype=np.float64),
         "residual_doppler_hz": np.full(shape, 0.002, dtype=np.float64),
     }
-    result = TransformResultV2.from_arrays(fields, operation=Operation.GEO2RDR)
+    result = TransformResult.from_arrays(fields, operation=Operation.GEO2RDR)
 
     def unexpected_decision(*_: object, **__: object) -> None:
         raise AssertionError
@@ -1412,6 +1414,8 @@ def test_native_public_no_callback_preserves_scalar_status_semantics() -> None:
         "latitude_deg": np.array([1.0, 2.0, np.nan], dtype=np.float64),
         "longitude_deg": np.array([1.0, 2.0, 3.0], dtype=np.float64),
         "height_m": np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        "incidence_deg": np.ones(3, dtype=np.float64),
+        "look_azimuth_deg": np.ones(3, dtype=np.float64),
         "range_index": np.ones(3, dtype=np.float64),
         "azimuth_index": np.ones(3, dtype=np.float64),
         "converged": np.array([True, False, False]),
@@ -1424,7 +1428,7 @@ def test_native_public_no_callback_preserves_scalar_status_semantics() -> None:
         "residual_range_m": np.ones(3, dtype=np.float64),
         "residual_doppler_hz": np.ones(3, dtype=np.float64),
     }
-    result = TransformResultV2.from_arrays(
+    result = TransformResult.from_arrays(
         fields,
         operation=Operation.GEO2RDR,
         invalid_mask=np.array([False, False, True]),
@@ -1604,7 +1608,7 @@ def test_native_context_rejects_nonfinite_dem_before_executor() -> None:
 def test_native_context_allows_nan_dem_nodata() -> None:
     """NaN DEM nodata is part of the native raster contract."""
     from faninsar.processing.geometry.public import _validate_native_context_inputs
-    from faninsar.processing.geometry.v2 import DeviceKey
+    from faninsar.processing.geometry.transforms import DeviceKey
 
     model = _model()
     context = _native_context(model, Operation.RDR2GEO)

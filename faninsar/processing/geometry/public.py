@@ -1,11 +1,11 @@
 # ruff: noqa: A002, EM101, EM102, TRY003
-"""Public preparation and execution boundary for geometry v2.
+"""Public preparation and execution boundary for geometry.
 
 The public boundary is intentionally small.  Preparation creates the eager
 Torch adapter and, when requested, the compiled adapter or a native candidate.
 Execution only selects an already prepared entry in the local dispatcher; it
 never calls a compiler.  All results, including native results, are converted
-through :class:`TransformResultV2`; callback-enabled results use the canonical
+through :class:`TransformResult`; callback-enabled results use the canonical
 boundary normalizer.
 """
 
@@ -33,29 +33,29 @@ from faninsar.processing.geometry.boundary import (
     evaluate_canonical_boundary,
     normalize_result_boundary,
 )
-from faninsar.processing.geometry.native_v2.bindings import (
+from faninsar.processing.geometry.native.bindings import (
     ecef_from_native_outputs,
     result_from_native_outputs,
 )
-from faninsar.processing.geometry.torch_backends_v2 import (
+from faninsar.processing.geometry.torch_backends import (
     PreparedTorchGeometry,
     TorchGeometryResult,
     prepare_torch_geometry,
 )
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     DeviceKey,
     ExecutionProfile,
     GeometryValidationError,
     Operation,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
     validate_array_span,
     validate_tensor_span,
 )
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry import DEM
-    from faninsar.processing.geometry.native_v2.builder import PreparedNativeCandidate
+    from faninsar.processing.geometry.native.builder import PreparedNativeCandidate
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.processing.runtime.types import DeviceLike
 
@@ -287,22 +287,22 @@ def _resolve_native_entrypoint(
 
 
 def _normalize_without_boundary_callback(
-    result: TransformResultV2,
+    result: TransformResult,
     *,
     invalid_mask: np.ndarray,
-) -> TransformResultV2:
+) -> TransformResult:
     """Publish a result without constructing scalar boundary decisions.
 
     Parameters
     ----------
-    result : TransformResultV2
+    result : TransformResult
         Validated backend result.
     invalid_mask : numpy.ndarray
         Final coordinate-validity mask used by the public contract.
 
     Returns
     -------
-    TransformResultV2
+    TransformResult
         The original result when no status needs changing, otherwise a result
         sharing untouched arrays and copying only fields that are normalized.
 
@@ -339,6 +339,8 @@ def _normalize_without_boundary_callback(
             "latitude_deg",
             "longitude_deg",
             "height_m",
+            "incidence_deg",
+            "look_azimuth_deg",
             "range_index",
             "azimuth_index",
             "decision_residual",
@@ -358,7 +360,7 @@ def _normalize_without_boundary_callback(
             value.reshape(-1)[flat_invalid] = False
             fields[name] = value
 
-    return TransformResultV2(**fields)
+    return TransformResult(**fields)
 
 
 def _validate_native_context_inputs(
@@ -495,7 +497,7 @@ def _device_key(
             raise DispatchError("CUDA geometry preparation requires a physical UUID")
         return DeviceKey.cuda(physical_uuid, mig_uuid=mig_uuid)
     if resolved.type != "cpu":
-        raise DispatchError(f"geometry v2 only supports CPU and CUDA, got {device!r}")
+        raise DispatchError(f"geometry only supports CPU and CUDA, got {device!r}")
     return DeviceKey.cpu()
 
 
@@ -596,10 +598,11 @@ def _native_public_result(
     slant_range_tolerance_m: float = 0.01,
     iteration_budget: int | None = None,
     output_shape: tuple[int, ...] | None = None,
-) -> TransformResultV2:
+    model: RadarGeometryModel | None = None,
+) -> TransformResult:
     """Convert and canonically normalize one backend result."""
-    if isinstance(outputs, TransformResultV2):
-        result = TransformResultV2.from_arrays(
+    if isinstance(outputs, TransformResult):
+        result = TransformResult.from_arrays(
             {name: getattr(outputs, name) for name in outputs.fields},
             operation=operation,
             invalid_mask=~np.isfinite(
@@ -609,14 +612,14 @@ def _native_public_result(
     else:
         if not isinstance(outputs, Sequence):
             raise DispatchError("native geometry executor did not return a sequence")
-        result = result_from_native_outputs(outputs, operation=operation)
+        result = result_from_native_outputs(outputs, operation=operation, model=model)
 
     if output_shape is not None and result.latitude_deg.shape != output_shape:
         fields = {
             name: np.asarray(getattr(result, name)).reshape(output_shape)
             for name in result.fields
         }
-        result = TransformResultV2.from_arrays(
+        result = TransformResult.from_arrays(
             fields,
             operation=operation,
             invalid_mask=~np.isfinite(
@@ -740,7 +743,7 @@ def _native_public_result(
             flat_iterations[index] = attempts[index]
         if decision.boundary_rechecked and not decision.converged:
             flat_exhausted[index] = True
-    return TransformResultV2(**dict(fields))
+    return TransformResult(**dict(fields))
 
 
 _normalize_public_result = _native_public_result
@@ -783,9 +786,7 @@ def _key(
         )
         toolchain_digest = digest_paths((*plan.compile_flags, *plan.link_flags))
         runtime_digest = hashlib.sha256(str(plan.runtime_name).encode()).hexdigest()
-        abi_digest = hashlib.sha256(
-            b"faninsar.geometry.native_v2.14-field.v1"
-        ).hexdigest()
+        abi_digest = hashlib.sha256(b"faninsar.geometry.native.14-field.v1").hexdigest()
     else:
         source_digest = toolchain_digest = runtime_digest = artifact_digest = (
             abi_digest
@@ -881,14 +882,14 @@ class PreparedGeometry:
         self,
         *inputs: object,
         selector: BackendSelector = "auto",
-    ) -> TransformResultV2:
+    ) -> TransformResult:
         """Execute the selected prepared backend without compiling."""
         result = self.dispatcher.dispatch(
             self._key_for_selector(selector), selector, *inputs
         )
         if isinstance(result, TorchGeometryResult):
             return _normalize_public_result(result.transform, operation=self.operation)
-        if not isinstance(result, TransformResultV2):
+        if not isinstance(result, TransformResult):
             raise DispatchError("geometry backend returned an unknown result type")
         return result.validate()
 
@@ -1035,7 +1036,7 @@ def prepare_geometry(
         else None
     )
 
-    def eager_execute(*args: object) -> TransformResultV2:
+    def eager_execute(*args: object) -> TransformResult:
         """Execute eager reference geometry for the public dispatcher."""
         return _normalize_public_result(
             eager.execute(*args).transform,
@@ -1075,6 +1076,7 @@ def prepare_geometry(
                 doppler_tolerance_hz=solver.doppler_tolerance_hz,
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
                 iteration_budget=solver.budget,
+                model=model,
             ),
         )
     if native_executor is not None or native_candidate is not None:
@@ -1129,7 +1131,7 @@ def prepare_geometry(
                 native_executor, op, profile.device, solver, ecef=True
             )
 
-        def execute_native(*args: object) -> TransformResultV2:
+        def execute_native(*args: object) -> TransformResult:
             """Execute and centrally validate the supplied native entry point."""
             native_inputs = _validate_public_inputs(
                 op,
@@ -1153,6 +1155,7 @@ def prepare_geometry(
                     slant_range_tolerance_m=solver.slant_range_tolerance_m,
                     iteration_budget=solver.budget,
                     output_shape=normalized_shape,
+                    model=model,
                 )
             if entry is None:
                 raise DispatchError("native geometry executor is missing")
@@ -1165,6 +1168,7 @@ def prepare_geometry(
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
                 iteration_budget=solver.budget,
                 output_shape=normalized_shape,
+                model=model,
             )
 
         def execute_native_ecef(*args: object) -> object:
@@ -1215,7 +1219,7 @@ def execute_geometry(
     prepared: PreparedGeometry,
     *inputs: object,
     selector: BackendSelector = "auto",
-) -> TransformResultV2:
+) -> TransformResult:
     """Execute a :func:`prepare_geometry` result without implicit compilation."""
     return prepared.execute(*inputs, selector=selector)
 

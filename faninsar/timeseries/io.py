@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from faninsar.io.storage.product import commit_product, open_product
+from faninsar.io.storage.product import open_product, publish_product
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.timeseries.results import SpatialMetadata, TimeSeries
@@ -335,7 +335,7 @@ def write_timeseries_product(
         group.attrs.update(attrs)
         return {"timeseries": {"href": _ZARR_NAME, "type": "application/vnd+zarr"}}
 
-    product = commit_product(
+    product = publish_product(
         path,
         kind=TIMESERIES_KIND,
         properties={**timeseries_properties(result), **dict(properties or {})},

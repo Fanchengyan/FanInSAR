@@ -11,10 +11,10 @@ from faninsar.processing.geometry.backend_dispatch import (
     Dispatcher,
     resolve_geometry_device,
 )
-from faninsar.processing.geometry.torch_backends_v2 import _resolve_device
-from faninsar.processing.geometry.v2 import CandidateKey, DeviceKey
+from faninsar.processing.geometry.torch_backends import _resolve_device
+from faninsar.processing.geometry.transforms import CandidateKey, DeviceKey
 
-from .test_public_geometry_v2 import _model
+from .test_public_geometry import _model
 
 
 def test_resolve_geometry_device_auto_selects_cuda_when_available(

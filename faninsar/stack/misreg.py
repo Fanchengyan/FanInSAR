@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from faninsar.io.storage.product import commit_product, open_product
+from faninsar.io.storage.product import open_product, publish_product
 from faninsar.processing.coregistration.misreg_network import DateMisreg, MisregArc
 
 if TYPE_CHECKING:
@@ -131,7 +131,7 @@ def write_misreg(
     existing = _identical_existing_product(root, properties)
     if existing is not None:
         return existing
-    return commit_product(
+    return publish_product(
         root,
         kind=MISREG_KIND,
         properties=properties,

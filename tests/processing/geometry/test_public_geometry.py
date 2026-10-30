@@ -1,4 +1,4 @@
-"""Integration tests for the public geometry-v2 preparation seam."""
+"""Integration tests for the public geometry preparation seam."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from faninsar.processing.geometry import (
     prepare_geometry,
 )
 from faninsar.processing.geometry.prepare_production import run_geo2rdr
-from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.torch_backends import prepare_torch_geometry
+from faninsar.processing.geometry.transforms import (
     CandidateKey,
     DeviceKey,
     ExecutionProfile,
@@ -36,7 +36,7 @@ def _model() -> RadarGeometryModel:
         )
         for index in range(5)
     )
-    orbit = OrbitMetadata("ITRF", "public-v2-test", vectors)
+    orbit = OrbitMetadata("ITRF", "public-test", vectors)
     grid = RadarGrid(
         shape=(8, 8),
         starting_slant_range_m=800_000.0,

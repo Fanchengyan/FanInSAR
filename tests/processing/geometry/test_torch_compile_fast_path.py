@@ -5,9 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from faninsar.processing.geometry import torch_backends_v2, torch_kernels
+from faninsar.processing.geometry import torch_backends, torch_kernels
 
-from .test_public_geometry_v2 import _model
+from .test_public_geometry import _model
 
 
 def test_cpu_geo2rdr_compile_creates_two_unwarmed_graphs_for_real_inputs(
@@ -31,7 +31,7 @@ def test_cpu_geo2rdr_compile_creates_two_unwarmed_graphs_for_real_inputs(
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr",
         _model(),
         shape=(1,),
@@ -67,7 +67,7 @@ def test_cpu_geo2rdr_compile_wrappers_are_immutable_across_concurrent_first_call
         return function
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr", _model(), shape=(1,), compile_kernel=True, max_iter=3
     )
     assert compile_count == 2
@@ -100,10 +100,10 @@ def test_cpu_geo2rdr_compile_reuses_each_prepared_graph_cache(
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     model = _model()
-    first = torch_backends_v2.prepare_torch_geometry(
+    first = torch_backends.prepare_torch_geometry(
         "geo2rdr", model, shape=(1,), compile_kernel=True, max_iter=3
     )
-    second = torch_backends_v2.prepare_torch_geometry(
+    second = torch_backends.prepare_torch_geometry(
         "geo2rdr", model, shape=(2,), compile_kernel=True, max_iter=3
     )
     assert compile_count == 4
@@ -148,7 +148,7 @@ def test_compile_configuration_is_fullgraph_and_shape_static(
         return function
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr",
         _model(),
         shape=(1,),
@@ -195,7 +195,7 @@ def test_non_geo2rdr_compile_branch_keeps_single_warmed_callable(
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    torch_backends_v2.prepare_torch_geometry(
+    torch_backends.prepare_torch_geometry(
         "rdr2geo", _model(), shape=(1,), compile_kernel=True
     )
 
@@ -220,7 +220,7 @@ def test_cpu_geo2rdr_compile_continues_state_without_restart(
     import torch
 
     attempts_before_step: list[np.ndarray] = []
-    original_step = torch_backends_v2._geo2rdr_step
+    original_step = torch_backends._geo2rdr_step
 
     def fake_compile(function: object, **kwargs: object) -> object:
         del kwargs
@@ -233,7 +233,7 @@ def test_cpu_geo2rdr_compile_continues_state_without_restart(
         return original_step(state, *args, **kwargs)
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch_backends_v2, "_geo2rdr_step", counted_step)
+    monkeypatch.setattr(torch_backends, "_geo2rdr_step", counted_step)
     values = (
         np.array([-60.0, -60.0], dtype=np.float64),
         np.array([-180.0, -175.5], dtype=np.float64),
@@ -246,10 +246,10 @@ def test_cpu_geo2rdr_compile_continues_state_without_restart(
         "range_tol_m": 1.0e-4,
         "doppler_tol_hz": 0.1,
     }
-    eager = torch_backends_v2.prepare_torch_geometry(
+    eager = torch_backends.prepare_torch_geometry(
         "geo2rdr", _model(), compile_kernel=False, **settings
     ).execute(*values)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr", _model(), compile_kernel=True, **settings
     )
 
@@ -284,7 +284,7 @@ def test_cpu_geo2rdr_compile_does_not_fallback_for_invalid_lanes(
     import torch
 
     calls = 0
-    original_step = torch_backends_v2._geo2rdr_step
+    original_step = torch_backends._geo2rdr_step
 
     def fake_compile(function: object, **kwargs: object) -> object:
         del kwargs
@@ -298,8 +298,8 @@ def test_cpu_geo2rdr_compile_does_not_fallback_for_invalid_lanes(
         return original_step(state, *args, **kwargs)
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch_backends_v2, "_geo2rdr_step", counted_step)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    monkeypatch.setattr(torch_backends, "_geo2rdr_step", counted_step)
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr", _model(), shape=(1,), compile_kernel=True, max_iter=40
     )
     calls = 0
@@ -329,11 +329,11 @@ def test_cpu_geo2rdr_finite_lane_failed_derivative_is_not_exhausted(
         orbit[3],
     )
     monkeypatch.setattr(
-        torch_backends_v2,
+        torch_backends,
         "prepared_orbit_tensors",
         lambda *_args, **_kwargs: zero_velocity_orbit,
     )
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr", model, shape=(1,), max_iter=5
     )
 
@@ -365,7 +365,7 @@ def test_cpu_geo2rdr_compile_honors_zero_or_one_remaining_iteration(
     import torch
 
     calls = 0
-    original_step = torch_backends_v2._geo2rdr_step
+    original_step = torch_backends._geo2rdr_step
 
     def fake_compile(function: object, **kwargs: object) -> object:
         del kwargs
@@ -379,8 +379,8 @@ def test_cpu_geo2rdr_compile_honors_zero_or_one_remaining_iteration(
         return original_step(state, *args, **kwargs)
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch_backends_v2, "_geo2rdr_step", counted_step)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    monkeypatch.setattr(torch_backends, "_geo2rdr_step", counted_step)
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr", _model(), shape=(1,), compile_kernel=True, max_iter=budget
     )
     calls = 0
@@ -402,7 +402,7 @@ def test_cpu_geo2rdr_compile_preserves_full_budget_exhaustion(
     import torch
 
     calls = 0
-    original_step = torch_backends_v2._geo2rdr_step
+    original_step = torch_backends._geo2rdr_step
 
     def fake_compile(function: object, **kwargs: object) -> object:
         del kwargs
@@ -416,8 +416,8 @@ def test_cpu_geo2rdr_compile_preserves_full_budget_exhaustion(
         return original_step(state, *args, **kwargs)
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch_backends_v2, "_geo2rdr_step", counted_step)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    monkeypatch.setattr(torch_backends, "_geo2rdr_step", counted_step)
+    prepared = torch_backends.prepare_torch_geometry(
         "geo2rdr",
         _model(),
         shape=(1,),
@@ -643,7 +643,7 @@ def test_prepared_rdr2geo_ecef_transfer_skips_non_coordinate_fields() -> None:
     import torch
 
     model = _model()
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "rdr2geo", model, shape=(2,), max_iter=4
     )
     inputs = (
@@ -1085,14 +1085,14 @@ def test_prepared_rdr2geo_passes_primary_and_extra_budgets_separately(
 ) -> None:
     """The prepared adapter preserves the split primary and extra budgets."""
     calls: list[tuple[int, int]] = []
-    original_kernel = torch_backends_v2.rdr2geo_kernel
+    original_kernel = torch_backends.rdr2geo_kernel
 
     def wrapped_kernel(*args: object, **kwargs: object) -> dict[str, object]:
         calls.append((int(kwargs["max_iter"]), int(kwargs["extra_iter"])))
         return original_kernel(*args, **kwargs)
 
-    monkeypatch.setattr(torch_backends_v2, "rdr2geo_kernel", wrapped_kernel)
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    monkeypatch.setattr(torch_backends, "rdr2geo_kernel", wrapped_kernel)
+    prepared = torch_backends.prepare_torch_geometry(
         "rdr2geo",
         _model(),
         shape=(1,),
@@ -1154,7 +1154,7 @@ def test_rdr2geo_failed_lane_publishes_invalid_sentinels() -> None:
     import torch
 
     model = _model()
-    prepared = torch_backends_v2.prepare_torch_geometry(
+    prepared = torch_backends.prepare_torch_geometry(
         "rdr2geo",
         model,
         shape=(1,),

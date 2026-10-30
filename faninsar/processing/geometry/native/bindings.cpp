@@ -1,9 +1,9 @@
-#include "native_v2_abi.h"
+#include "native_abi.h"
 
 #include <pybind11/stl.h>
 
-#ifndef FANINSAR_NATIVE_V2_CUDA
-namespace faninsar_native_v2 {
+#ifndef FANINSAR_NATIVE_CUDA
+namespace faninsar_native {
 
 std::vector<Tensor> geo2rdr_cpu(
     const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -19,49 +19,49 @@ std::vector<Tensor> rdr2geo_cpu_dem(
     double, double, bool, const Tensor&, double, double, double, double,
     int64_t, double);
 
-}  // namespace faninsar_native_v2
+}  // namespace faninsar_native
 #endif
 
-#ifdef FANINSAR_NATIVE_V2_CUDA
-namespace faninsar::geometry::cuda_v2 {
+#ifdef FANINSAR_NATIVE_CUDA
+namespace faninsar::geometry::cuda_native {
 
-std::vector<torch::Tensor> geo2rdr_cuda_v2(
+std::vector<torch::Tensor> geo2rdr_cuda_native(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, double, int64_t, int64_t, double, double, double);
-std::vector<torch::Tensor> geo2rdr_cuda_v2_with_visit_counts(
+std::vector<torch::Tensor> geo2rdr_cuda_native_with_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, double, int64_t, int64_t, double, double, double);
-torch::Tensor geo2rdr_cuda_v2_visit_counts(
+torch::Tensor geo2rdr_cuda_native_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, double, int64_t, int64_t, double, double, double);
-std::vector<torch::Tensor> rdr2geo_cuda_v2(
+std::vector<torch::Tensor> rdr2geo_cuda_native(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool);
-std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_native_with_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool);
-std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_native_with_visit_counts_row_width(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool, int64_t);
-std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_native_with_ecef_row_width(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool, int64_t);
-torch::Tensor rdr2geo_tcn_cuda_v2_visit_counts(
+torch::Tensor rdr2geo_tcn_cuda_native_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
@@ -85,7 +85,7 @@ std::vector<torch::Tensor> geo2rdr_cuda_public(
               "geo2rdr input arrays must be one- or two-dimensional");
   const auto sizes = latitude.sizes();
   const auto flat_shape = std::vector<int64_t>{latitude.numel()};
-  auto result = geo2rdr_cuda_v2(
+  auto result = geo2rdr_cuda_native(
       latitude.contiguous().reshape(flat_shape),
       longitude.contiguous().reshape(flat_shape),
       height.contiguous().reshape(flat_shape), orbit_times, orbit_positions,
@@ -125,7 +125,7 @@ std::vector<torch::Tensor> rdr2geo_cuda_public(
     }
   }
   const auto flat_shape = std::vector<int64_t>{azimuth.numel()};
-  auto result = rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+  auto result = rdr2geo_tcn_cuda_native_with_visit_counts_row_width(
       azimuth.contiguous().reshape(flat_shape),
       range.contiguous().reshape(flat_shape),
       height_seed.contiguous().reshape(flat_shape), orbit_times,
@@ -168,7 +168,7 @@ std::vector<torch::Tensor> rdr2geo_cuda_ecef_public(
     }
   }
   const auto flat_shape = std::vector<int64_t>{azimuth.numel()};
-  auto result = rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+  auto result = rdr2geo_tcn_cuda_native_with_ecef_row_width(
       azimuth.contiguous().reshape(flat_shape),
       range.contiguous().reshape(flat_shape),
       height_seed.contiguous().reshape(flat_shape), orbit_times,
@@ -186,14 +186,14 @@ std::vector<torch::Tensor> rdr2geo_cuda_ecef_public(
   return result;
 }
 
-}  // namespace faninsar::geometry::cuda_v2
+}  // namespace faninsar::geometry::cuda_native
 #endif
 
 namespace {
 
-#ifndef FANINSAR_NATIVE_V2_CUDA
-pybind11::dict native_v2_telemetry() {
-  const auto snapshot = faninsar_native_v2::telemetry_snapshot();
+#ifndef FANINSAR_NATIVE_CUDA
+pybind11::dict native_telemetry() {
+  const auto snapshot = faninsar_native::telemetry_snapshot();
   pybind11::dict result;
   result["openmp_defined"] = snapshot.openmp_defined;
   result["runtime_name"] = snapshot.runtime_name;
@@ -209,38 +209,38 @@ pybind11::dict native_v2_telemetry() {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-#ifndef FANINSAR_NATIVE_V2_CUDA
-  module.def("geo2rdr_cpu", &faninsar_native_v2::geo2rdr_cpu,
+#ifndef FANINSAR_NATIVE_CUDA
+  module.def("geo2rdr_cpu", &faninsar_native::geo2rdr_cpu,
              "Run the OpenMP CPU geo2rdr kernel");
-  module.def("rdr2geo_cpu", &faninsar_native_v2::rdr2geo_cpu,
+  module.def("rdr2geo_cpu", &faninsar_native::rdr2geo_cpu,
              "Run the OpenMP CPU rdr2geo kernel");
-  module.def("rdr2geo_cpu_dem", &faninsar_native_v2::rdr2geo_cpu_dem,
+  module.def("rdr2geo_cpu_dem", &faninsar_native::rdr2geo_cpu_dem,
              "Run rdr2geo with a six-by-six DEM spline fixed point");
-  module.def("native_v2_telemetry", &native_v2_telemetry,
+  module.def("native_telemetry", &native_telemetry,
              "Return exact geometry-loop OpenMP telemetry");
 #endif
   module.def("native_source_abi", []() {
-    return std::string("faninsar.geometry.native_v2.14-field.v1");
+    return std::string("faninsar.geometry.native.14-field.v1");
   });
-#ifdef FANINSAR_NATIVE_V2_CUDA
-  module.def("geo2rdr_cuda", &faninsar::geometry::cuda_v2::geo2rdr_cuda_public,
+#ifdef FANINSAR_NATIVE_CUDA
+  module.def("geo2rdr_cuda", &faninsar::geometry::cuda_native::geo2rdr_cuda_public,
              "Run the CUDA geo2rdr kernel");
-  module.def("rdr2geo_cuda", &faninsar::geometry::cuda_v2::rdr2geo_cuda_public,
+  module.def("rdr2geo_cuda", &faninsar::geometry::cuda_native::rdr2geo_cuda_public,
              "Run the CUDA rdr2geo kernel");
   module.def("rdr2geo_cuda_ecef",
-             &faninsar::geometry::cuda_v2::rdr2geo_cuda_ecef_public,
+             &faninsar::geometry::cuda_native::rdr2geo_cuda_ecef_public,
              "Run CUDA rdr2geo and publish device-resident ECEF outputs");
   module.def("geo2rdr_cuda_diagnostic",
-             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_with_visit_counts,
+             &faninsar::geometry::cuda_native::geo2rdr_cuda_native_with_visit_counts,
              "Run CUDA geo2rdr with qualification telemetry");
   module.def("rdr2geo_cuda_diagnostic",
-             &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_with_visit_counts,
+             &faninsar::geometry::cuda_native::rdr2geo_tcn_cuda_native_with_visit_counts,
              "Run CUDA rdr2geo with qualification telemetry");
   module.def("geo2rdr_cuda_visit_counts",
-             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_visit_counts,
+             &faninsar::geometry::cuda_native::geo2rdr_cuda_native_visit_counts,
              "Return CUDA geo2rdr qualification visit counts");
   module.def("rdr2geo_cuda_visit_counts",
-             &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_visit_counts,
+             &faninsar::geometry::cuda_native::rdr2geo_tcn_cuda_native_visit_counts,
              "Return CUDA rdr2geo qualification visit counts");
 #endif
 }

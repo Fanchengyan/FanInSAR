@@ -690,7 +690,7 @@ def _lut_identity_payload(
     are overlaid at load time and windows slice existing entries.
     """
     from faninsar.processing.geometry.api import dem_content_identity
-    from faninsar.processing.geometry.torch_backends_v2 import (
+    from faninsar.processing.geometry.torch_backends import (
         _array_digest,
         _model_digests,
     )

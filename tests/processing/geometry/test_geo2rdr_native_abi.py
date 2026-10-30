@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from faninsar.processing.geometry import public as geometry_public
-from faninsar.processing.geometry.v2 import DeviceKey, Operation, SolverSettings
+from faninsar.processing.geometry.transforms import DeviceKey, Operation, SolverSettings
 
 
 @pytest.mark.parametrize(

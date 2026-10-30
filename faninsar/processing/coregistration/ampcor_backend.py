@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from faninsar.logging import reject, setup_logger
-from faninsar.processing.geometry.native_v2 import (
+from faninsar.processing.geometry.native import (
     NativeBackend,
     NativeBuilder,
     NativeBuildRequest,
@@ -220,7 +220,7 @@ def _current_ncc_runtime_profile(
 
 def _current_ncc_source_digest() -> str:
     """Hash the current NCC source set once for one registry acquisition."""
-    source_root = Path(__file__).resolve().parents[1] / "geometry" / "native_v2"
+    source_root = Path(__file__).resolve().parents[1] / "geometry" / "native"
     sources = (
         source_root / "ampcor_ncc_cuda_bindings.cpp",
         source_root / "ampcor_ncc_postprocess_cuda.cu",

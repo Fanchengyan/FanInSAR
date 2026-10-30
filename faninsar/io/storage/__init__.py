@@ -33,9 +33,9 @@ if TYPE_CHECKING:
     from faninsar.io.storage.product import (
         Product,
         ProductWriter,
-        commit_product,
         discover_products,
         open_product,
+        publish_product,
         verify_product,
     )
     from faninsar.io.storage.provenance import (
@@ -74,7 +74,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "SceneWriter": ("scene_store", "SceneWriter"),
     "Product": ("product", "Product"),
     "ProductWriter": ("product", "ProductWriter"),
-    "commit_product": ("product", "commit_product"),
+    "publish_product": ("product", "publish_product"),
     "discover_products": ("product", "discover_products"),
     "open_product": ("product", "open_product"),
     "verify_product": ("product", "verify_product"),
@@ -122,9 +122,9 @@ __all__ = [
     "SoftwareIdentity",
     "StacProvenanceProperties",
     "UnwrappedArtifact",
-    "commit_product",
     "discover_products",
     "open_product",
+    "publish_product",
     "read_ion_correction_artifact",
     "validate_pipeline_rebuild_manifest",
     "verify_product",

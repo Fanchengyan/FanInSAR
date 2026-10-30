@@ -23,7 +23,7 @@ from faninsar.io.storage.ifg_store import (
     _is_sha256,
     _is_source_identity,
 )
-from faninsar.io.storage.product import Product, commit_product, open_product
+from faninsar.io.storage.product import Product, open_product, publish_product
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
@@ -347,7 +347,7 @@ def write_ionosphere_artifact(
             write_zarr_array(staging / f"{name}.zarr", array)
         return {name: {"href": f"{name}.zarr"} for name in arrays}
 
-    product = commit_product(
+    product = publish_product(
         root,
         kind=ION_KIND,
         properties=properties,
@@ -432,7 +432,7 @@ def write_ion_correction_artifact(
         )
         return {"unwrapped_phase": {"href": "unwrapped_phase.zarr"}}
 
-    product = commit_product(
+    product = publish_product(
         store.unwrap_root / ION_CORRECTED_NAME,
         kind=ION_CORRECTED_KIND,
         properties=properties,

@@ -1,4 +1,4 @@
-"""Device-resident Torch geometry kernels used by the public v2 adapter.
+"""Device-resident Torch geometry kernels used by the public adapter.
 
 The kernels intentionally keep the numerical loop in Torch.  Preparation
 materialises the orbit samples; execution performs interpolation, coordinate
@@ -38,7 +38,7 @@ def _llh_to_ecef(lat: Any, lon: Any, height: Any) -> Any:
 def _ecef_to_llh(ecef: Any) -> tuple[Any, Any, Any]:
     """Convert ECEF tensors to degree LLH with Vermeille's closed form.
 
-    The native v2 rdr2geo implementation uses the Vermeille construction,
+    The native rdr2geo implementation uses the Vermeille construction,
     rather than an iterative latitude update.  Keeping this expression in
     Torch is important for both eager/device execution and compiled kernels.
     """
@@ -291,7 +291,7 @@ def _guarded_aitken_height(
 
 
 def _result_invalid(output: dict[str, Any], finite: Any) -> dict[str, Any]:
-    """Apply v2 invalid-lane sentinels to a tensor result."""
+    """Apply invalid-lane sentinels to a tensor result."""
     import torch
 
     for name in (

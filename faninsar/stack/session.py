@@ -823,7 +823,7 @@ def _commit_geocoded_product(
     """
     from affine import Affine
 
-    from faninsar.io.storage.product import commit_product
+    from faninsar.io.storage.product import publish_product
     from faninsar.network.readers.raster_io import write_cog
     from faninsar.processing.geometry.grids import GeoGrid
 
@@ -872,7 +872,7 @@ def _commit_geocoded_product(
             },
         }
 
-    commit_product(
+    publish_product(
         target_dir,
         kind=GEOCODED_KIND,
         properties={

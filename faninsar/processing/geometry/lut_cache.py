@@ -67,17 +67,10 @@ def write_transform_cache(
         shutil.rmtree(store_path)
 
     root_group = zarr.open_group(str(store_path), mode="w")
-    arrays = {
-        "latitude_deg": result.latitude_deg,
-        "longitude_deg": result.longitude_deg,
-        "height_m": result.height_m,
-        "range_index": result.range_index,
-        "azimuth_index": result.azimuth_index,
-        "converged": result.converged.astype(np.uint8),
-        "residual_range_m": result.residual_range_m,
-        "residual_doppler_hz": result.residual_doppler_hz,
-    }
-    for name, values in arrays.items():
+    for name in result.fields:
+        values = getattr(result, name)
+        if values.dtype == np.dtype(bool):
+            values = values.astype(np.uint8)
         root_group.create_array(name, data=np.asarray(values), overwrite=True)
     root_group.attrs.update(
         {
@@ -123,14 +116,16 @@ def read_transform_cache(store_path: str | Path) -> tuple[TransformCacheKey, obj
         orbit_source=str(attrs["orbit_source"]),
         grid_shape=(int(attrs["grid_shape"][0]), int(attrs["grid_shape"][1])),
     )
-    result = TransformResult(
-        latitude_deg=np.asarray(group["latitude_deg"]),
-        longitude_deg=np.asarray(group["longitude_deg"]),
-        height_m=np.asarray(group["height_m"]),
-        range_index=np.asarray(group["range_index"]),
-        azimuth_index=np.asarray(group["azimuth_index"]),
-        converged=np.asarray(group["converged"]).astype(bool),
-        residual_range_m=np.asarray(group["residual_range_m"]),
-        residual_doppler_hz=np.asarray(group["residual_doppler_hz"]),
+    direction = str(attrs["direction"])
+    fields: dict[str, np.ndarray] = {}
+    for name in TransformResult.invalid(1).fields:
+        stored = np.asarray(group[name])
+        if name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
+            stored = stored.astype(bool)
+        fields[name] = stored
+    result = TransformResult.from_arrays(
+        fields,
+        operation=direction,
+        invalid_mask=~np.isfinite(fields["latitude_deg"]),
     )
     return key, result

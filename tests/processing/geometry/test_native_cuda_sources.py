@@ -1,4 +1,4 @@
-"""Source and optional direct-array tests for the native-v2 CUDA kernels."""
+"""Source and optional direct-array tests for the native CUDA kernels."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ CUDA_SOURCE_ROOT = (
     / "faninsar"
     / "processing"
     / "geometry"
-    / "native_v2"
+    / "native"
     / "cuda"
 )
 RESULT_FLOAT_FIELDS = (0, 1, 2, 3, 4, 7, 8, 9, 12, 13)
@@ -25,9 +25,9 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     geo2rdr = (CUDA_SOURCE_ROOT / "geo2rdr_cuda.cu").read_text()
     rdr2geo = (CUDA_SOURCE_ROOT / "rdr2geo_tcn_cuda.cu").read_text()
 
-    assert "geo2rdr_cuda_v2" in geo2rdr
-    assert "rdr2geo_tcn_cuda_v2" in rdr2geo
-    assert "rdr2geo_cuda_v2" in rdr2geo
+    assert "geo2rdr_cuda_native" in geo2rdr
+    assert "rdr2geo_tcn_cuda_native" in rdr2geo
+    assert "rdr2geo_cuda_native" in rdr2geo
     assert "_with_visit_counts" in geo2rdr
     assert "_with_visit_counts" in rdr2geo
     for source in (geo2rdr, rdr2geo):
@@ -62,15 +62,15 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "atomicAdd" in rdr2geo
     assert "work_index" in rdr2geo
     assert "kBlocksPerSm" in rdr2geo
-    assert "FANINSAR_NATIVE_V2_BLOCKS_PER_SM" in rdr2geo
+    assert "FANINSAR_NATIVE_BLOCKS_PER_SM" in rdr2geo
     assert "multiProcessorCount" in rdr2geo
     assert "point_blocks" in rdr2geo
     assert "worker_blocks" in rdr2geo
     assert "prepare_rdr2geo_contexts_kernel<<<input_blocks" in rdr2geo
     assert "rdr2geo_tcn_kernel<<<worker_blocks" in rdr2geo
-    assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in rdr2geo
-    assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in common
-    assert "rdr2geo_tcn_cuda_v2_with_ecef" in common
+    assert "rdr2geo_tcn_cuda_native_with_visit_counts_row_width" in rdr2geo
+    assert "rdr2geo_tcn_cuda_native_with_visit_counts_row_width" in common
+    assert "rdr2geo_tcn_cuda_native_with_ecef" in common
     assert "row_width" in binding
     assert "azimuth.narrow" in binding
     assert "row_width = 1" in binding
@@ -109,8 +109,8 @@ def test_cuda_rdr2geo_exhaustion_uses_common_final_publication() -> None:
 
 
 @pytest.mark.skipif(
-    os.environ.get("FANINSAR_TEST_NATIVE_V2_CUDA") != "1",
-    reason="native-v2 CUDA build test is explicitly enabled",
+    os.environ.get("FANINSAR_TEST_NATIVE_CUDA") != "1",
+    reason="native CUDA build test is explicitly enabled",
 )
 def test_cuda_direct_array_fixture_matches_result_contract(tmp_path: Path) -> None:
     """Compile both kernels and exercise valid, invalid, boundary, and DEM-OOB lanes."""
@@ -121,15 +121,15 @@ def test_cuda_direct_array_fixture_matches_result_contract(tmp_path: Path) -> No
     binding = r"""
 #include "geometry_cuda.cuh"
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.def("geo2rdr", &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2);
-    module.def("rdr2geo", &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2);
+  module.def("geo2rdr", &faninsar::geometry::cuda_native::geo2rdr_cuda_native);
+    module.def("rdr2geo", &faninsar::geometry::cuda_native::rdr2geo_tcn_cuda_native);
     module.def("rdr2geo_ecef", [](py::args args) {
           TORCH_CHECK(args.size() == 24, "rdr2geo_ecef expects 24 arguments");
           auto tensor = [&](size_t index) { return args[index].cast<torch::Tensor>(); };
           auto point = [&](size_t index) { return tensor(index).reshape({-1}); };
       auto scalar = [&](size_t index) { return args[index].cast<double>(); };
       auto integer = [&](size_t index) { return args[index].cast<int64_t>(); };
-      auto result = faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_with_ecef(
+      auto result = faninsar::geometry::cuda_native::rdr2geo_tcn_cuda_native_with_ecef(
               point(0), point(1), point(2), tensor(3), tensor(4), tensor(5),
           scalar(6), scalar(7), scalar(8), scalar(9), tensor(10), scalar(11),
           scalar(12), scalar(13), scalar(14), scalar(15), scalar(16),
@@ -143,14 +143,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           return result;
     });
   module.def("geo2rdr_visit_counts",
-             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_visit_counts);
+             &faninsar::geometry::cuda_native::geo2rdr_cuda_native_visit_counts);
   module.def("rdr2geo_visit_counts",
-             &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_visit_counts);
+             &faninsar::geometry::cuda_native::rdr2geo_tcn_cuda_native_visit_counts);
 }
 """
     (tmp_path / "binding.cpp").write_text(binding)
     module = extension.load(
-        name="faninsar_native_v2_cuda_fixture",
+        name="faninsar_native_cuda_fixture",
         sources=[
             str(tmp_path / "binding.cpp"),
             str(CUDA_SOURCE_ROOT / "geo2rdr_cuda.cu"),

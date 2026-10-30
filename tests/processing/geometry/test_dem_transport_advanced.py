@@ -1,4 +1,4 @@
-"""PROPOSAL-0030 S1 v2 transport tests: FetchPlan grammar, host pinning,
+"""PROPOSAL-0030 S1 advanced transport tests: FetchPlan grammar, host pinning,
 credential hygiene, redirects, Earthdata ranged exclusion, FTP, and zip.
 """
 
@@ -26,7 +26,7 @@ from faninsar.processing.geometry.dem_transport import (
 )
 
 # ---------------------------------------------------------------------------
-# Fake HTTP layer shared with the v1 scaffold conventions
+# Fake HTTP layer shared with the base scaffold conventions
 # ---------------------------------------------------------------------------
 
 

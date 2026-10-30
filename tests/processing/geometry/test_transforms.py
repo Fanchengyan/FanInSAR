@@ -192,6 +192,89 @@ def test_rdr2geo_geo2rdr_round_trip_residuals() -> None:
     assert np.all(np.abs(result_bwd.residual_range_m[result_bwd.converged]) < 1.0)
 
 
+def test_rdr2geo_publishes_incidence_and_look_azimuth() -> None:
+    """Converged rdr2geo lanes publish LOS-convention look angles."""
+    orbit, grid = _orbit_and_grid()
+    model = RadarGeometryModel.from_radar_grid(grid, orbit)
+    result = run_rdr2geo(
+        model,
+        np.array([0.0, 1.0, 1.0e9]),
+        np.array([10.0, 20.0, 10.0]),
+        device="cpu",
+        max_iter=40,
+    )
+    conv = result.converged
+    assert np.any(conv)
+    # Incidence is measured from the local ellipsoid normal; a low-Earth
+    # synthetic orbit at these slant ranges yields a plausible mid-range
+    # incidence, and right-looking geometry publishes a positive look
+    # azimuth clockwise from north.
+    assert np.all(np.isfinite(result.incidence_deg[conv]))
+    assert np.all((result.incidence_deg[conv] > 0.0) & (result.incidence_deg[conv] < 90.0))
+    assert np.all(np.isfinite(result.look_azimuth_deg[conv]))
+    assert np.all(
+        (result.look_azimuth_deg[conv] >= 0.0)
+        & (result.look_azimuth_deg[conv] < 360.0)
+    )
+    assert np.all(np.isnan(result.incidence_deg[~conv]))
+    assert np.all(np.isnan(result.look_azimuth_deg[~conv]))
+
+    # Consistency: the published LOS unit-vector convention must rebuild
+    # the same ground-to-satellite direction as the solved geometry.
+    from faninsar.processing.geometry import interpolate_orbit, llh_to_ecef
+
+    index = int(np.flatnonzero(conv)[0])
+    az_time = model.azimuth_time(result.azimuth_index[index])
+    state = interpolate_orbit(orbit, az_time)
+    sat = np.asarray(state.position_m, dtype=np.float64)
+    ground = np.asarray(
+        llh_to_ecef(
+            result.latitude_deg[index],
+            result.longitude_deg[index],
+            result.height_m[index],
+        )
+    )
+    los = (sat - ground) / np.linalg.norm(sat - ground)
+    lat = np.deg2rad(result.latitude_deg[index])
+    lon = np.deg2rad(result.longitude_deg[index])
+    up = np.array(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)]
+    )
+    los_up = float(np.dot(los, up))
+    np.testing.assert_allclose(
+        los_up, np.cos(np.deg2rad(result.incidence_deg[index])), atol=1e-9
+    )
+
+
+def test_geo2rdr_publishes_incidence_and_look_azimuth() -> None:
+    """geo2rdr publishes the same look angles for the solved line of sight."""
+    orbit, grid = _orbit_and_grid()
+    model = RadarGeometryModel.from_radar_grid(grid, orbit)
+    forward = run_rdr2geo(
+        model,
+        np.array([0.0]),
+        np.array([10.0]),
+        device="cpu",
+        max_iter=40,
+    )
+    assert bool(forward.converged[0])
+    back = run_geo2rdr(
+        model,
+        forward.latitude_deg,
+        forward.longitude_deg,
+        forward.height_m,
+        device="cpu",
+        max_iter=40,
+    )
+    assert bool(back.converged[0])
+    np.testing.assert_allclose(
+        back.incidence_deg, forward.incidence_deg, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        back.look_azimuth_deg, forward.look_azimuth_deg, atol=1.0e-6
+    )
+
+
 def test_rdr2geo_chunked_matches_full() -> None:
     """Chunked helper produces identical results to the full-array helper."""
     orbit, grid = _orbit_and_grid()

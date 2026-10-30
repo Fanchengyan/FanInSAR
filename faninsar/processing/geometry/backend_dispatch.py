@@ -19,12 +19,12 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkabl
 import numpy as np
 
 from faninsar.logging import reject, setup_logger
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     CandidateKey as FoundationCandidateKey,
 )
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     GeometryValidationError,
-    TransformResultV2,
+    TransformResult,
 )
 from faninsar.processing.runtime.device import parse_device
 
@@ -722,15 +722,15 @@ class Dispatcher:
         validator: ResultValidator | None,
         key: CandidateKeyProtocol | None,
     ) -> object:
-        """Apply an optional validator and common v2 result checks."""
+        """Apply an optional validator and common result checks."""
         if result is None:
             reject("geometry executor returned no result", IncorrectResultError)
-        if isinstance(result, TransformResultV2):
+        if isinstance(result, TransformResult):
             try:
                 result.validate()
             except Exception as error:
                 reject(
-                    "geometry executor returned an invalid v2 result",
+                    "geometry executor returned an invalid result",
                     IncorrectResultError,
                     cause=error,
                 )

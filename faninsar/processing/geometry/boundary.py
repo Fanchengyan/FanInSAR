@@ -1,4 +1,4 @@
-"""Canonical convergence-boundary evaluation for geometry v2."""
+"""Canonical convergence-boundary evaluation for geometry."""
 
 # Boundary errors are deliberately raised at the narrow public seam; each is
 # validated before any callback or pointer-like array access.
@@ -12,10 +12,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from faninsar.logging import reject
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     GeometryValidationError,
     Operation,
-    TransformResultV2,
+    TransformResult,
 )
 
 _BOUNDARY_ULPS = 32.0 * np.finfo(np.float64).eps
@@ -159,11 +159,11 @@ def evaluate_canonical_boundary(
 
 
 def normalize_result_boundary(
-    result: TransformResultV2,
+    result: TransformResult,
     decisions: BoundaryDecision | Sequence[BoundaryDecision],
     *,
     invalid_mask: np.ndarray | None = None,
-) -> TransformResultV2:
+) -> TransformResult:
     """Publish canonical status fields without disturbing invalid lanes."""
     values: list[BoundaryDecision] = (
         [decisions] if isinstance(decisions, BoundaryDecision) else list(decisions)
@@ -192,6 +192,8 @@ def normalize_result_boundary(
             "latitude_deg",
             "longitude_deg",
             "height_m",
+            "incidence_deg",
+            "look_azimuth_deg",
             "range_index",
             "azimuth_index",
             "decision_residual",
@@ -205,7 +207,7 @@ def normalize_result_boundary(
         flat["iterations"][mask] = -1
         for name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
             flat[name][mask] = False
-    return TransformResultV2(
+    return TransformResult(
         **{name: array.reshape(shape) for name, array in flat.items()}
     )
 

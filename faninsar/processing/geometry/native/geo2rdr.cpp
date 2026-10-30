@@ -1,4 +1,4 @@
-#include "native_v2_abi.h"
+#include "native_abi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,7 +9,7 @@
 #include <omp.h>
 #endif
 
-namespace faninsar_native_v2 {
+namespace faninsar_native {
 namespace {
 
 constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
@@ -354,4 +354,4 @@ std::vector<Tensor> geo2rdr_cpu(
           residual_doppler};
 }
 
-}  // namespace faninsar_native_v2
+}  // namespace faninsar_native

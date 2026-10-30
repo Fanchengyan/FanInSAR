@@ -795,7 +795,7 @@ def _patch_fake_native_loader(
     import torch
 
     from faninsar.processing.coregistration import ampcor_backend
-    from faninsar.processing.geometry.native_v2.builder import (
+    from faninsar.processing.geometry.native.builder import (
         BuildPlan,
         NativeBackend,
         NativeOperation,

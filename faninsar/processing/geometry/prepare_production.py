@@ -22,7 +22,7 @@ from faninsar.processing.geometry.backend_dispatch import (
     DispatchError,
     resolve_geometry_device,
 )
-from faninsar.processing.geometry.native_v2.builder import (
+from faninsar.processing.geometry.native.builder import (
     NativeBackend,
     NativeBuilder,
     NativeBuildRequest,
@@ -30,12 +30,11 @@ from faninsar.processing.geometry.native_v2.builder import (
     PreparationStatus,
 )
 from faninsar.processing.geometry.public import execute_geometry, prepare_geometry
-from faninsar.processing.geometry.transforms import TransformResult
-from faninsar.processing.geometry.v2 import (
+from faninsar.processing.geometry.transforms import (
     GeometryValidationError,
     Operation,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
 )
 
 if TYPE_CHECKING:
@@ -48,7 +47,7 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
-_NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent / "native_v2"
+_NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent / "native"
 _CUDA_MODULES: dict[str, object] = {}
 _PREPARED_CACHE: dict[tuple[object, ...], object] = {}
 _PREPARED_CACHE_LIMIT = 12
@@ -147,7 +146,7 @@ def _prepared_cache_key(
     solver.for_operation, and device UUID. Excludes toolchain/runtime and
     ``id(model)``.
     """
-    from faninsar.processing.geometry.torch_backends_v2 import (
+    from faninsar.processing.geometry.torch_backends import (
         _dem_digest,
         _model_digests,
     )
@@ -190,7 +189,7 @@ def _native_build_dir(operation: NativeOperation | None = None) -> Path:
     """
     from faninsar.processing.runtime.compute.cache import resolve_compile_cache_dir
 
-    root = resolve_compile_cache_dir().parent / "native_v2_geometry"
+    root = resolve_compile_cache_dir().parent / "native_geometry"
     path = root / (operation.value if operation is not None else "shared")
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -470,20 +469,6 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
     return module
 
 
-def to_transform_result(result: TransformResultV2) -> TransformResult:
-    """Project the fourteen-field v2 result onto the production value type."""
-    return TransformResult(
-        latitude_deg=result.latitude_deg,
-        longitude_deg=result.longitude_deg,
-        height_m=result.height_m,
-        range_index=result.range_index,
-        azimuth_index=result.azimuth_index,
-        converged=result.converged,
-        residual_range_m=result.residual_range_m,
-        residual_doppler_hz=result.residual_doppler_hz,
-    )
-
-
 def _prepare_geometry_identities(
     op: Operation,
     model: RadarGeometryModel,
@@ -740,8 +725,8 @@ def _geo2rdr_native_manifest(
 ) -> tuple[object, dict[str, object]]:
     """Build the explicit CandidateKey + orbit context for CUDA geo2rdr."""
     from faninsar.processing.geometry.backend_dispatch import CandidateKey
-    from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
-    from faninsar.processing.geometry.v2 import DeviceKey, ExecutionProfile
+    from faninsar.processing.geometry.torch_backends import prepare_torch_geometry
+    from faninsar.processing.geometry.transforms import DeviceKey, ExecutionProfile
 
     if not physical_uuid:
         message = "CUDA native geo2rdr requires a physical UUID"
@@ -775,9 +760,7 @@ def _geo2rdr_native_manifest(
         toolchain_digest=digest,
         runtime_digest=digest,
         artifact_digest=digest,
-        abi_digest=hashlib.sha256(
-            b"faninsar.geometry.native_v2.14-field.v1"
-        ).hexdigest(),
+        abi_digest=hashlib.sha256(b"faninsar.geometry.native.14-field.v1").hexdigest(),
         support_contract_digest=torch_prepared.identity.settings_digest,
         profile=ExecutionProfile(device_key),
     )
@@ -868,8 +851,8 @@ def _rdr2geo_native_manifest(
 ) -> tuple[object, dict[str, object]]:
     """Build the CandidateKey + orbit/DEM context for CUDA rdr2geo."""
     from faninsar.processing.geometry.backend_dispatch import CandidateKey
-    from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
-    from faninsar.processing.geometry.v2 import DeviceKey, ExecutionProfile
+    from faninsar.processing.geometry.torch_backends import prepare_torch_geometry
+    from faninsar.processing.geometry.transforms import DeviceKey, ExecutionProfile
 
     if not physical_uuid:
         message = "CUDA native rdr2geo requires a physical UUID"
@@ -905,9 +888,7 @@ def _rdr2geo_native_manifest(
         toolchain_digest=digest,
         runtime_digest=digest,
         artifact_digest=digest,
-        abi_digest=hashlib.sha256(
-            b"faninsar.geometry.native_v2.14-field.v1"
-        ).hexdigest(),
+        abi_digest=hashlib.sha256(b"faninsar.geometry.native.14-field.v1").hexdigest(),
         support_contract_digest=torch_prepared.identity.settings_digest,
         profile=ExecutionProfile(device_key),
     )
@@ -962,19 +943,18 @@ def _rdr2geo_native_manifest(
 def _reshape_transform_result(
     result: TransformResult,
     shape: tuple[int, ...],
+    operation: Operation,
 ) -> TransformResult:
     """Restore the public ND layout after a 1-D native or Torch solve."""
     if result.azimuth_index.shape == shape:
         return result
-    return TransformResult(
-        latitude_deg=np.asarray(result.latitude_deg).reshape(shape),
-        longitude_deg=np.asarray(result.longitude_deg).reshape(shape),
-        height_m=np.asarray(result.height_m).reshape(shape),
-        range_index=np.asarray(result.range_index).reshape(shape),
-        azimuth_index=np.asarray(result.azimuth_index).reshape(shape),
-        converged=np.asarray(result.converged).reshape(shape),
-        residual_range_m=np.asarray(result.residual_range_m).reshape(shape),
-        residual_doppler_hz=np.asarray(result.residual_doppler_hz).reshape(shape),
+    return TransformResult.from_arrays(
+        {
+            name: np.asarray(getattr(result, name)).reshape(shape)
+            for name in result.fields
+        },
+        operation=operation,
+        invalid_mask=~np.isfinite(np.asarray(result.latitude_deg).reshape(shape)),
     )
 
 
@@ -1016,15 +996,13 @@ def run_geo2rdr(
             doppler_tolerance_hz=doppler_tol_hz,
         ),
     )
-    result = to_transform_result(
-        execute_geometry(
-            prepared,
-            lat.reshape(-1),
-            lon.reshape(-1),
-            height.reshape(-1),
-        )
+    result = execute_geometry(
+        prepared,
+        lat.reshape(-1),
+        lon.reshape(-1),
+        height.reshape(-1),
     )
-    return _reshape_transform_result(result, original_shape)
+    return _reshape_transform_result(result, original_shape, Operation.GEO2RDR)
 
 
 def run_rdr2geo(
@@ -1054,7 +1032,7 @@ def run_rdr2geo(
             doppler_tolerance_hz=doppler_tol_hz,
         ),
     )
-    return to_transform_result(execute_geometry(prepared, az, rg))
+    return execute_geometry(prepared, az, rg)
 
 
 def run_rdr2geo_chunked(
@@ -1078,12 +1056,7 @@ def run_rdr2geo_chunked(
     rg = np.asarray(range_index, dtype=np.float64)
     az_b, rg_b = np.broadcast_arrays(az, rg)
     shape = az_b.shape
-    lat = np.full(shape, np.nan, dtype=np.float64)
-    lon = np.full(shape, np.nan, dtype=np.float64)
-    height = np.full(shape, np.nan, dtype=np.float64)
-    converged = np.zeros(shape, dtype=bool)
-    residual_range = np.full(shape, np.nan, dtype=np.float64)
-    residual_doppler = np.full(shape, np.nan, dtype=np.float64)
+    buffers: dict[str, np.ndarray] = {}
     az_chunk, rg_chunk = chunk_size
     prepared_full = None
     full_tile = (min(az_chunk, shape[0]), min(rg_chunk, shape[1]))
@@ -1123,24 +1096,26 @@ def run_rdr2geo_chunked(
                         doppler_tolerance_hz=doppler_tol_hz,
                     ),
                 )
-            chunk_result = to_transform_result(
-                execute_geometry(prepared, tile_az, rg_b[slc])
-            )
-            lat[slc] = chunk_result.latitude_deg
-            lon[slc] = chunk_result.longitude_deg
-            height[slc] = chunk_result.height_m
-            converged[slc] = chunk_result.converged
-            residual_range[slc] = chunk_result.residual_range_m
-            residual_doppler[slc] = chunk_result.residual_doppler_hz
-    return TransformResult(
-        latitude_deg=lat,
-        longitude_deg=lon,
-        height_m=height,
-        range_index=rg_b.copy(),
-        azimuth_index=az_b.copy(),
-        converged=converged,
-        residual_range_m=residual_range,
-        residual_doppler_hz=residual_doppler,
+            chunk_result = execute_geometry(prepared, tile_az, rg_b[slc])
+            if not buffers:
+                buffers = {
+                    name: np.full(
+                        shape,
+                        -1 if name == "iterations" else np.nan,
+                        dtype=getattr(chunk_result, name).dtype,
+                    )
+                    for name in chunk_result.fields
+                }
+                for name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
+                    buffers[name][:] = False
+            for name in chunk_result.fields:
+                buffers[name][slc] = getattr(chunk_result, name)
+    if not buffers:
+        return TransformResult.invalid(shape, operation=Operation.RDR2GEO)
+    return TransformResult.from_arrays(
+        buffers,
+        operation=Operation.RDR2GEO,
+        invalid_mask=~np.isfinite(buffers["latitude_deg"]),
     )
 
 

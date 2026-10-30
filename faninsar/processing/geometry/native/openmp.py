@@ -225,6 +225,6 @@ def _flags_for_platform(
         )
     if normalized == "windows":
         return _unsupported(
-            "Windows OpenMP provider is not part of the first native-v2 slice"
+            "Windows OpenMP provider is not part of the first native slice"
         )
     return _unsupported(f"unsupported platform: {platform or sys.platform}")

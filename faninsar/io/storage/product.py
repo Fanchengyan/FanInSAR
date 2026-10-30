@@ -38,10 +38,10 @@ __all__ = [
     "ITEM_NAME",
     "Product",
     "ProductWriter",
-    "commit_product",
     "discover_products",
     "new_write_id",
     "open_product",
+    "publish_product",
     "remove_product",
     "verify_product",
 ]
@@ -312,7 +312,7 @@ class ProductWriter:
             self.abort()
 
 
-def commit_product(
+def publish_product(
     target: str | Path,
     *,
     kind: str,
@@ -342,7 +342,7 @@ def commit_product(
     Returns
     -------
     Product
-        The committed product.
+        The published product.
 
     Raises
     ------

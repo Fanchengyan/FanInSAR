@@ -17,7 +17,7 @@ _DEFAULT_NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent
 
 
 class NativeOperation(StrEnum):
-    """Exact operation identities supported by the native v2 builder."""
+    """Exact operation identities supported by the native builder."""
 
     GEO2RDR = "geo2rdr"
     RDR2GEO = "rdr2geo"
@@ -141,7 +141,7 @@ def select_native_sources(
     backend : NativeBackend or str
         ``cpu`` or ``cuda`` native implementation.
     source_root : path-like, optional
-        Root containing the v2 native source tree.
+        Root containing the native source tree.
 
     Returns
     -------
@@ -186,7 +186,7 @@ def select_native_sources(
         )
     return (
         root / "bindings.cpp",
-        root / "native_v2_abi.cpp",
+        root / "native_abi.cpp",
         root / f"{GeometryOperation.GEO2RDR.value}{suffix}",
         root / f"{GeometryOperation.RDR2GEO.value}{suffix}",
     )
@@ -202,7 +202,7 @@ class NativeBuilder:
     def plan(self, request: NativeBuildRequest) -> BuildPlan:
         """Create a deterministic build plan without compiling anything."""
         operation_name = request.operation.value.replace(".", "_")
-        extension = f"faninsar_{operation_name}_v2_{request.backend.value}"
+        extension = f"faninsar_{operation_name}_{request.backend.value}"
         if request.operation in (
             NativeOperation.AMPCOR_PREFIX_ENERGY,
             NativeOperation.AMPCOR_NCC_POSTPROCESS,
@@ -299,7 +299,7 @@ class NativeBuilder:
                 flags.runtime_name or None,
                 False,
                 (
-                    "native-v2 CPU kernels are experimental and not scientifically "
+                    "native CPU kernels are experimental and not scientifically "
                     "qualified"
                     if flags.supported
                     else flags.reason

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from faninsar.processing.geometry.native_v2 import (
+from faninsar.processing.geometry.native import (
     GeometryOperation,
     NativeBackend,
     NativeBuilder,
@@ -16,7 +16,7 @@ from faninsar.processing.geometry.native_v2 import (
 )
 
 SOURCE_ROOT = (
-    Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+    Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native"
 )
 
 

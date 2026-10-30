@@ -1,4 +1,12 @@
-"""Validated Python boundary for native-v2 fourteen-field results."""
+"""Validated Python boundary for native fourteen-field results.
+
+The native extension ABI stays at the shared fourteen solver fields.  The
+unified public ``TransformResult`` contract is sixteen fields; this module
+computes ``incidence_deg`` and ``look_azimuth_deg`` at the Python boundary
+from the prepared geometry model and the solved ground position so the
+compiled artifact remains byte-identical.  Extending the ABI to emit the
+angles natively is a recorded follow-up.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +15,16 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import reject
-from faninsar.processing.geometry.v2 import Operation, TransformResultV2
+from faninsar.processing.geometry.transforms import (
+    Operation,
+    TransformResult,
+    look_angles_deg,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from faninsar.processing.geometry.transforms import RadarGeometryModel
 
 NATIVE_RESULT_FIELDS: tuple[str, ...] = (
     "latitude_deg",
@@ -116,9 +130,12 @@ def ecef_from_native_outputs(
 
 
 def result_from_native_outputs(
-    outputs: Sequence[object], *, operation: Operation | str
-) -> TransformResultV2:
-    """Convert one native output sequence through the central v2 validator.
+    outputs: Sequence[object],
+    *,
+    operation: Operation | str,
+    model: RadarGeometryModel | None = None,
+) -> TransformResult:
+    """Convert one native output sequence through the central validator.
 
     Parameters
     ----------
@@ -127,10 +144,14 @@ def result_from_native_outputs(
         ``rdr2geo_cpu``.  CPU tensors must expose ``detach().cpu().numpy()``.
     operation : Operation or str
         Operation identity used for operation-specific tolerance validation.
+    model : RadarGeometryModel, optional
+        Prepared geometry model.  When given, ``incidence_deg`` and
+        ``look_azimuth_deg`` are computed from the orbit and the solved
+        ground position; without it both fields publish NaN.
 
     Returns
     -------
-    TransformResultV2
+    TransformResult
         Validated NumPy arrays with the exact public result contract. CUDA
         tensor fields retain the independent host allocation created by their
         ``.cpu()`` transfer; CPU tensor and NumPy fields are copied.
@@ -164,7 +185,22 @@ def result_from_native_outputs(
     # an extension that silently changes its field types; native CPU/CUDA
     # kernels are responsible for publishing float64/int32/bool fields.
     invalid_mask = ~np.isfinite(np.asarray(fields["latitude_deg"], dtype=np.float64))
-    return TransformResultV2.from_arrays(
+    if model is not None:
+        incidence_deg, look_azimuth_deg = look_angles_deg(
+            model,
+            fields["azimuth_index"],
+            fields["latitude_deg"],
+            fields["longitude_deg"],
+            fields["height_m"],
+            fields["converged"],
+        )
+        fields["incidence_deg"] = incidence_deg
+        fields["look_azimuth_deg"] = look_azimuth_deg
+    else:
+        shape = fields["latitude_deg"].shape
+        fields["incidence_deg"] = np.full(shape, np.nan, dtype=np.float64)
+        fields["look_azimuth_deg"] = np.full(shape, np.nan, dtype=np.float64)
+    return TransformResult.from_arrays(
         fields,
         operation=operation,
         invalid_mask=invalid_mask,

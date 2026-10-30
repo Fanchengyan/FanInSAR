@@ -14,19 +14,21 @@ from faninsar.processing.geometry import (
     Operation,
     OperationSettings,
     SolverSettings,
-    TransformResultV2,
+    TransformResult,
     validate_array_span,
 )
 
 
-def test_invalid_result_has_exact_fourteen_fields_and_invalid_tolerance() -> None:
+def test_invalid_result_has_exact_sixteen_fields_and_invalid_tolerance() -> None:
     """Invalid lanes publish every required field and NaN tolerance."""
-    result = TransformResultV2.invalid((2,), operation=Operation.GEO2RDR)
+    result = TransformResult.invalid((2,), operation=Operation.GEO2RDR)
 
     assert result.fields == (
         "latitude_deg",
         "longitude_deg",
         "height_m",
+        "incidence_deg",
+        "look_azimuth_deg",
         "range_index",
         "azimuth_index",
         "converged",
@@ -39,7 +41,9 @@ def test_invalid_result_has_exact_fourteen_fields_and_invalid_tolerance() -> Non
         "residual_range_m",
         "residual_doppler_hz",
     )
-    assert len(result.fields) == 14
+    assert len(result.fields) == 16
+    assert np.all(np.isnan(result.incidence_deg))
+    assert np.all(np.isnan(result.look_azimuth_deg))
     assert result.iterations.dtype == np.int32
     assert np.array_equal(result.iterations, [-1, -1])
     assert np.all(np.isnan(result.tolerance))
@@ -48,7 +52,7 @@ def test_invalid_result_has_exact_fourteen_fields_and_invalid_tolerance() -> Non
 
 def test_invalid_rdr2geo_lanes_use_nan_tolerance() -> None:
     """Radar-to-geo invalid lanes use NaN for all floating diagnostics."""
-    result = TransformResultV2.invalid(3, operation="rdr2geo")
+    result = TransformResult.invalid(3, operation="rdr2geo")
     assert np.all(np.isnan(result.tolerance))
     assert np.all(np.isnan(result.latitude_deg))
     assert np.array_equal(result.iterations, np.full(3, -1, dtype=np.int32))
@@ -61,6 +65,8 @@ def test_from_arrays_applies_per_lane_geo2rdr_tolerance_and_sentinels() -> None:
         "latitude_deg": np.zeros(shape, dtype=np.float64),
         "longitude_deg": np.zeros(shape, dtype=np.float64),
         "height_m": np.zeros(shape, dtype=np.float64),
+        "incidence_deg": np.zeros(shape, dtype=np.float64),
+        "look_azimuth_deg": np.zeros(shape, dtype=np.float64),
         "range_index": np.zeros(shape, dtype=np.float64),
         "azimuth_index": np.zeros(shape, dtype=np.float64),
         "converged": np.array([True, False], dtype=bool),
@@ -73,7 +79,7 @@ def test_from_arrays_applies_per_lane_geo2rdr_tolerance_and_sentinels() -> None:
         "residual_range_m": np.zeros(shape, dtype=np.float64),
         "residual_doppler_hz": np.zeros(shape, dtype=np.float64),
     }
-    result = TransformResultV2.from_arrays(
+    result = TransformResult.from_arrays(
         fields, operation="geo2rdr", invalid_mask=np.array([False, True], dtype=bool)
     )
     assert result.tolerance[0] == 1.0
@@ -85,7 +91,7 @@ def test_result_rejects_wrong_dtypes() -> None:
     """Result publication does not silently wrap or coerce ABI fields."""
     fields = {
         name: np.zeros(1, dtype=np.float64)
-        for name in TransformResultV2.invalid(1).fields
+        for name in TransformResult.invalid(1).fields
     }
     fields["converged"] = np.zeros(1, dtype=bool)
     fields["iterations"] = np.zeros(1, dtype=np.int32)
@@ -93,7 +99,7 @@ def test_result_rejects_wrong_dtypes() -> None:
     fields["boundary_rechecked"] = np.zeros(1, dtype=bool)
     fields["iterations"] = np.zeros(1, dtype=np.int64)
     with pytest.raises(GeometryValidationError, match="iterations"):
-        TransformResultV2.from_arrays(fields)
+        TransformResult.from_arrays(fields)
 
 
 @pytest.mark.parametrize(

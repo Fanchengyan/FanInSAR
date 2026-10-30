@@ -26,9 +26,9 @@ from faninsar.io.storage._zarr_stac import (
 )
 from faninsar.io.storage.product import (
     Product,
-    commit_product,
     is_write_id,
     open_product,
+    publish_product,
 )
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
@@ -736,7 +736,7 @@ def write_ifg_artifact(
                 assets[name] = {"href": f"{name}.zarr"}
         return assets
 
-    product = commit_product(
+    product = publish_product(
         root,
         kind=IFG_KIND,
         properties=properties,
@@ -843,7 +843,7 @@ def write_unwrapped_artifact(
 
     target = store.unwrap_root
     target.parent.mkdir(parents=True, exist_ok=True)
-    product = commit_product(
+    product = publish_product(
         target,
         kind=UNWRAP_KIND,
         properties=item_properties,

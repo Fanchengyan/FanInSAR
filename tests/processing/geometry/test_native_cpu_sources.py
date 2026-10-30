@@ -1,4 +1,4 @@
-"""Contract and CPU-boundary tests for the native-v2 vertical slice."""
+"""Contract and CPU-boundary tests for the native vertical slice."""
 
 from __future__ import annotations
 
@@ -10,14 +10,14 @@ import numpy as np
 import pytest
 
 from faninsar.processing.geometry import ecef_to_llh
-from faninsar.processing.geometry.native_v2 import (
+from faninsar.processing.geometry.native import (
     NATIVE_RESULT_FIELDS,
     result_from_native_outputs,
 )
 from faninsar.processing.geometry.torch_kernels import _rdr2geo_once
 
 SOURCE_ROOT = (
-    Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+    Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native"
 )
 
 
@@ -26,14 +26,14 @@ def serial_native_extension(tmp_path_factory: pytest.TempPathFactory) -> object:
     """Build the CPU sources without OpenMP for a diagnostic ABI check."""
     pytest.importorskip("torch")
     extension = pytest.importorskip("torch.utils.cpp_extension")
-    build_dir = tmp_path_factory.mktemp("native-v2-serial")
+    build_dir = tmp_path_factory.mktemp("native-serial")
     return extension.load(
-        name="faninsar_native_v2_serial_fixture",
+        name="faninsar_native_serial_fixture",
         sources=[
             str(SOURCE_ROOT / name)
             for name in (
                 "bindings.cpp",
-                "native_v2_abi.cpp",
+                "native_abi.cpp",
                 "geo2rdr.cpp",
                 "rdr2geo.cpp",
             )
@@ -57,7 +57,7 @@ def test_cpu_sources_export_both_operation_symbols_and_openmp_loop() -> None:
 
 
 def test_native_result_binding_centralizes_fourteen_field_validation() -> None:
-    """Native outputs are converted to the exact public v2 result contract."""
+    """Native outputs are converted to the exact public result contract."""
     values: list[np.ndarray] = [
         np.zeros(2, dtype=np.float64) for _ in NATIVE_RESULT_FIELDS
     ]
@@ -68,7 +68,11 @@ def test_native_result_binding_centralizes_fourteen_field_validation() -> None:
     values[11] = np.zeros(2, dtype=bool)
     result = result_from_native_outputs(values, operation="geo2rdr")
 
-    assert result.fields == NATIVE_RESULT_FIELDS
+    assert tuple(name for name in result.fields if name in NATIVE_RESULT_FIELDS) == (
+        NATIVE_RESULT_FIELDS
+    )
+    assert "incidence_deg" in result.fields
+    assert "look_azimuth_deg" in result.fields
     assert result.iterations.dtype == np.dtype(np.int32)
     assert result.converged.dtype == np.dtype(bool)
 
@@ -184,7 +188,7 @@ def test_cpu_contract_requires_strict_metrics_and_invalid_lane_rules() -> None:
 def test_cpu_telemetry_contract_keeps_qualification_metadata_out_of_result() -> None:
     """Operation and coverage metadata stay in telemetry, not result fields."""
     binding = (SOURCE_ROOT / "bindings.cpp").read_text()
-    abi = (SOURCE_ROOT / "native_v2_abi.h").read_text()
+    abi = (SOURCE_ROOT / "native_abi.h").read_text()
     assert "operation_symbol" in binding
     assert "processed_point_count" in abi
     assert "observed_affinity" in abi
@@ -193,7 +197,7 @@ def test_cpu_telemetry_contract_keeps_qualification_metadata_out_of_result() -> 
 
 def test_cpu_validation_and_runtime_identity_fail_closed() -> None:
     """Native validation rejects nonfinite geometry and unknown runtimes."""
-    abi_source = (SOURCE_ROOT / "native_v2_abi.cpp").read_text()
+    abi_source = (SOURCE_ROOT / "native_abi.cpp").read_text()
     rdr_source = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
     assert "orbit position/velocity values must be finite" in abi_source
     assert "dem_samples must contain only finite values" in rdr_source
@@ -293,7 +297,7 @@ def test_native_dem_matches_torch_post_budget_ecef_transition() -> None:
 
 def test_native_orbit_lookup_and_telemetry_visit_are_hot_loop_safe() -> None:
     """Orbit lookup is logarithmic and per-point telemetry has no lock."""
-    abi = (SOURCE_ROOT / "native_v2_abi.cpp").read_text()
+    abi = (SOURCE_ROOT / "native_abi.cpp").read_text()
     record_visit = abi.split("void record_visit", maxsplit=1)[1].split(
         "TelemetrySnapshot telemetry_snapshot", maxsplit=1
     )[0]
@@ -413,7 +417,7 @@ def test_geo2rdr_uniform_packed_orbit_matches_nonuniform_fallback(
 
 
 @pytest.mark.skipif(
-    os.environ.get("FANINSAR_TEST_NATIVE_V2_BUILD") != "1",
+    os.environ.get("FANINSAR_TEST_NATIVE_BUILD") != "1",
     reason="native extension build is explicitly enabled",
 )
 def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) -> None:
@@ -421,12 +425,12 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     torch = pytest.importorskip("torch")
     cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
     module = cpp_extension.load(
-        name="faninsar_native_v2_cpu_fixture",
+        name="faninsar_native_cpu_fixture",
         sources=[
             str(SOURCE_ROOT / name)
             for name in (
                 "bindings.cpp",
-                "native_v2_abi.cpp",
+                "native_abi.cpp",
                 "geo2rdr.cpp",
                 "rdr2geo.cpp",
             )
@@ -468,7 +472,7 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert not bool(geo[10][1])
     assert float(geo[3][0]) == pytest.approx(2186.3, abs=1.0e-8)
     assert float(geo[8][0]) < 1.0
-    telemetry = module.native_v2_telemetry()
+    telemetry = module.native_telemetry()
     assert telemetry["operation_symbol"] == "geo2rdr_cpu"
     assert telemetry["processed_point_count"] == 2
     assert telemetry["visit_counts"] == [1, 1]
@@ -578,7 +582,7 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert float(rdr[8][0]) < 1.0
     assert float(rdr[7][0]) == pytest.approx(float(rdr[12][0]))
     assert float(rdr[8][0]) == pytest.approx(float(rdr[12][0]))
-    dem_telemetry = module.native_v2_telemetry()
+    dem_telemetry = module.native_telemetry()
     assert dem_telemetry["operation_symbol"] == "rdr2geo_cpu_dem"
     assert dem_telemetry["processed_point_count"] == 1
     assert dem_telemetry["visit_counts"] == [1]
@@ -606,13 +610,13 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert int(exhausted[6][0]) == 1
     assert bool(exhausted[10][0])
     assert not bool(exhausted[5][0])
-    assert module.native_v2_telemetry()["operation_symbol"] == "rdr2geo_cpu"
+    assert module.native_telemetry()["operation_symbol"] == "rdr2geo_cpu"
 
 
 def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     serial_native_extension: object,
 ) -> None:
-    """A serial diagnostic build publishes the shared v2 result contract."""
+    """A serial diagnostic build publishes the shared result contract."""
     torch = pytest.importorskip("torch")
     dtype = torch.float64
     extension = serial_native_extension
@@ -641,10 +645,12 @@ def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     result = result_from_native_outputs(outputs, operation="geo2rdr")
 
     assert len(outputs) == len(NATIVE_RESULT_FIELDS) == 14
-    assert result.fields == NATIVE_RESULT_FIELDS
+    assert tuple(name for name in result.fields if name in NATIVE_RESULT_FIELDS) == (
+        NATIVE_RESULT_FIELDS
+    )
     assert result.converged.tolist() == [True]
     assert result.iterations.tolist() == [1]
-    telemetry = extension.native_v2_telemetry()
+    telemetry = extension.native_telemetry()
     assert telemetry["openmp_defined"] is False
     assert telemetry["runtime_name"] == "unknown"
     assert telemetry["visit_counts"] == [1]

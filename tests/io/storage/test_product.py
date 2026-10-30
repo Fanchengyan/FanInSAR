@@ -11,7 +11,7 @@ import pytest
 
 from faninsar.io.storage.product import (
     Product,
-    commit_product,
+    publish_product,
     discover_products,
     open_product,
     verify_product,
@@ -37,7 +37,7 @@ def test_commit_and_open_roundtrip(tmp_path: Path) -> None:
     """A committed product exposes its properties, assets, and a write id."""
     target = tmp_path / "coreg" / "20240101"
     payload = np.arange(6, dtype=np.float32).reshape(2, 3)
-    product = commit_product(
+    product = publish_product(
         target,
         kind="scene",
         properties={"faninsar:date": "20240101"},
@@ -57,10 +57,10 @@ def test_every_commit_gets_a_fresh_write_id(tmp_path: Path) -> None:
     """Overwriting with identical bytes still mints a new write id."""
     target = tmp_path / "p"
     writer = _write_arrays({"a": np.zeros((2, 2), dtype=np.float32)})
-    first = commit_product(target, kind="x", properties={}, write_payloads=writer)
+    first = publish_product(target, kind="x", properties={}, write_payloads=writer)
     with pytest.raises(InvalidProcessingStateError, match="exists"):
-        commit_product(target, kind="x", properties={}, write_payloads=writer)
-    second = commit_product(
+        publish_product(target, kind="x", properties={}, write_payloads=writer)
+    second = publish_product(
         target, kind="x", properties={}, write_payloads=writer, overwrite=True
     )
     assert second.write_id != first.write_id
@@ -76,11 +76,11 @@ def test_crash_before_item_leaves_no_product(tmp_path: Path) -> None:
         raise RuntimeError("crash mid-payload")
 
     with pytest.raises(RuntimeError, match="crash"):
-        commit_product(target, kind="x", properties={}, write_payloads=broken)
+        publish_product(target, kind="x", properties={}, write_payloads=broken)
     assert not target.exists()
     assert discover_products(tmp_path, kind="x") == []
     # The next writer succeeds and removes the stale staging sibling.
-    commit_product(
+    publish_product(
         target,
         kind="x",
         properties={},
@@ -93,13 +93,13 @@ def test_crash_after_aside_keeps_old_product_discoverable(tmp_path: Path) -> Non
     """A crash between the aside rename and rename-in loses only the new data."""
     target = tmp_path / "p"
     writer = _write_arrays({"a": np.zeros((1, 1), dtype=np.float32)})
-    first = commit_product(target, kind="x", properties={}, write_payloads=writer)
+    first = publish_product(target, kind="x", properties={}, write_payloads=writer)
     aside = tmp_path / f".p.aside-{first.write_id}"
     os.rename(target, aside)
     assert discover_products(tmp_path, kind="x") == []
     with pytest.raises(InvalidProcessingStateError, match="missing"):
         open_product(target)
-    commit_product(target, kind="x", properties={}, write_payloads=writer)
+    publish_product(target, kind="x", properties={}, write_payloads=writer)
     assert not aside.exists()
 
 
@@ -119,13 +119,13 @@ def test_asset_hrefs_must_be_plain_basenames(tmp_path: Path, href: str) -> None:
         return {"a": {"href": href}}
 
     with pytest.raises(InvalidProcessingStateError, match="basename"):
-        commit_product(tmp_path / "p", kind="x", properties={}, write_payloads=writer)
+        publish_product(tmp_path / "p", kind="x", properties={}, write_payloads=writer)
 
 
 def test_symlinked_asset_is_rejected_on_open(tmp_path: Path) -> None:
     """A symlinked asset inside a committed product fails to open."""
     target = tmp_path / "p"
-    commit_product(
+    publish_product(
         target,
         kind="x",
         properties={},
@@ -144,7 +144,7 @@ def test_cleanup_never_follows_a_symlinked_staging_entry(tmp_path: Path) -> None
     victim.mkdir()
     (victim / "keep.txt").write_text("x", encoding="utf-8")
     os.symlink(victim, tmp_path / ".p.tmp")
-    commit_product(
+    publish_product(
         tmp_path / "p",
         kind="x",
         properties={},
@@ -156,7 +156,7 @@ def test_cleanup_never_follows_a_symlinked_staging_entry(tmp_path: Path) -> None
 def test_metadata_must_be_strict_json(tmp_path: Path) -> None:
     """NaN in metadata fails at write, before anything is published."""
     with pytest.raises(InvalidProcessingStateError, match="JSON"):
-        commit_product(
+        publish_product(
             tmp_path / "p",
             kind="x",
             properties={"bad": float("nan")},
@@ -168,10 +168,10 @@ def test_metadata_must_be_strict_json(tmp_path: Path) -> None:
 def test_inputs_record_upstream_write_ids(tmp_path: Path) -> None:
     """Dependents record upstream write ids and detect a replaced upstream."""
     writer = _write_arrays({"a": np.ones((1, 1), dtype=np.float32)})
-    upstream = commit_product(
+    upstream = publish_product(
         tmp_path / "up", kind="u", properties={}, write_payloads=writer
     )
-    down = commit_product(
+    down = publish_product(
         tmp_path / "down",
         kind="d",
         properties={},
@@ -180,7 +180,7 @@ def test_inputs_record_upstream_write_ids(tmp_path: Path) -> None:
     )
     assert open_product(tmp_path / "down").inputs == {"reference": upstream.write_id}
     assert down.stale_inputs({"reference": upstream}) == []
-    replaced = commit_product(
+    replaced = publish_product(
         tmp_path / "up", kind="u", properties={}, write_payloads=writer, overwrite=True
     )
     assert down.stale_inputs({"reference": replaced}) == ["reference"]
@@ -189,7 +189,7 @@ def test_inputs_record_upstream_write_ids(tmp_path: Path) -> None:
 def test_verify_detects_modified_payload(tmp_path: Path) -> None:
     """``verify_product`` re-hashes payloads against write-time checksums."""
     target = tmp_path / "p"
-    commit_product(
+    publish_product(
         target,
         kind="x",
         properties={},
@@ -208,7 +208,7 @@ def test_verify_detects_modified_payload(tmp_path: Path) -> None:
 def test_item_is_stac_feature(tmp_path: Path) -> None:
     """``item.json`` is a STAC Feature with namespaced custom fields."""
     target = tmp_path / "p"
-    commit_product(
+    publish_product(
         target,
         kind="scene",
         properties={"faninsar:date": "20240101"},
@@ -226,9 +226,9 @@ def test_discover_lists_committed_products_by_kind(tmp_path: Path) -> None:
     """Discovery returns committed children of one kind, sorted by name."""
     writer = _write_arrays({"a": np.ones((1, 1), dtype=np.float32)})
     for name in ("b", "a"):
-        commit_product(
+        publish_product(
             tmp_path / name, kind="scene", properties={}, write_payloads=writer
         )
-    commit_product(tmp_path / "c", kind="other", properties={}, write_payloads=writer)
+    publish_product(tmp_path / "c", kind="other", properties={}, write_payloads=writer)
     found = discover_products(tmp_path, kind="scene")
     assert [product.path.name for product in found] == ["a", "b"]
