@@ -174,6 +174,26 @@ def _encode_geometry_or_dem(value: Any) -> object:
         return {"faninsar:mask_plan": value.to_mapping()}
     if isinstance(value, (SourceDEM, RasterDEM, ConstantDEM)):
         return _encode_dem(value)
+    from faninsar.data.query.polygons import Polygons
+
+    if isinstance(value, Polygons):
+        gdf = value.geodataframe
+        crs = None if gdf.crs is None else str(gdf.crs)
+        features = [
+            {
+                "geometry": geom.__geo_interface__,
+                "properties": {"types": row["types"]},
+            }
+            for (_, row), geom in zip(gdf.iterrows(), gdf.geometry, strict=True)
+        ]
+        return {
+            "faninsar:polygons": {
+                "features": features,
+                "crs": crs,
+                "all_touched": value.all_touched,
+                "pad": value.pad,
+            }
+        }
     if hasattr(value, "__geo_interface__"):
         from pyproj import CRS
 
@@ -240,7 +260,11 @@ def _decode_typed(value: Mapping[str, object]) -> Any:
             height=int(payload["height"]),
             width=int(payload["width"]),
         )
-    if "faninsar:bbox" in value or "faninsar:geometry" in value:
+    if (
+        "faninsar:bbox" in value
+        or "faninsar:geometry" in value
+        or "faninsar:polygons" in value
+    ):
         return _decode_geometry(value)
     if "faninsar:mask_plan" in value:
         from faninsar.stack.mask_plan import MaskPlan
@@ -251,8 +275,30 @@ def _decode_typed(value: Mapping[str, object]) -> Any:
     return _UNTYPED
 
 
+def _decode_polygons(payload: Mapping[str, object]) -> Any:
+    """Decode a ``faninsar:polygons`` payload back to :class:`Polygons`."""
+    import geopandas as gpd
+    import shapely.geometry
+
+    from faninsar.data.query.polygons import Polygons
+
+    features = payload["features"]
+    geometries = [shapely.geometry.shape(f["geometry"]) for f in features]
+    types = [f["properties"]["types"] for f in features]
+    crs = payload.get("crs")
+    gdf = gpd.GeoDataFrame({"types": types}, geometry=geometries, crs=crs)
+    return Polygons(
+        gdf,
+        types=types,
+        all_touched=bool(payload.get("all_touched", True)),
+        pad=bool(payload.get("pad", False)),
+    )
+
+
 def _decode_geometry(value: Mapping[str, object]) -> Any:
     """Decode one ROI geometry payload."""
+    if "faninsar:polygons" in value:
+        return _decode_polygons(value["faninsar:polygons"])
     if "faninsar:bbox" in value:
         from faninsar.data.query.bbox import BoundingBox
 
