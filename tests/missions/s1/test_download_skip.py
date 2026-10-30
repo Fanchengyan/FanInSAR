@@ -19,6 +19,7 @@ import pytest
 
 from faninsar import remote
 from faninsar.data.query import BoundingBox
+from faninsar.missions.s1.s1search import S1Search
 from faninsar.missions.s1.stack import (
     S1Stack,
     _excluded_acquisition_provenance,
@@ -29,6 +30,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 ROI = BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326")
+
+
+def _asf_search(items: list[remote.CatalogItem]) -> S1Search:
+    """Wrap ASF catalog items in an ``S1Search`` for ``from_search`` tests."""
+    return S1Search(
+        items=tuple(items),
+        catalog="sentinel1-asf",
+        spatial=ROI,
+        query={},
+    )
 
 
 def _item(*assets: remote.RemoteAsset) -> remote.CatalogItem:
@@ -82,9 +93,6 @@ def test_checksum_mismatch_skips_acquisition_and_continues(
     """A verification failure warns, records the exclusion, and keeps others."""
     failed = replace(_item(_asset("failed")), item_id="S1_FAILED")
     good = replace(_item(_asset("good")), item_id="S1_GOOD")
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [failed, good])
-    )
     failed_destination = tmp_path / "inputs" / "S1_FAILED.zip"
     captured: list[tuple[tuple[Path, ...], dict[str, Any]]] = []
 
@@ -107,7 +115,11 @@ def test_checksum_mismatch_skips_acquisition_and_continues(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with caplog.at_level(logging.WARNING, logger="faninsar.missions.s1.stack"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="scene", provider="asf")
+        S1Stack.from_search(
+            _asf_search([failed, good]),
+            work_dir=tmp_path,
+            product_type="scene",
+        )
 
     assert len(captured) == 1
     paths, kwargs = captured[0]
@@ -133,9 +145,6 @@ def test_other_integrity_errors_still_fail_the_operation(
     """Non-verification integrity errors keep the fail-closed contract."""
     first = replace(_item(_asset("first")), item_id="S1_FIRST")
     second = replace(_item(_asset("second")), item_id="S1_SECOND")
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [first, second])
-    )
     constructed = False
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
@@ -159,7 +168,11 @@ def test_other_integrity_errors_still_fail_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(remote.RemoteIntegrityError) as integrity_error:
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="scene", provider="asf")
+        S1Stack.from_search(
+            _asf_search([first, second]),
+            work_dir=tmp_path,
+            product_type="scene",
+        )
     assert integrity_error.value.reason == "content_length_mismatch"
     assert not constructed
 
@@ -169,9 +182,6 @@ def test_network_transfer_failure_still_fails_the_operation(
 ) -> None:
     """Transport-level download errors keep the fail-closed contract."""
     item = _item(_asset())
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [item])
-    )
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
         del asset, destination, kwargs
@@ -187,7 +197,9 @@ def test_network_transfer_failure_still_fails_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(OSError, match="connection reset"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="scene", provider="asf")
+        S1Stack.from_search(
+            _asf_search([item]), work_dir=tmp_path, product_type="scene"
+        )
 
 
 def test_all_acquisitions_failed_verification_raises_without_stack(
@@ -195,9 +207,6 @@ def test_all_acquisitions_failed_verification_raises_without_stack(
 ) -> None:
     """No surviving acquisition fails closed with a clear error."""
     only = replace(_item(_asset("only")), item_id="S1_ONLY")
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [only])
-    )
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
         del asset, destination, kwargs
@@ -214,7 +223,9 @@ def test_all_acquisitions_failed_verification_raises_without_stack(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(ValueError, match="download verification"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="scene", provider="asf")
+        S1Stack.from_search(
+            _asf_search([only]), work_dir=tmp_path, product_type="scene"
+        )
 
 
 def test_burst_poll_path_skips_verification_failure(
@@ -225,9 +236,6 @@ def test_burst_poll_path_skips_verification_failure(
 
     failed = replace(_item(_asset("burst-failed")), item_id="S1_BFAILED")
     good = replace(_item(_asset("burst-good")), item_id="S1_BGOOD")
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [failed, good])
-    )
 
     def probe(asset: Any, **kwargs: Any) -> Any:
         del kwargs
@@ -254,7 +262,11 @@ def test_burst_poll_path_skips_verification_failure(
         return _FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+    S1Stack.from_search(
+        _asf_search([failed, good]),
+        work_dir=tmp_path,
+        product_type="burst",
+    )
 
     assert captured == [(tmp_path / "inputs" / "S1_BGOOD.zip",)]
 

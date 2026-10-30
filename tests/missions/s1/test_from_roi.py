@@ -1,8 +1,10 @@
-"""Tests for S1Stack.from_roi (PROPOSAL-0061).
+"""Tests for S1Stack.from_search (PROPOSAL-0062).
 
-The constructor is the single top-level acquisition entry: granularity is the
-scientific axis, provider is derived, and CDSE ROI materializes a full-burst-
-height canvas before ``from_safes``.  ``from_search`` is deleted.
+``from_search`` is the single acquisition entry: it takes a pre-filtered
+:class:`~faninsar.missions.s1.s1search.S1Search` and dispatches on
+``search.catalog`` — ``sentinel1-cdse`` materializes full-burst-height
+canvases before ``from_safes``; ``sentinel1-asf`` downloads complete
+burst/scene products.  ``from_roi`` is deleted.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from faninsar.missions.s1.annotation import parse_annotation_xml
 from faninsar.missions.s1.errors import Sentinel1ProductError
 from faninsar.missions.s1.io.canvas import BurstFetchedWindow, RoiSafeCanvas
 from faninsar.missions.s1.overlap import BurstOverlapWindow
+from faninsar.missions.s1.s1search import S1Search
 from faninsar.missions.s1.stack import S1Stack
 from faninsar.remote.errors import RemoteAccessError
 
@@ -62,6 +65,45 @@ MEASUREMENT_URL = (
     "https://catalogue.dataspace.copernicus.eu/odata/v1/"
     "Products(S1A_TEST)/Nodes(measurement.tiff)/$value"
 )
+
+
+def _cdse_asset(
+    key: str,
+    href: str,
+    *,
+    media_type: str | None = None,
+    size_bytes: int | None = None,
+    properties: dict[str, object] | None = None,
+) -> remote.RemoteAsset:
+    """Build one CDSE catalog asset for bind tests."""
+    return remote.RemoteAsset(
+        provider="CDSE",
+        catalog="sentinel1-cdse",
+        collection="SENTINEL-1",
+        item_id="S1A_TEST",
+        key=key,
+        href=href,
+        media_type=media_type,
+        size_bytes=size_bytes,
+        properties=properties or {},
+    )
+
+
+def _cdse_item(*assets: remote.RemoteAsset) -> remote.CatalogItem:
+    """Build one CDSE catalog item wrapping the given assets."""
+    return remote.CatalogItem(
+        provider="CDSE",
+        catalog="sentinel1-cdse",
+        collection="SENTINEL-1",
+        item_id="S1A_TEST",
+        acquisition=remote.AcquisitionMetadata(
+            acquisition_id="S1A_TEST",
+            start=datetime(2016, 12, 7, tzinfo=UTC),
+            end=datetime(2016, 12, 7, tzinfo=UTC),
+        ),
+        assets={asset.key: asset for asset in assets},
+        raw_metadata={"polarization": "VV"},
+    )
 
 
 def _parent_xml() -> str:
@@ -200,19 +242,50 @@ def parent_swath() -> Iterator[tuple[S1Swath, MemoryFile, str, np.ndarray]]:
 def _resolve_roi_acquisition(**kwargs: Any) -> tuple[str, str]:
     """Call the mission resolver; fail as an assertion if it is missing."""
     resolver = getattr(acquisition_mod, "resolve_roi_acquisition", None)
-    assert resolver is not None, "resolve_roi_acquisition is required by from_roi"
+    assert resolver is not None, (
+        "resolve_roi_acquisition is the granularity/provider table resolver "
+        "consumed by the materialization layer"
+    )
     return resolver(**kwargs)
 
 
-def _from_roi(*args: Any, **kwargs: Any) -> Any:
-    """Call S1Stack.from_roi; fail as an assertion if it is missing."""
-    constructor = getattr(S1Stack, "from_roi", None)
-    assert constructor is not None, "S1Stack.from_roi is required by PROPOSAL-0061"
-    return constructor(*args, **kwargs)
+def _cdse_search(item: remote.CatalogItem | None = None) -> S1Search:
+    """Wrap one CDSE ``CatalogItem`` (or the default) in an ``S1Search``."""
+    return S1Search(
+        items=(
+            item
+            if item is not None
+            else _cdse_item(
+                _cdse_asset(
+                    "annotation",
+                    ANNOTATION_URL,
+                    media_type="application/xml",
+                    size_bytes=845_602,
+                ),
+                _cdse_asset(
+                    "measurement",
+                    MEASUREMENT_URL,
+                    media_type="image/tiff",
+                    size_bytes=1_135_276_112,
+                    properties={"file:size": 1_135_276_112, "swath": "IW1"},
+                ),
+            ),
+        ),
+        catalog="sentinel1-cdse",
+        spatial=ROI,
+        query={},
+    )
+
+
+def _from_search(search: S1Search, **kwargs: Any) -> Any:
+    """Call S1Stack.from_search; fail as an assertion if it is missing."""
+    constructor = getattr(S1Stack, "from_search", None)
+    assert constructor is not None, "S1Stack.from_search is required by PROPOSAL-0062"
+    return constructor(search, **kwargs)
 
 
 class TestResolutionMatrix:
-    """Every legal combo infers the right provider; illegal combos fail fast."""
+    """The granularity/provider table still resolves; illegal combos fail fast."""
 
     @pytest.mark.parametrize(
         ("granularity", "provider", "expected_granularity", "expected_provider"),
@@ -241,23 +314,11 @@ class TestResolutionMatrix:
         self,
         granularity: str,
         provider: str,
-        tmp_path: Path,
     ) -> None:
         """Illegal combinations raise ValueError that cites the matrix table."""
         with pytest.raises(ValueError, match="table") as resolved:
             _resolve_roi_acquisition(granularity=granularity, provider=provider)
         message = str(resolved.value)
-        assert granularity in message
-        assert provider in message
-
-        with pytest.raises(ValueError, match="table") as constructed:
-            _from_roi(
-                ROI,
-                work_dir=tmp_path,
-                granularity=granularity,
-                provider=provider,
-            )
-        message = str(constructed.value)
         assert granularity in message
         assert provider in message
 
@@ -276,67 +337,49 @@ def test_odata_annotation_stem_uses_nodes_filename() -> None:
     assert _annotation_stem("memory://parent-annotation.xml") == "parent-annotation"
 
 
-def test_roi_acquisition_extra_keys_are_classified() -> None:
-    """``from_roi`` records granularity/provider as classified derived extras."""
-    from faninsar.stack.identity import DERIVED_EXTRA_KEYS
-
-    assert {"roi_granularity", "roi_provider"} <= DERIVED_EXTRA_KEYS
-
-
-def test_from_search_is_gone() -> None:
-    """``from_search`` is deleted with no deprecation shim."""
-    assert not hasattr(S1Stack, "from_search")
+def test_from_roi_is_gone() -> None:
+    """``from_roi`` is deleted with no deprecation shim (PROPOSAL-0062)."""
+    assert not hasattr(S1Stack, "from_roi")
     with pytest.raises(AttributeError):
-        S1Stack.from_search  # noqa: B018
-    with pytest.raises(AttributeError, match="from_search"):
-        S1Stack.from_search(object(), work_dir="unused")  # type: ignore[misc]
+        S1Stack.from_roi  # noqa: B018
+    with pytest.raises(AttributeError, match="from_roi"):
+        S1Stack.from_roi(object(), work_dir="unused")  # type: ignore[misc]
 
 
-def test_from_roi_docstring_documents_matrix_without_fixed_fraction() -> None:
-    """The constructor docstring carries the table and no fixed byte contract."""
-    constructor = getattr(S1Stack, "from_roi", None)
-    assert constructor is not None, "S1Stack.from_roi is required by PROPOSAL-0061"
-    doc = inspect.getdoc(constructor)
-    assert doc is not None
-    lowered = doc.lower()
-    for token in (
-        "granularity",
-        "providers",
-        "inferred provider",
-        "roi",
-        "burst",
-        "scene",
-        "cdse",
-        "asf",
-        "table",
-    ):
-        assert token in lowered
-    assert "2.9%" not in doc
-    assert "3%" not in doc
-    assert "roi shape" in lowered or "shape" in lowered
+def test_from_search_rejects_non_s1search() -> None:
+    """``from_search`` requires an S1Search, not a raw spatial query."""
+    with pytest.raises(TypeError, match="S1Search"):
+        S1Stack.from_search(ROI, work_dir="unused")
 
 
-def test_from_roi_signature_matches_proposal() -> None:
-    """The public signature matches the PROPOSAL-0061 constructor contract."""
-    constructor = getattr(S1Stack, "from_roi", None)
-    assert constructor is not None, "S1Stack.from_roi is required by PROPOSAL-0061"
+def test_from_search_rejects_empty_result() -> None:
+    """An empty S1Search fails fast with a clear error."""
+    empty = S1Search(items=(), catalog="sentinel1-cdse", spatial=ROI, query={})
+    with pytest.raises(ValueError, match="empty"):
+        S1Stack.from_search(empty, work_dir="unused")
+
+
+def test_from_search_signature_matches_proposal() -> None:
+    """The public signature matches the PROPOSAL-0062 constructor contract."""
+    constructor = getattr(S1Stack, "from_search", None)
+    assert constructor is not None, "S1Stack.from_search is required by PROPOSAL-0062"
     parameters = inspect.signature(constructor).parameters
-    assert list(parameters)[:2] == ["roi", "datetime_range"]
-    assert parameters["datetime_range"].default is None
-    assert parameters["datetime_range"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert next(iter(parameters)) == "search"
     for name in (
-        "granularity",
-        "provider",
+        "roi",
         "polarizations",
         "work_dir",
+        "granularity",
+        "product_type",
+        "coreg_mode",
         "orbit_paths",
         "calibration_paths",
-        "coreg_mode",
     ):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["granularity"].default == "roi"
-    assert parameters["provider"].default is None
+    assert parameters["roi"].default is None
     assert parameters["polarizations"].default == ("VV",)
+    assert parameters["granularity"].default is None
+    assert parameters["product_type"].default is None
     assert parameters["coreg_mode"].default == "geometry"
 
 
@@ -349,7 +392,7 @@ class TestCdseRoiCanvasOrder:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Mocked catalog + range fetch still writes a full-burst-height canvas."""
+        """CDSE from_search binds the item, writes canvas, then from_safes."""
         swath, _memfile, xml_text, data = parent_swath
         order: list[str] = []
         captured_paths: list[tuple[Path, ...]] = []
@@ -371,20 +414,6 @@ class TestCdseRoiCanvasOrder:
 
         from faninsar.missions.s1 import acquisition as acquisition_mod
         from faninsar.missions.s1.io import canvas as canvas_mod
-
-        def fake_discover(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
-            del args, kwargs
-            order.append("discover")
-            return [
-                {
-                    "product_id": "S1A_TEST",
-                    "annotation_url": ANNOTATION_URL,
-                    "measurement_url": MEASUREMENT_URL,
-                    "measurement_size": 16_000,
-                    "polarization": "VV",
-                    "swath": "IW1",
-                }
-            ]
 
         async def fake_fetch_ranges_async(
             spans: Any,
@@ -432,7 +461,6 @@ class TestCdseRoiCanvasOrder:
                     assert dataset.width == SAMPLES_PER_BURST
             return FakeStack()
 
-        monkeypatch.setattr(acquisition_mod, "discover_cdse_slc_items", fake_discover)
         monkeypatch.setattr(
             "faninsar.remote.fetch.fetch_ranges_async",
             fake_fetch_ranges_async,
@@ -484,8 +512,8 @@ class TestCdseRoiCanvasOrder:
         )
         monkeypatch.setattr(S1Stack, "from_safes", classmethod(fake_from_safes))
 
-        result = _from_roi(
-            ROI,
+        result = _from_search(
+            _cdse_search(),
             work_dir=tmp_path,
             granularity="roi",
             coreg_mode="nesd",
@@ -499,7 +527,6 @@ class TestCdseRoiCanvasOrder:
         safes_at = order.index("from_safes")
         prepare_at = order.index("prepare")
         assert write_at < splice_at < safes_at < prepare_at
-        assert "discover" in order
         assert "fetch_ranges" in order
 
 
@@ -642,45 +669,6 @@ def _complex_int16_bytes(samples: np.ndarray) -> bytes:
     interleaved[..., 0] = real
     interleaved[..., 1] = imag
     return interleaved.tobytes()
-
-
-def _cdse_asset(
-    key: str,
-    href: str,
-    *,
-    media_type: str | None = None,
-    size_bytes: int | None = None,
-    properties: dict[str, object] | None = None,
-) -> remote.RemoteAsset:
-    """Build one CDSE catalog asset for bind tests."""
-    return remote.RemoteAsset(
-        provider="CDSE",
-        catalog="sentinel1-cdse",
-        collection="SENTINEL-1",
-        item_id="S1A_TEST",
-        key=key,
-        href=href,
-        media_type=media_type,
-        size_bytes=size_bytes,
-        properties=properties or {},
-    )
-
-
-def _cdse_item(*assets: remote.RemoteAsset) -> remote.CatalogItem:
-    """Build one CDSE catalog item wrapping the given assets."""
-    return remote.CatalogItem(
-        provider="CDSE",
-        catalog="sentinel1-cdse",
-        collection="SENTINEL-1",
-        item_id="S1A_TEST",
-        acquisition=remote.AcquisitionMetadata(
-            acquisition_id="S1A_TEST",
-            start=datetime(2016, 12, 7, tzinfo=UTC),
-            end=datetime(2016, 12, 7, tzinfo=UTC),
-        ),
-        assets={asset.key: asset for asset in assets},
-        raw_metadata={"polarization": "VV"},
-    )
 
 
 class TestStripTableDecode:
@@ -898,7 +886,7 @@ class TestCdseCatalogAndODataBind:
     def test_discover_auto_registers_catalog_and_binds_odata(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``from_roi`` discovery registers ``sentinel1-cdse`` and binds OData hrefs."""
+        """CDSE discovery registers ``sentinel1-cdse`` and binds OData hrefs."""
         registered: list[str] = []
 
         def fake_ensure(name: str | None = None) -> str:
@@ -1282,3 +1270,325 @@ class TestRoiWgs84AndPointEnvelope:
         lon, lat = float(normalized.values[0, 0]), float(normalized.values[0, 1])
         assert abs(lon - 100.0) < 1e-5
         assert abs(lat - 40.0) < 1e-5
+
+
+class TestNarrowRoiRule:
+    """Probe-based narrow-ROI rule for exact-column per-row span planning."""
+
+    def test_rule_requires_context(self) -> None:
+        """Without a fetch context the narrow rule never engages."""
+        assert (
+            acquisition_mod._use_exact_columns(None, n_cols=10, samples=1000) is False
+        )
+
+    def test_rule_requires_measured_bandwidth(self) -> None:
+        """A context with no probe bytes yet leaves whole-row planning on."""
+        context = acquisition_mod._RoiFetchContext()
+        assert context.bandwidth_bps is None
+        assert (
+            acquisition_mod._use_exact_columns(context, n_cols=10, samples=1000)
+            is False
+        )
+
+    def test_rule_engages_below_both_thresholds(self) -> None:
+        """Slow link plus <30% width enables exact-column planning."""
+        context = acquisition_mod._RoiFetchContext()
+        context.probed_bytes = 1000
+        context.probed_seconds = 1.0  # 1 KB/s << 1.3 MiB/s
+        assert (
+            acquisition_mod._use_exact_columns(context, n_cols=299, samples=1000)
+            is True
+        )
+
+    def test_rule_stays_off_at_30_percent_width(self) -> None:
+        """An ROI exactly 30% of the row width keeps whole-row spans."""
+        context = acquisition_mod._RoiFetchContext()
+        context.probed_bytes = 1000
+        context.probed_seconds = 1.0
+        assert (
+            acquisition_mod._use_exact_columns(context, n_cols=300, samples=1000)
+            is False
+        )
+
+    def test_rule_stays_off_above_bandwidth_ceiling(self) -> None:
+        """A fast link keeps whole-row spans even for a narrow ROI."""
+        context = acquisition_mod._RoiFetchContext()
+        context.probed_bytes = 10 * 1024 * 1024
+        context.probed_seconds = 1.0  # 10 MiB/s > 1.3 MiB/s
+        assert (
+            acquisition_mod._use_exact_columns(context, n_cols=10, samples=1000)
+            is False
+        )
+
+
+class TestRoiFetchContextDedup:
+    """Shared context dedups probes and identical byte ranges."""
+
+    def test_deduped_fetch_collapses_identical_ranges(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two spans on one byte range produce a single request."""
+        requested: list[tuple[int, int]] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                requested.append((span.start, span.end))
+                bodies[span.label] = b"\x01" * (span.end - span.start + 1)
+            return bodies
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        context = acquisition_mod._RoiFetchContext()
+        spans = (
+            remote.fetch.RangeSpan(MEASUREMENT_URL, 100, 199, "row-0-1"),
+            remote.fetch.RangeSpan(MEASUREMENT_URL, 100, 199, "alias"),
+            remote.fetch.RangeSpan(MEASUREMENT_URL, 200, 299, "row-1-2"),
+        )
+        bodies = acquisition_mod._fetch_deduped(spans, context)
+        assert requested == [(100, 199), (200, 299)]
+        assert bodies["row-0-1"] == bodies["alias"] == b"\x01" * 100
+        assert bodies["row-1-2"] == b"\x01" * 100
+
+    def test_deduped_fetch_reuses_cached_range(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A range already in the context is never requested again."""
+        requested: list[tuple[int, int]] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            requested.extend((span.start, span.end) for span in spans)
+            return {span.label: b"\x02" * (span.end - span.start + 1) for span in spans}
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        context = acquisition_mod._RoiFetchContext()
+        first = (remote.fetch.RangeSpan(MEASUREMENT_URL, 0, 99, "row-0-1"),)
+        second = (remote.fetch.RangeSpan(MEASUREMENT_URL, 0, 99, "overlap-0-1"),)
+        acquisition_mod._fetch_deduped(first, context)
+        bodies = acquisition_mod._fetch_deduped(second, context)
+        assert requested == [(0, 99)]
+        assert bodies["overlap-0-1"] == b"\x02" * 100
+
+    def test_deduped_fetch_without_context_requests_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No context means no dedup: every span is dispatched as before."""
+        requested: list[tuple[int, int]] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            requested.extend((span.start, span.end) for span in spans)
+            return {span.label: b"\x00" for span in spans}
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        spans = (
+            remote.fetch.RangeSpan(MEASUREMENT_URL, 0, 99, "a"),
+            remote.fetch.RangeSpan(MEASUREMENT_URL, 0, 99, "b"),
+        )
+        acquisition_mod._fetch_deduped(spans, None)
+        assert requested == [(0, 99), (0, 99)]
+
+    def test_measurement_bodies_reuse_strip_tables_and_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A shared context probes once and never re-fetches identical spans."""
+        n_rows = 4
+        samples = 100
+        row_stride = samples * 4
+        offsets = [1000 + index * row_stride for index in range(n_rows)]
+        counts = [row_stride] * n_rows
+        header = b"II" + struct.pack("<HI", 42, 16)
+        probe_requests: list[str] = []
+        row_requests: list[tuple[int, int]] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.label == "tiff-header":
+                    probe_requests.append(span.label)
+                    bodies[span.label] = header
+                elif span.label.startswith("row-"):
+                    row_requests.append((span.start, span.end))
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+                else:
+                    probe_requests.append(span.label)
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+            return bodies
+
+        def fake_tables(
+            _bodies: Any, *, samples: int
+        ) -> tuple[list[int], list[int], int]:
+            del samples
+            return list(offsets), list(counts), 1
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        monkeypatch.setattr(acquisition_mod, "_strip_tables_from_probes", fake_tables)
+        context = acquisition_mod._RoiFetchContext()
+        file_size = offsets[-1] + row_stride
+        first = acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=file_size,
+            line0=0,
+            line1=2,
+            col0=0,
+            col1=samples,
+            samples=samples,
+            fetch_context=context,
+        )
+        # Second call plans the identical byte range (same rows/columns), as
+        # happens when an ROI span and an overlap span cover the same rows.
+        second = acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=file_size,
+            line0=0,
+            line1=2,
+            col0=0,
+            col1=samples,
+            samples=samples,
+            fetch_context=context,
+        )
+        # Header + IFD probed exactly once; the identical row range was not
+        # requested again.
+        assert probe_requests == ["tiff-header", "ifd-16"]
+        assert row_requests == [(1000, 1000 + 2 * row_stride - 1)]
+        assert second["row-0-2"] == first["row-0-2"]
+
+    def test_exact_column_spans_decode_through_assembly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The narrow-ROI path fetches col spans and assembles them correctly."""
+        n_rows = 4
+        samples = 1000
+        col0, col1 = 100, 250  # 15% of the row -> narrow
+        row_stride = samples * 4
+        offsets = [500 + index * row_stride for index in range(n_rows)]
+        counts = [row_stride] * n_rows
+        header = b"II" + struct.pack("<HI", 42, 16)
+        expected = (
+            np.arange(n_rows * (col1 - col0), dtype=np.float32).reshape(
+                n_rows, col1 - col0
+            )
+            + 1j
+        )
+        captured: list[Any] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.label == "tiff-header":
+                    bodies[span.label] = header
+                elif span.label.startswith("col-"):
+                    captured.append(span)
+                    row = int(span.label.split("-")[1])
+                    bodies[span.label] = _complex_int16_bytes(expected[row])
+                else:
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+            return bodies
+
+        def fake_tables(
+            _bodies: Any, *, samples: int
+        ) -> tuple[list[int], list[int], int]:
+            del samples
+            return list(offsets), list(counts), 1
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        monkeypatch.setattr(acquisition_mod, "_strip_tables_from_probes", fake_tables)
+        context = acquisition_mod._RoiFetchContext()
+        # Seed a slow observed bandwidth so the narrow rule engages.
+        context.probed_bytes = 1000
+        context.probed_seconds = 1.0
+        bodies = acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=offsets[-1] + row_stride,
+            line0=0,
+            line1=n_rows,
+            col0=col0,
+            col1=col1,
+            samples=samples,
+            fetch_context=context,
+        )
+        assert len(captured) == n_rows
+        for line, span in enumerate(captured):
+            row_start = offsets[line]
+            assert (span.start, span.end) == (
+                row_start + col0 * 4,
+                row_start + col1 * 4 - 1,
+            )
+            assert span.label == f"col-{line}-{col0}-{col1}"
+        assembled = acquisition_mod._assemble_window_samples(
+            bodies,
+            parent_line0=0,
+            n_lines=n_rows,
+            col0=col0,
+            n_cols=col1 - col0,
+            samples_per_burst=samples,
+        )
+        np.testing.assert_array_equal(assembled, expected)
+
+    def test_column_span_mismatch_fails_closed(self) -> None:
+        """A col- span whose columns differ from the request is rejected."""
+        payload = _complex_int16_bytes(np.zeros(10, dtype=np.complex64))
+        with pytest.raises(Sentinel1ProductError):
+            acquisition_mod._assemble_window_samples(
+                {"col-0-0-10": payload},
+                parent_line0=0,
+                n_lines=1,
+                col0=5,
+                n_cols=5,
+                samples_per_burst=100,
+            )
+
+
+class TestBurstSubSpans:
+    """Large CDSE full-burst selections split into parallel 4 MiB sub-spans."""
+
+    def test_full_burst_selection_splits_into_capped_sub_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A >4 MiB burst emits multiple row-aligned spans in one batch."""
+        samples = 262144  # 1 MiB rows
+        n_rows = 6  # 6 MiB > 4 MiB cap
+        row_stride = samples * 4
+        offsets = [index * row_stride for index in range(n_rows)]
+        counts = [row_stride] * n_rows
+        header = b"II" + struct.pack("<HI", 42, 16)
+        captured: list[Any] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.label == "tiff-header":
+                    bodies[span.label] = header
+                else:
+                    captured.append(span)
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+            return bodies
+
+        def fake_tables(
+            _bodies: Any, *, samples: int
+        ) -> tuple[list[int], list[int], int]:
+            del samples
+            return list(offsets), list(counts), 1
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        monkeypatch.setattr(acquisition_mod, "_strip_tables_from_probes", fake_tables)
+        acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=offsets[-1] + row_stride,
+            line0=0,
+            line1=n_rows,
+            col0=0,
+            col1=samples,
+            samples=samples,
+        )
+        row_spans = [span for span in captured if span.label.startswith("row-")]
+        assert len(row_spans) == 2  # 4 MiB + 2 MiB
+        for span in row_spans:
+            assert span.end - span.start + 1 <= acquisition_mod.MAX_SPAN_BYTES
+            assert (span.end + 1) % row_stride == 0
+        # Spans stay byte-adjacent so the parallel batch reassembles cleanly.
+        assert row_spans[1].start == row_spans[0].end + 1

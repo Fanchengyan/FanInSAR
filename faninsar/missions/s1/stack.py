@@ -20,9 +20,9 @@ from faninsar.stack.search import (
 from faninsar.stack.session import Stack
 
 from .acquisition import (
+    _bind_cdse_item,
     materialize_cdse_roi_safes,
     normalize_roi_wgs84,
-    resolve_roi_acquisition,
 )
 from .search import (
     S1PolarizationRequest,
@@ -358,132 +358,158 @@ class S1Stack(Stack):
         return stack  # type: ignore[return-value]
 
     @classmethod
-    def from_roi(
+    def from_search(
         cls,
-        roi: Points | BoundingBox | Polygons,
-        datetime_range: tuple[datetime, datetime] | None = None,
+        search: Any,
         *,
-        granularity: str = "roi",
-        provider: str | None = None,
+        roi: Points | BoundingBox | Polygons | None = None,
         polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
         work_dir: str | Path,
+        granularity: str | None = None,
+        product_type: S1ProductType | None = None,
+        coreg_mode: CoregMode = "geometry",
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         calibration_paths: Sequence[str | Path] | None = None,
-        coreg_mode: CoregMode = "geometry",
         **kwargs: Any,
     ) -> Self:
-        """Search, acquire, and prepare a Sentinel-1 Stack for one ROI.
+        """Build a Stack from a pre-filtered :class:`S1Search` result set.
 
-        Scientific granularity is the user-facing axis; the provider is
-        derived.  Bytes transferred depend on ROI shape and burst coverage;
-        this method does not promise a fixed byte fraction.
+        The acquisitions to materialize come from ``search.items`` — already
+        filtered/composed client-side — so the provider search step is skipped
+        entirely.  ``search.catalog`` picks the provider path:
 
-        Provider x granularity table:
+        - ``sentinel1-cdse`` → byte-range windows (``granularity``, default
+          ``"roi"``) materialized via :func:`materialize_cdse_roi_safes`.
+        - ``sentinel1-asf`` → complete burst/scene products via
+          :meth:`_from_asf_complete` (``product_type``, default ``"burst"``).
 
-        ============  ==========  =================  =================================
-        granularity   providers   inferred provider  notes
-        ============  ==========  =================  =================================
-        roi (default) cdse        cdse               byte-range windows; bytes depend
-                                                     on ROI shape
-        burst         cdse, asf   cdse               full-burst contiguous row ranges
-                                                     (cdse) or ASF burst products
-        scene         asf         asf                complete scene/frame products
-        ============  ==========  =================  =================================
-
-        Both ``granularity`` and ``provider`` omitted → ``roi`` + ``cdse``.
-        Illegal combinations (``roi``+``asf``, ``scene``+``cdse``) raise
-        :class:`ValueError` citing this table.  Overlap strips for NESD/ESD
-        are fetched internally and are not a user knob.  ``catalog`` /
-        ``collections`` are adapter configuration, not constructor
-        arguments.
-
-        CDSE paths (``roi`` and ``burst@cdse``) materialize a full-burst-
-        height SAFE-subset canvas then call :meth:`from_safes` →
-        :meth:`prepare`.  Geometry canvases list intersecting bursts and
-        skip overlap fetch; NESD canvases list every parent burst of the
-        intersecting swath and splice that frame's overlap strips.  ASF
-        paths download complete objects and follow the same
-        ``from_safes`` → ``prepare`` join.
+        ``roi`` is optional.  When given it bounds processing — CDSE crops to
+        byte ranges on download; ASF downloads whole products but ``prepare``/
+        ``coregister`` still crop to the ROI.  When omitted the full
+        frame/burst extent is used.
 
         Parameters
         ----------
-        roi : Points, BoundingBox, or Polygons
-            FanInSAR spatial query.  A CRS is required; non-WGS84
-            coordinates are transformed to EPSG:4326.  A single
-            :class:`~faninsar.data.query.Points` query is buffered by
-            1 km on the ground before CDSE window inversion.
-        datetime_range : tuple, optional
-            Inclusive acquisition time range.
-        granularity : {"roi", "burst", "scene"}, default="roi"
-            Acquisition granularity (not a provider product type).
-        provider : {"cdse", "asf"} or None, optional
-            Explicit provider; inferred from ``granularity`` when omitted.
-        polarizations : sequence of str or "all", default=("VV",)
+        search : S1Search
+            Filtered/composed acquisitions (see
+            :func:`~faninsar.missions.s1.s1search.search_acquisitions`).
+        roi : spatial, optional
+            Optional processing bound.  ``search.spatial`` is reused when the
+            search was ROI-scoped and ``roi`` is omitted and CDSE windows
+            still need one — pass it explicitly to be safe.
+        polarizations : sequence of str or "all", optional
             Sentinel-1 single/dual channels to retain.
         work_dir : path-like
             Stack work directory and local input cache.
+        granularity : {"roi", "burst"} or None, optional
+            CDSE byte-range granularity.  Defaults to ``"roi"``.  Ignored on
+            the ASF path.
+        product_type : {"burst", "scene"} or None, optional
+            ASF product family.  Defaults to ``"burst"``.  Ignored on the
+            CDSE path.
+        coreg_mode : {"geometry", "nesd"}, optional
+            Stack coregistration mode.
         orbit_paths, calibration_paths : optional
             Explicit local orbit candidates/bindings and AUX_CAL files passed
             to :meth:`from_safes`.
-        coreg_mode : {"geometry", "nesd"}, optional
-            Stack coregistration mode. Defaults to ``"geometry"``.
-            Tests that exercise NESD pass ``coreg_mode="nesd"``.
-        **kwargs : Any
-            Existing :meth:`from_safes` options plus internal ASF search
-            options (``flight_direction``, ``filters``, ``limit``,
-            ``budget``).  ``catalog`` / ``collections`` remain internal.
+        **kwargs
+            Forwarded to the provider constructor / ``from_safes``.
 
         Returns
         -------
         S1Stack
-            A locally materialized and prepared Stack.
-
-        Raises
-        ------
-        ValueError
-            If the ROI has no CRS, the granularity x provider pair is
-            illegal, the query returns no products, every download fails
-            verification, or local construction fails.
-
-        Notes
-        -----
-        A download whose bytes fail provider checksum verification excludes
-        only that acquisition (PROPOSAL-0055): it is warned, recorded as
-        ``status: failed`` in ``config.extra["excluded_acquisitions"]``, and
-        excluded from pair formation.  Any other download error remains
-        operation-fatal.
+            Prepared Stack over the selected acquisitions.
 
         """
-        resolved_granularity, resolved_provider = resolve_roi_acquisition(
-            granularity,
-            provider,
-        )
-        roi = normalize_roi_wgs84(roi)
-        extra = dict(kwargs.pop("extra", {}) or {})
-        extra["roi_granularity"] = resolved_granularity
-        extra["roi_provider"] = resolved_provider
-        kwargs["extra"] = extra
-        kwargs.setdefault("coreg_mode", coreg_mode)
-        if resolved_provider == "cdse":
-            return cls._from_cdse_roi(
-                roi,
-                datetime_range=datetime_range,
-                granularity=resolved_granularity,
-                polarizations=polarizations,
+        from faninsar.missions.s1.s1search import S1Search
+
+        if not isinstance(search, S1Search):
+            message = (
+                "from_search expects an S1Search, got "
+                f"{type(search).__name__}; produce one via "
+                "search_acquisitions(...)"
+            )
+            raise TypeError(message)
+        if not search.items:
+            message = "from_search received an empty S1Search; nothing to download"
+            logger.error(message)
+            raise ValueError(message)
+        selected_polarizations = normalize_polarizations(polarizations)
+        catalog = search.catalog
+        effective_roi = roi if roi is not None else search.spatial
+        if effective_roi is not None:
+            effective_roi = normalize_roi_wgs84(effective_roi)
+
+        if catalog == "sentinel1-cdse":
+            requested = (
+                None
+                if selected_polarizations == "all"
+                else {str(p).upper() for p in selected_polarizations}
+            )
+            bindings = []
+            for item in search.items:
+                bindings.extend(_bind_cdse_item(item))
+            if requested is not None:
+                bindings = [b for b in bindings if b.get("polarization") in requested]
+            if effective_roi is None:
+                message = (
+                    "CDSE from_search needs a spatial bound for byte-range "
+                    "windows; pass roi=... or use a spatial-scoped search"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            dem = kwargs.pop("dem", None)
+            local_paths = materialize_cdse_roi_safes(
+                effective_roi,
+                polarizations=selected_polarizations,
                 work_dir=work_dir,
-                orbit_paths=orbit_paths,
-                calibration_paths=calibration_paths,
+                granularity=granularity or "roi",
+                coreg_mode=coreg_mode,
+                items=bindings,
+                dem=dem,
+            )
+            extra = dict(kwargs.pop("extra", {}) or {})
+            extra.update(
+                {
+                    "search_product_type": granularity or "roi",
+                    "search_polarizations": selected_polarizations,
+                }
+            )
+            if orbit_paths is not None:
+                kwargs["orbit_paths"] = orbit_paths
+            if calibration_paths is not None:
+                kwargs["calibration_paths"] = calibration_paths
+            if effective_roi is not None:
+                kwargs.setdefault("roi", effective_roi)
+            kwargs["extra"] = extra
+            stack = cls.from_safes(
+                local_paths,
+                work_dir=work_dir,
+                polarizations=selected_polarizations,
                 **kwargs,
             )
-        product_type: S1ProductType = (
-            "scene" if resolved_granularity == "scene" else "burst"
-        )
+            prepare = getattr(stack, "prepare", None)
+            if callable(prepare):
+                prepare()
+            else:
+                stack.prepare_scenes()
+            return stack
+
+        # ASF (and any catalog that ships complete products).
+        spatial_arg = effective_roi if effective_roi is not None else search.spatial
+        if spatial_arg is None:
+            message = (
+                "from_search needs a spatial bound for the ASF path; the "
+                "search was not spatial-scoped and roi= was not given"
+            )
+            logger.error(message)
+            raise ValueError(message)
         return cls._from_asf_complete(
-            roi,
+            spatial_arg,
             work_dir=work_dir,
-            product_type=product_type,
-            polarizations=polarizations,
-            datetime_range=datetime_range,
+            product_type=product_type or "burst",
+            polarizations=selected_polarizations,
+            items=list(search.items),
             orbit_paths=orbit_paths,
             calibration_paths=calibration_paths,
             **kwargs,
@@ -516,6 +542,7 @@ class S1Stack(Stack):
         )
         search_kwargs = {key: kwargs.pop(key) for key in search_keys if key in kwargs}
         coreg_mode = kwargs.get("coreg_mode", "geometry")
+        dem = kwargs.pop("dem", None)
         local_paths = materialize_cdse_roi_safes(
             roi,
             datetime_range=datetime_range,
@@ -523,6 +550,7 @@ class S1Stack(Stack):
             work_dir=root,
             granularity=granularity,
             coreg_mode=coreg_mode,
+            dem=dem,
             **search_kwargs,
         )
         extra = dict(kwargs.pop("extra", {}) or {})
@@ -569,14 +597,16 @@ class S1Stack(Stack):
         budget: RemoteResourceBudget | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         calibration_paths: Sequence[str | Path] | None = None,
+        items: Sequence[CatalogItem] | None = None,
         **kwargs: Any,
     ) -> Self:
         """Search ASF, download complete SAFE inputs, and prepare a Stack.
 
         Absorbed from the deleted ``from_search`` constructor
         (PROPOSAL-0061).  Burst products poll until ready; scene products
-        download immediately.
-
+        download immediately.  When ``items`` is given the internal
+        :meth:`search` call is skipped and those items are downloaded
+        directly — the ``from_search`` path.
         """
         selected_polarizations = normalize_polarizations(polarizations)
         catalog_name = catalog or catalog_for_product(product_type)
@@ -585,19 +615,20 @@ class S1Stack(Stack):
         from faninsar import remote
 
         budget = budget or remote.RemoteResourceBudget()
-        items = cls.search(
-            spatial,
-            product_type=product_type,
-            polarizations=selected_polarizations,
-            catalog=catalog_name,
-            collections=collections,
-            datetime_range=datetime_range,
-            flight_direction=flight_direction,
-            filters=filters,
-            auth_profile=auth_profile,
-            limit=limit,
-            budget=budget,
-        )
+        if items is None:
+            items = cls.search(
+                spatial,
+                product_type=product_type,
+                polarizations=selected_polarizations,
+                catalog=catalog_name,
+                collections=collections,
+                datetime_range=datetime_range,
+                flight_direction=flight_direction,
+                filters=filters,
+                auth_profile=auth_profile,
+                limit=limit,
+                budget=budget,
+            )
         selected_items = canonical_items(items)
         if not selected_items:
             message = "Sentinel-1 search returned no products"

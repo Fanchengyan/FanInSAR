@@ -18,12 +18,22 @@ Contract (PROPOSAL-0061):
 - fail closed on compressed or tiled TIFFs;
 - never emit a ``0..EOF`` span: every span is bounded by strip-table
   arithmetic or explicit probe lengths;
-- every measurement span is a whole-row block; callers slice columns after
-  download;
-- any contiguous range is split into spans of at most
+- measurement spans are whole-row blocks by default; callers slice
+  columns after download.  A probe-based narrow-ROI rule (measured
+  fetch bandwidth below :data:`NARROW_ROI_BANDWIDTH_BPS` *and* an ROI
+  column width below :data:`NARROW_ROI_MAX_WIDTH_FRACTION` of the row)
+  may instead emit exact-column per-row spans; each such span covers
+  only ``[col0, col1)`` of one row and is labeled ``col-{line}-{col0}-
+  {col1}`` so assembly can place the tight payload;
+- any contiguous whole-row range is split into spans of at most
   :data:`MAX_SPAN_BYTES` (4 MiB) that end on row boundaries using the
-  known row stride; a single row wider than the cap is the only exception
-  and is emitted whole;
+  known row stride; a single row wider than the cap is the only
+  exception and is emitted whole.  Large full-burst CDSE selections
+  therefore split into parallel sub-spans fetched concurrently;
+- identical ``(url, start, end)`` byte ranges are fetched once per
+  :class:`_RoiFetchContext`; ROI windows and NESD overlap rectangles
+  share the context so repeated probes and identical ranges are not
+  requested twice;
 - CDSE ROI/burst paths write a full-burst-height canvas then hand the
   SAFE tree to ``from_safes``.  Geometry canvases list intersecting
   bursts only.  NESD canvases list every parent burst of the swath and
@@ -39,6 +49,7 @@ import math
 import re
 import struct
 import threading
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -59,6 +70,7 @@ from faninsar.missions.s1.io.canvas import (
     write_roi_safe_canvas,
 )
 from faninsar.missions.s1.overlap import burst_overlap_windows
+from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.remote.errors import RemoteAccessError
 from faninsar.remote.fetch import RangeSpan, fetch_ranges_async
 
@@ -95,6 +107,15 @@ _BYTES_PER_COMPLEX_INT16 = 4
 
 _ROW_SPAN_LABEL = re.compile(r"^row-(\d+)-(\d+)$")
 """Planner labels ``row-{line0}-{line1}`` with exclusive ``line1``."""
+
+_COL_SPAN_LABEL = re.compile(r"^col-(\d+)-(\d+)-(\d+)$")
+"""Exact-column labels ``col-{line}-{col0}-{col1}`` with exclusive ``col1``."""
+
+NARROW_ROI_BANDWIDTH_BPS = 1.3 * 1024 * 1024
+"""Probe-bandwidth ceiling (B/s) for exact-column per-row span planning."""
+
+NARROW_ROI_MAX_WIDTH_FRACTION = 0.30
+"""ROI column width below this fraction of the row is "narrow"."""
 
 _TIFF_TYPE_SIZE = {
     1: 1,  # BYTE
@@ -142,6 +163,7 @@ def plan_measurement_spans(
     col1: int,
     compressed: bool = False,
     tiled: bool = False,
+    exact_columns: bool = False,
 ) -> tuple[RangeSpan, ...]:
     """Plan bounded, row-aligned byte spans for one ROI of a strip TIFF.
 
@@ -150,6 +172,13 @@ def plan_measurement_spans(
     (line % rows_per_strip) * row_stride``.  The row stride is
     ``samples * bytes_per_sample``.  Labels are stable planner-generated
     ``row-{line0}-{line1}`` strings; the fetcher treats them as opaque.
+
+    With ``exact_columns=True`` the planner instead emits one tight span per
+    ROI row covering only ``[col0, col1)``, labeled
+    ``col-{line}-{col0}-{col1}``.  Exact-column spans never merge across
+    rows (inter-slice gaps are fetched nowhere), so they trade request
+    count for bytes saved; callers enable them only when the probe-based
+    narrow-ROI rule says the saved bytes beat the per-request cost.
 
     Parameters
     ----------
@@ -175,6 +204,10 @@ def plan_measurement_spans(
         True for a compressed TIFF; rejected (default False).
     tiled : bool, optional
         True for a tiled TIFF; rejected (default False).
+    exact_columns : bool, optional
+        True to emit one tight ``[col0, col1)`` span per ROI row instead
+        of whole-row blocks (default False; used by the probe-based
+        narrow-ROI rule).
 
     Returns
     -------
@@ -183,7 +216,8 @@ def plan_measurement_spans(
         is at most :data:`MAX_SPAN_BYTES`, ends on a row boundary, and
         consecutive spans stay byte-adjacent within a group.  Column bounds
         are validated here and sliced after download; they do not trim the
-        HTTP range.
+        HTTP range.  With ``exact_columns=True`` the return is one
+        ``col-{line}-{col0}-{col1}`` span per ROI row instead.
 
     Raises
     ------
@@ -254,9 +288,61 @@ def plan_measurement_spans(
         )
         for line in range(line0, line1)
     ]
+    if exact_columns:
+        return _exact_column_spans(
+            url,
+            intervals,
+            line0=line0,
+            col0=col0,
+            col1=col1,
+            bytes_per_sample=bytes_per_sample,
+        )
     spans: list[RangeSpan] = []
     for group in _merge_row_groups(intervals, line0):
         spans.extend(_split_group(url, group, intervals, line0))
+    return tuple(spans)
+
+
+def _exact_column_spans(
+    url: str,
+    intervals: Sequence[_RowInterval],
+    *,
+    line0: int,
+    col0: int,
+    col1: int,
+    bytes_per_sample: int,
+) -> tuple[RangeSpan, ...]:
+    """Emit one tight ``[col0, col1)`` span per ROI row.
+
+    Each span is bounded by strip-table arithmetic (the row interval) plus
+    the validated column slice, so no span ever escapes the strip tables.
+    Spans are never merged across rows: the inter-slice gap is bytes the
+    narrow-ROI rule decided not to fetch.
+
+    Parameters
+    ----------
+    url : str
+        Object URL each span requests.
+    intervals : sequence of _RowInterval
+        Whole-row byte interval of every ROI row, indexed from ``line0``.
+    line0 : int
+        First ROI row index (labels are row-based).
+    col0, col1 : int
+        ROI column bounds; ``col1`` is exclusive.
+    bytes_per_sample : int
+        Storage bytes per sample.
+
+    Returns
+    -------
+    tuple of RangeSpan
+        One span per ROI row labeled ``col-{line}-{col0}-{col1}``.
+
+    """
+    spans: list[RangeSpan] = []
+    for index, (row_start, _row_end) in enumerate(intervals):
+        start = row_start + col0 * bytes_per_sample
+        end = row_start + col1 * bytes_per_sample - 1
+        spans.append(RangeSpan(url, start, end, f"col-{line0 + index}-{col0}-{col1}"))
     return tuple(spans)
 
 
@@ -756,6 +842,8 @@ def windows_from_cdse_fetch(
     *,
     xml_text: str,
     granularity: str = "roi",
+    fetch_context: _RoiFetchContext | None = None,
+    dem: RasterDEM | None = None,
     **kwargs: Any,
 ) -> tuple[S1Swath, list[BurstFetchedWindow], str]:
     """Build fetched windows for one CDSE measurement from annotation XML.
@@ -775,6 +863,13 @@ def windows_from_cdse_fetch(
     granularity : {"roi", "burst"}, optional
         ``burst`` fetches full-burst row ranges; ``roi`` uses the inverted
         line/pixel envelope.
+    fetch_context : _RoiFetchContext or None, optional
+        Shared per-measurement fetch context.  When supplied by
+        :func:`materialize_cdse_roi_safes`, probe results and identical
+        byte ranges are shared with later NESD overlap fetches.
+    dem : RasterDEM or None, optional
+        DEM used by the multi-polygon geo2rdr inversion.  Required when
+        ``roi`` is a multi-desired-polygon :class:`Polygons`.
     **kwargs : Any
         Unused; accepted so tests can add seams without breaking callers.
 
@@ -791,6 +886,23 @@ def windows_from_cdse_fetch(
         annotation_path=str(item.get("annotation_url", "cdse://annotation.xml")),
         measurement_path=str(item.get("measurement_url", "cdse://measurement.tiff")),
     )
+    if (
+        isinstance(roi, Polygons)
+        and granularity == "roi"
+        and len(roi.to_desired().geodataframe) > 1
+    ):
+        if dem is None:
+            reject_product("multi-polygon ROI requires a DEM for per-polygon geo2rdr")
+        envelopes = _polygon_envelopes(roi, swath, dem)
+        windows = _windows_for_polygons(
+            swath,
+            envelopes,
+            url=str(item.get("measurement_url", "")),
+            file_size=int(item.get("measurement_size") or 0),
+            fetch_context=fetch_context,
+        )
+        return swath, windows, xml_text
+
     line0, line1, col0, col1 = invert_geolocation_grid(xml_text, roi)
     if granularity == "burst":
         line0, line1 = _full_intersecting_burst_lines(swath, line0, line1)
@@ -803,6 +915,7 @@ def windows_from_cdse_fetch(
         col1=col1,
         url=str(item.get("measurement_url", "")),
         file_size=int(item.get("measurement_size") or 0),
+        fetch_context=fetch_context,
     )
     return swath, windows, xml_text
 
@@ -1038,6 +1151,8 @@ def materialize_cdse_roi_safes(
     work_dir: str | Path,
     granularity: str = "roi",
     coreg_mode: Literal["geometry", "nesd"] = "geometry",
+    dem: RasterDEM | None = None,
+    items: Sequence[dict[str, Any]] | None = None,
     **kwargs: Any,
 ) -> list[Path]:
     """Materialize CDSE ROI/burst SAFE-subset canvases under ``work_dir``.
@@ -1059,8 +1174,16 @@ def materialize_cdse_roi_safes(
         CDSE acquisition granularity.
     coreg_mode : {"geometry", "nesd"}, optional
         Canvas listing and overlap policy.  Default ``"geometry"``.
+    items : sequence of mapping, optional
+        Pre-bound measurement dicts (as produced by ``_bind_cdse_item``).
+        When given, the internal ``discover_cdse_slc_items`` search is
+        skipped and these bindings are materialized directly — the
+        ``from_search`` path.
+    dem : RasterDEM, optional
+        DEM used for per-polygon geo2rdr inversion when ``roi`` holds
+        multiple desired polygons.  Fetched automatically when omitted.
     **kwargs : Any
-        Forwarded to discovery.
+        Forwarded to discovery (ignored when ``items`` is given).
 
     Returns
     -------
@@ -1079,12 +1202,30 @@ def materialize_cdse_roi_safes(
         logger.error(message)
         raise ValueError(message)
     roi = normalize_roi_wgs84(roi)
-    items = discover_cdse_slc_items(
-        roi,
-        datetime_range=datetime_range,
-        polarizations=polarizations,
-        **kwargs,
-    )
+    # Multi-polygon ROI needs DEM for per-polygon geo2rdr inversion.
+    if (
+        isinstance(roi, Polygons)
+        and granularity == "roi"
+        and len(roi.to_desired().geodataframe) > 1
+        and dem is None
+    ):
+        dem = _fetch_dem_for_polygons(roi, work_dir=work_dir)
+    if items is None:
+        items = discover_cdse_slc_items(
+            roi,
+            datetime_range=datetime_range,
+            polarizations=polarizations,
+            **kwargs,
+        )
+    else:
+        requested = (
+            None if polarizations == "all" else {p.upper() for p in polarizations}
+        )
+        items = [
+            binding
+            for binding in items
+            if requested is None or binding.get("polarization") in requested
+        ]
     if not items:
         message = "Sentinel-1 CDSE search returned no products"
         logger.error(message)
@@ -1093,7 +1234,8 @@ def materialize_cdse_roi_safes(
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for item in items:
-        xml_text = _fetch_annotation_xml(item)
+        fetch_context = _RoiFetchContext()
+        xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
         if not _roi_overlaps_geolocation(xml_text, roi):
             logger.warning(
                 "Skipping CDSE measurement %s %s %s: "
@@ -1108,6 +1250,8 @@ def materialize_cdse_roi_safes(
             roi,
             xml_text=xml_text,
             granularity=granularity,
+            fetch_context=fetch_context,
+            dem=dem,
         )
         if not windows:
             continue
@@ -1129,26 +1273,20 @@ def materialize_cdse_roi_safes(
         )
         if coreg_mode == "nesd":
             by_index = {int(window.burst_index): window for window in windows}
-            for overlap in overlap_windows_for_canvas(
+            overlaps = overlap_windows_for_canvas(
                 swath,
                 windows,
                 canvas,
                 listed_indices=listed_indices,
-            ):
-                top = _overlap_rectangle_samples(
-                    item,
-                    swath,
-                    overlap,
-                    role="top",
-                    window=by_index.get(int(overlap.top_index)),
-                )
-                bottom = _overlap_rectangle_samples(
-                    item,
-                    swath,
-                    overlap,
-                    role="bottom",
-                    window=by_index.get(int(overlap.bottom_index)),
-                )
+            )
+            rectangles = _fetch_overlap_rectangles(
+                item,
+                swath,
+                overlaps,
+                by_index=by_index,
+                fetch_context=fetch_context,
+            )
+            for overlap, (top, bottom) in zip(overlaps, rectangles, strict=True):
                 splice_overlap_into_canvas(canvas, overlap, role="top", samples=top)
                 splice_overlap_into_canvas(
                     canvas, overlap, role="bottom", samples=bottom
@@ -1161,12 +1299,49 @@ def materialize_cdse_roi_safes(
     return paths
 
 
-def _fetch_annotation_xml(item: Mapping[str, Any]) -> str:
-    """Fetch one annotation XML document via the async range engine."""
+def _fetch_dem_for_polygons(
+    roi: Polygons,
+    work_dir: str | Path,
+) -> RasterDEM:
+    """Fetch a Copernicus DEM mosaic covering all desired polygons.
+
+    Downloads GLO-30 tiles for the union bounding box and writes a merged
+    GeoTIFF under ``work_dir/dem/``.  The result is persisted so a later
+    ``prepare`` pass can reuse it without re-downloading.
+    """
+    from faninsar.processing.geometry.dem_manager import DEMManager
+
+    gdf = roi.to_desired().geodataframe.to_crs(4326)
+    bounds = gdf.total_bounds
+    out_dir = Path(work_dir) / "dem"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "rgv_stack.tif"
+    mgr = DEMManager(cache_dir=Path(work_dir) / "dem-cache")
+    mgr.fetch_dem(bounds=tuple(bounds), output_path=out_path)
+    return RasterDEM(path=out_path)
+
+
+def _fetch_annotation_xml(
+    item: Mapping[str, Any],
+    *,
+    fetch_context: _RoiFetchContext | None = None,
+) -> str:
+    """Fetch one annotation XML document via the async range engine.
+
+    The annotation body (up to ~2 MiB) is the largest probe-stage
+    download, so when ``fetch_context`` is given its elapsed time feeds
+    the observed bandwidth used by the narrow-ROI rule.
+    """
     url = str(item.get("annotation_url", ""))
     size = int(item.get("annotation_size") or _ANNOTATION_PROBE_BYTES)
     span = RangeSpan(url, 0, max(size - 1, 0), "annotation")
+    started = time.monotonic()
     bodies = _fetch_cdse_ranges((span,))
+    if fetch_context is not None:
+        fetch_context.record_probe(
+            bytes_fetched=span.end - span.start + 1,
+            seconds=time.monotonic() - started,
+        )
     return bodies["annotation"].decode("utf-8")
 
 
@@ -1464,6 +1639,286 @@ def _full_intersecting_burst_lines(
     return start * lpb, (stop + 1) * lpb
 
 
+class _RoiFetchContext:
+    """Per-measurement fetch context shared by ROI and overlap planning.
+
+    A context is created once per measurement item and threaded through
+    ``windows_from_cdse_fetch`` and the NESD overlap fetches so:
+
+    - IFD probe results (strip tables) are fetched once per
+      ``(url, file_size, samples)`` instead of once per rectangle;
+    - identical ``(url, start, end)`` byte ranges are requested once and
+      reused, whichever label asked for them;
+    - the observed fetch bandwidth (bytes per second across every range
+      batch issued through the context) feeds the probe-based narrow-ROI
+      rule in :func:`_fetch_measurement_bodies`.
+    """
+
+    def __init__(self) -> None:
+        self.strip_tables: dict[
+            tuple[str, int, int], tuple[list[int], list[int], int]
+        ] = {}
+        self.bodies: dict[tuple[str, int, int], bytes] = {}
+        self.probed_bytes = 0
+        self.probed_seconds = 0.0
+        # NESD overlap rectangles fetch in a bounded thread pool; every
+        # cache/counter mutation goes through this lock.
+        self.lock = threading.Lock()
+
+    @property
+    def bandwidth_bps(self) -> float | None:
+        """Observed bytes/second across all range fetches in this context."""
+        if self.probed_seconds <= 0.0:
+            return None
+        return self.probed_bytes / self.probed_seconds
+
+    def record_probe(self, *, bytes_fetched: int, seconds: float) -> None:
+        """Accumulate one probe batch into the bandwidth meter."""
+        with self.lock:
+            self.probed_seconds += seconds
+            self.probed_bytes += bytes_fetched
+
+
+def _polygon_envelopes(
+    polygons: Polygons,
+    swath: S1Swath,
+    dem: RasterDEM,
+) -> list[tuple[int, int, int, int]]:
+    """Invert each desired polygon to a per-polygon (line0, line1, col0, col1).
+
+    Each polygon's WGS84 bounding box is sampled on an adaptive N x N grid
+    (N from :func:`_geo2rdr_grid_size`, 4x4 to 10x10 log-interpolated by
+    polygon size).  DEM heights are sampled at the grid points and
+    ``run_geo2rdr`` solves for (line, pixel) per point.  The polygon's
+    envelope is the bounding box of converged solutions.
+
+    Returns
+    -------
+    list of tuple of int
+        One ``(line0, line1, col0, col1)`` per desired polygon, clamped to
+        the swath extent.  Polygons with no converged geo2rdr points are
+        skipped.
+
+    """
+    from faninsar.missions.s1.processing import _radar_model
+    from faninsar.processing.geometry.prepare_production import run_geo2rdr
+
+    gdf = polygons.to_desired().geodataframe.to_crs(4326)
+    if gdf.empty:
+        return []
+
+    burst = swath.bursts[0]
+    model = _radar_model(
+        swath,
+        burst,
+        shape=(int(swath.lines_per_burst), int(swath.samples_per_burst)),
+        row0=0,
+        col0=0,
+    )
+    total_lines = int(swath.lines)
+    total_samples = int(swath.samples_per_burst)
+    envelopes: list[tuple[int, int, int, int]] = []
+    for geom in gdf.geometry:
+        minx, miny, maxx, maxy = geom.bounds
+        n = _geo2rdr_grid_size(maxx - minx, maxy - miny)
+        xs = np.linspace(minx, maxx, n)
+        ys = np.linspace(miny, maxy, n)
+        lons, lats = np.meshgrid(xs, ys)
+        lons = lons.ravel()
+        lats = lats.ravel()
+        heights = np.asarray(dem.sample(lats, lons), dtype=np.float64)
+        heights = np.where(np.isnan(heights), 0.0, heights)
+        result = run_geo2rdr(model, lats, lons, heights, device="cpu")
+        az = np.asarray(result.azimuth_index).ravel()
+        rg = np.asarray(result.range_index).ravel()
+        conv = np.asarray(result.converged).ravel().astype(bool)
+        if not conv.any():
+            continue
+        az_ok = az[conv]
+        rg_ok = rg[conv]
+        line0 = max(0, math.floor(az_ok.min()))
+        line1 = min(total_lines, math.ceil(az_ok.max()) + 1)
+        col0 = max(0, math.floor(rg_ok.min()))
+        col1 = min(total_samples, math.ceil(rg_ok.max()) + 1)
+        if line1 > line0 and col1 > col0:
+            envelopes.append((line0, line1, col0, col1))
+    return envelopes
+
+
+def _geo2rdr_grid_size(bbox_w_deg: float, bbox_h_deg: float) -> int:
+    """Return adaptive geo2rdr sampling grid size 4..10 via log interpolation.
+
+    Small polygons (<0.1 km) get 4x4; large ones (>=20 km) cap at 10x10.
+    The mapping is logarithmic so small polygons get denser sampling than
+    a linear ramp would give them.
+    """
+    # Approximate km at mid-latitudes (RGV is ~46 deg N).
+    w_km = bbox_w_deg * 111.0 * 0.7
+    h_km = bbox_h_deg * 111.0
+    max_km = max(w_km, h_km)
+    if max_km <= 0.1:
+        return 4
+    if max_km >= 20.0:
+        return 10
+    t = math.log(max_km / 0.1) / math.log(20.0 / 0.1)
+    return round(4 + t * 6)
+
+
+def _merge_line_segments(
+    segments: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Merge overlapping line segments into disjoint union intervals.
+
+    Parameters
+    ----------
+    segments : sequence of (line0, line1)
+        Per-polygon row ranges (half-open).
+
+    Returns
+    -------
+    list of (line0, line1)
+        Sorted, non-overlapping merged intervals.
+
+    """
+    if not segments:
+        return []
+    sorted_segs = sorted(segments)
+    merged: list[list[int]] = [list(sorted_segs[0])]
+    for lo, hi in sorted_segs[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(seg[0], seg[1]) for seg in merged]
+
+
+def _windows_for_polygons(
+    swath: S1Swath,
+    envelopes: Sequence[tuple[int, int, int, int]],
+    *,
+    url: str,
+    file_size: int,
+    fetch_context: _RoiFetchContext | None = None,
+) -> list[BurstFetchedWindow]:
+    """Build per-burst windows for multiple polygon envelopes.
+
+    Line segments from all envelopes are unioned into disjoint ranges,
+    each fetched once via the range planner.  Small polygons whose column
+    width falls below the narrow-ROI rule use exact-column spans; larger
+    ones fetch whole rows.  Envelopes on the same burst whose column
+    ranges overlap are merged into one window so samples do not
+    overwrite each other.
+    """
+    if not envelopes:
+        return []
+    lpb = int(swath.lines_per_burst)
+    samples_per_burst = int(swath.samples_per_burst)
+
+    # Drop envelopes that intersect no burst before any fetch.
+    burst_line_ranges = [
+        (int(burst.index) * lpb, (int(burst.index) + 1) * lpb) for burst in swath.bursts
+    ]
+    envelopes = [
+        env
+        for env in envelopes
+        if any(env[0] < b1 and env[1] > b0 for b0, b1 in burst_line_ranges)
+    ]
+    if not envelopes:
+        reject_product("no polygon envelope intersects any Sentinel-1 burst")
+
+    # 1. Group envelopes by burst index; each burst's union envelope
+    #    decides whether its rows fetch whole or exact-column spans.
+    burst_groups: dict[int, list[tuple[int, int, int, int]]] = {}
+    for env in envelopes:
+        for burst in swath.bursts:
+            burst_line0 = int(burst.index) * lpb
+            burst_line1 = burst_line0 + lpb
+            if env[0] < burst_line1 and env[1] > burst_line0:
+                burst_groups.setdefault(int(burst.index), []).append(env)
+
+    all_bodies: dict[str, bytes] = {}
+    for burst_envs in burst_groups.values():
+        line0 = min(env[0] for env in burst_envs)
+        line1 = max(env[1] for env in burst_envs)
+        col0 = min(env[2] for env in burst_envs)
+        col1 = max(env[3] for env in burst_envs)
+        col0 = max(0, col0)
+        col1 = min(samples_per_burst, max(col0 + 1, col1))
+        bodies = _fetch_measurement_bodies(
+            url,
+            file_size=file_size,
+            line0=line0,
+            line1=line1,
+            col0=col0,
+            col1=col1,
+            samples=samples_per_burst,
+            fetch_context=fetch_context,
+        )
+        all_bodies.update(bodies)
+
+    # 3. Merge envelopes on the same burst whose column ranges overlap,
+    #    then slice each merged window's columns from the fetched rows.
+    windows: list[BurstFetchedWindow] = []
+    for burst in swath.bursts:
+        burst_line0 = burst.index * lpb
+        burst_line1 = burst_line0 + lpb
+        burst_envs = [
+            env for env in envelopes if env[0] < burst_line1 and env[1] > burst_line0
+        ]
+        if not burst_envs:
+            continue
+        # All envelopes on this burst merge into one window covering the
+        # union rectangle (write_roi_safe_canvas allows one window per
+        # burst index).
+        merged = _merge_burst_windows(burst_envs)
+        for line0, line1, env_col0, env_col1 in merged:
+            col0 = max(0, env_col0)
+            col1 = min(samples_per_burst, max(col0 + 1, env_col1))
+            inter0 = max(line0, burst_line0)
+            inter1 = min(line1, burst_line1)
+            row0 = inter0 - burst_line0
+            n_lines = inter1 - inter0
+            n_cols = col1 - col0
+            samples = _assemble_window_samples(
+                all_bodies,
+                parent_line0=inter0,
+                n_lines=n_lines,
+                col0=col0,
+                n_cols=n_cols,
+                samples_per_burst=samples_per_burst,
+            )
+            windows.append(
+                BurstFetchedWindow(
+                    burst_index=int(burst.index),
+                    row0=row0,
+                    col0=col0,
+                    samples=samples,
+                )
+            )
+    if not windows:
+        reject_product("no polygon envelope intersects any Sentinel-1 burst")
+    return windows
+
+
+def _merge_burst_windows(
+    envelopes: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Merge all envelopes on one burst into a single union window.
+
+    ``write_roi_safe_canvas`` accepts at most one ``BurstFetchedWindow``
+    per burst index, so every polygon covering the same burst is merged
+    into one rectangle spanning the union of their line and column
+    ranges.
+    """
+    if not envelopes:
+        return []
+    line0 = min(env[0] for env in envelopes)
+    line1 = max(env[1] for env in envelopes)
+    col0 = min(env[2] for env in envelopes)
+    col1 = max(env[3] for env in envelopes)
+    return [(line0, line1, col0, col1)]
+
+
 def _windows_for_lines(
     swath: S1Swath,
     *,
@@ -1473,6 +1928,7 @@ def _windows_for_lines(
     col1: int,
     url: str,
     file_size: int,
+    fetch_context: _RoiFetchContext | None = None,
 ) -> list[BurstFetchedWindow]:
     """Build per-burst fetched windows, filling samples from range fetches."""
     lpb = int(swath.lines_per_burst)
@@ -1487,6 +1943,7 @@ def _windows_for_lines(
         col0=col0,
         col1=col1,
         samples=samples_per_burst,
+        fetch_context=fetch_context,
     )
     windows: list[BurstFetchedWindow] = []
     for burst in swath.bursts:
@@ -1529,10 +1986,87 @@ def _fetch_measurement_bodies(
     col0: int,
     col1: int,
     samples: int,
+    fetch_context: _RoiFetchContext | None = None,
 ) -> dict[str, bytes]:
-    """Fetch IFD probes then bounded measurement spans for one ROI window."""
+    """Fetch IFD probes then bounded measurement spans for one ROI window.
+
+    With ``fetch_context`` the strip tables come from the context cache
+    when an earlier rectangle of the same measurement already probed
+    them, measurement spans identical to an earlier request are not
+    re-requested, and the probe fetch feeds the context bandwidth used
+    by the narrow-ROI rule.  Without a context every call probes and
+    fetches independently, exactly as before.
+    """
     if not url:
         reject_product("CDSE measurement fetch requires a non-empty object URL")
+    cached = _strip_tables_for(
+        url, file_size=file_size, samples=samples, fetch_context=fetch_context
+    )
+    offsets, counts, rows_per_strip = cached
+    spans = plan_measurement_spans(
+        url=url,
+        strip_offsets=offsets,
+        strip_byte_counts=counts,
+        rows_per_strip=rows_per_strip,
+        samples=samples,
+        bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
+        line0=line0,
+        line1=line1,
+        col0=col0,
+        col1=col1,
+        exact_columns=_use_exact_columns(
+            fetch_context,
+            n_cols=col1 - col0,
+            samples=samples,
+        ),
+    )
+    return _fetch_deduped(spans, fetch_context)
+
+
+def _strip_tables_for(
+    url: str,
+    *,
+    file_size: int,
+    samples: int,
+    fetch_context: _RoiFetchContext | None,
+) -> tuple[list[int], list[int], int]:
+    """Return ``(offsets, counts, rows_per_strip)`` for one measurement.
+
+    With ``fetch_context`` the tables are cached per
+    ``(url, file_size, samples)``; concurrent callers hold the context
+    lock for the whole probe so the header + IFD ranges are fetched once
+    and the probe feeds the context bandwidth meter exactly once.
+    Without a context this probes independently, exactly as before.
+    """
+    if fetch_context is None:
+        probed, _n = _probe_strip_tables(url, file_size=file_size, samples=samples)
+        return probed
+    table_key = (url, int(file_size), int(samples))
+    with fetch_context.lock:
+        cached = fetch_context.strip_tables.get(table_key)
+        if cached is not None:
+            return cached
+        started = time.monotonic()
+        probed, probe_bytes = _probe_strip_tables(
+            url, file_size=file_size, samples=samples
+        )
+        fetch_context.probed_seconds += time.monotonic() - started
+        fetch_context.probed_bytes += probe_bytes
+        fetch_context.strip_tables[table_key] = probed
+        return probed
+
+
+def _probe_strip_tables(
+    url: str,
+    *,
+    file_size: int,
+    samples: int,
+) -> tuple[tuple[list[int], list[int], int], int]:
+    """Fetch header + IFD probes and parse the strip tables.
+
+    Returns ``((offsets, counts, rows_per_strip), bytes_fetched)`` so the
+    caller can charge the actual requested bytes to a bandwidth meter.
+    """
     header_probe = (RangeSpan(url, 0, HEADER_PROBE_BYTES - 1, "tiff-header"),)
     header_bodies = _fetch_cdse_ranges(header_probe)
     ifd_offset, _endian, _bigtiff = _parse_tiff_header(header_bodies["tiff-header"])
@@ -1549,22 +2083,80 @@ def _fetch_measurement_bodies(
     probe_bodies = dict(header_bodies)
     if remaining:
         probe_bodies.update(_fetch_cdse_ranges(remaining))
-    offsets, counts, rows_per_strip = _strip_tables_from_probes(
-        probe_bodies, samples=samples
+    fetched = sum(span.end - span.start + 1 for span in header_probe) + sum(
+        span.end - span.start + 1 for span in remaining
     )
-    spans = plan_measurement_spans(
-        url=url,
-        strip_offsets=offsets,
-        strip_byte_counts=counts,
-        rows_per_strip=rows_per_strip,
-        samples=samples,
-        bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
-        line0=line0,
-        line1=line1,
-        col0=col0,
-        col1=col1,
-    )
-    return _fetch_cdse_ranges(spans)
+    return _strip_tables_from_probes(probe_bodies, samples=samples), fetched
+
+
+def _use_exact_columns(
+    fetch_context: _RoiFetchContext | None,
+    *,
+    n_cols: int,
+    samples: int,
+) -> bool:
+    """Probe-based narrow-ROI rule for exact-column per-row span planning.
+
+    Exact-column spans trade many small requests for bytes not fetched,
+    which only pays off on a slow link with a narrow ROI.  The rule
+    engages when both hold:
+
+    - the bandwidth observed through ``fetch_context`` is below
+      :data:`NARROW_ROI_BANDWIDTH_BPS` (1.3 MiB/s), and
+    - the ROI column width is below
+      :data:`NARROW_ROI_MAX_WIDTH_FRACTION` (30%) of the row.
+
+    Without a context (or before its first probe completes) the rule
+    stays off and whole-row planning is preserved.
+    """
+    if fetch_context is None:
+        return False
+    bandwidth = fetch_context.bandwidth_bps
+    if bandwidth is None or bandwidth >= NARROW_ROI_BANDWIDTH_BPS:
+        return False
+    return n_cols < NARROW_ROI_MAX_WIDTH_FRACTION * samples
+
+
+def _fetch_deduped(
+    spans: Sequence[RangeSpan],
+    fetch_context: _RoiFetchContext | None,
+) -> dict[str, bytes]:
+    """Fetch spans, reusing identical byte ranges already in the context.
+
+    Deduplication is on ``(url, start, end)``: a span whose byte range was
+    fetched earlier in this context is answered from cache under its own
+    label.  Duplicate ranges inside one batch collapse to a single
+    request.  Without a context this is a plain :func:`_fetch_cdse_ranges`
+    dispatch.
+    """
+    span_tuple = tuple(spans)
+    if fetch_context is None:
+        return _fetch_cdse_ranges(span_tuple)
+    bodies: dict[str, bytes] = {}
+    missing: list[RangeSpan] = []
+    pending: dict[tuple[str, int, int], list[str]] = {}
+    with fetch_context.lock:
+        cache = fetch_context.bodies
+        for span in span_tuple:
+            key = (span.url, span.start, span.end)
+            if key in cache:
+                bodies[span.label] = cache[key]
+                continue
+            if key in pending:
+                pending[key].append(span.label)
+                continue
+            pending[key] = [span.label]
+            missing.append(span)
+    if missing:
+        fetched = _fetch_cdse_ranges(missing)
+        with fetch_context.lock:
+            for span in missing:
+                key = (span.url, span.start, span.end)
+                payload = fetched[span.label]
+                fetch_context.bodies[key] = payload
+                for label in pending.pop(key):
+                    bodies[label] = payload
+    return bodies
 
 
 def _cdse_range_host(url: str) -> bool:
@@ -1646,34 +2238,188 @@ def _assemble_window_samples(
     n_cols: int,
     samples_per_burst: int,
 ) -> np.ndarray:
-    """Assemble complex64 samples from fetched row-labeled span bodies."""
+    """Assemble complex64 samples from fetched span bodies.
+
+    ``row-{line0}-{line1}`` spans carry whole rows sliced to the canvas
+    columns; ``col-{line}-{col0}-{col1}`` spans carry one row's tight
+    column slice and must match the requested ``(col0, n_cols)``.
+    """
     canvas = np.zeros((n_lines, n_cols), dtype=np.complex64)
     parent_line1 = parent_line0 + n_lines
     for label, payload in bodies.items():
-        match = _ROW_SPAN_LABEL.fullmatch(label)
-        if match is None:
+        row_match = _ROW_SPAN_LABEL.fullmatch(label)
+        if row_match is not None:
+            span_line0 = int(row_match.group(1))
+            span_line1 = int(row_match.group(2))
+            if span_line1 <= span_line0:
+                reject_product(f"row span {label} has an empty line interval")
+            n_span_lines = span_line1 - span_line0
+            decoded = _bytes_to_complex_span(
+                payload,
+                n_span_lines=n_span_lines,
+                samples_per_burst=samples_per_burst,
+                col0=col0,
+                n_cols=n_cols,
+            )
+            overlap0 = max(parent_line0, span_line0)
+            overlap1 = min(parent_line1, span_line1)
+            if overlap1 <= overlap0:
+                continue
+            dst0 = overlap0 - parent_line0
+            src0 = overlap0 - span_line0
+            height = overlap1 - overlap0
+            canvas[dst0 : dst0 + height] = decoded[src0 : src0 + height]
             continue
-        span_line0 = int(match.group(1))
-        span_line1 = int(match.group(2))
-        if span_line1 <= span_line0:
-            reject_product(f"row span {label} has an empty line interval")
-        n_span_lines = span_line1 - span_line0
-        decoded = _bytes_to_complex_span(
+        col_match = _COL_SPAN_LABEL.fullmatch(label)
+        if col_match is None:
+            continue
+        span_line = int(col_match.group(1))
+        span_col0 = int(col_match.group(2))
+        span_col1 = int(col_match.group(3))
+        if not parent_line0 <= span_line < parent_line1:
+            continue
+        if span_col0 != col0 or span_col1 - span_col0 != n_cols:
+            reject_product(
+                f"column span {label} does not match the requested "
+                f"columns [{col0}, {col0 + n_cols})"
+            )
+        canvas[span_line - parent_line0] = _bytes_to_complex_column(
             payload,
-            n_span_lines=n_span_lines,
-            samples_per_burst=samples_per_burst,
-            col0=col0,
             n_cols=n_cols,
+            label=label,
         )
-        overlap0 = max(parent_line0, span_line0)
-        overlap1 = min(parent_line1, span_line1)
-        if overlap1 <= overlap0:
-            continue
-        dst0 = overlap0 - parent_line0
-        src0 = overlap0 - span_line0
-        height = overlap1 - overlap0
-        canvas[dst0 : dst0 + height] = decoded[src0 : src0 + height]
     return canvas
+
+
+def _bytes_to_complex_column(
+    raw: bytes,
+    *,
+    n_cols: int,
+    label: str,
+) -> np.ndarray:
+    """Decode one exact-column span payload into ``n_cols`` complex64."""
+    expected = n_cols * _BYTES_PER_COMPLEX_INT16
+    if len(raw) != expected:
+        reject_product(f"column span {label} is {len(raw)} bytes, expected {expected}")
+    pairs = np.frombuffer(raw, dtype="<i2").reshape(n_cols, 2)
+    real = pairs[:, 0].astype(np.float32)
+    imag = pairs[:, 1].astype(np.float32)
+    return (real + 1j * imag).astype(np.complex64)
+
+
+_MAX_OVERLAP_FETCH_WORKERS = 8
+"""Bounded fan-out for independent overlap-rectangle range fetches."""
+
+
+def _fetch_overlap_rectangles(
+    item: Mapping[str, Any],
+    swath: S1Swath,
+    overlaps: Sequence[BurstOverlapWindow],
+    *,
+    by_index: Mapping[int, BurstFetchedWindow],
+    fetch_context: _RoiFetchContext | None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Fetch every ``(top, bottom)`` overlap rectangle, parallel across bursts.
+
+    Rectangles already covered by a fetched window are sliced without I/O.
+    The remainder are independent ``(url, start, end)`` batches on the same
+    measurement, so they are fetched concurrently in a bounded thread pool
+    — each worker owns its ``run_sync`` event loop while the shared
+    ``fetch_context`` deduplicates byte ranges under a lock.  Splice order
+    is preserved by returning results aligned with ``overlaps``.
+    """
+    pending: list[tuple[int, BurstOverlapWindow]] = []
+    results: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for index, overlap in enumerate(overlaps):
+        top_window = by_index.get(int(overlap.top_index))
+        bottom_window = by_index.get(int(overlap.bottom_index))
+        top_covered = top_window is not None and _window_covers_rectangle(
+            top_window,
+            row0=int(overlap.top_row0),
+            col0=int(overlap.col0),
+            n_lines=int(overlap.n_lines),
+            n_cols=int(overlap.n_samples),
+        )
+        bottom_covered = bottom_window is not None and _window_covers_rectangle(
+            bottom_window,
+            row0=int(overlap.bottom_row0),
+            col0=int(overlap.col0),
+            n_lines=int(overlap.n_lines),
+            n_cols=int(overlap.n_samples),
+        )
+        if top_covered and bottom_covered:
+            results[index] = (
+                _overlap_rectangle_samples(
+                    item,
+                    swath,
+                    overlap,
+                    role="top",
+                    window=top_window,
+                    fetch_context=fetch_context,
+                ),
+                _overlap_rectangle_samples(
+                    item,
+                    swath,
+                    overlap,
+                    role="bottom",
+                    window=bottom_window,
+                    fetch_context=fetch_context,
+                ),
+            )
+        else:
+            pending.append((index, overlap))
+    if pending:
+        workers = min(_MAX_OVERLAP_FETCH_WORKERS, len(pending))
+        if workers == 1:
+            for index, overlap in pending:
+                results[index] = (
+                    _overlap_rectangle_samples(
+                        item,
+                        swath,
+                        overlap,
+                        role="top",
+                        window=by_index.get(int(overlap.top_index)),
+                        fetch_context=fetch_context,
+                    ),
+                    _overlap_rectangle_samples(
+                        item,
+                        swath,
+                        overlap,
+                        role="bottom",
+                        window=by_index.get(int(overlap.bottom_index)),
+                        fetch_context=fetch_context,
+                    ),
+                )
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _job(overlap: BurstOverlapWindow) -> tuple[np.ndarray, np.ndarray]:
+                return (
+                    _overlap_rectangle_samples(
+                        item,
+                        swath,
+                        overlap,
+                        role="top",
+                        window=by_index.get(int(overlap.top_index)),
+                        fetch_context=fetch_context,
+                    ),
+                    _overlap_rectangle_samples(
+                        item,
+                        swath,
+                        overlap,
+                        role="bottom",
+                        window=by_index.get(int(overlap.bottom_index)),
+                        fetch_context=fetch_context,
+                    ),
+                )
+
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="s1-overlap-fetch"
+            ) as pool:
+                fetched = list(pool.map(lambda pair: _job(pair[1]), pending))
+            for (index, _overlap), rectangle in zip(pending, fetched, strict=True):
+                results[index] = rectangle
+    return [results[index] for index in range(len(overlaps))]
 
 
 def _overlap_rectangle_samples(
@@ -1683,6 +2429,7 @@ def _overlap_rectangle_samples(
     *,
     role: Literal["top", "bottom"],
     window: BurstFetchedWindow | None = None,
+    fetch_context: _RoiFetchContext | None = None,
 ) -> np.ndarray:
     """Return one overlap rectangle from a fetched window or a dedicated fetch."""
     burst_index = int(overlap.top_index if role == "top" else overlap.bottom_index)
@@ -1713,6 +2460,7 @@ def _overlap_rectangle_samples(
         col0=burst_col0,
         col1=burst_col0 + n_samples,
         samples=int(swath.samples_per_burst),
+        fetch_context=fetch_context,
     )
     return _assemble_window_samples(
         bodies,

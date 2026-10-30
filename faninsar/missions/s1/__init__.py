@@ -61,6 +61,14 @@ def __getattr__(name: str) -> Any:
         from faninsar.missions.s1.coregister import coregister_s1_scene
 
         return coregister_s1_scene
+    if name == "S1Search":
+        from faninsar.missions.s1.s1search import S1Search
+
+        return S1Search
+    if name == "search_acquisitions":
+        from faninsar.missions.s1.s1search import search_acquisitions
+
+        return search_acquisitions
     raise AttributeError(name)
 
 
@@ -100,6 +108,7 @@ __all__ = [
     "S1PolarizationRequest",
     "S1Product",
     "S1ProductType",
+    "S1Search",
     "S1Stack",
     "S1Swath",
     "Sentinel1ProductError",
@@ -123,5 +132,6 @@ __all__ = [
     "read_full_burst",
     "read_swath_bursts",
     "reject_product",
+    "search_acquisitions",
     "stitch_bursts",
 ]

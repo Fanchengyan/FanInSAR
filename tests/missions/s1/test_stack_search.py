@@ -12,6 +12,7 @@ import pytest
 
 from faninsar import remote
 from faninsar.data.query import BoundingBox
+from faninsar.missions.s1.s1search import S1Search
 from faninsar.missions.s1.search import (
     catalog_for_product,
     complete_safe_asset,
@@ -29,6 +30,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 ROI = BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326")
+
+
+def _asf_search(items: list[remote.CatalogItem], spatial: Any = ROI) -> S1Search:
+    """Wrap ASF catalog items in an ``S1Search`` for ``from_search`` tests."""
+    return S1Search(
+        items=tuple(items),
+        catalog="sentinel1-asf",
+        spatial=spatial,
+        query={},
+    )
 
 
 def _item(
@@ -273,10 +284,6 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
     downloaded: list[Path] = []
     prepared: list[bool] = []
 
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [item])
-    )
-
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
         del asset, kwargs
         downloaded.append(destination)
@@ -295,8 +302,8 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    result = S1Stack.from_roi(
-        ROI, work_dir=tmp_path, granularity="burst", provider="asf"
+    result = S1Stack.from_search(
+        _asf_search([item]), work_dir=tmp_path, product_type="burst"
     )
     assert isinstance(result, FakeStack)
     assert downloaded == [tmp_path / "inputs" / "S1_TEST.zip"]
@@ -310,11 +317,6 @@ def test_from_search_downloads_safes_concurrently_in_selection_order(
     """A ready SAFE can finish while an earlier burst is still preparing."""
     slow = replace(_item(_asset("slow")), item_id="A_SLOW")
     fast = replace(_item(_asset("fast")), item_id="B_FAST")
-    monkeypatch.setattr(
-        S1Stack,
-        "search",
-        classmethod(lambda _cls, *_args, **_kwargs: [slow, fast]),
-    )
     barrier = threading.Barrier(2)
     fast_done = threading.Event()
     completed: list[str] = []
@@ -342,7 +344,9 @@ def test_from_search_downloads_safes_concurrently_in_selection_order(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+    S1Stack.from_search(
+        _asf_search([slow, fast]), work_dir=tmp_path, product_type="burst"
+    )
 
     assert completed == ["B_FAST.zip", "A_SLOW.zip"]
     assert captured == [
@@ -360,9 +364,6 @@ def test_from_search_sweeps_burst_probes_oldest_first(
         _item(replace(_asset(f"burst-{index}"), item_id=f"S1_{index}"))
         for index in range(3)
     ]
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: items)
-    )
     observations: dict[str, int] = {}
     probe_calls: list[tuple[str, int]] = []
 
@@ -393,7 +394,7 @@ def test_from_search_sweeps_burst_probes_oldest_first(
         "from_safes",
         classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
     )
-    S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+    S1Stack.from_search(_asf_search(items), work_dir=tmp_path, product_type="burst")
 
     assert sorted(index for index, attempt in probe_calls if attempt == 0) == [
         "S1_0",
@@ -414,11 +415,6 @@ def test_from_search_does_not_construct_stack_after_download_failure(
     """One failed SAFE cancels the construction boundary for the whole search."""
     first = replace(_item(_asset("first")), item_id="S1_FIRST")
     second = replace(_item(_asset("second")), item_id="S1_SECOND")
-    monkeypatch.setattr(
-        S1Stack,
-        "search",
-        classmethod(lambda _cls, *_args, **_kwargs: [first, second]),
-    )
     stack_constructed = False
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
@@ -439,7 +435,9 @@ def test_from_search_does_not_construct_stack_after_download_failure(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(RuntimeError, match="burst generation failed"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+        S1Stack.from_search(
+            _asf_search([first, second]), work_dir=tmp_path, product_type="burst"
+        )
     assert not stack_constructed
 
 
@@ -468,9 +466,6 @@ def test_from_search_rejects_tiff_xml_without_burst_extractor_safe(
         representation="component",
     )
     item = _item(measurement, annotation)
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [item])
-    )
 
     downloads: list[object] = []
     monkeypatch.setattr(
@@ -480,7 +475,9 @@ def test_from_search_rejects_tiff_xml_without_burst_extractor_safe(
     )
 
     with pytest.raises(ValueError, match="exactly one complete SAFE ZIP"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+        S1Stack.from_search(
+            _asf_search([item]), work_dir=tmp_path, product_type="burst"
+        )
 
     assert downloads == []
 
@@ -495,9 +492,6 @@ def test_from_search_rejects_ambiguous_safe_zips_before_download(
         _asset("measurement", "https://sentinel1.asf.alaska.edu/burst.tiff"),
         _asset("annotation", "https://sentinel1.asf.alaska.edu/burst.xml"),
     )
-    monkeypatch.setattr(
-        S1Stack, "search", classmethod(lambda _cls, *_args, **_kwargs: [item])
-    )
     downloads: list[object] = []
     monkeypatch.setattr(
         remote,
@@ -506,6 +500,8 @@ def test_from_search_rejects_ambiguous_safe_zips_before_download(
     )
 
     with pytest.raises(ValueError, match="found 2"):
-        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
+        S1Stack.from_search(
+            _asf_search([item]), work_dir=tmp_path, product_type="burst"
+        )
 
     assert downloads == []
