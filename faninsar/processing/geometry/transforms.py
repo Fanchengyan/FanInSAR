@@ -470,6 +470,7 @@ _RESULT_FIELDS = (
     "boundary_rechecked",
     "residual_range_m",
     "residual_doppler_hz",
+    "geom_flags",
 )
 _FLOAT_RESULT_FIELDS = {
     "latitude_deg",
@@ -486,11 +487,21 @@ _FLOAT_RESULT_FIELDS = {
     "residual_doppler_hz",
 }
 _BOOL_RESULT_FIELDS = {"converged", "max_iter_exhausted", "boundary_rechecked"}
+_UINT8_RESULT_FIELDS = {"geom_flags"}
+
+#: ``geom_flags`` bit meanings (ISCE2-style layover/shadow mask).
+GEOM_FLAG_LAYOVER = np.uint8(0b01)
+GEOM_FLAG_SHADOW = np.uint8(0b10)
 
 
 @dataclass(frozen=True, slots=True)
 class TransformResult:
-    """The exact sixteen-field result contract for both transforms."""
+    """The exact seventeen-field result contract for both transforms.
+
+    ``geom_flags`` is an rdr2geo-only output: a uint8 bitmask with bit 0 set
+    on layover lanes and bit 1 on shadow lanes.  geo2rdr results carry a
+    zero field so both operations share one contract.
+    """
 
     latitude_deg: np.ndarray
     longitude_deg: np.ndarray
@@ -508,6 +519,7 @@ class TransformResult:
     boundary_rechecked: np.ndarray
     residual_range_m: np.ndarray
     residual_doppler_hz: np.ndarray
+    geom_flags: np.ndarray
 
     def __post_init__(self) -> None:
         """Validate exact field names, dtypes, and common shape."""
@@ -525,6 +537,9 @@ class TransformResult:
                 reject(message, GeometryValidationError)
             if name in _BOOL_RESULT_FIELDS and value.dtype != np.dtype(bool):
                 message = f"{name} must have dtype bool"
+                reject(message, GeometryValidationError)
+            if name in _UINT8_RESULT_FIELDS and value.dtype != np.dtype(np.uint8):
+                message = f"{name} must have dtype uint8"
                 reject(message, GeometryValidationError)
             if shape is None:
                 shape = value.shape
@@ -578,6 +593,7 @@ class TransformResult:
             false(),
             nan(),
             nan(),
+            np.zeros(shape_tuple, dtype=np.uint8),
         )
 
     @classmethod
@@ -627,6 +643,8 @@ class TransformResult:
         mutable["iterations"][mask] = -1
         for name in _BOOL_RESULT_FIELDS:
             mutable[name][mask] = False
+        for name in _UINT8_RESULT_FIELDS:
+            mutable[name][mask] = 0
         mutable["tolerance"][mask] = np.nan
         return cls(**mutable)
 
@@ -733,6 +751,166 @@ def look_angles_deg(
     incidence = np.where(invalid, np.nan, incidence)
     look_azimuth = np.where(invalid, np.nan, look_azimuth)
     return incidence.reshape(shape), look_azimuth.reshape(shape)
+
+
+def geom_flags(
+    model: RadarGeometryModel,
+    azimuth_index: np.ndarray,
+    range_index: np.ndarray,
+    latitude_deg: np.ndarray,
+    longitude_deg: np.ndarray,
+    height_m: np.ndarray,
+    converged: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute the ISCE2-style layover/shadow bitmask for solved rdr2geo lanes.
+
+    The test follows the ISCE3 ``Topo::setLayoverShadow`` criterion evaluated
+    at the satellite.  For every lane the satellite position comes from the
+    orbit interpolator and the ground position from the solved geodetic
+    coordinates; both are converted to ECEF.  The geocentric elevation angle
+    at the satellite is the angle between the sub-satellite (nadir) direction
+    and the satellite-to-ground line of sight; the cross-track coordinate is
+    the perpendicular distance from the satellite nadir line to the ground
+    point in the slant-range plane.
+
+    The criterion mirrors ISCE3 ``Topo::setLayoverShadow``.  For every lane
+    the satellite position and velocity come from the orbit interpolator and
+    the ground position from the solved geodetic coordinates; both are
+    converted to ECEF.  A geocentric TCN basis is built per lane: the nadir
+    unit ``n = -sat/|sat|`` and the cross-track unit ``c = (n x v)/|n x v|``.
+    Each lane then has
+
+    * a geocentric *elevation angle* — the angle at the satellite between the
+      nadir direction and the satellite-to-ground line of sight,
+      ``acos(sat · (sat - ground) / (|sat| |sat - ground|))``;
+    * a *cross-track* coordinate ``satToGround · c`` (positive on the look
+      side for a right-looking sensor); and
+    * its *slant range* ``|sat - ground|``.
+
+    Lanes in one azimuth row are sorted by cross-track and walked from near
+    to far: a lane is in **shadow** (bit 1) when its elevation angle falls at
+    or below the running maximum — a nearer lane occludes it.  The lanes are
+    then re-sorted by slant range and walked in both directions: a lane is in
+    **layover** (bit 0) when its cross-track coordinate falls inside the
+    running cross-track envelope, i.e. the ground folds back over a nearer
+    line of sight.  On flat terrain both walks are monotonic so the mask is
+    identically zero.  Non-converged and non-finite lanes publish a zero
+    bitmask and never occlude other lanes.
+
+    Parameters
+    ----------
+    model : RadarGeometryModel
+        Timing/geometry model supplying the orbit interpolator and the
+        slant-range mapping.
+    azimuth_index : numpy.ndarray
+        Solved azimuth sample index per lane.
+    range_index : numpy.ndarray
+        Solved slant-range sample index per lane (float column index).
+    latitude_deg, longitude_deg, height_m : numpy.ndarray
+        Solved ground position per lane (WGS84 geodetic).
+    converged : numpy.ndarray, optional
+        Boolean lane mask; non-converged and non-finite lanes publish a
+        zero bitmask and are never occluders.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``uint8`` bitmask with bit 0 = layover (:data:`GEOM_FLAG_LAYOVER`)
+        and bit 1 = shadow (:data:`GEOM_FLAG_SHADOW`).
+
+    """
+    from faninsar.processing.geometry.ellipsoid import llh_to_ecef
+
+    azimuth_index = np.asarray(azimuth_index, dtype=np.float64)
+    shape = azimuth_index.shape
+    if azimuth_index.ndim == 0:
+        return np.zeros(shape, dtype=np.uint8)
+    flat_azimuth = azimuth_index.reshape(-1)
+    flat_range = np.asarray(range_index, dtype=np.float64).reshape(-1)
+    flat_lat = np.asarray(latitude_deg, dtype=np.float64).reshape(-1)
+    flat_lon = np.asarray(longitude_deg, dtype=np.float64).reshape(-1)
+    flat_hgt = np.asarray(height_m, dtype=np.float64).reshape(-1)
+
+    times_s = model.azimuth_time_seconds(flat_azimuth)
+    in_coverage = (
+        np.isfinite(times_s)
+        & (times_s >= model.orbit.t_min_s)
+        & (times_s <= model.orbit.t_max_s)
+    )
+    size = flat_azimuth.size
+    sat_xyz = np.full((size, 3), np.nan, dtype=np.float64)
+    sat_vel = np.full((size, 3), np.nan, dtype=np.float64)
+    if np.any(in_coverage):
+        positions, velocities = model.orbit.evaluate_array(times_s[in_coverage])
+        sat_xyz[in_coverage] = positions
+        sat_vel[in_coverage] = velocities
+    ground_x, ground_y, ground_z = llh_to_ecef(flat_lat, flat_lon, flat_hgt)
+    ground = np.stack([ground_x, ground_y, ground_z], axis=-1)
+
+    valid = in_coverage & np.isfinite(flat_range)
+    valid &= np.isfinite(flat_lat) & np.isfinite(flat_lon)
+    valid &= np.isfinite(flat_hgt) & np.isfinite(sat_xyz).all(axis=-1)
+    if converged is not None:
+        valid &= np.asarray(converged, dtype=bool).reshape(-1)
+
+    # Satellite-to-ground vector and geocentric elevation angle.
+    sat_to_ground = ground - sat_xyz
+    to_ground_norm = np.linalg.norm(sat_to_ground, axis=-1)
+    sat_norm = np.linalg.norm(sat_xyz, axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cos_elev = -np.einsum("ij,ij->i", sat_xyz, sat_to_ground) / (
+            sat_norm * to_ground_norm
+        )
+        elevation = np.arccos(np.clip(cos_elev, -1.0, 1.0))
+
+    # Geocentric TCN cross-track unit: n = -sat/|sat|, c = (n x v)/|n x v|.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nadir = -sat_xyz / sat_norm[:, None]
+    cross_axis = np.cross(nadir, sat_vel)
+    cross_norm = np.linalg.norm(cross_axis, axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cross_unit = cross_axis / cross_norm[:, None]
+    cross_track = np.einsum("ij,ij->i", sat_to_ground, cross_unit)
+    if model.look_direction == "left":
+        cross_track = -cross_track
+
+    finite = valid & np.isfinite(elevation) & np.isfinite(cross_track)
+    finite &= np.isfinite(to_ground_norm)
+    elevation = np.where(finite, elevation, np.inf)
+    cross_track = np.where(finite, cross_track, -np.inf)
+    slant_range = np.where(finite, to_ground_norm, np.inf)
+
+    flags = np.zeros(size, dtype=np.uint8)
+    cols = shape[-1] if shape else size
+    rows = size // cols if cols else 0
+    for row in range(rows):
+        lo, hi = row * cols, (row + 1) * cols
+        ctrack = cross_track[lo:hi]
+        elev = elevation[lo:hi]
+        srange = slant_range[lo:hi]
+        lane_valid = finite[lo:hi]
+        order_c = np.argsort(ctrack, kind="stable")
+        # Shadow: near-to-far in cross-track order, running-max elevation.
+        max_elev = np.maximum.accumulate(elev[order_c])
+        prev_max = np.concatenate(([-np.inf], max_elev[:-1]))
+        shadow_sorted = lane_valid[order_c] & (elev[order_c] <= prev_max)
+        shadow_row = np.zeros(cols, dtype=bool)
+        shadow_row[order_c] = shadow_sorted
+        # Layover: re-sort by slant range, two-sided cross-track reversal.
+        order_r = np.argsort(srange, kind="stable")
+        c_by_range = ctrack[order_r]
+        r_valid = lane_valid[order_r]
+        layover_sorted = np.zeros(cols, dtype=bool)
+        run_min = np.minimum.accumulate(c_by_range)
+        prev_min = np.concatenate(([np.inf], run_min[:-1]))
+        layover_sorted[1:] |= r_valid[1:] & (c_by_range[1:] <= prev_min[1:])
+        run_max = np.maximum.accumulate(c_by_range[::-1])[::-1]
+        next_max = np.concatenate((run_max[1:], [-np.inf]))
+        layover_sorted[:-1] |= r_valid[:-1] & (c_by_range[:-1] >= next_max[:-1])
+        layover_row = np.zeros(cols, dtype=bool)
+        layover_row[order_r] = layover_sorted
+        flags[lo:hi] = layover_row.astype(np.uint8) | (shadow_row.astype(np.uint8) << 1)
+    return flags.reshape(shape)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1048,6 +1226,8 @@ validate_input_span = validate_array_span
 
 
 __all__ = [
+    "GEOM_FLAG_LAYOVER",
+    "GEOM_FLAG_SHADOW",
     "INT32_MAX",
     "ArraySpan",
     "CandidateKey",
@@ -1062,6 +1242,7 @@ __all__ = [
     "RawTensorSpan",
     "SolverSettings",
     "TransformResult",
+    "geom_flags",
     "validate_array_span",
     "validate_input_span",
     "validate_native_spans",

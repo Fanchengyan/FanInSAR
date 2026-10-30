@@ -34,6 +34,7 @@ from faninsar.processing.geometry.transforms import (
     OperationSettings,
     SolverSettings,
     TransformResult,
+    geom_flags,
     look_angles_deg,
 )
 
@@ -404,6 +405,20 @@ class TorchGeometryResult:
         else:
             incidence_deg = np.full(shape, np.nan, dtype=np.float64)
             look_azimuth_deg = np.full(shape, np.nan, dtype=np.float64)
+        if "geom_flags" in values:
+            flags = np.asarray(values["geom_flags"], dtype=np.uint8)
+        elif model is not None and operation is Operation.RDR2GEO:
+            flags = geom_flags(
+                model,
+                np.asarray(values["azimuth_index"], dtype=np.float64),
+                np.asarray(values["range_index"], dtype=np.float64),
+                np.asarray(values["latitude_deg"], dtype=np.float64),
+                np.asarray(values["longitude_deg"], dtype=np.float64),
+                np.asarray(values["height_m"], dtype=np.float64),
+                converged,
+            )
+        else:
+            flags = np.zeros(shape, dtype=np.uint8)
         if operation is Operation.GEO2RDR:
             decision = np.maximum(
                 np.abs(residual_range) / range_tolerance,
@@ -431,6 +446,7 @@ class TorchGeometryResult:
                 "boundary_rechecked": np.zeros(shape, dtype=bool),
                 "residual_range_m": residual_range,
                 "residual_doppler_hz": residual_doppler,
+                "geom_flags": flags,
             },
             operation=operation,
             invalid_mask=invalid_mask,

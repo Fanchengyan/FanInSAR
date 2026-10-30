@@ -32,7 +32,7 @@ if TYPE_CHECKING:
         CoregisteredSceneStore,
         SceneLayers,
     )
-    from faninsar.network.layers import InterferogramLayers
+    from faninsar.network.layers import InterferogramLayers, ProductLayer
     from faninsar.stack.session import Stack
 
 _ASSETS = ("complex", "unw_phase", "wrapped_phase", "amplitude", "coherence")
@@ -741,6 +741,100 @@ class StackSceneCollection(dict):
     def reference(self) -> str | None:
         """Return the Reference acquisition date, when it is committed."""
         return self._stack.reference
+
+    # ---- Reference-bound geometry sugar (PROPOSAL-0066) ------------------
+
+    def _reference_layers(self) -> SceneLayers:
+        """Return the Reference scene's bound layer view.
+
+        Geometry and LOS layers are Reference-bound, so they resolve only on
+        the Reference scene. A Stack with no committed Reference has no
+        radar-geometry frame to read.
+        """
+        from faninsar.processing.errors import reject_invalid_state
+
+        reference = self._stack.reference_scene
+        if reference is None:
+            reject_invalid_state(
+                "the Stack Reference scene is not committed; run "
+                "coregister_scenes before reading geometry layers"
+            )
+        return self._bound(reference).layers
+
+    def _los_layer(self, name: str) -> ProductLayer:
+        """Return one cached virtual LOS unit-vector layer.
+
+        The cache is a plain session-scoped dict keyed on the
+        ``(incidence_write_id, azimuth_write_id)`` pair of the Reference
+        scene item: a re-materialized Reference invalidates the entry, and a
+        fresh ``stack.scenes`` collection drops it entirely.
+        """
+        from faninsar.io.storage.product import open_product
+
+        layers = self._reference_layers()
+        # The incidence/azimuth payloads are committed on the Reference item
+        # under the scene write_id, so that id is the cache key for every
+        # derived LOS layer. A re-materialized Reference invalidates it.
+        product = open_product(layers._store.root)
+        key = (product.write_id, product.write_id, name)
+        cache = self._los_cache
+        if key not in cache:
+            cache[key] = getattr(layers, name)
+        return cache[key]
+
+    @property
+    def _los_cache(self) -> dict[tuple[str, str, str], ProductLayer]:
+        """Return this collection's session-scoped LOS layer cache."""
+        cache = getattr(self, "_los_cache_dict", None)
+        if cache is None:
+            cache = {}
+            self._los_cache_dict = cache
+        return cache
+
+    @property
+    def latitude(self) -> ProductLayer:
+        """Return the Reference geodetic latitude field (degrees)."""
+        return self._reference_layers().latitude
+
+    @property
+    def longitude(self) -> ProductLayer:
+        """Return the Reference geodetic longitude field (degrees)."""
+        return self._reference_layers().longitude
+
+    @property
+    def height(self) -> ProductLayer:
+        """Return the Reference ellipsoidal height field (metres)."""
+        return self._reference_layers().height
+
+    @property
+    def incidence(self) -> ProductLayer:
+        """Return the Reference incidence-angle field (degrees)."""
+        return self._reference_layers().incidence
+
+    @property
+    def azimuth(self) -> ProductLayer:
+        """Return the Reference look-azimuth field (degrees)."""
+        return self._reference_layers().azimuth
+
+    @property
+    def geom_flags(self) -> ProductLayer:
+        """Return the Reference layover/shadow bitmask layer."""
+        return self._reference_layers().geom_flags
+
+    @property
+    def los_east(self) -> ProductLayer:
+        """Return the virtual east LOS unit-vector component."""
+        return self._los_layer("los_east")
+
+    @property
+    def los_north(self) -> ProductLayer:
+        """Return the virtual north LOS unit-vector component."""
+        return self._los_layer("los_north")
+
+    @property
+    def los_up(self) -> ProductLayer:
+        """Return the virtual up LOS unit-vector component."""
+        return self._los_layer("los_up")
 
     # ---- read views ----------------------------------------------------
 

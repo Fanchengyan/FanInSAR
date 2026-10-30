@@ -35,6 +35,7 @@ from faninsar.processing.geometry.transforms import (
     Operation,
     SolverSettings,
     TransformResult,
+    geom_flags,
 )
 
 if TYPE_CHECKING:
@@ -1098,20 +1099,37 @@ def run_rdr2geo_chunked(
                 )
             chunk_result = execute_geometry(prepared, tile_az, rg_b[slc])
             if not buffers:
+                fill = {
+                    "iterations": -1,
+                    "converged": False,
+                    "max_iter_exhausted": False,
+                    "boundary_rechecked": False,
+                    "geom_flags": 0,
+                }
                 buffers = {
                     name: np.full(
                         shape,
-                        -1 if name == "iterations" else np.nan,
+                        fill.get(name, np.nan),
                         dtype=getattr(chunk_result, name).dtype,
                     )
                     for name in chunk_result.fields
                 }
-                for name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
-                    buffers[name][:] = False
             for name in chunk_result.fields:
                 buffers[name][slc] = getattr(chunk_result, name)
     if not buffers:
         return TransformResult.invalid(shape, operation=Operation.RDR2GEO)
+    # geom_flags is a running-max criterion across each azimuth row, so a
+    # per-chunk solve would miss occlusions that cross a chunk boundary.
+    # Recompute it once over the full grid from the assembled positions.
+    buffers["geom_flags"] = geom_flags(
+        model,
+        buffers["azimuth_index"],
+        buffers["range_index"],
+        buffers["latitude_deg"],
+        buffers["longitude_deg"],
+        buffers["height_m"],
+        buffers["converged"],
+    )
     return TransformResult.from_arrays(
         buffers,
         operation=Operation.RDR2GEO,

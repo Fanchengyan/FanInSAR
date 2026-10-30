@@ -1546,14 +1546,22 @@ class SceneLayers:
             return self._store
         return self._store.select_units(self._selection)
 
-    def _layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
+    def _layer(
+        self,
+        name: str,
+        asset_kind: AssetKind,
+        *,
+        _store: CoregisteredSceneStore | None = None,
+        _full_grid: bool = False,
+    ) -> ProductLayer:
         """Build one lazy :class:`ProductLayer` bound to this view."""
         from faninsar.io.storage.product import open_product
         from faninsar.network.layers import ProductLayer
 
-        store = self._active_store
-        extent = None if self._full else store.selected_extent()
-        origin = (0, 0) if self._full else store.selected_origin()
+        store = _store if _store is not None else self._active_store
+        full = self._full or _full_grid
+        extent = None if full else store.selected_extent()
+        origin = (0, 0) if full else store.selected_origin()
         product = open_product(store.root, kind=SCENE_KIND)
         return ProductLayer(
             product,
@@ -1598,6 +1606,100 @@ class SceneLayers:
         from faninsar.network.products import AssetKind
 
         return self._layer("phase", AssetKind.WRAPPED_PHASE)
+
+    # ---- Reference-bound geometry layers (PROPOSAL-0066) -----------------
+
+    def _geometry_layer(self, name: str) -> ProductLayer:
+        """Return one committed Reference geometry layer, materializing lazily.
+
+        The six radar-domain geometry fields are committed on the Reference
+        scene product, so they are only available on the Stack Reference.
+        The first access runs the rdr2geo solve once and commits all six
+        payloads; later reads open the persisted zarr directly.
+        """
+        from faninsar.io.storage.scene_geometry import (
+            SCENE_GEOMETRY_ASSETS,
+            commit_scene_geometry,
+        )
+        from faninsar.network.products import AssetKind
+
+        if name not in SCENE_GEOMETRY_ASSETS:
+            reject_invalid_state(f"unknown scene geometry layer {name!r}")
+        if not self._store.is_reference:
+            reject_invalid_state(
+                f"geometry layer {name!r} is bound to the Stack Reference; "
+                f"scene {self._store.date_id!r} is a secondary"
+            )
+        store = self._store
+        if name not in open_product(store.root, kind=SCENE_KIND).assets:
+            if store._session is None:
+                reject_invalid_state(
+                    f"geometry layer {name!r} is not committed and this scene "
+                    "is not bound to a Stack session; obtain it via "
+                    "stack.scenes to materialize the geometry assets"
+                )
+            store = commit_scene_geometry(store)
+        asset_kind = AssetKind.LABEL if name == "geom_flags" else AssetKind.DISPLACEMENT
+        return self._layer(name, asset_kind, _store=store, _full_grid=True)
+
+    def _los_layer(self, name: str) -> ProductLayer:
+        """Return one virtual LOS unit-vector layer derived at read time."""
+        from faninsar.io.storage.scene_geometry import VIRTUAL_LOS_LAYERS
+        from faninsar.network.products import AssetKind
+
+        if name not in VIRTUAL_LOS_LAYERS:
+            reject_invalid_state(f"unknown LOS layer {name!r}")
+        if not self._store.is_reference:
+            reject_invalid_state(
+                f"LOS layer {name!r} is bound to the Stack Reference; "
+                f"scene {self._store.date_id!r} is a secondary"
+            )
+        return self._layer(name, AssetKind.DISPLACEMENT, _full_grid=True)
+
+    @property
+    def latitude(self) -> ProductLayer:
+        """Return the committed Reference geodetic latitude field (degrees)."""
+        return self._geometry_layer("latitude")
+
+    @property
+    def longitude(self) -> ProductLayer:
+        """Return the committed Reference geodetic longitude field (degrees)."""
+        return self._geometry_layer("longitude")
+
+    @property
+    def height(self) -> ProductLayer:
+        """Return the committed Reference ellipsoidal height field (metres)."""
+        return self._geometry_layer("height")
+
+    @property
+    def incidence(self) -> ProductLayer:
+        """Return the committed Reference incidence-angle field (degrees)."""
+        return self._geometry_layer("incidence")
+
+    @property
+    def azimuth(self) -> ProductLayer:
+        """Return the committed Reference look-azimuth field (degrees)."""
+        return self._geometry_layer("azimuth")
+
+    @property
+    def geom_flags(self) -> ProductLayer:
+        """Return the committed layover/shadow bitmask (bit0 layover, bit1 shadow)."""
+        return self._geometry_layer("geom_flags")
+
+    @property
+    def los_east(self) -> ProductLayer:
+        """Return the virtual east LOS unit-vector component (ground to sat)."""
+        return self._los_layer("los_east")
+
+    @property
+    def los_north(self) -> ProductLayer:
+        """Return the virtual north LOS unit-vector component (ground to sat)."""
+        return self._los_layer("los_north")
+
+    @property
+    def los_up(self) -> ProductLayer:
+        """Return the virtual up LOS unit-vector component (ground to sat)."""
+        return self._los_layer("los_up")
 
     def __repr__(self) -> str:
         """Return a concise summary of this scene layer view."""

@@ -1,11 +1,12 @@
 """Validated Python boundary for native fourteen-field results.
 
 The native extension ABI stays at the shared fourteen solver fields.  The
-unified public ``TransformResult`` contract is sixteen fields; this module
-computes ``incidence_deg`` and ``look_azimuth_deg`` at the Python boundary
-from the prepared geometry model and the solved ground position so the
-compiled artifact remains byte-identical.  Extending the ABI to emit the
-angles natively is a recorded follow-up.
+unified public ``TransformResult`` contract is seventeen fields; this module
+computes ``incidence_deg``, ``look_azimuth_deg``, and the rdr2geo
+``geom_flags`` layover/shadow bitmask at the Python boundary from the
+prepared geometry model and the solved ground position so the compiled
+artifact remains byte-identical.  Extending the ABI to emit the angles and
+flags natively is a recorded follow-up.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from faninsar.logging import reject
 from faninsar.processing.geometry.transforms import (
     Operation,
     TransformResult,
+    geom_flags,
     look_angles_deg,
 )
 
@@ -147,7 +149,9 @@ def result_from_native_outputs(
     model : RadarGeometryModel, optional
         Prepared geometry model.  When given, ``incidence_deg`` and
         ``look_azimuth_deg`` are computed from the orbit and the solved
-        ground position; without it both fields publish NaN.
+        ground position; without it both fields publish NaN.  rdr2geo also
+        publishes the ``geom_flags`` layover/shadow bitmask; without a model
+        or for geo2rdr the field is all zeros.
 
     Returns
     -------
@@ -185,6 +189,7 @@ def result_from_native_outputs(
     # an extension that silently changes its field types; native CPU/CUDA
     # kernels are responsible for publishing float64/int32/bool fields.
     invalid_mask = ~np.isfinite(np.asarray(fields["latitude_deg"], dtype=np.float64))
+    op = Operation(operation)
     if model is not None:
         incidence_deg, look_azimuth_deg = look_angles_deg(
             model,
@@ -196,10 +201,25 @@ def result_from_native_outputs(
         )
         fields["incidence_deg"] = incidence_deg
         fields["look_azimuth_deg"] = look_azimuth_deg
+        if op is Operation.RDR2GEO:
+            fields["geom_flags"] = geom_flags(
+                model,
+                fields["azimuth_index"],
+                fields["range_index"],
+                fields["latitude_deg"],
+                fields["longitude_deg"],
+                fields["height_m"],
+                fields["converged"],
+            )
+        else:
+            fields["geom_flags"] = np.zeros(
+                fields["latitude_deg"].shape, dtype=np.uint8
+            )
     else:
         shape = fields["latitude_deg"].shape
         fields["incidence_deg"] = np.full(shape, np.nan, dtype=np.float64)
         fields["look_azimuth_deg"] = np.full(shape, np.nan, dtype=np.float64)
+        fields["geom_flags"] = np.zeros(shape, dtype=np.uint8)
     return TransformResult.from_arrays(
         fields,
         operation=operation,

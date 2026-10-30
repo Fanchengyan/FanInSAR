@@ -85,6 +85,8 @@ from .seam import (
     plan_query_windows,
 )
 from .transforms import (
+    GEOM_FLAG_LAYOVER,
+    GEOM_FLAG_SHADOW,
     INT32_MAX,
     ArraySpan,
     CandidateKey,
@@ -98,6 +100,7 @@ from .transforms import (
     RawSpan,
     SolverSettings,
     TransformResult,
+    geom_flags,
     validate_array_span,
     validate_input_span,
     validate_native_spans,
@@ -135,6 +138,8 @@ __all__ = [
     "DEM",
     "EGM96",
     "EGM2008_2_5",
+    "GEOM_FLAG_LAYOVER",
+    "GEOM_FLAG_SHADOW",
     "GLO30_PC",
     "GLO90_PC",
     "INT32_MAX",
@@ -197,6 +202,7 @@ __all__ = [
     "fetch_required",
     "format_bounds_and_crs",
     "geoinfo_from_xy",
+    "geom_flags",
     "geometric_baseline",
     "get_provider",
     "interpolate_orbit",

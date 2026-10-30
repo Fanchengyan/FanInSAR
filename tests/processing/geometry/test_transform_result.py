@@ -19,7 +19,7 @@ from faninsar.processing.geometry import (
 )
 
 
-def test_invalid_result_has_exact_sixteen_fields_and_invalid_tolerance() -> None:
+def test_invalid_result_has_exact_seventeen_fields_and_invalid_tolerance() -> None:
     """Invalid lanes publish every required field and NaN tolerance."""
     result = TransformResult.invalid((2,), operation=Operation.GEO2RDR)
 
@@ -40,14 +40,17 @@ def test_invalid_result_has_exact_sixteen_fields_and_invalid_tolerance() -> None
         "boundary_rechecked",
         "residual_range_m",
         "residual_doppler_hz",
+        "geom_flags",
     )
-    assert len(result.fields) == 16
+    assert len(result.fields) == 17
     assert np.all(np.isnan(result.incidence_deg))
     assert np.all(np.isnan(result.look_azimuth_deg))
     assert result.iterations.dtype == np.int32
     assert np.array_equal(result.iterations, [-1, -1])
     assert np.all(np.isnan(result.tolerance))
     assert not np.any(result.converged)
+    assert result.geom_flags.dtype == np.uint8
+    assert not np.any(result.geom_flags)
 
 
 def test_invalid_rdr2geo_lanes_use_nan_tolerance() -> None:
@@ -78,6 +81,7 @@ def test_from_arrays_applies_per_lane_geo2rdr_tolerance_and_sentinels() -> None:
         "boundary_rechecked": np.zeros(shape, dtype=bool),
         "residual_range_m": np.zeros(shape, dtype=np.float64),
         "residual_doppler_hz": np.zeros(shape, dtype=np.float64),
+        "geom_flags": np.array([3, 3], dtype=np.uint8),
     }
     result = TransformResult.from_arrays(
         fields, operation="geo2rdr", invalid_mask=np.array([False, True], dtype=bool)
@@ -85,6 +89,8 @@ def test_from_arrays_applies_per_lane_geo2rdr_tolerance_and_sentinels() -> None:
     assert result.tolerance[0] == 1.0
     assert np.isnan(result.tolerance[1])
     assert result.iterations[1] == -1
+    assert result.geom_flags[0] == 3
+    assert result.geom_flags[1] == 0
 
 
 def test_result_rejects_wrong_dtypes() -> None:

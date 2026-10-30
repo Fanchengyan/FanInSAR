@@ -35,6 +35,24 @@ _VIRTUAL_IFG_LAYERS = ("wrapped_phase", "amplitude")
 #: computed support mask. All five are virtual handles on the scene product.
 SCENE_LAYER_NAMES = ("slc", "amplitude", "intensity", "phase", "valid_mask")
 
+#: Virtual LOS unit-vector layers on a Reference scene product. They derive
+#: from the stored ``incidence``/``azimuth`` geometry assets at read time and
+#: persist no payload (PROPOSAL-0066).
+_SCENE_LOS_LAYERS = ("los_east", "los_north", "los_up")
+
+#: Committed Reference geometry assets served directly off the scene product
+#: item.json. Unlike the per-unit ``slc`` mosaics these are single-frame
+#: rasters, so they read through the asset branch — but they must not fall
+#: through to the scene-mosaic branch when absent.
+_SCENE_GEOMETRY_ASSETS = (
+    "latitude",
+    "longitude",
+    "height",
+    "incidence",
+    "azimuth",
+    "geom_flags",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProductLayer:
@@ -93,7 +111,9 @@ class ProductLayer:
             return self._product.asset_path(self.name)
         if self.name in _VIRTUAL_IFG_LAYERS:
             return None
-        if self._product.kind == "scene" and self.name in SCENE_LAYER_NAMES:
+        if self._product.kind == "scene" and self.name in (
+            SCENE_LAYER_NAMES + _SCENE_LOS_LAYERS
+        ):
             return None
         message = (
             f"layer {self.name!r} is not stored in {self._product.path}; it is "
@@ -226,9 +246,32 @@ class ProductLayer:
         message = f"unknown scene layer: {name!r}"
         raise FileNotFoundError(message)
 
+    def _read_scene_los(self, name: str) -> np.ndarray:
+        """Derive one LOS unit-vector layer from the Reference geometry assets.
+
+        Opens the scene store through the product path so the lazy
+        materialization trigger in
+        :func:`~faninsar.io.storage.scene_geometry.los_unit_vector` runs the
+        rdr2geo solve and commits ``incidence``/``azimuth`` on first access.
+        """
+        from faninsar.io.storage.scene_geometry import los_unit_vector
+        from faninsar.io.storage.scene_store import (
+            SCENE_KIND,
+            CoregisteredSceneStore,
+        )
+
+        if self._product.kind != SCENE_KIND:
+            reject_invalid_state(
+                f"layer {name!r} is virtual and requires a scene product source"
+            )
+        store = CoregisteredSceneStore.open(self._product.path)
+        return los_unit_vector(store, name)
+
     def _read(self, name: str) -> np.ndarray:
         if name in self._product.assets:
             values = self._product.read(name)
+        elif self._product.kind == "scene" and name in _SCENE_LOS_LAYERS:
+            values = self._read_scene_los(name)
         elif self._product.kind == "scene" and name in SCENE_LAYER_NAMES:
             values = self._read_scene_layer(name)
         elif name in _VIRTUAL_IFG_LAYERS:
@@ -299,7 +342,22 @@ class ProductLayer:
 
         self.validate_source()
         product = self._product
-        if self._product.kind == "scene":
+        is_scene = self._product.kind == "scene"
+        if is_scene and self.name in _SCENE_LOS_LAYERS:
+            # Virtual LOS: derive eagerly at build time from the stored
+            # incidence/azimuth assets (which materialize lazily on demand).
+            data = da.from_array(self._read_scene_los(self.name), chunks=self.shape)
+        elif is_scene and self.name in product.assets:
+            # Committed Reference geometry assets are single-frame rasters on
+            # the scene item, not per-unit mosaics; read the zarr directly.
+            data = da.from_zarr(str(self.path), chunks=self.shape)
+        elif is_scene and self.name not in SCENE_LAYER_NAMES:
+            message = (
+                f"layer {self.name!r} is not stored in {self._product.path}; "
+                "it is neither a persisted asset nor a derivable virtual layer"
+            )
+            raise FileNotFoundError(message)
+        elif is_scene:
             from faninsar.io.storage._zarr_stac import read_zarr_array
             from faninsar.io.storage.scene_store import (
                 CoregisteredSceneStore,

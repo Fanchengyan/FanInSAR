@@ -359,6 +359,9 @@ def _normalize_without_boundary_callback(
             value = np.array(fields[name], copy=True)
             value.reshape(-1)[flat_invalid] = False
             fields[name] = value
+        value = np.array(fields["geom_flags"], copy=True)
+        value.reshape(-1)[flat_invalid] = 0
+        fields["geom_flags"] = value
 
     return TransformResult(**fields)
 

@@ -207,6 +207,7 @@ def normalize_result_boundary(
         flat["iterations"][mask] = -1
         for name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
             flat[name][mask] = False
+        flat["geom_flags"][mask] = 0
     return TransformResult(
         **{name: array.reshape(shape) for name, array in flat.items()}
     )

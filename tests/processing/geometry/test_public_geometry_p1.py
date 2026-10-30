@@ -1384,6 +1384,7 @@ def test_native_public_no_callback_uses_array_normalization_fast_path(
         "boundary_rechecked": np.zeros(shape, dtype=bool),
         "residual_range_m": np.full(shape, 0.002, dtype=np.float64),
         "residual_doppler_hz": np.full(shape, 0.002, dtype=np.float64),
+        "geom_flags": np.zeros(shape, dtype=np.uint8),
     }
     result = TransformResult.from_arrays(fields, operation=Operation.GEO2RDR)
 
@@ -1427,6 +1428,7 @@ def test_native_public_no_callback_preserves_scalar_status_semantics() -> None:
         "boundary_rechecked": np.array([False, True, True]),
         "residual_range_m": np.ones(3, dtype=np.float64),
         "residual_doppler_hz": np.ones(3, dtype=np.float64),
+        "geom_flags": np.zeros(3, dtype=np.uint8),
     }
     result = TransformResult.from_arrays(
         fields,
