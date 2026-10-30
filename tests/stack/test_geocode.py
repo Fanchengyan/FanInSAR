@@ -203,13 +203,13 @@ def test_pair_phase_attributes_retain_wrapped_and_unwrapped_semantics(
         ifg_manifest_digest=store.write_id,
     )
     ifg = stack.interferograms["20240101_20240113"]
-    assert str(ifg.wrapped.asset_kind) == "wrapped_phase"
-    assert str(ifg.unwrapped.asset_kind) == "unwrapped_phase"
-    assert ifg.wrapped.path is None
+    assert str(ifg.wrapped_phase.asset_kind) == "wrapped_phase"
+    assert str(ifg.unwrapped_phase.asset_kind) == "unwrapped_phase"
+    assert ifg.wrapped_phase.path is None
     assert ifg.amplitude.path is None
-    assert ifg.complex_ifg.path.is_dir()
-    wrapped = stack.geocode(ifg.wrapped)
-    unwrapped = stack.geocode(ifg.unwrapped)
+    assert ifg.complex.path.is_dir()
+    wrapped = stack.geocode(ifg.wrapped_phase)
+    unwrapped = stack.geocode(ifg.unwrapped_phase)
     np.testing.assert_allclose(wrapped.values[wrapped.valid], 0.7, atol=1e-5)
     np.testing.assert_allclose(
         unwrapped.values[unwrapped.valid], 10 * np.pi + 0.7, atol=1e-5
@@ -226,13 +226,13 @@ def test_flat_layer_surface_lists_names_and_keeps_virtual_paths_none(
 
     store = _write_ifg(stack)
     ifg = stack.interferograms["20240101_20240113"]
-    assert ifg.layers == ["amplitude", "coherence", "complex_ifg", "wrapped"]
-    assert ifg.wrapped.path is None
+    assert ifg.layers == ["amplitude", "coherence", "complex", "wrapped_phase"]
+    assert ifg.wrapped_phase.path is None
     assert ifg.amplitude.path is None
-    assert ifg.complex_ifg.path.is_dir()
-    np.testing.assert_allclose(ifg.wrapped.values, 0.7, atol=1e-5)
+    assert ifg.complex.path.is_dir()
+    np.testing.assert_allclose(ifg.wrapped_phase.values, 0.7, atol=1e-5)
     np.testing.assert_allclose(ifg.amplitude.values, 1.0, atol=1e-6)
-    assert ifg.wrapped.geocode_kind == "phase"
+    assert ifg.wrapped_phase.geocode_kind == "phase"
     # Deriving values must never materialize a virtual payload on disk.
     assert not (store.root / "wrapped_phase.zarr").exists()
     assert not (store.root / "amplitude.zarr").exists()
@@ -248,13 +248,13 @@ def test_flat_layer_surface_lists_names_and_keeps_virtual_paths_none(
     assert stack.interferograms["20240101_20240113"].layers == [
         "amplitude",
         "coherence",
-        "complex_ifg",
+        "complex",
         "connected_components",
-        "unwrapped",
-        "wrapped",
+        "unwrapped_phase",
+        "wrapped_phase",
     ]
-    assert ifg.unwrapped.path.is_dir()
-    assert str(ifg.unwrapped.asset_kind) == "unwrapped_phase"
+    assert ifg.unwrapped_phase.path.is_dir()
+    assert str(ifg.unwrapped_phase.asset_kind) == "unwrapped_phase"
     assert ifg.connected_components.geocode_kind == "label"
     np.testing.assert_allclose(ifg.connected_components.values, 1, rtol=0.0, atol=1e-6)
 
@@ -300,11 +300,11 @@ def test_missing_optional_layers_raise_file_not_found(stack: Stack) -> None:
         valid_mask=None,
     )
     ifg = stack.interferograms["20240101_20240113"]
-    assert ifg.layers == ["amplitude", "complex_ifg", "wrapped"]
+    assert ifg.layers == ["amplitude", "complex", "wrapped_phase"]
     with pytest.raises(FileNotFoundError, match="coherence"):
         ifg.coherence
     with pytest.raises(FileNotFoundError, match="unwrapped"):
-        ifg.unwrapped
+        ifg.unwrapped_phase
     with pytest.raises(FileNotFoundError, match="unwrapped result"):
         ifg.connected_components
     assert not stack.interferograms.exists("20240101_20240113", "coherence")
@@ -313,8 +313,66 @@ def test_missing_optional_layers_raise_file_not_found(stack: Stack) -> None:
     with pytest.raises(FileNotFoundError, match="coherence"):
         stack.interferograms.path("20240101_20240113", "coherence")
     item = stack.interferograms.item("20240101_20240113")
-    assert set(item["assets"]) == {"complex_ifg"}
+    assert set(item["assets"]) == {"complex"}
     assert all(Path(asset["href"]).exists() for asset in item["assets"].values())
+
+
+def test_getitem_accepts_str_pair_and_pairs(stack: Stack) -> None:
+    """``stack.interferograms[...]`` resolves str, Pair, and Pairs uniformly."""
+    from faninsar.core.pair import Pair, Pairs
+
+    _write_ifg(stack)
+    collection = stack.interferograms
+    pair_name = "20240101_20240113"
+
+    by_str = collection[pair_name]
+    pair_obj = Pair.from_name(pair_name)
+    by_pair = collection[pair_obj]
+    assert by_str.root == by_pair.root
+    np.testing.assert_allclose(
+        by_str.wrapped_phase.values, by_pair.wrapped_phase.values
+    )
+
+    selected = collection[Pairs.from_names([pair_name])]
+    assert isinstance(selected, dict)
+    assert list(selected) == [pair_name]
+    np.testing.assert_allclose(
+        selected[pair_name].wrapped_phase.values, by_str.wrapped_phase.values
+    )
+
+    with pytest.raises(KeyError):
+        collection["20240101_20240201"]
+    with pytest.raises(KeyError):
+        collection[Pairs.from_names(["20240101_20240201"])]
+
+
+def test_product_layer_plot_renders_with_kind_defaults(stack: Stack) -> None:
+    """``ProductLayer.plot`` returns (fig, ax, im) with kind-driven defaults."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+
+    _write_ifg(stack)
+    ifg = stack.interferograms["20240101_20240113"]
+
+    fig, ax, im = ifg.wrapped_phase.plot()
+    assert im.get_clim() == (-np.pi, np.pi)
+    np.testing.assert_allclose(
+        np.asarray(im.get_array())[~np.isnan(im.get_array())], 0.7, atol=1e-5
+    )
+
+    _, _, im_coh = ifg.coherence.plot()
+    assert im_coh.get_clim() == (0.0, 1.0)
+
+    _, _, im_amp = ifg.amplitude.plot(colorbar=False)
+    assert im_amp.get_cmap().name == "gray"
+
+    # A complex layer renders two (I, Q) panels sharing one symmetric limit.
+    fig_c, axs_c, ims_c = ifg.complex.plot()
+    assert len(ims_c) == 2 and len(axs_c) == 2
+    assert axs_c[0].get_title().endswith("(I)")
+    assert axs_c[1].get_title().endswith("(Q)")
+    lo, hi = ims_c[0].get_clim()
+    assert lo == -hi
 
 
 def test_collection_items_and_paths_never_invent_virtual_files(stack: Stack) -> None:
@@ -325,7 +383,7 @@ def test_collection_items_and_paths_never_invent_virtual_files(stack: Stack) -> 
     collection = stack.interferograms
     pair = "20240101_20240113"
     item = collection.item(pair)
-    assert set(item["assets"]) == {"complex_ifg", "coherence"}
+    assert set(item["assets"]) == {"complex", "coherence"}
     for name in ("wrapped", "wrapped_phase", "amplitude"):
         with pytest.raises(FileNotFoundError, match="virtual"):
             collection.path(pair, name)
@@ -342,7 +400,7 @@ def test_collection_items_and_paths_never_invent_virtual_files(stack: Stack) -> 
         ifg_manifest_digest=store.write_id,
     )
     assert set(collection.item(pair)["assets"]) == {
-        "complex_ifg",
+        "complex",
         "coherence",
         "unw_phase",
     }
@@ -360,14 +418,14 @@ def test_geocode_complex_product_roundtrip_and_reuse(
 ) -> None:
     """A complex product geocodes once, commits COGs, and reuses on re-call."""
     store = _write_ifg(stack)
-    product = stack.interferograms["20240101_20240113"].complex_ifg
+    product = stack.interferograms["20240101_20240113"].complex
     values = product.read()
     raster = stack.geocode(product)
     assert raster.values.dtype == np.complex64
     assert raster.valid.dtype == np.bool_
     assert raster.valid.any()
     assert raster.grid.crs == UTM
-    target = store.root / "geocoded" / "complex_ifg"
+    target = store.root / "geocoded" / "complex"
     assert (target / "values.tif").is_file()
     assert (target / "valid.tif").is_file()
     assert (target / "item.json").is_file()
@@ -544,7 +602,7 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
     from faninsar.processing.errors import InvalidProcessingStateError
 
     store = _write_ifg(stack)
-    product = stack.interferograms["20240101_20240113"].wrapped
+    product = stack.interferograms["20240101_20240113"].wrapped_phase
     target = store.root / "geocoded" / "wrapped_phase"
     committed = stack.geocode(product)
     original = open_product(target)
@@ -557,7 +615,7 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
     assert not target.exists()
     with pytest.raises(InvalidProcessingStateError, match="replaced source"):
         stack.geocode(product)
-    fresh = stack.interferograms["20240101_20240113"].wrapped
+    fresh = stack.interferograms["20240101_20240113"].wrapped_phase
     replaced = stack.geocode(fresh)
     np.testing.assert_allclose(replaced.values[replaced.valid], 1.2, atol=1e-5)
     assert open_product(target).inputs["source"] == fresh_store.write_id
@@ -594,7 +652,7 @@ def test_layer_cache_is_lazy_and_tracks_dem_context(
     from faninsar.io.storage.product import Product, open_product
 
     store = _write_ifg(stack)
-    product = stack.interferograms["20240101_20240113"].wrapped
+    product = stack.interferograms["20240101_20240113"].wrapped_phase
     raster = stack.geocode(product)
     target = store.root / "geocoded" / "wrapped_phase"
     original = open_product(target).write_id
@@ -603,7 +661,7 @@ def test_layer_cache_is_lazy_and_tracks_dem_context(
         raise AssertionError("cached layer read input-array payloads")
 
     monkeypatch.setattr(Product, "read", forbid_payload)
-    cached = stack.geocode(stack.interferograms["20240101_20240113"].wrapped)
+    cached = stack.geocode(stack.interferograms["20240101_20240113"].wrapped_phase)
     np.testing.assert_array_equal(cached.values, raster.values)
     assert open_product(target).write_id == original
     stack.config.dem = ConstantDEM(20.0)
@@ -619,7 +677,7 @@ def test_alternate_grid_and_layer_outputs_do_not_replace_each_other(
 
     store = _write_ifg(stack)
     ifg = stack.interferograms["20240101_20240113"]
-    stack.geocode(ifg.wrapped)
+    stack.geocode(ifg.wrapped_phase)
     phase_target = store.root / "geocoded" / "wrapped_phase"
     original = open_product(phase_target).write_id
     stack.geocode(ifg.coherence)
@@ -631,14 +689,14 @@ def test_alternate_grid_and_layer_outputs_do_not_replace_each_other(
         height=stack.grid.height,
         resolution_m=stack.grid.resolution_m,
     )
-    raster = stack.geocode(ifg.wrapped, grid=alternate)
+    raster = stack.geocode(ifg.wrapped_phase, grid=alternate)
     assert raster.grid == alternate
     assert open_product(phase_target).write_id == original
     custom = stack.config.work_dir / "results" / "phase_alternate"
-    stack.geocode(ifg.wrapped, grid=alternate, path=custom)
+    stack.geocode(ifg.wrapped_phase, grid=alternate, path=custom)
     assert open_product(custom).inputs["source"] == store.write_id
     with pytest.raises(ValueError, match="source|ancestor"):
-        stack.geocode(ifg.wrapped, path=store.root, overwrite=True)
+        stack.geocode(ifg.wrapped_phase, path=store.root, overwrite=True)
     assert open_product(store.root).write_id == store.write_id
 
 
@@ -656,7 +714,7 @@ def test_unwrapped_support_and_labels_follow_the_source(stack: Stack) -> None:
         ifg_manifest_digest=store.write_id,
         extra_layers={"valid_mask": np.zeros(RADAR_SHAPE, dtype=bool)},
     )
-    unwrapped = stack.interferograms["20240101_20240113"].unwrapped
+    unwrapped = stack.interferograms["20240101_20240113"].unwrapped_phase
     raster = stack.geocode(unwrapped)
     assert not raster.valid.any()
     assert np.isnan(raster.values).all()
@@ -670,7 +728,7 @@ def test_unwrapped_support_and_labels_follow_the_source(stack: Stack) -> None:
 def test_layer_values_are_detached_from_committed_provenance(stack: Stack) -> None:
     """Changing a loaded array cannot silently change a source-bound request."""
     _write_ifg(stack)
-    layer = stack.interferograms["20240101_20240113"].wrapped
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
     detached = layer.read()
     detached[:] = -1.0
     assert not layer.values.flags.writeable
@@ -683,7 +741,7 @@ def test_layer_rejects_replacement_of_its_reference_frame(stack: Stack) -> None:
     from faninsar.processing.errors import InvalidProcessingStateError
 
     _write_ifg(stack)
-    layer = stack.interferograms["20240101_20240113"].wrapped
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
     reference = stack.reference_scene
     assert reference is not None
     write_scene(
@@ -718,7 +776,7 @@ def test_layer_rejects_a_different_stack_reference(
     from faninsar.processing.errors import InvalidProcessingStateError
 
     _write_ifg(stack)
-    layer = stack.interferograms["20240101_20240113"].wrapped
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
     other = Stack(
         catalog=stack.catalog,
         config=StackConfig(
@@ -1189,13 +1247,13 @@ def test_bound_layer_geocode_reuses_the_stack_child(stack: Stack) -> None:
     )
     assert session_field.compare is False
 
-    raster = ifg.wrapped.geocode()
+    raster = ifg.wrapped_phase.geocode()
     np.testing.assert_allclose(raster.values[raster.valid], 0.7, atol=1e-5)
     child = store.root / "geocoded" / "wrapped_phase"
     assert (child / "item.json").is_file()
 
     first_id = open_product(child).write_id
-    reused = stack.geocode(ifg.wrapped)
+    reused = stack.geocode(ifg.wrapped_phase)
     assert open_product(child).write_id == first_id
     np.testing.assert_allclose(reused.values[reused.valid], 0.7, atol=1e-5)
 
@@ -1216,7 +1274,7 @@ def test_bound_layer_geocode_routes_unwrap_layers_to_their_product(
         ifg_manifest_digest=store.write_id,
     )
     ifg = stack.interferograms["20240101_20240113"]
-    raster = ifg.unwrapped.geocode()
+    raster = ifg.unwrapped_phase.geocode()
     np.testing.assert_allclose(raster.values[raster.valid], 1.25, atol=1e-5)
     assert (
         store.unwrap_root / "geocoded" / "unwrapped_phase" / "item.json"
@@ -1238,7 +1296,7 @@ def test_unbound_layer_handle_fails_closed(stack: Stack) -> None:
         open_product(store.root, kind=IFG_KIND), store.shape, store.looks
     )
     with pytest.raises(InvalidProcessingStateError, match="not bound"):
-        handle.wrapped.geocode()
+        handle.wrapped_phase.geocode()
 
 
 def test_bound_layer_geocode_honours_grid_and_overwrite(stack: Stack) -> None:
@@ -1248,9 +1306,9 @@ def test_bound_layer_geocode_honours_grid_and_overwrite(stack: Stack) -> None:
     store = _write_ifg(stack)
     ifg = stack.interferograms["20240101_20240113"]
     child = store.root / "geocoded" / "wrapped_phase"
-    ifg.wrapped.geocode()
+    ifg.wrapped_phase.geocode()
     first_id = open_product(child).write_id
-    ifg.wrapped.geocode(overwrite=True)
+    ifg.wrapped_phase.geocode(overwrite=True)
     assert open_product(child).write_id != first_id
 
     alternate = GeoGridSpec(

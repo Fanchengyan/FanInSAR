@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import xarray as xr
 
+from faninsar.core import Pair, Pairs
 from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from faninsar.network.layers import InterferogramLayers
     from faninsar.stack.session import Stack
 
-_ASSETS = ("complex_ifg", "unw_phase", "wrapped_phase", "amplitude", "coherence")
+_ASSETS = ("complex", "unw_phase", "wrapped_phase", "amplitude", "coherence")
 _READABLE_ASSETS = frozenset(_ASSETS)
 #: Short public layer spellings accepted alongside the internal asset names.
 _SHORT_ASSET_NAMES = {"wrapped": "wrapped_phase", "unwrapped": "unw_phase"}
@@ -52,37 +53,48 @@ class StackInterferogramCollection(InterferogramCollection):
         """Bind the collection to a Stack."""
         self._stack = stack
 
-    def __getitem__(self, pair: str) -> InterferogramLayers:
-        """Return lazy, typed layers for one planned Pair.
+    def __getitem__(
+        self, pair: str | Pair | Pairs
+    ) -> InterferogramLayers | dict[str, InterferogramLayers]:
+        """Return lazy, typed layers for one planned Pair, or a subset.
 
         Parameters
         ----------
-        pair : str
-            Canonical date-pair identifier.
+        pair : str, Pair, or Pairs
+            Canonical date-pair identifier, a single :class:`Pair`, or a
+            :class:`Pairs` selection. A ``str`` or ``Pair`` returns one
+            layer view; a ``Pairs`` returns a ``dict`` keyed on the
+            canonical pair names in the input's order.
 
         Returns
         -------
-        InterferogramLayers
-            Flat view exposing ``wrapped``, ``complex_ifg``, ``coherence``,
-            ``amplitude``, ``unwrapped``, ``connected_components``, and the
-            accessible-name listing ``layers``. The ``wrapped`` and
+        InterferogramLayers or dict[str, InterferogramLayers]
+            Flat view exposing ``wrapped_phase``, ``complex``, ``coherence``,
+            ``amplitude``, ``unwrapped_phase``, ``connected_components``, and
+            the accessible-name listing ``layers``. The ``wrapped_phase`` and
             ``amplitude`` layers are virtual and derive from the committed
-            complex IFG.
+            complex IFG. A ``Pairs`` input yields one such view per pair.
 
         Raises
         ------
         KeyError
-            If the Pair is not part of this Stack.
+            If any requested Pair is not part of this Stack.
 
         """
+        if isinstance(pair, Pairs):
+            return {name: self._load_layers(name) for name in pair.to_names().tolist()}
+        pair_id = pair.name if isinstance(pair, Pair) else str(pair)
+        return self._load_layers(pair_id)
+
+    def _load_layers(self, pair_id: str) -> InterferogramLayers:
+        """Build the validated lazy-layer view for one committed Pair product."""
         from faninsar.io.storage.ifg_store import IFG_KIND, InterferogramArtifactStore
         from faninsar.io.storage.product import open_product
         from faninsar.io.storage.scene_store import SCENE_KIND, CoregisteredSceneStore
         from faninsar.network.layers import InterferogramLayers
         from faninsar.processing.errors import reject_invalid_state
 
-        pair_id = str(pair)
-        if pair_id not in self.pairs().to_names().tolist():
+        if pair_id not in self.pairs.to_names().tolist():
             raise KeyError(pair_id)
         store = InterferogramArtifactStore.open(self.root / pair_id)
         reference = self._stack.reference_scene
@@ -135,7 +147,7 @@ class StackInterferogramCollection(InterferogramCollection):
         stores = self._stores()
         assets_by_pair: dict[str, list[str]] = {}
         for store in stores:
-            assets = ["complex_ifg", "wrapped_phase", "amplitude"]
+            assets = ["complex", "wrapped_phase", "amplitude"]
             if "coherence" in store._payloads:
                 assets.append("coherence")
             if store.has_unwrapped():
@@ -177,9 +189,9 @@ class StackInterferogramCollection(InterferogramCollection):
             values["transform"] = list(first.transform)
         return values
 
-    def pairs(self) -> Any:
+    @property
+    def pairs(self) -> Pairs:
         """Return the planned Stack Pair graph."""
-        from faninsar.core import Pairs
         from faninsar.stack.session import _iter_pair_dates
 
         return Pairs.from_names(
@@ -214,7 +226,7 @@ class StackInterferogramCollection(InterferogramCollection):
         from faninsar.processing.errors import reject_invalid_state
 
         pair_id = str(pair)
-        if pair_id not in self.pairs().to_names().tolist():
+        if pair_id not in self.pairs.to_names().tolist():
             raise KeyError(pair)
         store = InterferogramArtifactStore.open(self.root / pair_id)
         if _pair_id(store) != pair_id:
@@ -243,7 +255,7 @@ class StackInterferogramCollection(InterferogramCollection):
                 message = "coherence is not present"
                 raise FileNotFoundError(message)
             return np.asarray(store.read_layer("coherence"))
-        if canonical in {"wrapped_phase", "amplitude", "complex_ifg"}:
+        if canonical in {"wrapped_phase", "amplitude", "complex"}:
             return np.asarray(store.read_layer(canonical))
         message = f"unknown Stack interferogram asset: {name}"
         raise ValueError(message)
@@ -265,7 +277,7 @@ class StackInterferogramCollection(InterferogramCollection):
         """
         del chunks
         requested = (
-            self.pairs().to_names().tolist()
+            self.pairs.to_names().tolist()
             if pairs is None
             else pairs.to_names().tolist()
         )
@@ -315,7 +327,7 @@ class StackInterferogramCollection(InterferogramCollection):
         if canonical == "unw_phase":
             return selected.has_unwrapped()
         if canonical in _VIRTUAL_ASSETS:
-            return "complex_ifg" in selected._payloads
+            return "complex" in selected._payloads
         return canonical in selected._payloads
 
     def path(self, pair: str, name: str) -> Path:
@@ -359,7 +371,7 @@ class StackInterferogramCollection(InterferogramCollection):
         Assets enumerate real payloads only: virtual derived layers are
         omitted rather than given a fabricated href.
         """
-        if str(pair) not in self.pairs().to_names().tolist():
+        if str(pair) not in self.pairs.to_names().tolist():
             raise KeyError(pair)
         assets: dict[str, Any] = {}
         for name in _ASSETS:

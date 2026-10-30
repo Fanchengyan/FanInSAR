@@ -297,7 +297,7 @@ class Network(NetworkContract):
         """
         from faninsar.processing.interferometry.contracts import InterferogramStack
 
-        pair_obj = pairs if pairs is not None else self.interferograms.pairs()
+        pair_obj = pairs if pairs is not None else self.interferograms.pairs
         unwrapped: np.ndarray | None = None
         coherence: np.ndarray | None = None
         try:
@@ -657,7 +657,7 @@ class Network(NetworkContract):
 
     def __repr__(self) -> str:
         """Return a concise Network summary."""
-        pair_count = len(self.interferograms.pairs()) if self.interferograms else 0
+        pair_count = len(self.interferograms.pairs) if self.interferograms else 0
         return f"Network(root={self.root!r}, pairs={pair_count})"
 
 

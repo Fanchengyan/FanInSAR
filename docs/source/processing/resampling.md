@@ -159,13 +159,13 @@ selected raster and its validity information.
 ```python
 ifg = stack.interferograms["20240101_20240113"]
 
-wrapped = ifg.wrapped.geocode()
-unwrapped = ifg.unwrapped.geocode()
+wrapped = ifg.wrapped_phase.geocode()
+unwrapped = ifg.unwrapped_phase.geocode()
 coherence = ifg.coherence.geocode()
 components = ifg.connected_components.geocode()
 
 # A handle obtained outside a Stack has no session; pass it explicitly.
-wrapped = stack.geocode(ifg.wrapped)
+wrapped = stack.geocode(ifg.wrapped_phase)
 ```
 
 A handle returned by `stack.interferograms[pair]` is bound to its Stack, so it
@@ -174,15 +174,16 @@ optional `grid`, `path`, and `overwrite`. An unbound handle fails closed with
 `InvalidProcessingStateError`.
 
 Both phase layers contain real radians. Their types remain distinct:
-`str(ifg.wrapped.asset_kind)` is `"wrapped_phase"`, and
-`str(ifg.unwrapped.asset_kind)` is `"unwrapped_phase"`. The first selects cyclic
-interpolation, the second continuous interpolation. Component labels use
+`str(ifg.wrapped_phase.asset_kind)` is `"wrapped_phase"`, and
+`str(ifg.unwrapped_phase.asset_kind)` is `"unwrapped_phase"`. The first selects
+cyclic interpolation, the second continuous interpolation. Component labels use
 `AssetKind.LABEL` and nearest-neighbor sampling. The kernel is always derived
 from the declared `asset_kind`; there is no per-call `kind` override.
-`ifg.layers` lists the accessible layer names. `wrapped` and `amplitude` are
-virtual: they derive from the committed complex interferogram, store no
+`ifg.layers` lists the accessible layer names. `wrapped_phase` and `amplitude`
+are virtual: they derive from the committed complex interferogram, store no
 payload, and report `path is None`. Accessing an unestimated optional result
-(`coherence`, `unwrapped`, `connected_components`) raises `FileNotFoundError`.
+(`coherence`, `unwrapped_phase`, `connected_components`) raises
+`FileNotFoundError`.
 
 On the Stack's standard grid, a committed layer saves to
 `<source>/geocoded/<asset>/`. Different layers have independent children.
@@ -200,9 +201,9 @@ from faninsar.processing.geocoding import RadarDomainProduct
 product = RadarDomainProduct(
     name="filtered_phase",
     values=filtered_phase,
-    full_radar_shape=ifg.unwrapped.full_radar_shape,
-    multilook=ifg.unwrapped.multilook,
-    origin=ifg.unwrapped.origin,
+    full_radar_shape=ifg.unwrapped_phase.full_radar_shape,
+    multilook=ifg.unwrapped_phase.multilook,
+    origin=ifg.unwrapped_phase.origin,
     asset_kind=AssetKind.UNWRAPPED_PHASE,
 )
 raster = stack.geocode(product)  # In-memory output.
@@ -214,7 +215,7 @@ already georeferenced product (`crs` set) may omit it. Build a non-default
 grid through the grid resolver rather than through `geocode`:
 
 ```python
-coarser = stack.geocode(ifg.wrapped, grid=stack.resolve_grid(resolution_m=60.0))
+coarser = stack.geocode(ifg.wrapped_phase, grid=stack.resolve_grid(resolution_m=60.0))
 ```
 
 `path` names a complete product directory containing `item.json`, `values.tif`,

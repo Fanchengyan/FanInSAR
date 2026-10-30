@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -50,7 +50,9 @@ class ProductLayer:
 
     Notes
     -----
-    Obtain layers from ``stack.interferograms[pair]``. Accessing a layer
+    Obtain layers from ``stack.interferograms[pair]``; ``pair`` may be a
+    name, a :class:`Pair`, or a :class:`Pairs` (the last yields a dict of
+    views). Accessing a layer
     property reads no raster. :attr:`values` loads only the selected layer
     and returns a read-only array. Derived arrays belong in an in-memory
     ``RadarDomainProduct`` and do not inherit the committed source identity.
@@ -239,6 +241,203 @@ class ProductLayer:
             mask = supported if mask is None else mask & supported
         return mask
 
+    def plot(
+        self,
+        ax: Any = None,
+        *,
+        cmap: str | None = None,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        colorbar: bool = True,
+        masked: bool = True,
+        figsize: tuple[float, float] | None = None,
+        title: str | None = None,
+        hist_colorbar: bool = True,
+        **imshow_kwargs: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Plot this layer with colormap and limits chosen from its asset kind.
+
+        Phase layers use a cyclic colormap with +/- pi limits and a pi-ticked
+        colorbar, ``coherence`` uses 0-1 grayscale, ``amplitude`` plots
+        magnitude, and ``label`` uses a discrete map. A complex interferogram
+        renders its in-phase and quadrature components as two side-by-side
+        panels; its phase and magnitude are reached through the dedicated
+        ``wrapped_phase`` and ``amplitude`` layers. Any default can be overridden
+        per call.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw into. A new figure and axes are created when *None*.
+            Ignored for a complex layer, which always builds a two-panel
+            figure.
+        cmap : str, optional
+            Colormap name overriding the kind default.
+        vmin, vmax : float, optional
+            Data limits overriding the kind default. For a complex layer the
+            same limits apply to both panels.
+        colorbar : bool, optional
+            Add a colorbar. Default True.
+        masked : bool, optional
+            Mask pixels outside :attr:`valid_mask` to NaN. Default True.
+        figsize : tuple[float, float], optional
+            Figure size when creating a new figure.
+        title : str, optional
+            Axes title. Defaults to the layer's public name; a complex layer
+            suffixes ``I``/``Q`` on each panel.
+        hist_colorbar : bool, optional
+            Use FanInSAR :class:`~faninsar.plotting.HistColorbar` (histogram
+            embedded beside the gradient) instead of a plain colorbar.
+            Default True.
+        **imshow_kwargs
+            Forwarded to :meth:`matplotlib.axes.Axes.imshow`.
+
+        Returns
+        -------
+        fig, ax, im
+            The figure, axes, and ``AxesImage`` so callers can keep
+            customizing. For a complex layer *ax* and *im* are each a
+            ``(I, Q)`` tuple; *fig* is the shared figure.
+
+        """
+        import matplotlib.pyplot as plt
+
+        if self.asset_kind == AssetKind.COMPLEX_INTERFEROGRAM:
+            return self._plot_iq(
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                colorbar=colorbar,
+                masked=masked,
+                figsize=figsize,
+                title=title,
+                hist_colorbar=hist_colorbar,
+                **imshow_kwargs,
+            )
+
+        values = np.asarray(self.values, dtype=np.result_type(self.values, np.float32))
+        if masked:
+            mask = self.valid_mask
+            if mask is not None:
+                values = np.where(mask, values, np.nan)
+
+        kind = self.asset_kind
+        if cmap is None:
+            cmap = {
+                AssetKind.WRAPPED_PHASE: "jet",
+                AssetKind.UNWRAPPED_PHASE: "viridis",
+                AssetKind.COHERENCE: "gray",
+                AssetKind.AMPLITUDE: "gray",
+                AssetKind.LABEL: "tab20",
+            }.get(kind, "viridis")
+        if vmin is None or vmax is None:
+            default_limits: dict[AssetKind | None, tuple[float, float]] = {
+                AssetKind.WRAPPED_PHASE: (-np.pi, np.pi),
+                AssetKind.COHERENCE: (0.0, 1.0),
+            }
+            lo, hi = default_limits.get(kind, (np.nanmin(values), np.nanmax(values)))
+            vmin = lo if vmin is None else vmin
+            vmax = hi if vmax is None else vmax
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=figsize)
+            if title is None:
+                title = self.name
+        im = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kwargs)
+        ax.set_title(title if title is not None else "")
+        if colorbar:
+            self._add_colorbar(
+                ax.figure,
+                ax,
+                im,
+                values,
+                phase=kind == AssetKind.WRAPPED_PHASE,
+                hist=hist_colorbar,
+            )
+        return ax.figure, ax, im
+
+    def _plot_iq(
+        self,
+        *,
+        cmap: str | None,
+        vmin: float | None,
+        vmax: float | None,
+        colorbar: bool,
+        masked: bool,
+        figsize: tuple[float, float] | None,
+        title: str | None,
+        hist_colorbar: bool,
+        **imshow_kwargs: Any,
+    ) -> tuple[Any, tuple[Any, Any], tuple[Any, Any]]:
+        """Render a complex layer as side-by-side in-phase/quadrature panels."""
+        import matplotlib.pyplot as plt
+
+        values = np.asarray(self.values, dtype=np.complex64)
+        mask = self.valid_mask if masked else None
+
+        if cmap is None:
+            cmap = "gray"
+        if vmin is None or vmax is None:
+            finite = np.concatenate(
+                [
+                    np.asarray(values.real)[np.isfinite(values.real)],
+                    np.asarray(values.imag)[np.isfinite(values.imag)],
+                ]
+            )
+            limit = float(np.abs(finite).max()) if finite.size else 1.0
+            vmin = -limit if vmin is None else vmin
+            vmax = limit if vmax is None else vmax
+
+        base = title if title is not None else "complex"
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=figsize,
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        ims = []
+        for axis, component, suffix in (
+            (axes[0, 0], values.real, "I"),
+            (axes[0, 1], values.imag, "Q"),
+        ):
+            data = np.asarray(component, dtype=np.float32)
+            if mask is not None:
+                data = np.where(mask, data, np.nan)
+            im = axis.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kwargs)
+            axis.set_title(f"{base} ({suffix})")
+            ims.append(im)
+            if colorbar:
+                self._add_colorbar(fig, axis, im, data, hist=hist_colorbar)
+        return fig, (axes[0, 0], axes[0, 1]), (ims[0], ims[1])
+
+    @staticmethod
+    def _add_colorbar(
+        fig: Any,
+        ax: Any,
+        im: Any,
+        data: np.ndarray,
+        *,
+        phase: bool = False,
+        hist: bool = True,
+    ) -> None:
+        """Attach a colorbar, FanInSAR HistColorbar when *hist* is set."""
+        if hist:
+            import faninsar.plotting  # noqa: F401  (installs Figure.hist_colorbar)
+
+            hcb = fig.hist_colorbar(np.asarray(data).ravel(), mappable=im, ax=ax)
+            if phase:
+                from faninsar.plotting.formatters import setup_phase_axis
+
+                setup_phase_axis(hcb.ax_cbar.yaxis)
+            return
+        cbar = fig.colorbar(im, ax=ax)
+        if phase:
+            from faninsar.plotting.formatters import setup_phase_axis
+
+            setup_phase_axis(cbar.ax.yaxis)
+
 
 @dataclass(frozen=True, slots=True)
 class InterferogramLayers:
@@ -274,19 +473,19 @@ class InterferogramLayers:
         """List accessible public layer names, virtual layers included.
 
         Persisted optionals (``coherence``) and the per-Pair unwrap results
-        (``unwrapped``, ``connected_components``) appear only when they
+        (``unwrapped_phase``, ``connected_components``) appear only when they
         exist and the unwrap product is bound to this IFG commit; stale
         unwrap products of a replaced IFG are not accessible and are not
-        listed. ``wrapped`` and ``amplitude`` are always computable.
+        listed. ``wrapped_phase`` and ``amplitude`` are always computable.
 
         """
-        names = ["amplitude", "complex_ifg", "wrapped"]
+        names = ["amplitude", "complex", "wrapped_phase"]
         if "coherence" in self._product.assets:
             names.append("coherence")
         from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
         if InterferogramArtifactStore.open(self.root).has_unwrapped():
-            names.extend(["connected_components", "unwrapped"])
+            names.extend(["connected_components", "unwrapped_phase"])
         return sorted(names)
 
     def _layer(
@@ -344,7 +543,7 @@ class InterferogramLayers:
         )
 
     @property
-    def wrapped(self) -> ProductLayer:
+    def wrapped_phase(self) -> ProductLayer:
         """Return real wrapped radians, sampled as cyclic angles.
 
         The layer is virtual: it derives from the owning complex IFG commit
@@ -354,9 +553,9 @@ class InterferogramLayers:
         return self._layer("wrapped_phase", AssetKind.WRAPPED_PHASE, virtual=True)
 
     @property
-    def complex_ifg(self) -> ProductLayer:
+    def complex(self) -> ProductLayer:
         """Return the complex interferogram layer."""
-        return self._layer("complex_ifg", AssetKind.COMPLEX_INTERFEROGRAM)
+        return self._layer("complex", AssetKind.COMPLEX_INTERFEROGRAM)
 
     @property
     def coherence(self) -> ProductLayer:
@@ -369,7 +568,7 @@ class InterferogramLayers:
         return self._layer("amplitude", AssetKind.AMPLITUDE, virtual=True)
 
     @property
-    def unwrapped(self) -> ProductLayer:
+    def unwrapped_phase(self) -> ProductLayer:
         """Return real unwrapped radians from the bound unwrap product."""
         return self._unwrap_layer("unwrapped_phase", AssetKind.UNWRAPPED_PHASE)
 
