@@ -5,22 +5,103 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.11398347.svg)](https://doi.org/10.5281/zenodo.11398347) [![Documentation Status](https://readthedocs.org/projects/faninsar/badge/?version=latest)](https://faninsar.readthedocs.io/en/latest/?badge=latest)  [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 
-**FanInSAR** is a **Fan**cy **In**terferometric **S**ynthetic **A**perture **R**adar (InSAR) scientific computing library written in Python. It provides reusable data, processing, Stack, Network, and time-series components for researchers and developers.
+# FanInSAR
 
+**FanInSAR** (**F**oundational **A**PIs and **N**umerics for **InSAR**) is a Python scientific computing library for InSAR processing and analysis. Inspired by **NumPy, SciPy, and xarray**, it provides fundamental data structures, numerical algorithms, and intuitive Python APIs, enabling researchers to directly manipulate InSAR data, explore individual algorithms, and build custom workflows rather than rely on predefined processing pipelines.
 
+By **unifying data, algorithms, and benchmarks**, FanInSAR aims to establish a common computational foundation for **flexible, interoperable, and reproducible InSAR research**.
 
-## Why FanInSAR?
+## Core Components
 
-Most existing community InSAR software adopts a workflow-oriented approach. While this lowers the entry barrier for new users, it often compromises flexibility and extensibility. For algorithm researchers, integrating new methods into these rigid workflows can be challenging, highlighting the need for a more adaptable framework for InSAR time series analysis.
+### 1. Data Commons — Standardized Data Structures and Interoperability
 
-**FanInSAR** is designed to bridge this gap with two clear product boundaries. A concrete **Stack** processes mission source data through interferogram generation and export. A **Network** opens an immutable, already processed generation for interferogram and time-series analysis. Lower-level scientific functions remain available from their owning packages without creating another workflow facade.
+Data Commons aims to provide a common data model for InSAR processing and analysis, together with standardized interfaces for data access, manipulation, and exchange.
+
+Its key capabilities include:
+
+- **Common InSAR Data Model:** Standardized, metadata-aware data structures covering spatial and temporal information, phase conventions, acquisition geometry, reference systems, quality indicators, and processing provenance.
+- **Bidirectional Data Interoperability:** Python APIs for importing, converting, and exporting supported data products across existing InSAR software packages, including ISCE, GMTSAR, and MintPy.
+- **Extensible Data Adapters:** A plugin mechanism allowing developers to register custom data readers and writers without modifying the core library.
+- **Cloud-Native Data Access:** Integration with xarray, STAC, Zarr, and Cloud Optimized GeoTIFF (COG) for efficient discovery, access, and analysis of large-scale InSAR datasets.
+- **Metadata Validation and Provenance:** Explicit handling of physical conventions, metadata consistency, and information preservation during data conversion.
+
+By providing common data structures and bidirectional conversion interfaces, Data Commons aims to reduce software integration costs and facilitate data exchange and algorithm comparisons across the InSAR community.
+
+### 2. Compute Commons — Core Algorithms and Pluggable Processing Engines
+
+Compute Commons provides the fundamental computational building blocks for InSAR processing and analysis.
+
+Unlike workflow-oriented processing systems, FanInSAR exposes individual algorithms through Python APIs, allowing researchers to execute specific operations, inspect intermediate results, and develop customized processing methods.
+
+Building upon its existing native implementation, Compute Commons will introduce:
+
+- **Core InSAR Algorithms:** Reusable numerical algorithms and processing functions accessible through intuitive Python APIs.
+- **Unified Algorithm Interfaces:** Standardized interfaces for common InSAR operations, such as phase filtering, phase unwrapping, geometric transformations, and time-series inversion.
+- **Pluggable Processing Engines:** An extensible engine architecture allowing users to select different algorithm implementations through the same API.
+- **User-Registered Engines:** A plugin registration mechanism enabling developers to integrate their own algorithms or established implementations from existing InSAR software without modifying the core library.
+- **Hardware-Accelerated Computing:** PyTorch-based numerical computing across supported CPU and GPU architectures.
+- **Distributed Computing:** Integration with Dask to support parallel execution and large-scale processing.
+
+For example, researchers will be able to call different phase-unwrapping implementations through a common Python interface simply by selecting a different processing engine.
+
+This architecture aims to simplify algorithm development, encourage reuse of existing methods, and provide a flexible computational foundation for both interactive scientific analysis and automated workflows.
+
+### 3. Benchmark Commons — Open and Reproducible Algorithm Evaluation
+
+Benchmark Commons aims to establish an open and extensible benchmarking suite for evaluating InSAR algorithms and software implementations.
+
+Building upon the common data structures and pluggable processing engines, the benchmarking suite will enable researchers to evaluate different algorithms under standardized and reproducible experimental conditions.
+
+Its main capabilities will include:
+
+- **Open Benchmark Datasets:** Synthetic and real-world InSAR datasets, with reference results and documented experimental configurations.
+- **Scientific Accuracy:** Evaluation of algorithm accuracy, robustness, and numerical consistency.
+- **Computational Efficiency:** Systematic comparison of processing time, memory consumption, and scalability.
+- **Automated Engine Benchmarking:** Direct evaluation of registered processing engines through common algorithm interfaces.
+- **Reproducible Experiments:** Recording of input datasets, algorithm parameters, software versions, computing environments, and processing histories.
+- **Community Contributions:** Support for researchers to register new algorithms and evaluate them using existing benchmark datasets and procedures.
+
+By connecting standardized data, interchangeable algorithm implementations, and common evaluation metrics, Benchmark Commons aims to enable fair, transparent, and reproducible comparisons across different InSAR methods and software packages.
 
 ## Highlight Features
 
-- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. For example, a series of well-known InSAR datasets are provided in the form of Python classes; loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Sampling values from an interferometric dataset is as easy as calling the ``query()`` method by passing the spatial (Points, BoundingBox, Polygons) and temporal (Pairs) queries. The warping process during sampling (such as reprojecting and resampling) is automatically handled by the library.
-- **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
-- **Flexible**: Generic datasets, spatial and temporal queries, and samplers live under `faninsar.data`; geometry, coregistration, interferometry, geocoding, and unwrapping remain independently reusable processing modules.
-- **Two clear workflows**: Use `S1Stack.from_safes(...)` or `NISARStack.from_rslc(...)` for source-to-product processing, and `Network.open(...)` for analysis of a completed product generation.
+### Pythonic — InSAR Computing Made Accessible
+
+FanInSAR provides intuitive Python APIs for InSAR data access, manipulation, and analysis.
+
+It already supports commonly used InSAR products, including HyP3 and LiCSAR datasets, through dedicated Python classes.
+
+Users can perform spatial and temporal queries using points, bounding boxes, polygons, and interferometric pairs. Coordinate transformations, reprojection, and resampling during data sampling are handled automatically by the library.
+
+The goal is to make working with InSAR data as straightforward as working with multidimensional scientific datasets in xarray.
+
+### Fast — Hardware-Accelerated Scientific Computing
+
+FanInSAR uses PyTorch for its core numerical computations, enabling efficient execution on supported CPU and GPU devices.
+
+The planned integration of distributed computing and cloud-native data access will further extend its capabilities for large-scale InSAR processing.
+
+### Flexible — Algorithms as Reusable Building Blocks
+
+FanInSAR is designed around independently accessible computational functions rather than rigid processing pipelines.
+
+Researchers can directly manipulate intermediate results, customize individual processing steps, and combine existing algorithms to develop new methods.
+
+Its extensible architecture will further support user-defined data adapters and processing engines, allowing researchers to integrate external algorithms without modifying the core library.
+
+### Interoperable — Connecting Existing InSAR Software
+
+Through standardized data structures and extensible import/export interfaces, FanInSAR aims to facilitate data exchange between different InSAR software packages.
+
+Unified algorithm APIs and pluggable processing engines will further enable researchers to access and compare implementations from multiple software packages within a common Python environment.
+
+### Reproducible — Transparent and Comparable InSAR Processing
+
+Reproducibility is a central principle of FanInSAR.
+
+By standardizing data conventions, documenting algorithm configurations, tracking processing provenance, and providing open benchmark datasets, FanInSAR aims to make InSAR results easier to reproduce, understand, and compare.
+
+Rather than requiring different algorithms to produce identical results, the goal is to ensure that their differences can be systematically evaluated and explained.
 
 ## API at a glance
 
