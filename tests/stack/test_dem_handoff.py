@@ -65,9 +65,9 @@ def test_prepare_promotes_source_dem_and_reopen_reloads(
 
     stack.prepare()
     assert isinstance(stack.dem, RasterDEM)
-    assert (work / "dem" / "stack.tif").is_file()
-    assert (work / "dem" / "stack.json").is_file()
-    assert stack.dem.path == work / "dem" / "stack.tif"
+    assert (work / "dem.tif").is_file()
+    assert (work / "dem.json").is_file()
+    assert stack.dem.path == work / "dem.tif"
 
     reopened = Stack._from_safes(
         _dummy_safes(tmp_path),
@@ -126,8 +126,8 @@ def test_prepare_writes_native_wgs84_from_source(
     stack.prepare()
 
     assert str(stack.dem.crs) == "EPSG:32633"
-    assert (work / "dem" / "stack.tif").is_file()
-    assert (work / "dem" / "stack_wgs84.tif").is_file()
+    assert (work / "dem.tif").is_file()
+    assert (work / "dem_wgs84.tif").is_file()
     wgs84 = stack._dem_wgs84
     assert wgs84 is not None
     assert str(wgs84.crs) == "EPSG:4326"
@@ -219,8 +219,8 @@ def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
     assert south <= 39.5
     assert east >= 11.0
     assert north >= 41.0
-    assert (work / "dem" / "stack.tif").is_file()
-    assert (work / "dem" / "stack_wgs84.tif").is_file()
+    assert (work / "dem.tif").is_file()
+    assert (work / "dem_wgs84.tif").is_file()
     assert any(str(grid.crs) == "EPSG:4326" and grid.bounds[0] <= 9.5 for grid in grids)
 
 

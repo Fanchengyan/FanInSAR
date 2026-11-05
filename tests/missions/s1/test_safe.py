@@ -142,6 +142,75 @@ def test_same_date_swath_canvases_merge_into_one_product(tmp_path: Path) -> None
     assert len(products[0].swath("IW2").bursts) == 2
 
 
+def _write_swath_canvas_zip(
+    tmp_path: Path,
+    *,
+    parent: str,
+    swath_name: str,
+    xml_text: str,
+) -> Path:
+    """Write one per-swath ROI canvas ZIP named like a CDSE canvas SAFE."""
+    import zipfile
+
+    zip_path = tmp_path / f"{parent}-{swath_name}-VV.SAFE.zip"
+    inner = f"{parent}-{swath_name}-VV.SAFE"
+    stem = (
+        f"{parent[:3].lower()}-{swath_name.lower()}-slc-vv-"
+        "20161207t111852-20161207t111919-014273-01716d-001"
+    )
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(f"{inner}/annotation/{stem}.xml", xml_text)
+        archive.writestr(f"{inner}/measurement/{stem}.tiff", b"tiff-bytes")
+    return zip_path
+
+
+def test_adjacent_frame_canvases_merge_per_parent(tmp_path: Path) -> None:
+    """An IW1-only neighbour frame does not block merging the parent IW canvases.
+
+    Track 66D dates look like this: one along-track parent is clipped to IW1
+    only, while the next parent has IW1/IW2/IW3 canvases.  Grouping by parent
+    stem keeps those complementary canvases together.
+    """
+    from faninsar.missions.s1.safe import open_acquisition_products
+
+    xml_text = FIXTURE.read_text(encoding="utf-8")
+    neighbour = "S1A_IW_SLC__1SDV_20260221T053501_20260221T053528_063313_07F369_4180"
+    parent = "S1A_IW_SLC__1SDV_20260221T053526_20260221T053553_063313_07F369_7F6C"
+    paths = [
+        _write_swath_canvas_zip(
+            tmp_path, parent=neighbour, swath_name="IW1", xml_text=xml_text
+        ),
+        _write_swath_canvas_zip(
+            tmp_path, parent=parent, swath_name="IW1", xml_text=xml_text
+        ),
+        _write_swath_canvas_zip(
+            tmp_path,
+            parent=parent,
+            swath_name="IW2",
+            xml_text=xml_text.replace("<swath>IW1</swath>", "<swath>IW2</swath>"),
+        ),
+        _write_swath_canvas_zip(
+            tmp_path,
+            parent=parent,
+            swath_name="IW3",
+            xml_text=xml_text.replace("<swath>IW1</swath>", "<swath>IW3</swath>"),
+        ),
+    ]
+
+    products = open_acquisition_products(paths)
+    assert len(products) == 2
+    by_swaths = {
+        frozenset(item.swath for item in product.swaths): product
+        for product in products
+    }
+    assert frozenset({"IW1"}) in by_swaths
+    assert frozenset({"IW1", "IW2", "IW3"}) in by_swaths
+    merged = by_swaths[frozenset({"IW1", "IW2", "IW3"})]
+    assert merged.find_swath("IW1") is not None
+    assert merged.find_swath("IW2") is not None
+    assert merged.swath("IW1").swath == "IW1"
+
+
 def test_one_burst_swath_canvases_keep_native_burst_indices(tmp_path: Path) -> None:
     """One-burst complementary canvases merge by swath, not as ASF burst segments."""
     import zipfile

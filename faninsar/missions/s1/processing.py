@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -24,7 +24,9 @@ from faninsar.missions.s1 import (
     read_swath_bursts,
     stitch_bursts,
 )
+from faninsar.missions.s1.aux_cal import correct_eap_phase, source_phase_binding
 from faninsar.missions.s1.safe import open_acquisition_products
+from faninsar.missions.s1.types import S1SourcePhase
 from faninsar.processing.coregistration import (
     combine_offset_fields,
     dense_geometry_offsets,
@@ -185,9 +187,17 @@ def _lineage_payload_digest(*arrays: np.ndarray | None) -> str:
 def _phase_state_manifest(state: ProductionPairState) -> dict[str, object] | None:
     """Serialize the typed phase state for a scene-unit manifest."""
     phase_state = state.phase_state
+    sources = {
+        "reference": _source_phase_manifest(state.primary),
+        "secondary": _source_phase_manifest(state.secondary),
+    }
+    source_metadata: dict[str, object] = {}
+    if any(value is not None for value in sources.values()):
+        source_metadata = {"source_phase": sources}
     if phase_state is None:
-        return None
+        return source_metadata or None
     return {
+        **source_metadata,
         "carrier": phase_state.carrier.value,
         "registration_model": phase_state.registration_model,
         "geometric_phase": phase_state.geometric_phase.value,
@@ -489,6 +499,15 @@ class ProductionScene:
     array: BurstArray
     carrier: TOPSCarrierModel
     geometry: RadarGeometryModel
+    source_phase: S1SourcePhase | None = None
+    source_orbits: dict[str, object] = field(default_factory=dict)
+
+
+def _source_phase_manifest(scene: ProductionScene) -> dict[str, object] | None:
+    """Serialize a qualified load binding, never infer it from sample values."""
+    if not isinstance(scene.source_phase, S1SourcePhase):
+        return None
+    return asdict(scene.source_phase)
 
 
 @dataclass(frozen=True, slots=True)
@@ -736,6 +755,7 @@ def load_production_scene(
     burst_index: int = 0,
     dem: DEM | None = None,
     orbit_path: str | Path | None = None,
+    aux_cal_path: str | Path | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     full_range: bool = False,
     read_samples: bool = True,
@@ -762,6 +782,10 @@ def load_production_scene(
         DEM used only to attach geometry context (not required for load).
     orbit_path : path, optional
         Precise ESA EOF orbit. Annotation orbit vectors are used when omitted.
+    aux_cal_path : path, optional
+        AUX_CAL file of this acquisition. Products processed by IPF 002.36
+        are corrected for the elevation antenna phase on load and require it;
+        other products ignore it.
     coregistration_grid : {"radar", "geo"}, optional
         Select the burst sample layout required by the coregistration grid.
     full_range : bool, optional
@@ -781,8 +805,30 @@ def load_production_scene(
     _ = dem
     product = open_safe_product(path) if product is None else product
     s1_swath = product.swath(swath)
+    phase_binding = source_phase_binding(product, aux_cal_path=aux_cal_path)
+    annotation_orbit = s1_swath.orbit
+    source_orbits: dict[str, object] = {
+        "source_plan": {
+            "role": "annotation",
+            "source": annotation_orbit.source,
+            "vectors_digest": hashlib.sha256(
+                json.dumps(
+                    asdict(annotation_orbit), sort_keys=True, default=str
+                ).encode()
+            ).hexdigest(),
+        },
+        "processing": {
+            "role": "external_eof" if orbit_path is not None else "annotation",
+            "source": str(orbit_path)
+            if orbit_path is not None
+            else annotation_orbit.source,
+        },
+    }
     if orbit_path is not None:
         s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+    source_orbits["processing"]["vectors_digest"] = hashlib.sha256(
+        json.dumps(asdict(s1_swath.orbit), sort_keys=True, default=str).encode()
+    ).hexdigest()
     if scope == "burst":
         array = read_full_burst(
             s1_swath,
@@ -791,9 +837,18 @@ def load_production_scene(
             full_range=full_range,
             read_samples=read_samples,
         )
+        if read_samples:
+            (array,) = correct_eap_phase(
+                product, s1_swath, [array], aux_cal_path=aux_cal_path
+            )
         burst = s1_swath.bursts[burst_index]
     elif scope == "swath":
-        bursts = read_swath_bursts(s1_swath)
+        bursts = correct_eap_phase(
+            product,
+            s1_swath,
+            read_swath_bursts(s1_swath),
+            aux_cal_path=aux_cal_path,
+        )
         array = stitch_bursts(bursts, overlap_blend=True)
         burst = s1_swath.bursts[0]
     else:
@@ -825,6 +880,8 @@ def load_production_scene(
         array=array,
         carrier=carrier,
         geometry=geometry,
+        source_phase=phase_binding,
+        source_orbits=source_orbits,
     )
 
 
@@ -2900,6 +2957,29 @@ BurstSelection = (
 )
 
 
+def _union_swath_names(products: Sequence[S1Product]) -> tuple[str, ...]:
+    """Return sub-swath names present on any frame, ordered by slant range."""
+    seen: dict[str, float] = {}
+    for product in products:
+        for swath in product.swaths:
+            seen.setdefault(swath.swath, float(swath.slant_range_time_s))
+    return tuple(name for name, _ in sorted(seen.items(), key=lambda item: item[1]))
+
+
+def _first_swath(products: Sequence[S1Product], name: str) -> S1Swath:
+    """Return the first frame that carries ``name``.
+
+    Adjacent along-track frames of one date need not share every IW/EW
+    sub-swath; range offsets and burst geometry still come from any frame
+    that holds the named swath.
+    """
+    for product in products:
+        found = product.find_swath(name)
+        if found is not None:
+            return found
+    return reject_invalid_state(f"swath {name!r} not found in any frame")
+
+
 def _as_frame_paths(
     value: str | Path | Sequence[str | Path],
     name: str,
@@ -2982,9 +3062,10 @@ def _normalize_burst_selection(
     if bursts is None:
         for frame_index in range(frame_count):
             for swath in swaths:
-                resolved[(frame_index, swath)] = list(
-                    range(burst_counts[(frame_index, swath)])
-                )
+                count = burst_counts.get((frame_index, swath), 0)
+                if count <= 0:
+                    continue
+                resolved[(frame_index, swath)] = list(range(count))
         return resolved
     if isinstance(bursts, list):
         if len(bursts) != frame_count:
@@ -3001,15 +3082,22 @@ def _normalize_burst_selection(
     for frame_index, selection in enumerate(per_frame):
         if selection is None:
             for swath in swaths:
-                resolved[(frame_index, swath)] = list(
-                    range(burst_counts[(frame_index, swath)])
-                )
+                count = burst_counts.get((frame_index, swath), 0)
+                if count <= 0:
+                    continue
+                resolved[(frame_index, swath)] = list(range(count))
             continue
         for swath in swaths:
+            count = burst_counts.get((frame_index, swath), 0)
+            if count <= 0:
+                continue
+            raw = selection.get(swath, "all")
+            if not raw:
+                continue
             resolved[(frame_index, swath)] = _burst_index_list(
-                selection.get(swath, "all"),
+                raw,
                 swath,
-                burst_counts[(frame_index, swath)],
+                count,
             )
     return resolved
 
@@ -3080,7 +3168,9 @@ def _auto_dem_bounds(
 
     quads: list[np.ndarray] = []
     for (frame_index, swath), indices in resolved.items():
-        s1_swath = primary_products[frame_index].swath(swath)
+        s1_swath = primary_products[frame_index].find_swath(swath)
+        if s1_swath is None:
+            continue
         orbit_path = None if orbits is None else orbits[frame_index]
         if orbit_path is not None:
             s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
@@ -3237,7 +3327,10 @@ def _select_bursts_by_roi(
     for frame_index, product in enumerate(products):
         orbit_path = None if orbits is None else orbits[frame_index]
         for swath in swaths:
-            s1_swath = product.swath(swath)
+            s1_swath = product.find_swath(swath)
+            if s1_swath is None:
+                resolved[(frame_index, swath)] = []
+                continue
             if orbit_path is not None:
                 s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
             indices: list[int] = []
@@ -3300,6 +3393,8 @@ def _roi_burst_window(
     *,
     device: str,
     buffer_m: float = 320.0,
+    first_valid_sample: Sequence[int] | None = None,
+    last_valid_sample: Sequence[int] | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Return the radar window covering the ROI-burst quad intersection."""
     from shapely.geometry import Polygon as ShapelyPolygon
@@ -3329,6 +3424,14 @@ def _roi_burst_window(
         lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
         lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
     height = np.asarray(dem.sample(lat, lon), dtype=np.float64)
+    # DEMs are typically cropped to the ROI bounding box; points that fall
+    # on or just outside the sampled edge return NaN and would otherwise
+    # fail geo2rdr convergence.  Fall back to the median of valid DEM
+    # heights (a better guess than ellipsoid h=0 when the ROI sits above
+    # or below mean sea level, e.g. ~3-4 km at high elevation sites).
+    valid_height = height[np.isfinite(height)]
+    fallback_h = float(np.median(valid_height)) if valid_height.size else 0.0
+    height = np.where(np.isfinite(height), height, fallback_h)
     transform = run_geo2rdr(geometry, lat, lon, height, device=device)
     azimuth = np.asarray(transform.azimuth_index, dtype=np.float64)
     range_index = np.asarray(transform.range_index, dtype=np.float64)
@@ -3349,6 +3452,27 @@ def _roi_burst_window(
     col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1 + rg_px)
     if row1 <= row0 or col1 <= col0:
         return None
+    # A sliced/canvas SAFE only holds echo on the lines its
+    # ``firstValidSample``/``lastValidSample`` mask marks valid.  The ROI can
+    # project onto lines that carry no samples at all; intersect the window
+    # with the per-line valid mask so a disjoint polygon does not produce an
+    # all-zero crop.  Columns shrink to the union of the valid columns of the
+    # lines the window keeps.
+    if first_valid_sample is not None and last_valid_sample is not None:
+        first = np.asarray(first_valid_sample, dtype=np.int64)
+        last = np.asarray(last_valid_sample, dtype=np.int64)
+        rows = np.arange(row0, min(row1, len(first)))
+        valid_rows = rows[(first[rows] >= 0) & (last[rows] > first[rows])]
+        if valid_rows.size == 0:
+            return None
+        row0 = int(valid_rows.min())
+        row1 = int(valid_rows.max()) + 1
+        lo = int(first[valid_rows].min())
+        hi = int(last[valid_rows].max()) + 1
+        col0 = max(col0, lo)
+        col1 = min(col1, hi)
+        if row1 <= row0 or col1 <= col0:
+            return None
     return row0, row1, col0, col1
 
 
@@ -3408,26 +3532,63 @@ def _burst_time_axis(
     )
 
 
+def _burst_absolute_id_map(swath: S1Swath) -> dict[int, int]:
+    """Return ``{absolute_burst_id: burst_index}`` for bursts that carry one.
+
+    ``absolute_burst_id`` is the mission-independent ESA identifier (stage-1
+    ``S1Burst.absolute_burst_id``): identical numbers on Sentinel-1A/B/C/D
+    mark the same along-track ground strip, so it is the exact pairing key
+    whenever the catalog supplied it.  Bursts parsed from annotation XML
+    alone keep ``None`` and are not mapped.
+    """
+    mapping: dict[int, int] = {}
+    for index, burst in enumerate(swath.bursts):
+        if burst.absolute_burst_id is None:
+            continue
+        mapping.setdefault(int(burst.absolute_burst_id), index)
+    return mapping
+
+
 def _common_burst_pairs(
     primary_swath: S1Swath,
     secondary_swath: S1Swath,
 ) -> dict[int, int]:
     """Return ``{primary_index: secondary_index}`` for bursts sharing ground.
 
-    Matches each primary burst to the secondary burst nearest in along-track
-    position (ISCE2 ``getBurstOffset`` model), so a whole-burst index shift
-    between products — as between Sentinel-1C and Sentinel-1D, whose bursts
-    are clipped to different start lines — still pairs the same ground strip.
-    A candidate is accepted when its position gap is within half of one
-    burst's azimuth extent.
+    Two-tier matching:
+
+    1. **Exact ``absolute_burst_id`` match** — when a primary burst carries
+       a catalog absolute id *and* the secondary carries any ids, the same
+       id on the secondary is its pair, unconditionally (the id already
+       encodes the shared ground strip across S1A/B/C/D).  A primary *with*
+       an id but no same-id secondary is left unpaired rather than guessed.
+    2. **ANX/time-axis fallback** — reached whenever exact matching is
+       impossible: a primary burst whose ``absolute_burst_id`` is ``None``,
+       or a secondary product that carries no ids at all.  The primary is
+       matched to the nearest secondary burst in along-track position
+       (ISCE2 ``getBurstOffset`` model), accepted when the position gap is
+       within half of one burst's azimuth extent.  Products clipped to
+       different start lines — e.g. Sentinel-1C vs Sentinel-1D — still
+       resolve this way.
     """
+    secondary_by_id = _burst_absolute_id_map(secondary_swath)
+    pairs: dict[int, int] = {}
     primary_axis, secondary_axis, circular = _burst_time_axis(
         primary_swath, secondary_swath
     )
     window_s = _burst_window_seconds(primary_swath)
     tolerance = 0.5 * window_s
-    pairs: dict[int, int] = {}
     for primary_index, primary_time in enumerate(primary_axis):
+        primary_absolute = primary_swath.bursts[primary_index].absolute_burst_id
+        if primary_absolute is not None and secondary_by_id:
+            # Exact id pairing: the absolute id is the shared-ground key.
+            # Only enforced when the secondary carries ids too — an
+            # annotation-only secondary product falls back to ANX below so
+            # id-bearing path-SAFEs still pair with legacy products.
+            match = secondary_by_id.get(int(primary_absolute))
+            if match is not None:
+                pairs[primary_index] = match
+            continue
         if not np.isfinite(primary_time):
             pairs[primary_index] = primary_index
             continue
@@ -3459,10 +3620,10 @@ def _swath_range_offsets(
     swaths: tuple[str, ...],
     primary_products: Sequence[S1Product],
 ) -> dict[str, int]:
-    first = primary_products[0].swath(swaths[0])
+    first = _first_swath(primary_products, swaths[0])
     offsets: dict[str, int] = {}
     for name in swaths:
-        item = primary_products[0].swath(name)
+        item = _first_swath(primary_products, name)
         if name == swaths[0]:
             offsets[name] = 0
         else:

@@ -1,14 +1,17 @@
 """Mission-owned covering EOF discovery and download (PROPOSAL-0054).
 
-Orbit fetch runs only after local SAFE files exist.  Covering POEORB then
-RESORB objects are listed and GET from the anonymous s1-orbits S3 origin.
-Caller-supplied covering files remain a pin.  A catalog miss leaves
-SAFE-embedded restituted vectors selected; a failed download is an error.
+Covering POEORB then RESORB objects are listed and GET from the anonymous
+s1-orbits S3 origin.  ``from_search`` may prefetch those files into the
+workspace cache while CDSE XML/burst bytes transfer; bindings still happen
+at the first precise-orbit stage.  Caller-supplied covering files remain a
+pin.  A catalog miss leaves SAFE-embedded restituted vectors selected; a
+failed download is an error.
 """
 
 from __future__ import annotations
 
 import re
+import threading
 import urllib.parse
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -175,6 +178,30 @@ def _cached_eof_paths(cache_dir: Path) -> tuple[Path, ...]:
     )
 
 
+def _cached_covering_paths(
+    cache_dir: Path,
+    intervals: Mapping[str, tuple[datetime, datetime]],
+    mission_ids: Mapping[str, str],
+) -> dict[str, Path]:
+    """Bind cached EOFs from filename windows without parsing XML bodies."""
+    cached = _cached_eof_paths(cache_dir)
+    if not cached:
+        return {}
+    names = [path.name for path in cached]
+    by_name = {path.name: path for path in cached}
+    selected: dict[str, Path] = {}
+    for date_id, interval in intervals.items():
+        mission = str(mission_ids.get(date_id, "")).upper()
+        ranked = select_covering_eof_keys(
+            names,
+            interval=interval,
+            mission_id=mission,
+        )
+        if ranked:
+            selected[date_id] = by_name[Path(ranked[0]).name]
+    return selected
+
+
 def _eof_asset(key: str) -> RemoteAsset:
     """Build an anonymous RemoteAsset for one s1-orbits EOF object."""
     parsed = parse_eof_filename(key)
@@ -211,6 +238,109 @@ def _raise_download_error(date_id: str, error: BaseException) -> None:
 def _adapter() -> S1OrbitsAdapter:
     """Return the registered anonymous s1-orbits adapter."""
     return get_s1_orbits_adapter()
+
+
+def covering_orbit_windows(
+    items: Sequence[object],
+) -> tuple[dict[str, tuple[datetime, datetime]], dict[str, str]]:
+    """Build covering EOF windows from catalog items without opening a SAFE.
+
+    Same calendar date on different satellites keeps a distinct key so both
+    files land in the cache.  Same satellite and date unions the sensing
+    interval.  Items missing a platform or start time are skipped.
+
+    Parameters
+    ----------
+    items : sequence
+        Provider catalog items (``CatalogItem``) from an ``S1Search``.
+
+    Returns
+    -------
+    tuple of dict
+        ``(intervals, mission_ids)`` keyed by ``"{mission}:{YYYYMMDD}"``.
+
+    """
+    from faninsar.missions.s1.s1search import _date_key, _end, _platform, _start
+
+    intervals: dict[str, tuple[datetime, datetime]] = {}
+    mission_ids: dict[str, str] = {}
+    for item in items:
+        date_id = _date_key(item)
+        mission = _platform(item)
+        start = _start(item)
+        if not date_id or mission not in _MISSIONS or start is None:
+            continue
+        stop = max(_end(item) or start, start)
+        key = f"{mission}:{date_id}"
+        if key in intervals:
+            lo, hi = intervals[key]
+            intervals[key] = (min(lo, start), max(hi, stop))
+        else:
+            intervals[key] = (start, stop)
+            mission_ids[key] = mission
+    return intervals, mission_ids
+
+
+def prefetch_covering_orbits(
+    items: Sequence[object],
+    cache_dir: str | Path,
+    *,
+    budget: RemoteResourceBudget | None = None,
+) -> dict[str, Path]:
+    """Download covering EOFs for search items into ``cache_dir``.
+
+    Bindings stay empty here; :func:`ensure_covering_orbit_paths` at the
+    precise-orbit stage reuses the cached files.
+    """
+    intervals, mission_ids = covering_orbit_windows(items)
+    if not intervals:
+        return {}
+    return ensure_covering_orbit_paths(
+        intervals=intervals,
+        mission_ids=mission_ids,
+        cache_dir=cache_dir,
+        auto_fetch=True,
+        budget=budget,
+    )
+
+
+def _run_orbit_prefetch(
+    items: tuple[object, ...],
+    cache_dir: Path,
+    budget: RemoteResourceBudget | None,
+) -> None:
+    """Download covering EOFs; log and continue on failure."""
+    try:
+        prefetch_covering_orbits(items, cache_dir, budget=budget)
+    except Exception:
+        logger.exception(
+            "orbit prefetch from s1-orbits failed; precise-orbit stage will retry"
+        )
+
+
+def start_orbit_prefetch(
+    items: Sequence[object],
+    cache_dir: str | Path,
+    *,
+    budget: RemoteResourceBudget | None = None,
+) -> threading.Thread | None:
+    """Start an s1-orbits GET on a dedicated thread.
+
+    The CDSE range path uses its own asyncio session and AIMD window.
+    Orbit bytes come from anonymous S3, so they must not share that
+    window.  Returns ``None`` when no catalog item has a covering window.
+    """
+    intervals, _mission_ids = covering_orbit_windows(items)
+    if not intervals:
+        return None
+    thread = threading.Thread(
+        target=_run_orbit_prefetch,
+        args=(tuple(items), Path(cache_dir), budget),
+        name="faninsar-s1-orbit-prefetch",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def ensure_covering_orbit_paths(
@@ -268,14 +398,12 @@ def ensure_covering_orbit_paths(
     if not auto_fetch:
         return pins
 
-    cached = _cached_eof_paths(cache)
-    if cached:
-        from_cache = select_orbit_bindings(
-            cached,
-            {date_id: intervals[date_id] for date_id in missing},
-            mission_ids=mission_ids,
-            require_coverage=False,
-        )
+    from_cache = _cached_covering_paths(
+        cache,
+        {date_id: intervals[date_id] for date_id in missing},
+        mission_ids,
+    )
+    if from_cache:
         pins.update(from_cache)
         missing = [date_id for date_id in intervals if date_id not in pins]
     if not missing:
@@ -328,13 +456,12 @@ def ensure_covering_orbit_paths(
         destination = _orbit_destination(cache, covering)
         overwrite = False
         if destination.is_file():
-            bound = select_orbit_bindings(
-                [destination],
-                {date_id: interval},
-                mission_ids={date_id: mission},
-                require_coverage=False,
+            ranked_local = select_covering_eof_keys(
+                [destination.name],
+                interval=interval,
+                mission_id=mission,
             )
-            if date_id in bound:
+            if ranked_local:
                 fetched[date_id] = destination
                 continue
             overwrite = True
@@ -350,22 +477,18 @@ def ensure_covering_orbit_paths(
             _raise_download_error(date_id, error)
         fetched[date_id] = destination
     pins.update(fetched)
-    if not pins:
-        return {}
-    return select_orbit_bindings(
-        pins,
-        {date_id: intervals[date_id] for date_id in pins},
-        mission_ids=mission_ids,
-        require_coverage=False,
-    )
+    return pins
 
 
 __all__ = [
     "S1_ORBITS_CATALOG",
     "S1_ORBITS_ORIGIN",
     "EofFilename",
+    "covering_orbit_windows",
     "ensure_covering_orbit_paths",
     "ensure_s1_orbits_catalog",
     "parse_eof_filename",
+    "prefetch_covering_orbits",
     "select_covering_eof_keys",
+    "start_orbit_prefetch",
 ]

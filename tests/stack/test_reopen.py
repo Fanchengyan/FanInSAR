@@ -69,10 +69,14 @@ def _stack(
     from faninsar.stack.search import MissionPreparedInputs
 
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
+    # Track resolution would write ``track_metadata`` into ``extra`` during
+    # prepare(), changing the resume digest of the pre-committed scenes;
+    # these tests exercise the identity flow, not the track map.
+    stack._track_metadata = lambda: None  # type: ignore[method-assign]
     # Every scene product is pre-committed, so Reference preparation would
     # only open the fixture SAFEs to resolve a selection nothing consumes.
     stack._prepare_reference_scene = (  # type: ignore[method-assign]
-        lambda *, overwrite: None
+        lambda *, overwrite, polygon=None: None
     )
     stack._prepare_mission = (  # type: ignore[method-assign]
         lambda: MissionPreparedInputs(
@@ -444,3 +448,33 @@ def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> 
     # The other orbit has no download record: surfaced as unverifiable.
     other = orbit_records[stack.catalog.dates[1]]
     assert other["verification"]["status"] == "unverifiable"
+
+
+def test_aux_cal_bindings_round_trip_through_stack_json(tmp_path: Path) -> None:
+    """Per-date AUX_CAL bindings persist under ``inputs.aux_cal`` and reopen."""
+    stack = _stack(tmp_path)
+    aux = (
+        stack.config.work_dir
+        / "aux_cal"
+        / "S1A_AUX_CAL_V20140908T000000_G20240327T101157.SAFE"
+        / "data"
+        / "s1a-aux-cal.xml"
+    )
+    aux.parent.mkdir(parents=True, exist_ok=True)
+    aux.write_bytes(b"<auxiliaryCalibration/>")
+    bound = dict.fromkeys(stack.catalog.dates, aux)
+    stack.config.extra["aux_cal_paths"] = dict(bound)
+    stack.prepare()
+    document = json.loads(
+        (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
+    )
+    assert set(document["inputs"]["aux_cal"]) == set(bound)
+    assert "calibrations" not in document["inputs"]
+
+    reopened = Stack.open(stack.config.work_dir, device="cpu")
+
+    restored = reopened.config.extra["aux_cal_paths"]
+    assert {date: str(path) for date, path in restored.items()} == {
+        date: str(path) for date, path in bound.items()
+    }
+    assert reopened._aux_cal_path_for(stack.catalog.dates[1]) == aux

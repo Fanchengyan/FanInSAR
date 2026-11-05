@@ -7,6 +7,7 @@ Submodules:
 - :mod:`faninsar.missions.s1.io.remote` — remote ASF burst extraction
 - :mod:`faninsar.missions.s1.io.export`  — SAFE subset directory export
 - :mod:`faninsar.missions.s1.io.canvas`  — full-burst-height ROI SAFE canvases
+- :mod:`faninsar.missions.s1.io.path_safe` — same-track multi-burst SAFE assembly
 
 Public names are re-exported here so existing imports
 (``from faninsar.missions.s1.io import read_full_burst``) keep working
@@ -30,6 +31,11 @@ from faninsar.missions.s1.io.extract import (
     extract_burst,
     extract_bursts,
 )
+from faninsar.missions.s1.io.path_safe import (
+    PathBurstPayload,
+    PathSafeResult,
+    write_path_safe,
+)
 from faninsar.missions.s1.io.read import (
     BurstArray,
     read_burst_window,
@@ -45,6 +51,8 @@ from faninsar.missions.s1.io.remote import (
 __all__ = [
     "BurstArray",
     "BurstFetchedWindow",
+    "PathBurstPayload",
+    "PathSafeResult",
     "RemoteSafe",
     "RoiSafeCanvas",
     "estimate_burst_bytes",
@@ -58,5 +66,6 @@ __all__ = [
     "read_swath_bursts",
     "splice_overlap_into_canvas",
     "stitch_bursts",
+    "write_path_safe",
     "write_roi_safe_canvas",
 ]

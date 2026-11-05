@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 import zipfile
 from collections import defaultdict
 from dataclasses import replace
@@ -22,6 +23,48 @@ if TYPE_CHECKING:
 _SUPPORTED_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
 _MISSION_PREFIXES = ("S1A", "S1B", "S1C", "S1D")
 _MISSION_ID_RE = re.compile(r"<missionId>\s*(S1[ABCD])\s*</missionId>", re.IGNORECASE)
+_IPF_SOFTWARE_NAME = "Sentinel-1 IPF"
+_SWATH_CANVAS_SUFFIX = re.compile(
+    r"[-_](IW[1-3]|EW[1-5])-(VV|VH|HH|HV)$",
+    re.IGNORECASE,
+)
+
+
+def parse_ipf_version(manifest: bytes | str) -> str | None:
+    """Return the Sentinel-1 IPF version recorded in ``manifest.safe``.
+
+    Reads ``processing/facility/software@version`` the way ISCE2's
+    ``populateIPFVersion`` does.  A software element named
+    ``"Sentinel-1 IPF"`` wins; otherwise the first versioned ``software``
+    element is used.
+
+    Parameters
+    ----------
+    manifest : bytes or str
+        ``manifest.safe`` document.
+
+    Returns
+    -------
+    str or None
+        Version such as ``"002.36"``, or ``None`` when the manifest is not XML
+        or has no processing software record.
+
+    """
+    try:
+        root = ET.fromstring(manifest)
+    except ET.ParseError:
+        return None
+    fallback: str | None = None
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "software":
+            continue
+        version = str(element.attrib.get("version", "")).strip()
+        if not version:
+            continue
+        if element.attrib.get("name", "").strip() == _IPF_SOFTWARE_NAME:
+            return version
+        fallback = fallback or version
+    return fallback
 
 
 def open_safe_product(
@@ -74,8 +117,9 @@ def open_acquisition_products(
 
     Full-scene frames stay separate. Same-date ASF burst ZIPs that each carry
     a single burst are assembled into one product so NESD sees adjacent bursts
-    of one swath. Same-date ROI canvases that each carry a disjoint sub-swath
-    of one parent scene are assembled the same way.
+    of one swath. ROI canvases that each carry a disjoint sub-swath of one
+    parent scene are assembled per parent, so an adjacent along-track frame
+    on the same date does not block the merge.
 
     Parameters
     ----------
@@ -98,13 +142,7 @@ def open_acquisition_products(
 
     """
     products = [open_safe_product(path, polarizations=polarizations) for path in paths]
-    if len(products) <= 1:
-        return products
-    if _all_complementary_swath_canvases(products):
-        return [_merge_swath_canvas_products(products)]
-    if _all_single_burst_segments(products):
-        return [_merge_burst_segment_products(products)]
-    return products
+    return _merge_same_date_products(products)
 
 
 def open_safe_acquisition(
@@ -143,6 +181,64 @@ def open_safe_acquisition(
     return products[0]
 
 
+def _canvas_stem(product: S1Product) -> str:
+    """Return the SAFE source stem with ``.SAFE`` / ``.zip`` suffixes stripped."""
+    name = Path(product.source_path).name
+    lower = name.lower()
+    if lower.endswith(".safe.zip"):
+        return name[: -len(".SAFE.zip")]
+    if lower.endswith(".zip"):
+        return name[: -len(".zip")]
+    if lower.endswith(".safe"):
+        return name[: -len(".SAFE")]
+    return name
+
+
+def _canvas_parent_key(product: S1Product) -> str:
+    """Return the parent-scene stem of a per-swath ROI canvas, else ``product_id``.
+
+    Canvas directories are named ``<parent>-IW1-VV.SAFE``.  Adjacent along-track
+    frames of the same date share a mission and absolute orbit, so grouping by
+    that parent stem keeps complementary IW canvases together without mixing
+    frames.
+    """
+    stem = _canvas_stem(product)
+    match = _SWATH_CANVAS_SUFFIX.search(stem)
+    if match is None:
+        return product.product_id
+    return stem[: match.start()]
+
+
+def _looks_like_swath_canvas(product: S1Product) -> bool:
+    """Return whether the source name is a per-swath ROI canvas."""
+    return _SWATH_CANVAS_SUFFIX.search(_canvas_stem(product)) is not None
+
+
+def _merge_same_date_products(products: Sequence[S1Product]) -> list[S1Product]:
+    """Merge complementary extracts, grouping ROI canvases by parent scene."""
+    if len(products) <= 1:
+        return list(products)
+    # ASF one-burst ZIPs share an orbit but not a canvas parent stem; keep the
+    # date-wide burst-segment merge.  Per-swath ROI canvases go by parent so an
+    # adjacent along-track frame cannot collide on IW1 and block IW2/IW3.
+    if _all_single_burst_segments(products) and not any(
+        _looks_like_swath_canvas(product) for product in products
+    ):
+        return [_merge_burst_segment_products(products)]
+    grouped: dict[str, list[S1Product]] = defaultdict(list)
+    for product in products:
+        grouped[_canvas_parent_key(product)].append(product)
+    merged: list[S1Product] = []
+    for group in grouped.values():
+        if _all_complementary_swath_canvases(group):
+            merged.append(_merge_swath_canvas_products(group))
+        elif _all_single_burst_segments(group):
+            merged.append(_merge_burst_segment_products(group))
+        else:
+            merged.extend(group)
+    return merged
+
+
 def _open_safe_directory(
     root: Path,
     *,
@@ -169,6 +265,12 @@ def _open_safe_directory(
     if not annotation_files:
         reject_product(f"no annotation XML found under {safe_root}")
 
+    manifest_path = safe_root / "manifest.safe"
+    ipf_version = (
+        parse_ipf_version(manifest_path.read_bytes())
+        if manifest_path.is_file()
+        else None
+    )
     swaths: list[S1Swath] = []
     xml_texts: list[str] = []
     for annotation in annotation_files:
@@ -191,6 +293,7 @@ def _open_safe_directory(
             *(path.name for path in annotation_files),
         ),
         xml_texts=xml_texts,
+        ipf_version=ipf_version,
     )
 
 
@@ -212,6 +315,12 @@ def _open_safe_zip(
         )
         if not annotation_names:
             reject_product(f"no annotation XML found in {zip_path}")
+        manifests = [name for name in names if name.endswith("manifest.safe")]
+        ipf_version = (
+            parse_ipf_version(archive.read(manifests[0]))
+            if len(manifests) == 1
+            else None
+        )
 
         swaths: list[S1Swath] = []
         xml_texts: list[str] = []
@@ -240,6 +349,7 @@ def _open_safe_zip(
         polarizations=polarizations,
         identity_names=identity_names,
         xml_texts=xml_texts,
+        ipf_version=ipf_version,
     )
 
 
@@ -272,6 +382,7 @@ def _assemble_product(
     polarizations: tuple[str, ...] | None,
     identity_names: Sequence[str] = (),
     xml_texts: Sequence[str] = (),
+    ipf_version: str | None = None,
 ) -> S1Product:
     present = tuple(sorted({swath.polarization for swath in swaths}))
     requested = polarizations or present
@@ -313,6 +424,7 @@ def _assemble_product(
         absolute_orbit=absolute_orbit,
         polarizations=tuple(requested),
         swaths=filtered,
+        ipf_version=ipf_version,
     )
 
 
@@ -408,7 +520,24 @@ def _merge_swath_canvas_products(products: Sequence[S1Product]) -> S1Product:
         absolute_orbit=first.absolute_orbit,
         polarizations=polarizations,
         swaths=tuple(merged_swaths),
+        ipf_version=_merged_ipf_version(products),
     )
+
+
+def _merged_ipf_version(products: Sequence[S1Product]) -> str | None:
+    """Return the shared IPF version of merged segments.
+
+    Segments of one acquisition date come from one processing run; a mix of
+    versions (mirroring ISCE2's slice-combination check) is rejected because
+    a single EAP-correction decision would be wrong for part of the scene.
+    """
+    versions = {product.ipf_version for product in products}
+    if len(versions) > 1:
+        reject_product(
+            "cannot merge same-date Sentinel-1 segments from different IPF "
+            f"versions: {sorted(str(v) for v in versions)}"
+        )
+    return next(iter(versions))
 
 
 def _all_single_burst_segments(products: Sequence[S1Product]) -> bool:
@@ -495,4 +624,5 @@ def _merge_burst_segment_products(products: Sequence[S1Product]) -> S1Product:
         absolute_orbit=first.absolute_orbit,
         polarizations=polarizations,
         swaths=tuple(merged_swaths),
+        ipf_version=_merged_ipf_version(products),
     )

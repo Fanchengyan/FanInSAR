@@ -456,6 +456,185 @@ def _record_from_product(product: Any) -> dict[str, Any]:
     raise AssertionError  # pragma: no cover
 
 
+def _umm_additional_attribute(umm: Mapping[str, Any], name: str) -> Any:
+    """Return one UMM ``AdditionalAttributes`` value, or ``None``."""
+    attributes = umm.get("AdditionalAttributes")
+    if not isinstance(attributes, Sequence) or isinstance(attributes, (str, bytes)):
+        return None
+    for attribute in attributes:
+        if not isinstance(attribute, Mapping):
+            continue
+        if str(attribute.get("Name", "")) != name:
+            continue
+        values = attribute.get("Values")
+        if (
+            isinstance(values, Sequence)
+            and not isinstance(values, (str, bytes))
+            and values
+        ):
+            return values[0]
+        return None
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Coerce one catalog attribute to ``int`` or return ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _datetime_or_none(value: Any) -> Any:
+    """Return a timezone-aware datetime for an ISO string, or ``None``."""
+    from datetime import UTC, datetime
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _nested_mapping(record: Mapping[str, Any], *keys: str) -> Mapping[str, Any]:
+    """Return the first mapping found at ``record[k1][k2]...``."""
+    current: Any = record
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, Mapping) else {}
+
+
+def _asf_science_properties(record: Mapping[str, Any], product: Any) -> dict[str, Any]:
+    """Extract track/burst search fields from one ASF product.
+
+    Both raw UMM records and translated ``properties``/``geojson`` payloads
+    are mined; SLC-BURST products additionally expose a nested ``burst``
+    mapping (asf-search ``S1BurstProduct``).  All values are best-effort —
+    missing attributes leave the key absent rather than ``None`` so
+    ``_sanitize`` keeps a compact property mapping.
+    """
+    umm = record
+    if "AdditionalAttributes" not in umm:
+        umm = getattr(product, "umm", None) if product is not None else None
+        if not isinstance(umm, Mapping):
+            umm = record
+    props = (
+        record.get("properties")
+        if isinstance(record.get("properties"), Mapping)
+        else getattr(product, "properties", None)
+    )
+    props = props if isinstance(props, Mapping) else {}
+    burst = props.get("burst") if isinstance(props.get("burst"), Mapping) else {}
+
+    science: dict[str, Any] = {}
+    absolute = _int_or_none(
+        burst.get("absoluteBurstID")
+        or props.get("absoluteBurstID")
+        or _umm_additional_attribute(umm, "BURST_ID_ABSOLUTE")
+    )
+    if absolute is not None:
+        science["absoluteBurstID"] = absolute
+    relative_burst = _int_or_none(
+        burst.get("relativeBurstID")
+        or props.get("relativeBurstID")
+        or _umm_additional_attribute(umm, "BURST_ID_RELATIVE")
+    )
+    if relative_burst is not None:
+        science["relativeBurstID"] = relative_burst
+    relative_orbit = _int_or_none(
+        props.get("pathNumber")
+        or props.get("relativeOrbit")
+        or record.get("relative_orbit")
+        or _umm_additional_attribute(umm, "PATH_NUMBER")
+    )
+    if relative_orbit is not None:
+        science["relativeOrbit"] = relative_orbit
+    direction = (
+        props.get("flightDirection")
+        or props.get("orbitDirection")
+        or record.get("orbit_direction")
+        or _umm_additional_attribute(umm, "ASCENDING_DESCENDING")
+    )
+    if isinstance(direction, str) and direction.strip():
+        science["orbitDirection"] = direction.strip().upper()
+    mission = (
+        props.get("missionName")
+        or props.get("mission")
+        or record.get("mission_id")
+        or _umm_additional_attribute(umm, "MISSION_NAME")
+    )
+    if mission is None:
+        # GeoJSON payloads expose only ``platform`` ("Sentinel-1A"); reduce
+        # it to the SAFE mission id so both record shapes agree.
+        platform = props.get("platform") or (
+            _nested_mapping(record, "Platforms")
+            if isinstance(record.get("Platforms"), list) and record["Platforms"]
+            else None
+        )
+        if isinstance(platform, list) and platform and isinstance(platform[0], Mapping):
+            platform = platform[0].get("ShortName")
+        if isinstance(platform, str):
+            text = platform.strip().upper().replace("-", "")
+            if text.startswith("SENTINEL1") and len(text) > len("SENTINEL1"):
+                mission = "S1" + text[-1]
+    if isinstance(mission, str) and mission.strip():
+        science["mission"] = mission.strip()
+    sensing = _datetime_or_none(
+        props.get("startTime")
+        or props.get("sensingStart")
+        or _umm_additional_attribute(umm, "SENSING_START")
+        or _nested_mapping(record, "TemporalExtent", "RangeDateTime").get(
+            "BeginningDateTime"
+        )
+        or _nested_mapping(record, "DataGranule").get("ProductionDateTime")
+    )
+    if sensing is not None:
+        science["sensingStart"] = sensing
+    return science
+
+
+def _merge_science_properties(
+    record: dict[str, Any], science: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Merge ASF track/burst fields into a yielded record's properties.
+
+    The CMR normalizer exposes ``acquisition.properties`` (published as
+    ``CatalogItem.acquisition.properties``); records that already carry
+    normalized ``assets`` keep their own shape.  Fields are merged into
+    both ``record["acquisition"]["properties"]`` and the top-level
+    ``record["properties"]`` so downstream readers see one location either
+    way; existing provider values win over re-derived ones.
+    """
+    if not science:
+        return record
+    acquisition = record.get("acquisition")
+    if isinstance(acquisition, Mapping):
+        merged = dict(acquisition)
+        existing = merged.get("properties")
+        base = dict(existing) if isinstance(existing, Mapping) else {}
+        base.update({k: v for k, v in science.items() if k not in base})
+        merged["properties"] = base
+        record["acquisition"] = merged
+    properties = record.get("properties")
+    if isinstance(properties, Mapping):
+        merged_props = dict(properties)
+        merged_props.update({k: v for k, v in science.items() if k not in merged_props})
+        record["properties"] = merged_props
+    elif not isinstance(acquisition, Mapping):
+        record["properties"] = dict(science)
+    return record
+
+
 def _with_asset_link(record: dict[str, Any], product: Any) -> dict[str, Any]:
     """Map ASF's URL property to a CMR data link when needed."""
     _validate_complete_safe_urls(record)
@@ -1000,13 +1179,23 @@ class ASFSearchAdapter:
                 return options
 
     def _pages(self, package: Any, options: Any) -> Iterable[Any]:
-        """Invoke only ASF discovery APIs, preferring bounded page iteration."""
-        generator = getattr(package, "search_generator", None)
-        if callable(generator):
-            return generator(opts=options)
+        """Invoke only ASF discovery APIs, preferring bounded page iteration.
+
+        ``asf_search.search`` is preferred over ``search_generator``: it
+        pages through CMR internally, tolerates ASF's occasional incomplete
+        terminal page (logging a warning instead of failing the whole
+        traversal), and returns a single result list.  ``search_generator``
+        exposes each raw page, and the SLC-BURST CMR collection has been
+        observed to return ``searchComplete=False`` on its final page for
+        multi-satellite windows — which would abort the entire query even
+        though every hit was delivered.
+        """
         search = getattr(package, "search", None)
         if callable(search):
             return (search(opts=options),)
+        generator = getattr(package, "search_generator", None)
+        if callable(generator):
+            return generator(opts=options)
         _error(
             ASFSearchError,
             "missing_search_api",
@@ -1184,6 +1373,7 @@ class ASFSearchAdapter:
                             "ASF result budget was reached before completion",
                         )
                     record = _with_asset_link(_record_from_product(product), product)
+                    science = _asf_science_properties(record, product)
                     if "provider" not in record and "Provider" not in record:
                         record["provider"] = self.provider
                     # ASF product payloads often expose a short name such as
@@ -1191,12 +1381,12 @@ class ASFSearchAdapter:
                     # restore the user-facing scientific identity below.
                     if isinstance(record.get("assets"), Mapping):
                         record["collection"] = self.collection
-                        yield record
+                        yield _merge_science_properties(record, science)
                     else:
                         record["collection"] = self.query_collection
                         normalized = normalizer._normalize(record)
                         normalized["collection"] = self.collection
-                        yield normalized
+                        yield _merge_science_properties(normalized, science)
                     produced += 1
                 if not complete and produced >= parameters["maxResults"]:
                     _error(
@@ -1205,10 +1395,14 @@ class ASFSearchAdapter:
                         "ASF result budget was reached before completion",
                     )
             if saw_page and not last_page_complete:
-                _error(
-                    ASFSearchError,
-                    "incomplete_results",
-                    "asf-search returned an incomplete terminal page",
+                # ``asf_search.search`` already returned every hit CMR
+                # delivered; its ``searchComplete=False`` terminal flag is
+                # unreliable on the SLC-BURST collection (ASF logs
+                # "Results may be incomplete" yet returns the full set).
+                # Treat it as a warning, not a reason to discard the hits.
+                logger.warning(
+                    "ASF flagged the terminal page as incomplete; "
+                    "publishing the hits it returned anyway"
                 )
         except (RemoteLimitError, ASFSearchError):
             raise

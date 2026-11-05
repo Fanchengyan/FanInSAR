@@ -24,10 +24,21 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+# Sit at this concurrency until a 429. A virgin 429 (no climb path) first
+# drops to 3/4, then to 1/2 of that origin. After a climb, a later 429
+# walks back the same steps (19→18→17→15) instead of cutting in half.
+# Concurrent 429s share one decrease. 401 is not congestion.
 _AIMD_SEED = 20
 _CONNECT_ATTEMPTS = 10
 _CONNECT_BACKOFF_S = 2.0
-_STREAM_CHUNK_BYTES = 256 * 1024
+_RATE_LIMIT_ATTEMPTS = 5
+_RATE_LIMIT_BACKOFF_S = 1.5
+# After a cut, leftover 429s from the same wave keep arriving at the new
+# window. Ignore them — and do not probe up — until this hold elapses.
+_AIMD_HOLD_S = 15.0
+_SOCK_CONNECT_S = 30
+_SOCK_READ_S = 60
+_STREAM_CHUNK_BYTES = 16 * 1024
 
 # RFC 9110 single-range Content-Range: ``bytes <first>-<last>/<complete|*>``.
 # Exact match against the requested span is required; anything looser would
@@ -58,8 +69,28 @@ class RangeSpan:
     label: str
 
 
+@dataclass(slots=True)
+class _Revision:
+    """Strong ETag pinning one span's received prefix to one object revision.
+
+    ``etag`` is sent as ``If-Range`` on every request that resumes a
+    non-empty prefix.  A request that starts at the span's first byte
+    replaces it with the response's strong ``ETag`` and reports that value
+    through ``on_etag``.  With no ``etag`` no validator is sent.
+    """
+
+    etag: str | None = None
+    on_etag: Callable[[str], None] | None = None
+
+
 class RangeFetcher:
-    """Reusable async session that concatenates already-sized spans."""
+    """Reusable async session that concatenates already-sized spans.
+
+    The AIMD window stays at ``_AIMD_SEED`` until a 429. With no climb path
+    it drops to 3/4, then 1/2 of that origin; after a climb it walks back
+    the same steps. ``TCPConnector.limit`` tracks the same integer. 401 is
+    auth refresh, not a window event.
+    """
 
     def __init__(
         self,
@@ -86,6 +117,16 @@ class RangeFetcher:
         self._refresh_lock = asyncio.Lock()
         self._generation = 0
         self._window = _AIMD_SEED
+        self._lo = 0
+        self._hi = _AIMD_SEED + 1
+        self._origin = _AIMD_SEED
+        self._ladder: list[int] = []
+        self._virgin = 0
+        self._congested = False
+        self._hold_until = 0.0
+        self._cool: asyncio.Event | None = None
+        self._cool_task: asyncio.Task[None] | None = None
+        self._cool_waiters = 0
 
     @property
     def window(self) -> int:
@@ -98,8 +139,125 @@ class RangeFetcher:
         if self._connector is not None:
             self._connector._limit = self._window
 
+    def _holding(self) -> bool:
+        """Return whether leftover 429s from the last cut should be ignored."""
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return False
+        return now < self._hold_until
+
+    def _retreat(self, sent: int) -> int:
+        """Walk back a remembered climb, else 3/4 then 1/2 of the origin."""
+        while self._ladder and self._ladder[-1] >= sent:
+            self._ladder.pop()
+        if self._ladder:
+            return self._ladder[-1]
+        if self._virgin == 0:
+            self._origin = sent
+            self._virgin = 1
+            nxt = max(1, (sent * 3) // 4)
+            self._ladder = [nxt]
+            return nxt
+        nxt = max(1, self._origin // 2)
+        if nxt >= self._window:
+            nxt = max(1, self._window // 2)
+        self._ladder = [nxt]
+        self._virgin = 2
+        return nxt
+
+    def _on_rate_limit(self, sent: int) -> None:
+        """Shrink once per congestion epoch; 3/4 then 1/2, or walk the climb.
+
+        Every 429 extends a quiet hold. Leftover 429s from the same wave are
+        not a new ceiling — ignore them until ``_AIMD_HOLD_S`` elapses with
+        no further 429, then a success may probe up.
+        """
+        holding = self._holding()
+        try:
+            self._hold_until = asyncio.get_running_loop().time() + _AIMD_HOLD_S
+        except RuntimeError:
+            self._hold_until = 0.0
+        if sent != self._window or holding or self._congested:
+            return
+        self._congested = True
+        self._hi = min(self._hi, sent)
+        nxt = self._retreat(sent)
+        nxt = max(1, min(nxt, self._window, _AIMD_SEED))
+        if self._hi > 1:
+            nxt = min(nxt, self._hi - 1)
+        if self._lo >= nxt:
+            self._lo = max(0, nxt - 1)
+        if nxt != self._window:
+            logger.warning(
+                "range AIMD window %d -> %d (lo=%d hi=%d)",
+                self._window,
+                nxt,
+                self._lo,
+                self._hi,
+            )
+        self._set_window(nxt)
+
+    def _on_success(self, sent: int) -> None:
+        """Mark ``sent`` safe and binary-search toward the last trigger.
+
+        A 206 that left at a higher window is leftover in-flight. During the
+        post-cut hold, successes may raise ``lo`` but must not probe up —
+        leftover 429s would otherwise look like a failed probe. Each probe
+        is remembered so a later 429 can walk the same path back.
+        """
+        if sent > self._window:
+            return
+        if sent < self._hi:
+            self._lo = max(self._lo, sent)
+        if sent == self._window:
+            self._congested = False
+        if self._holding() or self._cool is not None:
+            return
+        if sent != self._window or self._window >= self._hi - 1:
+            return
+        nxt = min(_AIMD_SEED, (self._window + self._hi) // 2)
+        if nxt != self._window:
+            logger.info(
+                "range AIMD window %d -> %d (lo=%d hi=%d)",
+                self._window,
+                nxt,
+                self._lo,
+                self._hi,
+            )
+            if not self._ladder or self._ladder[-1] != nxt:
+                self._ladder.append(nxt)
+        self._set_window(nxt)
+
+    async def _wait_rate_limit(self, sent: int, attempt: int) -> None:
+        """Decrease once, then share one backoff so a 429 wave retries together."""
+        self._on_rate_limit(sent)
+        delay = _RATE_LIMIT_BACKOFF_S * (2**attempt)
+        self._cool_waiters += 1
+        cool = self._cool
+        if cool is None:
+            cool = asyncio.Event()
+            self._cool = cool
+
+            async def _release() -> None:
+                try:
+                    prev = -1
+                    while prev != self._cool_waiters:
+                        prev = self._cool_waiters
+                        await asyncio.sleep(0)
+                    await asyncio.sleep(delay)
+                finally:
+                    if self._cool is cool:
+                        self._cool = None
+                    self._cool_task = None
+                    self._cool_waiters = 0
+                    cool.set()
+
+            self._cool_task = asyncio.create_task(_release())
+        await cool.wait()
+
     async def __aenter__(self) -> Self:
-        """Open one ClientSession with identity encoding and closed trust_env."""
+        """Open one ClientSession; live streams have no total timeout."""
         import aiohttp
 
         self._connector = aiohttp.TCPConnector(limit=self._window)
@@ -108,6 +266,11 @@ class RangeFetcher:
             auto_decompress=False,
             headers={"Accept-Encoding": "identity"},
             trust_env=False,
+            timeout=aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=_SOCK_CONNECT_S,
+                sock_read=_SOCK_READ_S,
+            ),
         )
         return self
 
@@ -119,6 +282,10 @@ class RangeFetcher:
     ) -> None:
         """Close the session."""
         del exc_type, exc, tb
+        task = self._cool_task
+        self._cool_task = None
+        if task is not None:
+            task.cancel()
         session = self._session
         self._session = None
         self._connector = None
@@ -146,7 +313,15 @@ class RangeFetcher:
         bodies = await asyncio.gather(*(_get_span(self, span) for span in span_list))
         return {span.label: body for span, body in zip(span_list, bodies, strict=True)}
 
-    async def fetch_into(self, span: RangeSpan, sink: str | Path | BinaryIO) -> int:
+    async def fetch_into(
+        self,
+        span: RangeSpan,
+        sink: str | Path | BinaryIO,
+        *,
+        on_bytes: Callable[[int], None] | None = None,
+        etag: str | None = None,
+        on_etag: Callable[[str], None] | None = None,
+    ) -> int:
         """Stream one span body into a caller-provided part file or byte sink.
 
         ``sink`` is either a filesystem path (a partial-download ``.part``
@@ -172,6 +347,20 @@ class RangeFetcher:
             append-binary mode for the duration of the call and flushed
             closed before returning; streams must support ``write`` and
             ``tell`` and stay owned by the caller.
+        on_bytes : callable, optional
+            Called with the byte count of each streamed chunk, for download
+            progress reporting.  Purely observational; it never affects the
+            fetch.
+        etag : str, optional
+            Strong ``ETag`` recorded when the existing prefix was started.
+            Every request that resumes a non-empty prefix sends it as
+            ``If-Range``; a response other than the exact expected 206 then
+            raises ``RemoteIntegrityError("revision_changed")`` without
+            consuming the body.  ``None`` sends no validator and assumes the
+            object is immutable.
+        on_etag : callable, optional
+            Called with the strong ``ETag`` of a response to a request that
+            starts at ``span.start``; later resumes in this call pin to it.
 
         Returns
         -------
@@ -187,7 +376,8 @@ class RangeFetcher:
             If ``sink`` is neither a path nor a writable, tell-able stream.
         RemoteIntegrityError
             If the destination already holds more than the span length, or
-            a resumed response fails the strict 206/Content-Range check.
+            a resumed response fails the strict 206/Content-Range check
+            (reason ``revision_changed`` when ``If-Range`` was sent).
         RemoteAccessError
             For the same redirect/401/429 semantics as :meth:`fetch`.
 
@@ -197,8 +387,21 @@ class RangeFetcher:
             msg = "RangeFetcher must be used as an async context manager"
             reject(msg, RuntimeError, logger=logger)
         write, received, close = _open_sink(span, sink)
+        if on_bytes is not None:
+            sink_write = write
+
+            def write(chunk: bytes) -> object:  # type: ignore[misc]
+                on_bytes(len(chunk))
+                return sink_write(chunk)
+
+        revision = _Revision(
+            etag=etag.strip() if etag and not etag.strip().startswith("W/") else None,
+            on_etag=on_etag,
+        )
         try:
-            await _attempt_span_stream(self, span, write, received, allow_refresh=True)
+            await _attempt_span_stream(
+                self, span, write, received, allow_refresh=True, revision=revision
+            )
         finally:
             close()
         return span.end - span.start + 1
@@ -222,9 +425,10 @@ def _open_sink(
     """Adapt ``sink`` to (write, received, close) for the streaming path.
 
     A path is opened in append-binary mode and its size is the received
-    prefix; a stream uses its own ``tell()``.  The returned ``received``
-    reflects live position so a resumed retry continues where the last
-    write stopped.
+    prefix; a stream uses its own ``tell()``.  Each path write is flushed
+    so a few kilobytes of body are visible on disk without waiting for
+    Python's file buffer.  The returned ``received`` reflects live
+    position so a resumed retry continues where the last write stopped.
     """
     expected = span.end - span.start + 1
     if isinstance(sink, str | Path):
@@ -244,12 +448,17 @@ def _open_sink(
                 "range part file is larger than the requested span",
             )
 
+        def write(chunk: bytes) -> object:
+            result = stream.write(chunk)
+            stream.flush()
+            return result
+
         def close() -> None:
             stream.flush()
             os.fsync(stream.fileno())
             stream.close()
 
-        return stream.write, stream.tell, close
+        return write, stream.tell, close
     write = getattr(sink, "write", None)
     tell = getattr(sink, "tell", None)
     if not callable(write) or not callable(tell):
@@ -295,14 +504,22 @@ async def _attempt_span_stream(
     received: Callable[[], int],
     *,
     allow_refresh: bool,
+    revision: _Revision | None = None,
 ) -> None:
     """Drive the streaming span through 429 requeue and shared 401 refresh."""
     last_access_error: RemoteAccessError | None = None
-    for _attempt in range(2):
+    origin_window = fetcher._window
+    for attempt in range(_RATE_LIMIT_ATTEMPTS):
         generation = fetcher._generation
+        sent_window = fetcher._window
         try:
             await _stream_span(
-                fetcher._session, span, write, received, token=fetcher._token
+                fetcher._session,
+                span,
+                write,
+                received,
+                token=fetcher._token,
+                revision=revision,
             )
         except RemoteAccessError as error:
             last_access_error = error
@@ -318,12 +535,19 @@ async def _attempt_span_stream(
                     write,
                     received,
                     allow_refresh=False,
+                    revision=revision,
                 )
                 return
             if error.reason != "range_unavailable":
                 raise
-            fetcher._set_window(fetcher._window // 2)
+            # Rate-limited: pin the window this span first sent at. Retries
+            # after a cut would otherwise look like the new window 429'd.
+            if attempt < _RATE_LIMIT_ATTEMPTS - 1:
+                await fetcher._wait_rate_limit(origin_window, attempt)
+            else:
+                fetcher._on_rate_limit(origin_window)
         else:
+            fetcher._on_success(sent_window)
             return
     assert last_access_error is not None
     raise last_access_error
@@ -350,15 +574,17 @@ async def _stream_span(
     received: Callable[[], int],
     *,
     token: str | None = None,
+    revision: _Revision | None = None,
 ) -> None:
     """Stream one span into ``write``; mid-stream drops resume the suffix.
 
     Each attempt issues ``Range: bytes=(start+received)-end`` so a
-    connection or payload failure that arrives after some bytes were
-    already sunk resumes from the live position instead of restarting
-    the span.  Whole-request failures resume identically because
-    ``received()`` is still zero.  Attempts are bounded by
+    connection, payload, or timeout failure that arrives after some
+    bytes were already sunk resumes from the live position instead of
+    restarting the span.  Whole-request failures resume identically
+    because ``received()`` is still zero.  Attempts are bounded by
     ``_CONNECT_ATTEMPTS`` with the same linear backoff as before.
+    ``revision`` pins resumed suffixes to one strong ETag (``If-Range``).
     """
     import aiohttp
 
@@ -366,6 +592,8 @@ async def _stream_span(
         aiohttp.ClientConnectionError,
         aiohttp.ClientPayloadError,
         asyncio.IncompleteReadError,
+        asyncio.TimeoutError,
+        TimeoutError,
     )
     expected = span.end - span.start + 1
     last_error: Exception | None = None
@@ -377,7 +605,9 @@ async def _stream_span(
         if received() >= expected:
             return
         try:
-            await _request_span_once(session, span, write, received(), token=token)
+            await _request_span_once(
+                session, span, write, received(), token=token, revision=revision
+            )
         except retryable as error:
             last_error = error
             logger.warning(
@@ -417,18 +647,27 @@ async def _request_span_once(
     received: int,
     *,
     token: str | None = None,
+    revision: _Revision | None = None,
 ) -> None:
     """GET the missing suffix once; 429 is retryable, a mismatched 206 is not.
 
     The request covers ``start + received`` through ``end`` so a resumed
     attempt validates the same strict contract: status 206 and an exact
     ``Content-Range: bytes <start+received>-<end>/<complete>`` match.
-    Body bytes are streamed to ``write`` in bounded chunks.
+    Body bytes are streamed to ``write`` in small socket-sized chunks.
+
+    With a pinned ``revision`` a resumed request (``received > 0``) sends
+    ``If-Range``; any answer other than the expected 206 then raises
+    ``revision_changed`` before the body is read.  A request from the
+    span's first byte records the response's strong ``ETag``.
     """
     request_start = span.start + received
     headers = {"Range": f"bytes={request_start}-{span.end}"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
+    if_range = revision.etag if revision is not None and received > 0 else None
+    if if_range:
+        headers["If-Range"] = if_range
     async with session.get(
         span.url,
         headers=headers,
@@ -473,6 +712,16 @@ async def _request_span_once(
             or int(parsed.group(1)) != request_start
             or int(parsed.group(2)) != span.end
         ):
+            if if_range:
+                logger.error(
+                    "range resume was not served from the pinned revision",
+                    extra={"label": span.label, "status": response.status},
+                )
+                _fail(
+                    RemoteIntegrityError,
+                    "revision_changed",
+                    "range resume did not match the recorded object revision",
+                )
             logger.error(
                 "range response did not match requested span",
                 extra={"label": span.label, "status": response.status},
@@ -482,6 +731,20 @@ async def _request_span_once(
                 "content_range_mismatch",
                 "range response did not match the requested span",
             )
+        returned_etag = response.headers.get("ETag", "").strip()
+        if if_range and returned_etag and returned_etag != if_range:
+            logger.error("range resume returned a changed ETag (label=%s)", span.label)
+            _fail(
+                RemoteIntegrityError,
+                "revision_changed",
+                "range resume returned a different object revision",
+            )
+        if received == 0 and revision is not None:
+            etag = returned_etag
+            if etag and not etag.startswith("W/"):
+                revision.etag = etag
+                if revision.on_etag is not None:
+                    revision.on_etag(etag)
         async for chunk in response.content.iter_chunked(_STREAM_CHUNK_BYTES):
             write(bytes(chunk))
 

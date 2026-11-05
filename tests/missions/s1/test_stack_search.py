@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import threading
+import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import numpy as np
 import pytest
 
 from faninsar import remote
@@ -20,16 +20,21 @@ from faninsar.missions.s1.search import (
     normalize_polarizations,
     product_filters,
     provider_polarization_filter,
-    safe_requires_aux_cal,
     select_orbit_bindings,
-    validate_calibration_paths,
 )
 from faninsar.missions.s1.stack import S1Stack
+from faninsar.stack.layout import staged_acquisition_path
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 ROI = BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326")
+
+# Minimal one-burst geometry used by the from_search ASF-path fakes: the
+# downloaded zip is a real one-burst SAFE the extractor can open and
+# reassemble into a path-SAFE.
+_LINES_PER_BURST = 8
+_SAMPLES_PER_BURST = 16
 
 
 def _asf_search(items: list[remote.CatalogItem], spatial: Any = ROI) -> S1Search:
@@ -45,6 +50,7 @@ def _asf_search(items: list[remote.CatalogItem], spatial: Any = ROI) -> S1Search
 def _item(
     *assets: remote.RemoteAsset,
     raw_metadata: dict[str, object] | None = None,
+    properties: dict[str, object] | None = None,
 ) -> remote.CatalogItem:
     """Build one normalized catalog item for seam tests."""
     acquisition = remote.AcquisitionMetadata(
@@ -55,6 +61,7 @@ def _item(
             "type": "Polygon",
             "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]],
         },
+        properties=properties or {},
     )
     return remote.CatalogItem(
         provider="ASF",
@@ -81,6 +88,131 @@ def _asset(
         media_type="application/zip",
         representation="complete",
     )
+
+
+def _burst_xml(sensing_second: int) -> str:
+    """Minimal one-burst IW1 annotation for a reassembled ASF product."""
+    first = " ".join(["0"] * _LINES_PER_BURST)
+    last = " ".join([str(_SAMPLES_PER_BURST - 1)] * _LINES_PER_BURST)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<product>
+  <adsHeader>
+    <missionId>S1A</missionId>
+    <productType>SLC</productType>
+    <polarisation>VV</polarisation>
+    <mode>IW</mode>
+    <swath>IW1</swath>
+    <startTime>2016-12-07T11:18:{sensing_second:02d}.000000</startTime>
+    <stopTime>2016-12-07T11:18:{sensing_second + 1:02d}.000000</stopTime>
+  </adsHeader>
+  <generalAnnotation>
+    <productInformation>
+      <rangeSamplingRate>64345238.12571428</rangeSamplingRate>
+      <radarFrequency>5405000454.33435</radarFrequency>
+      <azimuthSteeringRate>1.397440</azimuthSteeringRate>
+    </productInformation>
+    <orbitList count="2">
+      <orbit>
+        <time>2016-12-07T11:17:45.950212</time>
+        <frame>Earth Fixed</frame>
+        <position><x>-572093.4</x><y>5939124.4</y><z>3795662.9</z></position>
+        <velocity><x>2075.1</x><y>-3800.2</y><z>6239.7</z></velocity>
+      </orbit>
+      <orbit>
+        <time>2016-12-07T11:17:55.950213</time>
+        <frame>Earth Fixed</frame>
+        <position><x>-551342.0</x><y>5901124.0</y><z>3858060.0</z></position>
+        <velocity><x>2075.0</x><y>-3800.0</y><z>6240.0</z></velocity>
+      </orbit>
+    </orbitList>
+    <azimuthFmRateList count="1">
+      <azimuthFmRate>
+        <azimuthTime>2016-12-07T11:18:52.178090</azimuthTime>
+        <t0>0.0053317936</t0>
+        <azimuthFmRatePolynomial>-2330.5 451066.6</azimuthFmRatePolynomial>
+      </azimuthFmRate>
+    </azimuthFmRateList>
+  </generalAnnotation>
+  <imageAnnotation>
+    <imageInformation>
+      <slantRangeTime>0.0053317936</slantRangeTime>
+      <rangePixelSpacing>2.329562</rangePixelSpacing>
+      <azimuthPixelSpacing>13.96706</azimuthPixelSpacing>
+      <azimuthTimeInterval>0.0020555563</azimuthTimeInterval>
+      <numberOfSamples>{_SAMPLES_PER_BURST}</numberOfSamples>
+      <numberOfLines>{_LINES_PER_BURST}</numberOfLines>
+    </imageInformation>
+  </imageAnnotation>
+  <dopplerCentroid>
+    <dcEstimateList count="1">
+      <dcEstimate>
+        <azimuthTime>2016-12-07T11:18:53.140830</azimuthTime>
+        <t0>0.0053422084</t0>
+        <geometryDcPolynomial>-3.992857 -287.3943 134566.6</geometryDcPolynomial>
+      </dcEstimate>
+    </dcEstimateList>
+  </dopplerCentroid>
+  <swathTiming>
+    <linesPerBurst>{_LINES_PER_BURST}</linesPerBurst>
+    <samplesPerBurst>{_SAMPLES_PER_BURST}</samplesPerBurst>
+    <burstList count="1">
+      <burst>
+        <azimuthTime>2016-12-07T11:18:{sensing_second:02d}.426276</azimuthTime>
+        <azimuthAnxTime>607.4725</azimuthAnxTime>
+        <sensingTime>2016-12-07T11:18:{sensing_second:02d}.543845</sensingTime>
+        <byteOffset>0</byteOffset>
+        <firstValidSample>{first}</firstValidSample>
+        <lastValidSample>{last}</lastValidSample>
+      </burst>
+    </burstList>
+  </swathTiming>
+  <geolocationGrid>
+    <geolocationGridPointList count="2">
+      <geolocationGridPoint><line>0</line><pixel>0</pixel><latitude>40.0</latitude><longitude>100.0</longitude></geolocationGridPoint>
+      <geolocationGridPoint><line>{_LINES_PER_BURST - 1}</line><pixel>0</pixel><latitude>40.1</latitude><longitude>100.0</longitude></geolocationGridPoint>
+    </geolocationGridPointList>
+  </geolocationGrid>
+</product>"""
+
+
+def _write_burst_zip(dest: Path, sensing_second: int = 53) -> None:
+    """Write a minimal one-burst SAFE zip readable by ``open_safe_product``."""
+    from rasterio.io import MemoryFile
+    from rasterio.transform import Affine
+
+    stem = f"s1a-iw1-slc-vv-20161207t1118{sensing_second:02d}"
+    data = (
+        np.arange(_LINES_PER_BURST * _SAMPLES_PER_BURST, dtype=np.float32).reshape(
+            _LINES_PER_BURST, _SAMPLES_PER_BURST
+        )
+        + 1j
+    ).astype(np.complex64)
+    memfile = MemoryFile()
+    with memfile.open(
+        driver="GTiff",
+        height=_LINES_PER_BURST,
+        width=_SAMPLES_PER_BURST,
+        count=1,
+        dtype="complex64",
+        crs=None,
+        transform=Affine.identity(),
+    ) as dataset:
+        dataset.write(data, 1)
+    tiff_bytes = memfile.read()
+    memfile.close()
+    manifest = '<?xml version="1.0"?><xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1"/>'
+    with zipfile.ZipFile(dest, "w") as archive:
+        archive.writestr("X.SAFE/manifest.safe", manifest)
+        archive.writestr(f"X.SAFE/annotation/{stem}.xml", _burst_xml(sensing_second))
+        archive.writestr(f"X.SAFE/measurement/{stem}.tiff", tiff_bytes)
+
+
+def _fake_burst_download(asset: Any, destination: Path, **kwargs: Any) -> Path:
+    """Download hook that stages a real one-burst SAFE zip."""
+    del asset, kwargs
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _write_burst_zip(destination)
+    return destination
 
 
 def test_s1_polarization_defaults_and_dual_modes() -> None:
@@ -189,16 +321,49 @@ def test_orbit_selection_prefers_covering_poeorb(tmp_path: Path) -> None:
     assert selected == {"20240101": precise}
 
 
-def test_ipf_002_36_is_detected_from_safe_manifest(tmp_path: Path) -> None:
+def test_ipf_002_36_is_detected_from_safe_manifest() -> None:
     """ISCE2's early-product condition is read from manifest.safe."""
-    safe = tmp_path / "S1_TEST.SAFE"
-    safe.mkdir()
-    (safe / "manifest.safe").write_text(
+    from faninsar.missions.s1.safe import parse_ipf_version
+
+    manifest = (
         '<safe:processing xmlns:safe="http://www.esa.int/safe/sentinel-1.0">'
-        '<safe:facility><safe:software version="002.36"/></safe:facility>'
-        "</safe:processing>"
+        '<safe:facility><safe:software name="Sentinel-1 IPF" version="002.36"/>'
+        "</safe:facility></safe:processing>"
     )
-    assert safe_requires_aux_cal(safe)
+    assert parse_ipf_version(manifest) == "002.36"
+    assert parse_ipf_version("<not-xml") is None
+
+
+def test_pre_240_annotation_fm_rate_coefficients_parse() -> None:
+    """IPF < 2.40 stores azimuth FM-rate coefficients as c0, c1, ... elements."""
+    from pathlib import Path
+
+    from faninsar.missions.s1.annotation import parse_annotation_xml
+
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "data"
+        / "sentinel1"
+        / "minimal_annotation_iw1.xml"
+    )
+    xml_text = fixture.read_text(encoding="utf-8")
+    xml_text = xml_text.replace(
+        "<azimuthFmRatePolynomial>-2330.570588164277 451066.6805858936"
+        " -79121617.77766916</azimuthFmRatePolynomial>",
+        "<c0>-2.329526977539063e+03</c0>\n"
+        "        <c1>4.496041718043527e+05</c1>\n"
+        "        <c2>-7.886473300662930e+07</c2>",
+    )
+    swath = parse_annotation_xml(
+        xml_text,
+        annotation_path=str(fixture),
+        measurement_path="memory://synthetic.tiff",
+    )
+    assert swath.azimuth_fm_rate[0][2] == (
+        -2.329526977539063e03,
+        4.496041718043527e05,
+        -7.886473300662930e07,
+    )
 
 
 def test_burst_multi_polarization_filters_catalog_metadata() -> None:
@@ -267,13 +432,20 @@ def test_orbit_selection_rejects_configured_gap(tmp_path: Path) -> None:
         )
 
 
-def test_calibration_bindings_require_existing_local_files(tmp_path: Path) -> None:
-    """Explicit AUX_CAL bindings are validated and normalized to Paths."""
-    calibration = tmp_path / "AUX_CAL.xml"
-    calibration.touch()
-    assert validate_calibration_paths([calibration]) == (calibration,)
+def test_aux_cal_bindings_require_existing_local_files(tmp_path: Path) -> None:
+    """Explicit AUX_CAL bindings are validated and selected per date."""
+    from faninsar.missions.s1.aux_cal import select_aux_cal_bindings
+
+    aux = tmp_path / "S1A_AUX_CAL_V20140908T000000_G20240327T101157.SAFE.zip"
+    aux.touch()
+    sensing = datetime(2015, 1, 1, tzinfo=UTC)
+    assert select_aux_cal_bindings([aux], {"20150101": ("S1A", sensing)}) == {
+        "20150101": aux
+    }
     with pytest.raises(FileNotFoundError):
-        validate_calibration_paths([tmp_path / "missing.xml"])
+        select_aux_cal_bindings(
+            [tmp_path / "missing.zip"], {"20150101": ("S1A", sensing)}
+        )
 
 
 def test_from_search_downloads_one_selected_safe_and_prepares(
@@ -285,9 +457,8 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
     prepared: list[bool] = []
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
-        del asset, kwargs
         downloaded.append(destination)
-        return destination
+        return _fake_burst_download(asset, destination, **kwargs)
 
     monkeypatch.setattr(remote, "download", download)
 
@@ -302,35 +473,25 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    result = S1Stack.from_search(
-        _asf_search([item]), work_dir=tmp_path, product_type="burst"
-    )
+    result = S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
     assert isinstance(result, FakeStack)
-    assert downloaded == [tmp_path / "inputs" / "S1_TEST.zip"]
+    assert downloaded == [staged_acquisition_path(tmp_path / "inputs", "S1_TEST.zip")]
     assert prepared == [True]
     assert captured.get("roi") == ROI
 
 
-def test_from_search_downloads_safes_concurrently_in_selection_order(
+def test_from_search_downloads_safes_in_selection_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A ready SAFE can finish while an earlier burst is still preparing."""
+    """ASF burst items stage their zips then reassemble into path-SAFEs."""
     slow = replace(_item(_asset("slow")), item_id="A_SLOW")
     fast = replace(_item(_asset("fast")), item_id="B_FAST")
-    barrier = threading.Barrier(2)
-    fast_done = threading.Event()
-    completed: list[str] = []
+    downloaded: list[str] = []
     captured: list[tuple[Path, ...]] = []
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
-        del asset, kwargs
-        barrier.wait(timeout=2)
-        if destination.name.startswith("A_SLOW"):
-            assert fast_done.wait(timeout=2)
-        else:
-            fast_done.set()
-        completed.append(destination.name)
-        return destination
+        downloaded.append(destination.name)
+        return _fake_burst_download(asset, destination, **kwargs)
 
     monkeypatch.setattr(remote, "download", download)
 
@@ -344,45 +505,32 @@ def test_from_search_downloads_safes_concurrently_in_selection_order(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_search(
-        _asf_search([slow, fast]), work_dir=tmp_path, product_type="burst"
-    )
+    S1Stack.from_search(_asf_search([slow, fast]), work_dir=tmp_path, provider="asf")
 
-    assert completed == ["B_FAST.zip", "A_SLOW.zip"]
-    assert captured == [
-        (tmp_path / "inputs" / "A_SLOW.zip", tmp_path / "inputs" / "B_FAST.zip")
-    ]
+    # Both burst zips are staged, then reassembled into one path-SAFE that
+    # from_safes opens (not the raw staged zips).
+    assert downloaded == ["A_SLOW.zip", "B_FAST.zip"]
+    assert len(captured) == 1
+    assert len(captured[0]) == 1
+    safe_root = captured[0][0]
+    assert safe_root.suffix == ".SAFE"
+    assert safe_root.is_dir()
 
 
-def test_from_search_sweeps_burst_probes_oldest_first(
+def test_from_search_downloads_every_selected_burst_item(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Stack retries due burst probes centrally, then downloads ready inputs."""
-    from faninsar.remote.fetch.complete import _RemotePollObservation
-
+    """Each ASF burst item is staged and reassembled into the path-SAFE."""
     items = [
         _item(replace(_asset(f"burst-{index}"), item_id=f"S1_{index}"))
         for index in range(3)
     ]
-    observations: dict[str, int] = {}
-    probe_calls: list[tuple[str, int]] = []
-
-    def probe(asset: Any, **kwargs: Any) -> Any:
-        attempt = int(kwargs["attempt"])
-        observations[asset.item_id] = attempt
-        probe_calls.append((asset.item_id, attempt))
-        if attempt == 0:
-            return _RemotePollObservation("pending", kwargs["url"], 0.0)
-        return _RemotePollObservation("ready", kwargs["url"])
-
     downloaded: list[str] = []
 
     def download(asset: Any, destination: Path, **kwargs: Any) -> Path:
-        del kwargs
         downloaded.append(asset.item_id)
-        return destination
+        return _fake_burst_download(asset, destination, **kwargs)
 
-    monkeypatch.setattr(remote, "probe", probe)
     monkeypatch.setattr(remote, "download", download)
 
     class FakeStack:
@@ -394,19 +542,9 @@ def test_from_search_sweeps_burst_probes_oldest_first(
         "from_safes",
         classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
     )
-    S1Stack.from_search(_asf_search(items), work_dir=tmp_path, product_type="burst")
+    S1Stack.from_search(_asf_search(items), work_dir=tmp_path, provider="asf")
 
-    assert sorted(index for index, attempt in probe_calls if attempt == 0) == [
-        "S1_0",
-        "S1_1",
-        "S1_2",
-    ]
-    assert [index for index, attempt in probe_calls if attempt == 1] == [
-        "S1_0",
-        "S1_1",
-        "S1_2",
-    ]
-    assert sorted(downloaded) == ["S1_0", "S1_1", "S1_2"]
+    assert downloaded == ["S1_0", "S1_1", "S1_2"]
 
 
 def test_from_search_does_not_construct_stack_after_download_failure(
@@ -436,7 +574,7 @@ def test_from_search_does_not_construct_stack_after_download_failure(
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(RuntimeError, match="burst generation failed"):
         S1Stack.from_search(
-            _asf_search([first, second]), work_dir=tmp_path, product_type="burst"
+            _asf_search([first, second]), work_dir=tmp_path, provider="asf"
         )
     assert not stack_constructed
 
@@ -475,9 +613,7 @@ def test_from_search_rejects_tiff_xml_without_burst_extractor_safe(
     )
 
     with pytest.raises(ValueError, match="exactly one complete SAFE ZIP"):
-        S1Stack.from_search(
-            _asf_search([item]), work_dir=tmp_path, product_type="burst"
-        )
+        S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
 
     assert downloads == []
 
@@ -500,8 +636,287 @@ def test_from_search_rejects_ambiguous_safe_zips_before_download(
     )
 
     with pytest.raises(ValueError, match="found 2"):
-        S1Stack.from_search(
-            _asf_search([item]), work_dir=tmp_path, product_type="burst"
-        )
+        S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
 
     assert downloads == []
+
+
+def test_from_search_asf_items_rediscover_on_cdse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """provider="cdse" re-discovers ASF-selected frames inside CDSE.
+
+    ASF items carry no CDSE OData assets, so ``from_search`` re-discovers
+    them on CDSE narrowed to the ASF sensing window, keeps only the
+    searched tracks, and forwards the burst selector so the same bursts
+    are picked inside the CDSE parent frames.
+    """
+    science = {
+        "absoluteBurstID": 3001,
+        "relativeOrbit": 88,
+        "orbitDirection": "ASCENDING",
+        "mission": "S1A",
+        "sensingStart": "2024-01-01T00:00:10",
+    }
+    item = _item(_asset(), properties=science)
+    item = replace(
+        item,
+        acquisition=replace(
+            item.acquisition,
+            start=datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+            end=datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
+        ),
+    )
+    discover_calls: dict[str, Any] = {}
+    # Two CDSE bindings on different tracks; only the searched one (88A)
+    # must be materialized.
+    cdse_88 = {
+        "product_id": "P88",
+        "relative_orbit": 88,
+        "orbit_direction": "ASCENDING",
+        "mission_id": "S1A",
+        "polarization": "VV",
+        "swath": "IW1",
+    }
+    cdse_117 = {
+        "product_id": "P117",
+        "relative_orbit": 117,
+        "orbit_direction": "ASCENDING",
+        "mission_id": "S1A",
+        "polarization": "VV",
+        "swath": "IW1",
+    }
+
+    def fake_discover(roi, datetime_range=None, polarizations=None, **kw):
+        discover_calls["datetime_range"] = datetime_range
+        return [cdse_88, cdse_117]
+
+    captured: dict[str, Any] = {}
+
+    def fake_materialize(roi, **kwargs):
+        captured.update(kwargs)
+        return [tmp_path / "tracks" / "88A" / "acquisitions" / "X.SAFE"]
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.stack.discover_cdse_slc_items", fake_discover
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.stack.materialize_s1_acquisitions",
+        fake_materialize,
+    )
+    monkeypatch.setattr(
+        S1Stack,
+        "from_safes",
+        classmethod(
+            lambda _cls, _paths, **_kw: type("S", (), {"prepare": lambda self: None})()
+        ),
+    )
+    S1Stack.from_search(
+        _asf_search([item]),
+        work_dir=tmp_path,
+        provider="cdse",
+        extra={"orbit_auto_fetch": False},
+    )
+
+    # Re-discovery is narrowed to the ASF item's sensing window.
+    assert discover_calls["datetime_range"] == (
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
+    )
+    # Only the searched-track binding is materialized; burst selector
+    # forwards the ASF absoluteBurstID/sensingStart.
+    assert captured["items"] == [cdse_88]
+    assert captured["absolute_burst_ids"] == [3001]
+    assert [str(t) for t in captured["catalog_sensing_times"]] == [
+        "2024-01-01 00:00:10+00:00"
+    ]
+    assert captured["provider"] == "cdse"
+
+
+# -- single search implementation (PROPOSAL-0072 §2) -------------------------
+
+
+def _search_item(
+    item_id: str,
+    day: int,
+    *,
+    href: str | None = None,
+    polarization: str = "VV",
+) -> remote.CatalogItem:
+    """Build one ASF burst record with a distinct start and polarization."""
+    base = _item(
+        _asset(href=href or f"https://datapool.asf.alaska.edu/{item_id}.zip"),
+        raw_metadata={"Polarization": polarization},
+    )
+    start = datetime(2024, 1, day, tzinfo=UTC)
+    return replace(
+        base,
+        item_id=item_id,
+        acquisition=replace(base.acquisition, start=start, end=start),
+    )
+
+
+def _fake_remote_search(
+    monkeypatch: pytest.MonkeyPatch, items: list[remote.CatalogItem]
+) -> list[dict[str, Any]]:
+    """Replace the provider with one returning ``items`` in the given order."""
+    calls: list[dict[str, Any]] = []
+
+    def search(roi: Any, **kwargs: Any) -> list[remote.CatalogItem]:
+        del roi
+        calls.append(kwargs)
+        return list(items)
+
+    monkeypatch.setattr(remote, "search", search)
+    return calls
+
+
+def test_stack_search_and_module_search_are_one_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both public entry points return equal ``S1Search`` values."""
+    from faninsar.missions.s1 import search_acquisitions
+
+    items = [_search_item("B", 2), _search_item("A", 1)]
+    calls = _fake_remote_search(monkeypatch, items)
+    kwargs: dict[str, Any] = {
+        "datetime_range": ("2024-01-01", "2024-02-01"),
+        "track": 88,
+        "flight_direction": "ASCENDING",
+    }
+    via_class = S1Stack.search(ROI, **kwargs)
+    via_module = search_acquisitions(ROI, **kwargs)
+
+    assert S1Stack.search is search_acquisitions
+    assert isinstance(via_class, S1Search)
+    assert via_class == via_module
+    assert calls[0] == calls[1]
+    assert calls[0]["filters"] == {
+        "dataset": "SLC-BURST",
+        "processingLevel": "BURST",
+        "relativeOrbit": 88,
+        "polarization": "VV",
+    }
+    assert calls[0]["flight_direction"] == "ASCENDING"
+
+
+def test_search_orders_canonically_regardless_of_provider_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Start, item ID, then asset hrefs decide order; ``limit`` truncates last."""
+    late = _search_item("A_LATE", 3)
+    tie_b = _search_item("B_TIE", 2)
+    tie_a2 = _search_item("A_TIE", 2, href="https://datapool.asf.alaska.edu/z.zip")
+    tie_a1 = _search_item("A_TIE", 2, href="https://datapool.asf.alaska.edu/a.zip")
+    early = _search_item("Z_EARLY", 1)
+    expected = [early, tie_a1, tie_a2, tie_b, late]
+
+    for provider_order in (
+        [late, tie_b, tie_a2, tie_a1, early],
+        [tie_a1, early, late, tie_a2, tie_b],
+    ):
+        _fake_remote_search(monkeypatch, provider_order)
+        assert list(S1Stack.search(ROI)) == expected
+
+    _fake_remote_search(monkeypatch, [late, tie_b, tie_a2, tie_a1, early])
+    assert list(S1Stack.search(ROI, limit=2)) == expected[:2]
+
+
+def test_search_defaults_to_vv_and_named_values_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile defaults, then aliases, then named values (incl. the VV default)."""
+    calls = _fake_remote_search(monkeypatch, [])
+    result = S1Stack.search(
+        ROI,
+        track=88,
+        relativeOrbit=117,
+        platform="Sentinel-1A",
+        polarization="VH",
+        beamMode="IW",
+    )
+    assert result.query["polarizations"] == ("VV",)
+    assert calls[0]["filters"] == {
+        "dataset": "SLC-BURST",
+        "processingLevel": "BURST",
+        "relativeOrbit": 88,
+        "platform": "Sentinel-1A",
+        "polarization": "VV",
+        "beamMode": "IW",
+    }
+
+
+def test_search_uses_one_direction_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``flightDirection`` alias moves to the dedicated slot; named wins."""
+    calls = _fake_remote_search(monkeypatch, [])
+    S1Stack.search(ROI, flightDirection="DESCENDING")
+    S1Stack.search(ROI, flight_direction="ASCENDING", flightDirection="DESCENDING")
+    assert [call["flight_direction"] for call in calls] == ["DESCENDING", "ASCENDING"]
+    assert all("flightDirection" not in call["filters"] for call in calls)
+
+
+def test_search_all_returns_every_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``'all'`` sends no polarization filter and keeps every channel."""
+    items = [
+        _search_item("VV", 1, polarization="VV"),
+        _search_item("VH", 2, polarization="VH"),
+        _search_item("HH", 3, polarization="HH"),
+    ]
+    calls = _fake_remote_search(monkeypatch, items)
+    result = S1Stack.search(ROI, polarizations="all", polarization="VV")
+    assert "polarization" not in calls[0]["filters"]
+    assert [item.item_id for item in result] == ["VV", "VH", "HH"]
+
+
+def test_search_multi_channel_filters_client_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dual request drops a single-channel alias and filters metadata."""
+    items = [
+        _search_item("VV", 1, polarization="VV"),
+        _search_item("VH", 2, polarization="VH"),
+        _search_item("HH", 3, polarization="HH"),
+    ]
+    calls = _fake_remote_search(monkeypatch, items)
+    result = S1Stack.search(ROI, polarizations="VV+VH", polarization="VV")
+    assert "polarization" not in calls[0]["filters"]
+    assert [item.item_id for item in result] == ["VV", "VH"]
+
+
+def test_search_rejects_none_polarizations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All channels must be requested explicitly with ``'all'``."""
+    calls = _fake_remote_search(monkeypatch, [])
+    with pytest.raises(ValueError, match="polarizations='all'"):
+        S1Stack.search(ROI, polarizations=None)  # type: ignore[arg-type]
+    assert calls == []
+
+
+def test_from_search_accepts_stack_search_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``S1Stack.from_search(S1Stack.search(...))`` composes directly."""
+    _fake_remote_search(monkeypatch, [_item(_asset())])
+    monkeypatch.setattr(remote, "download", _fake_burst_download)
+
+    class FakeStack:
+        def prepare(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        S1Stack, "from_safes", classmethod(lambda _cls, _paths, **_kw: FakeStack())
+    )
+    result = S1Stack.from_search(S1Stack.search(ROI), work_dir=tmp_path, provider="asf")
+    assert isinstance(result, FakeStack)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+@pytest.mark.parametrize("explicit_budget", [False, True])
+def test_search_invalid_limit_has_consistent_query_error(
+    limit: int, explicit_budget: bool
+) -> None:
+    """A derived resource budget must not replace public query validation."""
+    from faninsar.remote.errors import RemoteQueryError
+
+    budget = remote.RemoteResourceBudget() if explicit_budget else None
+    with pytest.raises(RemoteQueryError, match="invalid_limit"):
+        S1Stack.search(ROI, limit=limit, budget=budget)

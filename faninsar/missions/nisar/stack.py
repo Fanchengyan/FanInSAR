@@ -6,7 +6,7 @@ import re
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import reject
@@ -80,6 +80,8 @@ class NISARStack(Stack):
     flattening, multilooking, coherence, and geocoding remain the shared Stack
     pipeline's responsibility.
     """
+
+    _sensor_registry_key: ClassVar[str] = "nisar"
 
     @classmethod
     def from_rslc(

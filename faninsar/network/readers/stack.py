@@ -3,8 +3,9 @@
 The collection reads ``ifg/ml_AxR/<pair>`` and ``unwrap/ml_AxR/<pair>``
 products in place; nothing is copied into a second layout.
 
-``sel(looks=, pair=, pairs=)`` returns an immutable view bound to a
-committed multilook tree or a subset of the planned Pair network
+``sel(looks=, pairs=, polygon=, track=, direction=, pol=, burst=)`` returns
+an immutable view bound to a committed multilook tree, a subset of the
+planned Pair network, one ROI-polygon subtree, or a track-axis date subset
 (PROPOSAL-0064); the default view binds ``StackConfig.multilook`` and the
 full network.
 """
@@ -57,12 +58,17 @@ class _Selection:
     """Internal selection carried by one collection view (PROPOSAL-0064).
 
     ``looks`` picks a committed ``ifg/ml_AxR`` tree; ``pairs`` narrows the
-    planned Pair network to a subset. ``None`` means the Stack defaults —
-    ``StackConfig.multilook`` and the full planned network.
+    planned Pair network to a subset; ``polygon`` reads one ``p<i>``
+    subtree of a multi-polygon ROI; ``track``/``pol`` hold the resolved
+    track label and polarization axis selectors. ``None`` means the Stack
+    defaults — ``StackConfig.multilook`` and the full planned network.
     """
 
     looks: tuple[int, int] | None = None
     pairs: Pairs | None = None
+    polygon: int | None = None
+    track: str | None = None
+    pol: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate looks shape; subset-of-plan is checked by ``sel``."""
@@ -137,6 +143,11 @@ class StackInterferogramCollection(InterferogramCollection):
         *,
         looks: tuple[int, int] | None = None,
         pairs: Pairs | Pair | str | None = None,
+        polygon: int | None = None,
+        track: str | None = None,
+        direction: str | None = None,
+        pol: str | list[str] | tuple[str, ...] | None = None,
+        burst: int | list[int] | tuple[int, ...] | None = None,
     ) -> StackInterferogramCollection | InterferogramLayers:
         """Return a view bound to a committed multilook or Pair subset.
 
@@ -154,12 +165,42 @@ class StackInterferogramCollection(InterferogramCollection):
             that pair's :class:`InterferogramLayers` — the same object
             ``collection[pair]`` returns. Mirrors the xarray ``sel``
             scalar-vs-list demotion rule.
+        polygon : int, optional
+            Index of the effective-ROI polygon whose ``p<i>`` product subtree
+            to read. Valid only when the Stack ROI decomposes to more than
+            one polygon (``stack.roi_polygon_count > 1``); a
+            :class:`BoundingBox`, a single polygon, or no ROI rejects it.
+            On a ``sel(track=)`` view the index is checked against
+            :attr:`Stack.polygon_tracks` — a polygon that falls on another
+            track is rejected with an error naming the correct track.
+            ``None`` keeps the current ``self._selection.polygon``.
+        track : str, optional
+            Track label of the ``"88A"`` form (or a bare relative-orbit
+            number, selecting both direction letters). Keeps only the
+            planned pairs whose two acquisition dates lie on the selected
+            track; cross-track pairs are never part of the narrowed view.
+            ``None`` keeps the current ``self._selection.track``.
+        direction : str, optional
+            ``"ASC"``/``"DESC"`` (or the full ``"ASCENDING"``/
+            ``"DESCENDING"``). Narrows the date axis the same way
+            ``track=`` does; composes with it.
+        pol : str or sequence of str, optional
+            Polarization channel(s) (``"VV"``, ``"VH"``, ``"HH"``,
+            ``"HV"``). Keeps pairs whose acquisitions all carry the
+            requested channels; the value is stored on the view so
+            consumers see the polarization constraint.
+        burst : int or sequence of int, optional
+            Absolute burst id(s). When the Stack's per-date burst metadata
+            is known the date axis is narrowed to acquisitions covering
+            the requested ids; unknown metadata fails closed with
+            :class:`ValueError` rather than silently ignoring the
+            selector.
 
         Returns
         -------
         StackInterferogramCollection or InterferogramLayers
-            A new collection when ``pairs`` is a :class:`Pairs`, or the
-            pair's layer view when ``pairs`` is a scalar.
+            A new collection for non-scalar selections, or the pair's
+            layer view when ``pairs`` is a scalar.
 
         Raises
         ------
@@ -170,7 +211,10 @@ class StackInterferogramCollection(InterferogramCollection):
             If a scalar ``pairs`` is not part of the planned network.
         ValueError
             If ``looks`` is not two positive integers, ``pairs`` is not a
-            non-empty subset of the planned network, or no dims select
+            non-empty subset of the planned network, ``polygon`` is given
+            for a single-polygon or absent ROI or names a polygon on
+            another track, ``track``/``direction``/``pol``/``burst``
+            select nothing or cannot be resolved, or no dims select
             anything.
 
         """
@@ -183,25 +227,99 @@ class StackInterferogramCollection(InterferogramCollection):
         ):
             message = f"looks must be two positive integers; got {looks!r}"
             raise ValueError(message)
+
+        resolved_track = self._resolve_track_selector(track)
+        resolved_pol = self._resolve_pol_selector(pol)
+        resolved_pairs = self._selection.pairs
+        if resolved_track is not None or direction is not None:
+            track_dates = self._stack._catalog_dates_for_track(
+                track=resolved_track,
+                direction=direction,
+            )
+            narrowed = self._stack._select_pairs_for_track(track_dates)
+            resolved_pairs = (
+                narrowed
+                if resolved_pairs is None
+                else resolved_pairs.intersect(narrowed)
+            )
+            if len(resolved_pairs) == 0:
+                label = resolved_track or direction
+                message = (
+                    f"sel(track={label!r}) selects no pairs of the planned "
+                    "network; both endpoints of a pair must lie on the "
+                    "selected track"
+                )
+                raise ValueError(message)
+        if resolved_pol is not None:
+            pol_dates = self._stack._catalog_dates_for_track(pol=resolved_pol)
+            narrowed = self._stack._select_pairs_for_track(pol_dates)
+            resolved_pairs = (
+                narrowed
+                if resolved_pairs is None
+                else resolved_pairs.intersect(narrowed)
+            )
+            if len(resolved_pairs) == 0:
+                message = (
+                    f"sel(pol={resolved_pol!r}) selects no pairs; not every "
+                    "selected date carries the requested channels"
+                )
+                raise ValueError(message)
+        if burst is not None:
+            resolved_pairs = self._resolve_burst_selector(burst, resolved_pairs)
+        effective_track = (
+            resolved_track if resolved_track is not None else self._selection.track
+        )
+        resolved_polygon = self._resolve_polygon(polygon, effective_track)
+
         selection = _Selection(
             looks=self._selection.looks if looks is None else looks,
-            pairs=self._selection.pairs,
+            pairs=resolved_pairs,
+            polygon=self._selection.polygon if polygon is None else resolved_polygon,
+            track=(
+                resolved_track if resolved_track is not None else self._selection.track
+            ),
+            pol=resolved_pol if resolved_pol is not None else self._selection.pol,
         )
         if pairs is None:
-            if looks is None:
-                message = "sel requires at least one of looks= or pairs="
+            if all(
+                value is None
+                for value in (looks, polygon, track, direction, pol, burst)
+            ):
+                message = (
+                    "sel requires at least one of looks=, pairs=, polygon=, "
+                    "track=, direction=, pol=, or burst="
+                )
                 raise ValueError(message)
             return StackInterferogramCollection(self._stack, selection)
         if isinstance(pairs, Pairs):
+            # A Pairs argument narrows this view's pair set. It must stay
+            # inside the planned network *and* — when the view is
+            # track-narrowed — inside the selected track's pair set so a
+            # sel(track=).sel(pairs=) chain cannot smuggle a cross-track
+            # pair back in.
             planned = set(self._planned_pairs().to_names().tolist())
             requested = pairs.to_names().tolist()
             if not requested or not set(requested).issubset(planned):
                 message = "pairs must be a non-empty subset of the planned network"
                 raise ValueError(message)
+            if selection.pairs is not None and not set(requested).issubset(
+                set(selection.pairs.to_names().tolist())
+            ):
+                message = (
+                    "pairs must be a subset of this view's selected network; "
+                    "the view is narrowed by track/direction/pol/burst"
+                )
+                raise ValueError(message)
             # Copy so a caller retaining the input Pairs cannot mutate this
             # view's selection via Pairs.sort(inplace=True) (PROPOSAL-0064
             # review: immutable views must not alias a mutable caller object).
-            selection = _Selection(looks=selection.looks, pairs=pairs.copy())
+            selection = _Selection(
+                looks=selection.looks,
+                pairs=pairs.copy(),
+                polygon=selection.polygon,
+                track=selection.track,
+                pol=selection.pol,
+            )
             return StackInterferogramCollection(self._stack, selection)
         if isinstance(pairs, Pair):
             pair_id = pairs.name
@@ -210,10 +328,75 @@ class StackInterferogramCollection(InterferogramCollection):
         else:
             message = f"pairs must be Pairs, Pair, or str; got {type(pairs).__name__}"
             raise TypeError(message)
-        if pair_id not in self.pairs.to_names().tolist():
-            raise KeyError(pairs)
+        # Membership is checked against the view's selected pair set (the
+        # track-/pol-/burst-narrowed network), not the whole plan.
         view = StackInterferogramCollection(self._stack, selection)
+        if pair_id not in view.pairs.to_names().tolist():
+            raise KeyError(pairs)
         return view._load_layers(pair_id)
+
+    def _resolve_track_selector(
+        self,
+        track: str | None,
+    ) -> str | None:
+        """Normalize ``track=`` against the Stack's known track labels."""
+        return self._stack._normalize_track_selector(track)
+
+    def _resolve_pol_selector(
+        self, pol: str | list[str] | tuple[str, ...] | None
+    ) -> tuple[str, ...] | None:
+        """Retain the channel constraint; mission policy validates it."""
+        if pol is None:
+            return None
+        return (pol,) if isinstance(pol, str) else tuple(pol)
+
+    def _resolve_burst_selector(
+        self,
+        burst: int | list[int] | tuple[int, ...],
+        pairs: Pairs | None,
+    ) -> Pairs:
+        """Narrow pairs using the Stack's normalized acquisition accessor."""
+        dates = self._stack._catalog_dates_for_track(burst=burst)
+        narrowed = self._stack._select_pairs_for_track(dates)
+        resolved = narrowed if pairs is None else pairs.intersect(narrowed)
+        if len(resolved) == 0:
+            message = f"sel(burst={burst!r}) selects no pairs of the planned network"
+            raise ValueError(message)
+        return resolved
+
+    def _resolve_polygon(
+        self,
+        polygon: int | None,
+        track: str | None,
+    ) -> int | None:
+        """Validate ``polygon=`` against ROI arity and the selected track."""
+        if polygon is None:
+            return None
+        count = int(getattr(self._stack, "roi_polygon_count", 0))
+        if count <= 1:
+            message = (
+                "sel(polygon=) requires a multi-polygon ROI; the effective "
+                f"ROI has {count} polygon(s)"
+            )
+            raise ValueError(message)
+        if (
+            not isinstance(polygon, int)
+            or isinstance(polygon, bool)
+            or polygon < 0
+            or polygon >= count
+        ):
+            message = f"polygon must be an integer in [0, {count}); got {polygon!r}"
+            raise ValueError(message)
+        if track is not None:
+            mapping = self._stack.polygon_tracks
+            actual = mapping.get(polygon)
+            if actual is not None and actual != track:
+                message = (
+                    f"polygon {polygon} falls on track {actual!r}, not "
+                    f"{track!r}; select sel(track={actual!r}) instead"
+                )
+                raise ValueError(message)
+        return polygon
 
     def __getitem__(
         self, pair: str | Pair | Pairs
@@ -258,8 +441,8 @@ class StackInterferogramCollection(InterferogramCollection):
 
         if pair_id not in self.pairs.to_names().tolist():
             raise KeyError(pair_id)
-        store = InterferogramArtifactStore.open(self.root / pair_id)
-        reference = self._stack.reference_scene
+        store = InterferogramArtifactStore.open(self._pair_dir(pair_id))
+        reference = self._stack._reference_scene_for(self._selection.polygon)
         if reference is None:
             reject_invalid_state(
                 "the Reference scene is missing; run coregister_scenes"
@@ -277,7 +460,8 @@ class StackInterferogramCollection(InterferogramCollection):
                 expected = reference.write_id
             else:
                 scene_product = open_product(
-                    self._stack.config.work_dir / "coreg" / date_id, kind=SCENE_KIND
+                    self._stack._scene_dir(date_id, self._selection.polygon),
+                    kind=SCENE_KIND,
                 )
                 scene = CoregisteredSceneStore.open(scene_product.path)
                 if scene.inputs.get("reference") != reference.write_id:
@@ -302,6 +486,13 @@ class StackInterferogramCollection(InterferogramCollection):
         """Return the IFG product directory of this view's multilook."""
         looks = self.looks
         return self._stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}"
+
+    def _pair_dir(self, pair_id: str) -> Path:
+        """Return the product directory of one Pair for this view's polygon."""
+        base = self.root / pair_id
+        if self._selection.polygon is None:
+            return base
+        return base / f"p{self._selection.polygon}"
 
     @property
     def index_metadata(self) -> dict[str, Any]:
@@ -414,7 +605,9 @@ class StackInterferogramCollection(InterferogramCollection):
         (PROPOSAL-0059 AC#6). Use :meth:`_selected_stores` for the subset
         view's reads.
         """
-        return self._stack._pair_artifact_stores(looks=self.looks)
+        return self._stack._pair_artifact_stores(
+            looks=self.looks, polygon=self._selection.polygon
+        )
 
     def _selected_stores(self) -> list[InterferogramArtifactStore]:
         """Open the IFG product stores of this view's selected pairs.
@@ -450,7 +643,7 @@ class StackInterferogramCollection(InterferogramCollection):
         pair_id = str(pair)
         if pair_id not in self.pairs.to_names().tolist():
             raise KeyError(pair)
-        store = InterferogramArtifactStore.open(self.root / pair_id)
+        store = InterferogramArtifactStore.open(self._pair_dir(pair_id))
         if _pair_id(store) != pair_id:
             reject_invalid_state(
                 "Stack IFG artifact pair differs from the configured network"
@@ -845,13 +1038,17 @@ class StackSceneCollection(dict):
     def sel(
         self,
         *,
-        dates: Acquisition | slice | list[str] | tuple[str, ...] | str,
+        dates: Acquisition | slice | list[str] | tuple[str, ...] | str | None = None,
+        track: str | None = None,
+        direction: str | None = None,
+        pol: str | list[str] | tuple[str, ...] | None = None,
+        burst: int | list[int] | tuple[int, ...] | None = None,
     ) -> StackSceneCollection | SceneLayers:
         """Return a view narrowed to a date subset.
 
         Parameters
         ----------
-        dates : Acquisition, slice, list of str, or str
+        dates : Acquisition, slice, list of str, or str, optional
             A :class:`Acquisition` index, a date-``str`` list, or a
             ``slice`` of date bounds selects a subset and returns a new
             :class:`StackSceneCollection`; a scalar date string or a
@@ -860,6 +1057,21 @@ class StackSceneCollection(dict):
             ``collection[date].layers`` returns. Mirrors the xarray
             ``sel`` scalar-vs-list demotion rule used by
             :meth:`StackInterferogramCollection.sel`.
+        track : str, optional
+            Track label (``"88A"``, or a bare relative-orbit number
+            selecting both direction letters). Keeps the committed dates
+            that lie on the selected track; cross-track dates drop out so
+            the view stays single-track.
+        direction : str, optional
+            ``"ASC"``/``"DESC"`` (or ``"ASCENDING"``/``"DESCENDING"``);
+            narrows the date axis the same way ``track=`` does.
+        pol : str or sequence of str, optional
+            Polarization channel(s); keeps dates whose acquisitions carry
+            every requested channel.
+        burst : int or sequence of int, optional
+            Absolute burst id(s); keeps dates whose acquisitions cover
+            every requested id. Fails closed when the Stack's per-date
+            burst metadata is unavailable.
 
         Returns
         -------
@@ -874,10 +1086,25 @@ class StackSceneCollection(dict):
         KeyError
             If ``dates`` names an uncommitted scene product.
         ValueError
-            If the selection is empty.
+            If the selection is empty or a track-axis selector cannot be
+            resolved.
 
         """
         from faninsar.core.acquisition import Acquisition
+
+        track_subset = self._track_selected_dates(
+            track=track, direction=direction, pol=pol, burst=burst
+        )
+        if dates is None:
+            if track_subset is None:
+                message = (
+                    "sel requires at least one of dates=, track=, direction=, "
+                    "pol=, or burst="
+                )
+                raise ValueError(message)
+            return StackSceneCollection(
+                self._stack, dict(self), selected=frozenset(track_subset)
+            )
 
         scalar_id: str | None = None
         if isinstance(dates, str):
@@ -887,6 +1114,12 @@ class StackSceneCollection(dict):
         if scalar_id is not None:
             if scalar_id not in self:
                 raise KeyError(dates)
+            if track_subset is not None and scalar_id not in track_subset:
+                message = (
+                    f"date {scalar_id!r} is not part of the track-axis "
+                    "selection; sel(track=/direction=/pol=/burst=) excludes it"
+                )
+                raise KeyError(message)
             return self[scalar_id].layers
 
         if isinstance(dates, slice):
@@ -899,15 +1132,14 @@ class StackSceneCollection(dict):
             )
         elif isinstance(dates, Iterable) and not isinstance(dates, str):
             subset = set(self._normalize_dates(dates))
-        elif dates is None:
-            message = "sel requires dates="
-            raise ValueError(message)
         else:
             message = (
                 "dates must be an Acquisition, a date str, a list of date "
                 f"strings, or a slice; got {type(dates).__name__}"
             )
             raise TypeError(message)
+        if track_subset is not None:
+            subset &= track_subset
         unknown = sorted(subset - set(dict.keys(self)))
         if unknown:
             message = f"scene products not committed for dates: {unknown!r}"
@@ -916,6 +1148,28 @@ class StackSceneCollection(dict):
             message = "sel produced an empty date selection"
             raise ValueError(message)
         return StackSceneCollection(self._stack, dict(self), selected=frozenset(subset))
+
+    def _track_selected_dates(
+        self,
+        *,
+        track: str | None,
+        direction: str | None,
+        pol: str | list[str] | tuple[str, ...] | None,
+        burst: int | list[int] | tuple[int, ...] | None,
+    ) -> set[str] | None:
+        """Return committed dates matching the track-axis selectors.
+
+        ``None`` means no selector was given; a set means the committed
+        dates surviving every selector (empty allowed — the caller decides
+        whether emptiness is an error).
+        """
+        if all(value is None for value in (track, direction, pol, burst)):
+            return None
+        normalized_track = self._stack._normalize_track_selector(track)
+        selected = self._stack._catalog_dates_for_track(
+            track=normalized_track, direction=direction, pol=pol, burst=burst
+        )
+        return set(selected) & set(dict.keys(self))
 
     def _date_bound(self, bound: object, default: Any) -> str:
         """Normalize one slice bound to a canonical ``%Y%m%d`` date id."""

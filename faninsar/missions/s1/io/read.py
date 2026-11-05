@@ -8,7 +8,7 @@ loaders.  For a byte-offset fast path that targets SAFE ZIP archives see
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from rasterio.windows import Window
@@ -31,6 +31,33 @@ class BurstArray:
     col0: int
     burst_index: int
     valid_mask: np.ndarray
+    phase_state: Literal["raw", "eap_corrected"] = "raw"
+
+
+def _is_rasterio_openable(path: str) -> bool:
+    """Return whether ``path`` is a URI rasterio can open directly.
+
+    Local paths, ``/vsi*`` handlers, and ``http(s)://`` are openable; opaque
+    placeholder schemes such as ``memory://`` or ``cdse://`` are not.
+    """
+    if "://" not in path:
+        return True
+    lowered = path.lower()
+    return lowered.startswith(("/vsi", "http://", "https://"))
+
+
+def _burst_measurement_path(swath: S1Swath, burst: S1Burst) -> str:
+    """Return the measurement raster path that actually holds ``burst``.
+
+    A merged one-burst extract keeps its own TIFF, recorded on
+    ``burst.measurement_path``; that path wins only when it differs from the
+    swath measurement and names a rasterio-openable source.  Placeholder URIs
+    (``memory://``, ``cdse://``) fall back to ``swath.measurement_path``.
+    """
+    path = burst.measurement_path
+    if path and path != swath.measurement_path and _is_rasterio_openable(path):
+        return path
+    return swath.measurement_path
 
 
 def _burst_line_offset(swath: S1Swath, burst: S1Burst) -> int:
@@ -39,7 +66,7 @@ def _burst_line_offset(swath: S1Swath, burst: S1Burst) -> int:
     One-burst ASF extracts store the burst at line 0 of their own TIFF.
     A full-scene measurement still places burst ``i`` at ``i * lines_per_burst``.
     """
-    if burst.measurement_path and burst.measurement_path != swath.measurement_path:
+    if _burst_measurement_path(swath, burst) != swath.measurement_path:
         return 0
     return int(burst.index * swath.lines_per_burst)
 
@@ -152,7 +179,7 @@ def read_full_burst(
         col1,
         height * width * 8 / (1024**2),
     )
-    measurement_path = burst.measurement_path or swath.measurement_path
+    measurement_path = _burst_measurement_path(swath, burst)
     with rasterio.open(measurement_path) as dataset:
         window = Window.from_slices(
             (file_row0, file_row0 + height),
@@ -236,6 +263,8 @@ def stitch_bursts(
     """
     if not bursts:
         reject_product("no bursts to stitch")
+    if len({burst.phase_state for burst in bursts}) != 1:
+        reject_product("cannot stitch bursts with different source phase states")
 
     # Find the common range intersection across all bursts.
     common_col0 = max(b.col0 for b in bursts)
@@ -285,6 +314,7 @@ def stitch_bursts(
         col0=common_col0,
         burst_index=-1,
         valid_mask=valid,
+        phase_state=bursts[0].phase_state,
     )
 
 

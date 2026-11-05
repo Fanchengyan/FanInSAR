@@ -63,6 +63,8 @@ def test_coregister_s1_scene_public_signature() -> None:
         "geo_lut_cache_dir",
         "primary_orbit_path",
         "secondary_orbit_path",
+        "primary_aux_cal_path",
+        "secondary_aux_cal_path",
         "device",
     ]
     for name in ("output_scene", "reference_scene", "dem", "misreg_az_px"):
@@ -197,8 +199,9 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     # Real azimuth_time so the baseline orbit interpolator gets a tz-aware
     # datetime inside the fake orbit's coverage (PROPOSAL-0065).
     scene.geometry.azimuth_time = (
-        lambda line, _burst=scene.swath.bursts[0], _dt=scene.swath.azimuth_time_interval_s: _burst.azimuth_time
-        + timedelta(seconds=float(line) * _dt)
+        lambda line, _burst=scene.swath.bursts[0], _dt=scene.swath.azimuth_time_interval_s: (
+            _burst.azimuth_time + timedelta(seconds=float(line) * _dt)
+        )
     )
     scene.array.samples = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
     scene.array.valid_mask = np.ones((_LINES, _SAMPLES), dtype=bool)
@@ -422,7 +425,11 @@ def test_wrapper_keeps_explicit_bursts_when_roi_is_set(
         pytest.fail("explicit bursts must not re-run ROI selection")
 
     monkeypatch.setattr(coreg_module, "_select_bursts_by_roi", fake_select)
-    monkeypatch.setattr(coreg_module, "_roi_burst_window", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        coreg_module,
+        "_roi_burst_window",
+        lambda *_a, **_k: (0, _LINES, 0, _SAMPLES),
+    )
     product = coregister_s1_scene(
         tmp_path / REFERENCE,
         tmp_path / SECONDARIES[0],
@@ -437,6 +444,46 @@ def test_wrapper_keeps_explicit_bursts_when_roi_is_set(
     )
     assert product.date_id == "20200113"
     assert isinstance(product, CoregisteredSceneStore)
+
+
+def test_reference_grid_is_bounded_by_the_roi_crop(
+    tmp_path: Path, fake_s1: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ROI shrinks the merged scene grid to the union of the unit crops."""
+    del fake_s1
+    crop = (2, 6, 1, 5)
+    monkeypatch.setattr(
+        coreg_module, "_roi_burst_window", lambda *_a, **_k: (3, 5, 2, 4)
+    )
+    monkeypatch.setattr(
+        coreg_module, "reference_window_crop", lambda _window, _shape: crop
+    )
+    context = _prepare(
+        tmp_path,
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
+        roi=BoundingBox(0.0, 0.0, 1.0, 1.0),
+    )
+    assert context.grid_shape == (crop[1] - crop[0], crop[3] - crop[2])
+    unit = context.units["f0_IW1_b0"]
+    assert unit.row_origin == 0
+    assert unit.col_origin == 0
+    payload, _ = context.product.read("f0_IW1_b0")
+    assert payload.shape == (crop[1] - crop[0], crop[3] - crop[2])
+    record = context.product.radar_geometry
+    assert record is not None
+    assert record["shape"] == [crop[1] - crop[0], crop[3] - crop[2]]
+    swath = _product(tmp_path / REFERENCE).swaths[0]
+    assert (
+        record["sensing_start"]
+        == (
+            _ORIGIN + timedelta(seconds=crop[0] * swath.azimuth_time_interval_s)
+        ).isoformat()
+    )
+    assert record["starting_slant_range_m"] == pytest.approx(
+        swath.slant_range_time_s * 299_792_458.0 / 2.0
+        + crop[2] * swath.range_pixel_spacing_m
+    )
 
 
 def _multi_swath_product(path: Path) -> S1Product:
@@ -517,3 +564,29 @@ def test_frame_geometry_record_matches_unit_placement_for_iw1_to_iw3(
             assert (
                 geometry.azimuth_time(row) - sensing
             ).total_seconds() == pytest.approx(0.0, abs=first.azimuth_time_interval_s)
+
+
+def test_unit_placement_reads_iw2_from_the_frame_that_has_it() -> None:
+    """An IW1-only first frame no longer raises when placing IW2 bursts."""
+    from dataclasses import replace
+
+    from faninsar.missions.s1.processing import _swath_range_offsets
+
+    first = _product(Path(REFERENCE))
+    second = _multi_swath_product(Path("S1A_IW_SLC__1SDV_20200101T000100.SAFE"))
+    iw1_only = replace(first, swaths=(first.swaths[0],))
+    products = [iw1_only, second]
+    swaths = ("IW1", "IW2", "IW3")
+    resolved = {
+        (0, "IW1"): [0],
+        (1, "IW1"): [0, 1],
+        (1, "IW2"): [0, 1],
+        (1, "IW3"): [0, 1],
+    }
+    offsets = _swath_range_offsets(swaths, products)
+    units, _rows, _cols = coreg_module._unit_placement(
+        products, resolved, swaths, offsets
+    )
+    assert units["IW1"]
+    assert units["IW2"]
+    assert all(frame == 1 for frame, _burst, _row in units["IW2"])

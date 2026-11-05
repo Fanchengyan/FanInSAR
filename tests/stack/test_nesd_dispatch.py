@@ -415,9 +415,13 @@ def test_measure_lists_parent_slots_apply_keeps_roi_bursts(
     apply_selection = (("IW1",), {"IW1": [1]})
     measure_selection = (("IW1",), {"IW1": [0, 1, 2]})
     monkeypatch.setattr(
-        stack, "_resolve_s1_roi_burst_selection", lambda: apply_selection
+        stack,
+        "_resolve_s1_roi_burst_selection",
+        lambda **_kwargs: apply_selection,
     )
-    monkeypatch.setattr(stack, "_resolve_s1_nesd_selection", lambda: measure_selection)
+    monkeypatch.setattr(
+        stack, "_resolve_s1_nesd_selection", lambda **_kwargs: measure_selection
+    )
     stack._s1_roi_burst_selection = apply_selection
     stack._s1_nesd_selection = measure_selection
     measure_kw: dict[str, object] = {}

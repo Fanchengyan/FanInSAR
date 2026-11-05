@@ -9,13 +9,17 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
 import pytest
 
 from faninsar.missions.s1.orbit_fetch import (
     S1_ORBITS_ORIGIN,
+    covering_orbit_windows,
     ensure_covering_orbit_paths,
     parse_eof_filename,
+    prefetch_covering_orbits,
     select_covering_eof_keys,
+    start_orbit_prefetch,
 )
 from faninsar.missions.s1.search import select_orbit_bindings
 
@@ -565,6 +569,200 @@ def test_open_manifest_reuse_does_not_auto_fetch(
     stack._ensure_precise_orbits()
     assert not stack.config.extra.get("orbit_paths")
     assert opener.requests == []
+
+
+def _catalog_item(
+    *,
+    item_id: str,
+    platform: str | None,
+    start: datetime,
+    end: datetime | None = None,
+) -> Any:
+    """Build one catalog item with a covering sensing window."""
+    from faninsar import remote
+
+    return remote.CatalogItem(
+        provider="ASF",
+        catalog="sentinel1-asf",
+        collection="S1-SLC",
+        item_id=item_id,
+        acquisition=remote.AcquisitionMetadata(
+            acquisition_id=item_id,
+            start=start,
+            end=end or start,
+            platform=platform,
+        ),
+        assets={},
+        raw_metadata={},
+    )
+
+
+def test_covering_orbit_windows_union_same_satellite_and_split_missions() -> None:
+    """Same date on two satellites keeps two cache keys; same satellite unions."""
+    early = datetime(2024, 1, 1, tzinfo=UTC)
+    late = datetime(2024, 1, 1, 0, 2, tzinfo=UTC)
+    items = (
+        _catalog_item(item_id="A1", platform="S1A", start=early, end=early),
+        _catalog_item(item_id="A2", platform="S1A", start=late, end=late),
+        _catalog_item(item_id="C1", platform="S1C", start=early, end=late),
+        _catalog_item(item_id="X", platform=None, start=early),
+    )
+    intervals, mission_ids = covering_orbit_windows(items)
+    assert mission_ids == {"S1A:20240101": "S1A", "S1C:20240101": "S1C"}
+    assert intervals["S1A:20240101"] == (early, late)
+    assert intervals["S1C:20240101"] == (early, late)
+
+
+def test_covering_orbit_windows_reads_asf_burst_mission_property() -> None:
+    """ASF burst item_ids are ``S1_<id>``; the satellite lives on properties."""
+    from faninsar import remote
+
+    item = remote.CatalogItem(
+        provider="ASF",
+        catalog="sentinel1-asf",
+        collection="S1-SLC",
+        item_id="S1_3001_IW1_VV_20240101T000000",
+        acquisition=remote.AcquisitionMetadata(
+            acquisition_id="S1_3001",
+            start=_SCENE_INTERVAL[0],
+            end=_SCENE_INTERVAL[1],
+            properties={"mission": "S1A"},
+        ),
+        assets={},
+        raw_metadata={"properties": {"mission": "S1A"}},
+    )
+    intervals, mission_ids = covering_orbit_windows([item])
+    assert mission_ids == {"S1A:20240101": "S1A"}
+    assert intervals["S1A:20240101"] == _SCENE_INTERVAL
+
+
+def test_prefetch_writes_eof_into_workspace_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Search-item prefetch lists and GET covering EOFs into the shared cache."""
+    payload = _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")
+    opener = _install_fake_s3(monkeypatch, _FakeS3Opener({COVERING_POEORB: payload}))
+    cache = tmp_path / "orbits"
+    selected = prefetch_covering_orbits(
+        [
+            _catalog_item(
+                item_id="S1A_TEST",
+                platform="S1A",
+                start=_SCENE_INTERVAL[0],
+                end=_SCENE_INTERVAL[1],
+            )
+        ],
+        cache,
+    )
+    bound = selected["S1A:20240101"]
+    assert bound.parent == cache
+    assert bound.name.startswith("S1A_OPER_AUX_POEORB_")
+    assert bound.is_file()
+    assert opener.requests
+    assert all("s1qc" not in request.full_url for request in opener.requests)
+
+
+def test_from_search_prefetches_orbits_beside_slc_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """s1-orbits GET overlaps CDSE/ASF materialize on a dedicated thread."""
+    import threading as threading_mod
+    import time
+
+    from faninsar.data.query import BoundingBox
+    from faninsar.missions.s1.s1search import S1Search
+    from faninsar.missions.s1.stack import S1Stack
+
+    events: list[tuple[str, float]] = []
+    started = threading_mod.Event()
+
+    def fake_prefetch(items: Any, cache_dir: Any, *, budget: Any = None) -> dict:
+        del items, cache_dir, budget
+        events.append(("orbit_start", time.monotonic()))
+        started.set()
+        time.sleep(0.2)
+        events.append(("orbit_end", time.monotonic()))
+        return {}
+
+    def fake_materialize(*_args: Any, **_kwargs: Any) -> list[Path]:
+        started.wait(timeout=2)
+        events.append(("slc_start", time.monotonic()))
+        time.sleep(0.2)
+        events.append(("slc_end", time.monotonic()))
+        return [tmp_path / "scene.SAFE"]
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.orbit_fetch.prefetch_covering_orbits",
+        fake_prefetch,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.stack.materialize_s1_acquisitions",
+        fake_materialize,
+    )
+    monkeypatch.setattr(
+        S1Stack,
+        "from_safes",
+        classmethod(
+            lambda _cls, _paths, **_kw: type("S", (), {"prepare": lambda self: None})()
+        ),
+    )
+    search = S1Search(
+        items=(
+            _catalog_item(
+                item_id="S1A_TEST",
+                platform="S1A",
+                start=_SCENE_INTERVAL[0],
+                end=_SCENE_INTERVAL[1],
+            ),
+        ),
+        catalog="sentinel1-asf",
+        spatial=BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326"),
+        query={},
+    )
+    S1Stack.from_search(search, work_dir=tmp_path, provider="asf")
+    stamps = dict(events)
+    assert stamps["orbit_start"] < stamps["slc_end"]
+    assert stamps["slc_start"] < stamps["orbit_end"]
+
+
+def test_track_open_reuses_workspace_orbit_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Track-scoped coregistration reuses the workspace-root EOF cache."""
+    from faninsar.missions.s1.stack import S1Stack
+    from faninsar.stack.layout import workspace_orbits_dir
+
+    cache = workspace_orbits_dir(tmp_path / "work" / "tracks" / "88A")
+    cache.mkdir(parents=True)
+    cached = cache / COVERING_POEORB.rsplit("/", 1)[1]
+    cached.write_bytes(_eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00"))
+    opener = _install_fake_s3(monkeypatch, _FakeS3Opener({COVERING_POEORB: b"stale"}))
+    monkeypatch.setattr(
+        "faninsar.missions.s1.safe.open_safe_product",
+        lambda *_args, **_kwargs: _fake_product(),
+    )
+    stack = S1Stack.from_safes(
+        [_dummy_safe(tmp_path)],
+        work_dir=tmp_path / "work" / "tracks" / "88A",
+    )
+    stack._ensure_precise_orbits()
+    bound = Path(stack.config.extra["orbit_paths"]["20240101"])
+    assert bound == cached
+    object_gets = [
+        request
+        for request in opener.requests
+        if urllib.parse.urlsplit(request.full_url).path.endswith(".EOF")
+    ]
+    assert object_gets == []
+
+
+def test_start_orbit_prefetch_skips_items_without_platform(tmp_path: Any) -> None:
+    """Items that cannot name a covering window do not start an S3 thread."""
+    thread = start_orbit_prefetch(
+        [_catalog_item(item_id="S1_TEST", platform=None, start=_SCENE_INTERVAL[0])],
+        tmp_path / "orbits",
+    )
+    assert thread is None
 
 
 def test_s1qc_origin_is_rejected_for_object_get(tmp_path: Any) -> None:

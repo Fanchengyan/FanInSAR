@@ -10,34 +10,33 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 from faninsar.logging import reject, setup_logger
-from faninsar.processing.errors import reject_pair_configuration
-from faninsar.stack.provider import StackSceneProvider
-from faninsar.stack.search import (
-    MissionPreparedInputs,
-    MissionSearchProfile,
-    SelectionRequest,
+from faninsar.processing.errors import (
+    reject_invalid_state,
+    reject_pair_configuration,
 )
+from faninsar.stack.provider import StackSceneProvider
+from faninsar.stack.search import MissionPreparedInputs
 from faninsar.stack.session import Stack
 
 from .acquisition import (
     _bind_cdse_item,
+    _binding_track_key,
+    asf_burst_selectors,
+    asf_frame_selectors,
+    discover_cdse_slc_items,
     materialize_cdse_roi_safes,
+    materialize_s1_acquisitions,
     normalize_roi_wgs84,
 )
+from .s1search import search_acquisitions
 from .search import (
     S1PolarizationRequest,
-    S1ProductType,
     canonical_items,
-    catalog_for_product,
     complete_safe_asset,
     ensure_asf_catalog,
-    filter_burst_polarizations,
     local_destination,
     normalize_polarizations,
-    product_filters,
-    safe_requires_aux_cal,
     select_orbit_bindings,
-    validate_calibration_paths,
 )
 
 if TYPE_CHECKING:
@@ -143,9 +142,13 @@ def _configure_s1_bindings(
     stack: S1Stack,
     *,
     orbit_paths: Mapping[str, object] | Sequence[str | Path] | None,
-    calibration_paths: Sequence[str | Path] | None,
+    aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None,
 ) -> None:
-    """Resolve explicit local S1 orbit and calibration bindings."""
+    """Resolve explicit local S1 orbit and AUX_CAL bindings.
+
+    AUX_CAL pins are recorded per IPF 002.36 date; dates they do not cover
+    are filled in by :meth:`S1Stack._prepare_mission`.
+    """
     intervals: dict[str, tuple[Any, Any]] = {}
     mission_ids: dict[str, str] = {}
     if orbit_paths is not None:
@@ -173,25 +176,42 @@ def _configure_s1_bindings(
         intervals,
         mission_ids=mission_ids or None,
     )
-    calibrations = validate_calibration_paths(calibration_paths)
-    if any(
-        safe_requires_aux_cal(path)
-        for date_id in stack.catalog.dates
-        for path in stack.catalog.paths_for(date_id)
-    ):
-        message = (
-            "Sentinel-1 IPF 002.36 requires AUX_CAL EAP correction, which the "
-            "FanInSAR SAFE reader does not yet implement"
-        )
-        reject(message, NotImplementedError, logger=logger)
+    aux_cal: dict[str, Path] = {}
+    if aux_cal_paths is not None:
+        from faninsar.missions.s1.aux_cal import select_aux_cal_bindings
+
+        aux_cal = select_aux_cal_bindings(aux_cal_paths, _eap_acquisitions(stack))
     if selected:
         stack.config.extra["orbit_paths"] = selected
     else:
         stack.config.extra.pop("orbit_paths", None)
-    if calibrations:
-        stack.config.extra["calibration_paths"] = calibrations
+    if aux_cal:
+        stack.config.extra["aux_cal_paths"] = aux_cal
     else:
-        stack.config.extra.pop("calibration_paths", None)
+        stack.config.extra.pop("aux_cal_paths", None)
+
+
+def _eap_acquisitions(stack: Stack) -> dict[str, tuple[str, Any]]:
+    """Return ``date -> (mission, sensing_mid)`` of IPF 002.36 acquisitions."""
+    from faninsar.missions.s1.aux_cal import requires_eap_correction
+    from faninsar.missions.s1.safe import open_acquisition_products
+
+    polarizations = stack.config.extra.get("polarizations")
+    selected = None if polarizations in (None, "all") else tuple(polarizations)
+    result: dict[str, tuple[str, Any]] = {}
+    for date_id in stack.catalog.dates:
+        products = open_acquisition_products(
+            stack.catalog.paths_for(date_id), polarizations=selected
+        )
+        flagged = [product for product in products if requires_eap_correction(product)]
+        if not flagged:
+            continue
+        swaths = [swath for product in flagged for swath in product.swaths]
+        starts = [swath.sensing_start for swath in swaths]
+        stops = [swath.sensing_stop for swath in swaths]
+        midpoint = min(starts) + (max(stops) - min(starts)) / 2
+        result[date_id] = (str(flagged[0].mission_id).upper(), midpoint)
+    return result
 
 
 class S1Stack(Stack):
@@ -202,77 +222,11 @@ class S1Stack(Stack):
     otherwise guesses how a source path should be opened.
     """
 
-    @classmethod
-    def _search_profile(cls) -> Any:
-        """Return the default Sentinel-1 burst search profile."""
-        ensure_asf_catalog(product_type="burst")
-        return MissionSearchProfile(
-            mission="sentinel-1",
-            catalog=catalog_for_product("burst"),
-            collections=("sentinel-1",),
-            default_filters={"dataset": "SLC-BURST", "processingLevel": "BURST"},
-            normalizer=canonical_items,
-            selector=lambda items, request: canonical_items(items)[: request.limit],
-        )
+    # The single Sentinel-1 search implementation (PROPOSAL-0072 §2):
+    # ``S1Stack.search`` and ``search_acquisitions`` are the same function.
+    search = staticmethod(search_acquisitions)
 
-    @classmethod
-    def search(
-        cls,
-        spatial: Points | BoundingBox | Polygons,
-        *,
-        product_type: S1ProductType = "burst",
-        polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
-        catalog: str | None = None,
-        collections: Sequence[str] | None = None,
-        datetime_range: tuple[datetime, datetime] | None = None,
-        flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
-        filters: Mapping[str, Any] | None = None,
-        auth_profile: str | None = "earthdata-asf",
-        limit: int = 100,
-        budget: RemoteResourceBudget | None = None,
-    ) -> list[CatalogItem]:
-        """Search Sentinel-1 ASF records with mission defaults applied."""
-        selected_polarizations = (
-            "all" if polarizations is None else normalize_polarizations(polarizations)
-        )
-        if catalog is None:
-            catalog = catalog_for_product(product_type)
-        if catalog == "sentinel1-asf":
-            ensure_asf_catalog(catalog, product_type=product_type)
-        from faninsar import remote
-
-        merged_filters = product_filters(product_type, selected_polarizations, filters)
-        profile = MissionSearchProfile(
-            mission="sentinel-1",
-            catalog=catalog,
-            collections=tuple(collections or ()),
-            default_filters=merged_filters,
-            normalizer=canonical_items,
-            selector=lambda values, request: canonical_items(values)[: request.limit],
-        )
-        items = remote.search(
-            spatial,
-            catalog=catalog,
-            collections=collections,
-            datetime_range=datetime_range,
-            flight_direction=flight_direction,
-            filters=merged_filters,
-            auth_profile=auth_profile,
-            limit=limit,
-            budget=budget,
-        )
-        ordered = profile.normalize(items)
-        if product_type == "burst" and selected_polarizations != "all":
-            ordered = filter_burst_polarizations(ordered, selected_polarizations)
-        return profile.select(
-            ordered,
-            SelectionRequest(
-                limit=limit,
-                datetime_range=datetime_range,
-                flight_direction=flight_direction,
-                filters=merged_filters,
-            ),
-        )
+    _sensor_registry_key = "sentinel1"
 
     @classmethod
     def from_safes(
@@ -282,7 +236,7 @@ class S1Stack(Stack):
         reference: object | None = None,
         polarizations: S1PolarizationRequest | Sequence[str] | str | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
-        calibration_paths: Sequence[str | Path] | None = None,
+        aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         coreg_mode: CoregMode = "geometry",
         swaths: tuple[str, ...] | None = None,
         bursts: BurstSelection | None = None,
@@ -293,15 +247,26 @@ class S1Stack(Stack):
         Parameters
         ----------
         paths : sequence of path-like
-            Sentinel-1 SAFE directories or archives.
+            Sentinel-1 SAFE directories or ``.zip`` archives.  Accepts whole
+            frame SAFEs, single-burst ASF ``-BURST`` zips, and the
+            ``tracks/<trackKey>/acquisitions`` path-SAFEs that
+            :meth:`from_search` materializes — so acquisitions downloaded
+            externally (whole frames or burst products) can start here
+            directly.  Paths whose track cannot be resolved (e.g. an old
+            frame name with no relative orbit) still load; they simply do
+            not participate in track/polygon ``sel`` routing.
         reference : date-like, optional
             Reference acquisition.  Defaults to the existing Stack default.
         polarizations : sequence of str or "all", optional
             Local Sentinel-1 channels to retain when opening SAFE inputs.
         orbit_paths : mapping or sequence, optional
             Explicit local POEORB/RESORB candidates or date bindings.
-        calibration_paths : sequence, optional
-            Explicit local AUX_CAL/calibration files.
+        aux_cal_paths : mapping or sequence, optional
+            Explicit local Sentinel-1 AUX_CAL files (``.SAFE.zip``, ``.SAFE``,
+            or ``s1?-aux-cal.xml``) or date bindings.  Only IPF 002.36
+            products use them, for the elevation antenna phase correction
+            applied on load; uncovered dates are downloaded from SAR-MPC
+            during :meth:`prepare`.
         coreg_mode : {"geometry", "nesd"}, optional
             Stack coregistration mode. Defaults to ``"geometry"``.
             Tests that exercise NESD pass ``coreg_mode="nesd"``.
@@ -351,7 +316,7 @@ class S1Stack(Stack):
         _configure_s1_bindings(
             stack,
             orbit_paths=orbit_paths,
-            calibration_paths=calibration_paths,
+            aux_cal_paths=aux_cal_paths,
         )
         return stack  # type: ignore[return-value]
 
@@ -360,26 +325,33 @@ class S1Stack(Stack):
         cls,
         search: Any,
         *,
-        roi: Points | BoundingBox | Polygons | None = None,
-        polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
         work_dir: str | Path,
-        granularity: str | None = None,
-        product_type: S1ProductType | None = None,
+        roi: Points | BoundingBox | Polygons | None = None,
+        provider: Literal["cdse", "asf"] = "cdse",
+        granularity: Literal["roi", "burst"] = "roi",
+        polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
         coreg_mode: CoregMode = "geometry",
+        orbit_group: str | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
-        calibration_paths: Sequence[str | Path] | None = None,
+        aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         **kwargs: Any,
     ) -> Self:
         """Build a Stack from a pre-filtered :class:`S1Search` result set.
 
         The acquisitions to materialize come from ``search.items`` — already
         filtered/composed client-side — so the provider search step is skipped
-        entirely.  ``search.catalog`` picks the provider path:
+        entirely.  ``provider`` picks how those items are downloaded; the
+        search catalog itself is not a download constraint:
 
-        - ``sentinel1-cdse`` → byte-range windows (``granularity``, default
-          ``"roi"``) materialized via :func:`materialize_cdse_roi_safes`.
-        - ``sentinel1-asf`` → complete burst/scene products via
-          :meth:`_from_asf_complete` (``product_type``, default ``"burst"``).
+        - ``"cdse"`` (default) → byte-range windows materialized via the
+          CDSE range path; ``granularity`` selects the window shape.  When
+          ``search.catalog`` is ``"sentinel1-asf"`` the searched items are
+          re-discovered inside the CDSE catalog and their
+          ``absoluteBurstID``/``sensingStart`` select the same bursts in the
+          CDSE parent frames (``asf_burst_selectors``).
+        - ``"asf"`` → complete burst products via the ASF burst-extractor
+          path.  ASF always downloads whole bursts, so ``granularity`` is
+          forced to ``"burst"``.
 
         ``roi`` is optional.  When given it bounds processing — CDSE crops to
         byte ranges on download; ASF downloads whole products but ``prepare``/
@@ -389,27 +361,43 @@ class S1Stack(Stack):
         Parameters
         ----------
         search : S1Search
-            Filtered/composed acquisitions (see
-            :func:`~faninsar.missions.s1.s1search.search_acquisitions`).
+            Filtered/composed acquisitions returned by :meth:`search`
+            (:func:`~faninsar.missions.s1.s1search.search_acquisitions`).
+        work_dir : path-like
+            Stack work directory and local input cache.  Required — the
+            Stack persists ``stack.json``, acquisitions, and products here.
         roi : spatial, optional
             Optional processing bound.  ``search.spatial`` is reused when the
             search was ROI-scoped and ``roi`` is omitted and CDSE windows
             still need one — pass it explicitly to be safe.
+        provider : {"cdse", "asf"}, optional
+            Download provider, default ``"cdse"``.  ``"cdse"`` re-discovers
+            the acquisitions on the CDSE catalog and range-fetches the
+            selected windows; ``"asf"`` downloads the ASF whole-burst
+            products directly.  The provider is independent of the search
+            catalog — an ASF-searched result can still be downloaded
+            through CDSE.
+        granularity : {"roi", "burst"}, optional
+            Download granularity.  ``"roi"`` (default) range-fetches the
+            polygon-union row windows on the CDSE path; ``"burst"``
+            materializes whole bursts.  Always ``"burst"`` on the ASF path.
         polarizations : sequence of str or "all", optional
             Sentinel-1 single/dual channels to retain.
-        work_dir : path-like
-            Stack work directory and local input cache.
-        granularity : {"roi", "burst"} or None, optional
-            CDSE byte-range granularity.  Defaults to ``"roi"``.  Ignored on
-            the ASF path.
-        product_type : {"burst", "scene"} or None, optional
-            ASF product family.  Defaults to ``"burst"``.  Ignored on the
-            CDSE path.
         coreg_mode : {"geometry", "nesd"}, optional
             Stack coregistration mode.
-        orbit_paths, calibration_paths : optional
-            Explicit local orbit candidates/bindings and AUX_CAL files passed
-            to :meth:`from_safes`.
+        orbit_group : {"auto", "require"} or str, optional
+            Track selection when ``search.items`` spans multiple orbit groups
+            (``relative_orbit`` + ``orbit_direction``; satellites sharing one
+            orbit land in the same group).  ``None`` (default) keeps every
+            selected track.  ROI range requests share one transfer pool;
+            each track retains its own acquisition directory.  Pass an
+            explicit ``"<REL_ORBIT>/<DIRECTION>"`` selector to pick one.
+        orbit_paths, aux_cal_paths : optional
+            Explicit local orbit and AUX_CAL candidates/bindings passed to
+            :meth:`from_safes`.  When ``orbit_paths`` is omitted, covering
+            EOFs are prefetched from anonymous s1-orbits on a dedicated
+            thread while XML/burst bytes transfer, then bound at the first
+            precise-orbit stage.
         **kwargs
             Forwarded to the provider constructor / ``from_safes``.
 
@@ -425,28 +413,106 @@ class S1Stack(Stack):
             message = (
                 "from_search expects an S1Search, got "
                 f"{type(search).__name__}; produce one via "
-                "search_acquisitions(...)"
+                "S1Stack.search(...) or search_acquisitions(...)"
             )
             raise TypeError(message)
         if not search.items:
             message = "from_search received an empty S1Search; nothing to download"
             reject(message, ValueError, logger=logger)
         selected_polarizations = normalize_polarizations(polarizations)
-        catalog = search.catalog
         effective_roi = roi if roi is not None else search.spatial
         if effective_roi is not None:
             effective_roi = normalize_roi_wgs84(effective_roi)
 
-        if catalog == "sentinel1-cdse":
+        # ``provider`` selects the download path; the search itself is
+        # catalog-agnostic.  ``provider="cdse"`` re-discovers the same
+        # acquisitions inside the CDSE catalog (the two catalogs share the
+        # ``absoluteBurstID`` namespace and the sensing-time axis), so the
+        # searched items only act as the selection, never as the asset.
+        if provider not in ("cdse", "asf"):
+            message = f"provider must be 'cdse' or 'asf'; got {provider!r}"
+            reject(message, ValueError, logger=logger)
+        if provider == "asf":
+            # ASF only ships whole burst products; there is no roi/scene
+            # granularity to select.
+            granularity = "burst"
+
+        extra_preview = dict(kwargs.get("extra", {}) or {})
+        orbit_prefetch = None
+        if orbit_paths is None and bool(extra_preview.get("orbit_auto_fetch", True)):
+            from faninsar.missions.s1.orbit_fetch import start_orbit_prefetch
+            from faninsar.stack.layout import workspace_orbits_dir
+
+            orbit_prefetch = start_orbit_prefetch(
+                search.items,
+                workspace_orbits_dir(work_dir),
+            )
+
+        try:
+            return cls._materialize_from_search(
+                search,
+                work_dir=work_dir,
+                provider=provider,
+                granularity=granularity,
+                polarizations=selected_polarizations,
+                coreg_mode=coreg_mode,
+                orbit_group=orbit_group,
+                orbit_paths=orbit_paths,
+                aux_cal_paths=aux_cal_paths,
+                effective_roi=effective_roi,
+                kwargs=kwargs,
+            )
+        finally:
+            if orbit_prefetch is not None:
+                orbit_prefetch.join()
+
+    @classmethod
+    def _materialize_from_search(
+        cls,
+        search: Any,
+        *,
+        work_dir: str | Path,
+        provider: Literal["cdse", "asf"],
+        granularity: str,
+        polarizations: Any,
+        coreg_mode: CoregMode,
+        orbit_group: str | None,
+        orbit_paths: Mapping[str, object] | Sequence[str | Path] | None,
+        aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None,
+        effective_roi: Any,
+        kwargs: dict[str, Any],
+    ) -> Self:
+        """Download selected acquisitions then join through ``from_safes``."""
+        selected_polarizations = polarizations
+        if provider == "cdse":
             requested = (
                 None
                 if selected_polarizations == "all"
                 else {str(p).upper() for p in selected_polarizations}
             )
-            bindings = []
-            for item in search.items:
+            # Split items by their own catalog: CDSE items already carry the
+            # OData node URLs the range path reads (bind directly), while ASF
+            # items carry whole-product assets the CDSE range path cannot
+            # read — those are re-discovered on CDSE narrowed to the ASF
+            # items' sensing window and track identities.  A mixed search
+            # (e.g. S1A from ASF + S1B/C/D from CDSE) splits per item so both
+            # catalogs feed the same download.
+            cdse_items = [
+                i for i in search.items if getattr(i, "catalog", "") == "sentinel1-cdse"
+            ]
+            asf_items = [
+                i for i in search.items if getattr(i, "catalog", "") == "sentinel1-asf"
+            ]
+            bindings: list[dict[str, Any]] | None = []
+            for item in cdse_items:
                 bindings.extend(_bind_cdse_item(item))
-            if requested is not None:
+            if asf_items:
+                absolute_ids, sensing_times = asf_burst_selectors(asf_items)
+                frame_window, frame_tracks = asf_frame_selectors(asf_items)
+            else:
+                absolute_ids, sensing_times = [], []
+                frame_window, frame_tracks = None, set()
+            if bindings is not None and requested is not None:
                 bindings = [b for b in bindings if b.get("polarization") in requested]
             if effective_roi is None:
                 message = (
@@ -455,26 +521,70 @@ class S1Stack(Stack):
                 )
                 reject(message, ValueError, logger=logger)
             dem = kwargs.pop("dem", None)
-            local_paths = materialize_cdse_roi_safes(
-                effective_roi,
-                polarizations=selected_polarizations,
-                work_dir=work_dir,
-                granularity=granularity or "roi",
-                coreg_mode=coreg_mode,
-                items=bindings,
-                dem=dem,
-            )
+            if asf_items:
+                # Re-discover the ASF-selected acquisitions on CDSE, narrowed
+                # to the ASF items' sensing window, then keep only bindings
+                # in the searched tracks so other orbits on the same ROI do
+                # not leak in.  Burst-level items additionally pass their
+                # absoluteBurstID/sensingStart selector through.  Any CDSE
+                # items in the same search are merged in afterwards.
+                rediscovered = discover_cdse_slc_items(
+                    effective_roi,
+                    datetime_range=frame_window,
+                    polarizations=selected_polarizations,
+                )
+                if frame_tracks:
+                    rediscovered = [
+                        b for b in rediscovered if _binding_track_key(b) in frame_tracks
+                    ]
+                per_mission = kwargs.pop("per_mission_limit", None)
+                if per_mission is not None:
+                    rediscovered = _cap_per_mission(rediscovered, int(per_mission))
+                if bindings:
+                    seen = {str(b.get("measurement_url")) for b in bindings}
+                    bindings.extend(
+                        b
+                        for b in rediscovered
+                        if str(b.get("measurement_url")) not in seen
+                    )
+                else:
+                    bindings = rediscovered
+                local_paths = materialize_s1_acquisitions(
+                    effective_roi,
+                    provider="cdse",
+                    granularity=granularity,
+                    polarizations=selected_polarizations,
+                    work_dir=work_dir,
+                    items=bindings,
+                    absolute_burst_ids=absolute_ids or None,
+                    catalog_sensing_times=sensing_times or None,
+                    orbit_group=orbit_group,
+                    dem=dem,
+                    coreg_mode=coreg_mode,
+                )
+            else:
+                local_paths = materialize_s1_acquisitions(
+                    effective_roi,
+                    provider="cdse",
+                    granularity=granularity,
+                    polarizations=selected_polarizations,
+                    work_dir=work_dir,
+                    items=bindings,
+                    orbit_group=orbit_group,
+                    dem=dem,
+                    coreg_mode=coreg_mode,
+                )
             extra = dict(kwargs.pop("extra", {}) or {})
             extra.update(
                 {
-                    "search_product_type": granularity or "roi",
+                    "search_product_type": granularity,
                     "search_polarizations": selected_polarizations,
                 }
             )
             if orbit_paths is not None:
                 kwargs["orbit_paths"] = orbit_paths
-            if calibration_paths is not None:
-                kwargs["calibration_paths"] = calibration_paths
+            if aux_cal_paths is not None:
+                kwargs["aux_cal_paths"] = aux_cal_paths
             if effective_roi is not None:
                 kwargs.setdefault("roi", effective_roi)
             kwargs["extra"] = extra
@@ -482,6 +592,7 @@ class S1Stack(Stack):
                 local_paths,
                 work_dir=work_dir,
                 polarizations=selected_polarizations,
+                coreg_mode=coreg_mode,
                 **kwargs,
             )
             prepare = getattr(stack, "prepare", None)
@@ -491,7 +602,9 @@ class S1Stack(Stack):
                 stack.prepare_scenes()
             return stack
 
-        # ASF (and any catalog that ships complete products).
+        # ASF burst-extractor path: whole-burst products reassembled into
+        # the same tracks/<key>/acquisitions path-SAFE layout the CDSE
+        # burst path emits.
         spatial_arg = effective_roi if effective_roi is not None else search.spatial
         if spatial_arg is None:
             message = (
@@ -499,16 +612,46 @@ class S1Stack(Stack):
                 "search was not spatial-scoped and roi= was not given"
             )
             reject(message, ValueError, logger=logger)
-        return cls._from_asf_complete(
+        excluded: list[dict[str, str]] = []
+        local_paths = materialize_s1_acquisitions(
             spatial_arg,
-            work_dir=work_dir,
-            product_type=product_type or "burst",
+            provider="asf",
+            granularity="burst",
             polarizations=selected_polarizations,
+            work_dir=work_dir,
             items=list(search.items),
-            orbit_paths=orbit_paths,
-            calibration_paths=calibration_paths,
+            on_exclusion=lambda item, destination: excluded.append(
+                _excluded_acquisition_record(item, destination)
+            ),
+        )
+        extra = dict(kwargs.pop("extra", {}) or {})
+        if excluded:
+            extra["excluded_acquisitions"] = tuple(excluded)
+        extra.update(
+            {
+                "search_product_type": "burst",
+                "search_polarizations": selected_polarizations,
+            }
+        )
+        if orbit_paths is not None:
+            kwargs["orbit_paths"] = orbit_paths
+        if aux_cal_paths is not None:
+            kwargs["aux_cal_paths"] = aux_cal_paths
+        kwargs.setdefault("roi", spatial_arg)
+        kwargs["extra"] = extra
+        stack = cls.from_safes(
+            local_paths,
+            work_dir=work_dir,
+            polarizations=selected_polarizations,
+            coreg_mode=coreg_mode,
             **kwargs,
         )
+        prepare = getattr(stack, "prepare", None)
+        if callable(prepare):
+            prepare()
+        else:
+            stack.prepare_scenes()
+        return stack
 
     @classmethod
     def _from_cdse_roi(
@@ -520,7 +663,7 @@ class S1Stack(Stack):
         polarizations: S1PolarizationRequest | Sequence[str] | str,
         work_dir: str | Path,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None,
-        calibration_paths: Sequence[str | Path] | None,
+        aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None,
         **kwargs: Any,
     ) -> Self:
         """Materialize CDSE canvases then join through ``from_safes``."""
@@ -557,8 +700,8 @@ class S1Stack(Stack):
         )
         if orbit_paths is not None:
             kwargs["orbit_paths"] = orbit_paths
-        if calibration_paths is not None:
-            kwargs["calibration_paths"] = calibration_paths
+        if aux_cal_paths is not None:
+            kwargs["aux_cal_paths"] = aux_cal_paths
         kwargs.setdefault("roi", roi)
         kwargs["extra"] = extra
         stack = cls.from_safes(
@@ -577,54 +720,54 @@ class S1Stack(Stack):
     @classmethod
     def _from_asf_complete(
         cls,
-        spatial: Points | BoundingBox | Polygons,
+        roi: Points | BoundingBox | Polygons,
         *,
         work_dir: str | Path,
-        product_type: S1ProductType = "burst",
+        missions: str | Sequence[str] | None = None,
         polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
-        catalog: str | None = None,
         collections: Sequence[str] | None = None,
-        datetime_range: tuple[datetime, datetime] | None = None,
+        datetime_range: tuple[Any, Any] | None = None,
         flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
-        filters: Mapping[str, Any] | None = None,
+        track: int | Sequence[int] | None = None,
+        burst_id: int | Sequence[int] | None = None,
         auth_profile: str | None = "earthdata-asf",
-        limit: int = 100,
+        limit: int = 10_000,
         budget: RemoteResourceBudget | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
-        calibration_paths: Sequence[str | Path] | None = None,
+        aux_cal_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         items: Sequence[CatalogItem] | None = None,
-        **kwargs: Any,
+        **filters: Any,
     ) -> Self:
         """Search ASF, download complete SAFE inputs, and prepare a Stack.
 
         Absorbed from the deleted ``from_search`` constructor
-        (PROPOSAL-0061).  Burst products poll until ready; scene products
-        download immediately.  When ``items`` is given the internal
-        :meth:`search` call is skipped and those items are downloaded
-        directly — the ``from_search`` path.
+        (PROPOSAL-0061).  Burst products poll until ready.  When ``items`` is
+        given the internal :meth:`search` call is skipped and those items are
+        downloaded directly — the ``from_search`` path.
         """
         selected_polarizations = normalize_polarizations(polarizations)
-        catalog_name = catalog or catalog_for_product(product_type)
-        if catalog_name == "sentinel1-asf":
-            ensure_asf_catalog(catalog_name, product_type=product_type)
+        ensure_asf_catalog("sentinel1-asf", product_type="burst")
         from faninsar import remote
         from faninsar.remote.errors import _fail
         from faninsar.remote.protocols import _CallLedger
 
         budget = budget or remote.RemoteResourceBudget()
         if items is None:
-            items = cls.search(
-                spatial,
-                product_type=product_type,
-                polarizations=selected_polarizations,
-                catalog=catalog_name,
-                collections=collections,
-                datetime_range=datetime_range,
-                flight_direction=flight_direction,
-                filters=filters,
-                auth_profile=auth_profile,
-                limit=limit,
-                budget=budget,
+            items = list(
+                cls.search(
+                    roi,
+                    missions=missions,
+                    polarizations=selected_polarizations,
+                    collections=collections,
+                    datetime_range=datetime_range,
+                    flight_direction=flight_direction,
+                    track=track,
+                    burst_id=burst_id,
+                    auth_profile=auth_profile,
+                    limit=limit,
+                    budget=budget,
+                    **filters,
+                )
             )
         selected_items = canonical_items(items)
         if not selected_items:
@@ -633,13 +776,12 @@ class S1Stack(Stack):
         root = Path(work_dir)
         poll_scheduler = None
         poll_tokens: list[Any | None] = [None] * len(selected_items)
-        if product_type == "burst":
-            from faninsar.remote.fetch.complete import _BurstPollScheduler
+        from faninsar.remote.fetch.complete import _BurstPollScheduler
 
-            poll_scheduler = _BurstPollScheduler()
-            poll_tokens = [
-                poll_scheduler.register(index) for index in range(len(selected_items))
-            ]
+        poll_scheduler = _BurstPollScheduler()
+        poll_tokens = [
+            poll_scheduler.register(index) for index in range(len(selected_items))
+        ]
         download_plans: list[tuple[CatalogItem, Any, Path]] = []
         identities: list[dict[str, str]] = []
         for item in selected_items:
@@ -808,27 +950,27 @@ class S1Stack(Stack):
                 "the recorded files and re-download them before preparing"
             )
             reject(message, ValueError, logger=logger)
-        extra = dict(kwargs.pop("extra", {}) or {})
+        extra = dict(filters.pop("extra", {}) or {})
         if excluded_acquisitions:
             extra["excluded_acquisitions"] = tuple(excluded_acquisitions)
         extra.update(
             {
-                "search_product_type": product_type,
+                "search_product_type": "burst",
                 "search_polarizations": selected_polarizations,
                 "search_items": tuple(identities),
             }
         )
         if orbit_paths is not None:
-            kwargs["orbit_paths"] = orbit_paths
-        if calibration_paths is not None:
-            kwargs["calibration_paths"] = calibration_paths
-        kwargs.setdefault("roi", spatial)
-        kwargs["extra"] = extra
+            filters["orbit_paths"] = orbit_paths
+        if aux_cal_paths is not None:
+            filters["aux_cal_paths"] = aux_cal_paths
+        filters.setdefault("roi", roi)
+        filters["extra"] = extra
         stack = cls.from_safes(
             local_paths,
             work_dir=root,
             polarizations=selected_polarizations,
-            **kwargs,
+            **filters,
         )
         prepare = getattr(stack, "prepare", None)
         if callable(prepare):
@@ -843,9 +985,10 @@ class S1Stack(Stack):
         return StackSceneProvider(name="Sentinel-1 SAFE")
 
     def prepare(self, *, refresh: bool = False) -> Self:
-        """Prepare shared inputs, re-enabling orbit auto-fetch on refresh."""
+        """Prepare shared inputs, re-enabling orbit/AUX_CAL auto-fetch on refresh."""
         if refresh:
             self.config.extra["orbit_auto_fetch"] = True
+            self.config.extra["aux_cal_auto_fetch"] = True
         return super().prepare()
 
     def _ensure_precise_orbits(self) -> None:
@@ -887,11 +1030,12 @@ class S1Stack(Stack):
         if not intervals:
             return
         cache = self.config.extra.get("orbit_cache_dir")
-        cache_dir = (
-            Path(cache)
-            if cache is not None
-            else self.config.work_dir / "inputs" / "orbits"
-        )
+        if cache is not None:
+            cache_dir = Path(cache)
+        else:
+            from faninsar.stack.layout import resolve_orbit_cache_dir
+
+            cache_dir = resolve_orbit_cache_dir(self.config.work_dir)
         selected = ensure_covering_orbit_paths(
             intervals=intervals,
             mission_ids=mission_ids,
@@ -904,10 +1048,28 @@ class S1Stack(Stack):
         elif existing_paths is None:
             self.config.extra.pop("orbit_paths", None)
 
+    def _ensure_aux_cal(self) -> None:
+        """Bind (and download if missing) AUX_CAL files for IPF 002.36 dates."""
+        acquisitions = _eap_acquisitions(self)
+        if not acquisitions:
+            self.config.extra.pop("aux_cal_paths", None)
+            return
+        from faninsar.missions.s1.aux_cal_fetch import ensure_aux_cal_paths
+        from faninsar.stack.layout import aux_cal_dir
+
+        existing = self.config.extra.get("aux_cal_paths")
+        self.config.extra["aux_cal_paths"] = ensure_aux_cal_paths(
+            acquisitions=acquisitions,
+            cache_dir=aux_cal_dir(self.config.work_dir),
+            existing=existing if isinstance(existing, Mapping) else None,
+            auto_fetch=bool(self.config.extra.get("aux_cal_auto_fetch", True)),
+        )
+
     def _prepare_mission(self) -> MissionPreparedInputs:
         """Return SAFE-derived S1 footprints and local mission bindings."""
         from faninsar.missions.s1.safe import open_safe_product
 
+        self._ensure_aux_cal()
         footprints: list[object] = []
         input_paths: list[Path] = []
         for date_id in self.catalog.dates:
@@ -931,13 +1093,18 @@ class S1Stack(Stack):
         return MissionPreparedInputs(
             selected_footprints=tuple(footprints),
             orbit_paths_by_acquisition=dict(self.config.extra.get("orbit_paths", {})),
-            calibration_paths=tuple(self.config.extra.get("calibration_paths", ())),
+            aux_cal_paths_by_acquisition=dict(
+                self.config.extra.get("aux_cal_paths", {})
+            ),
             provenance={
                 "mission": "sentinel-1",
                 "orbit_source": (
                     "external" if self.config.extra.get("orbit_paths") else "embedded"
                 ),
-                "calibration": str(len(self.config.extra.get("calibration_paths", ()))),
+                "eap_correction": ",".join(
+                    sorted(self.config.extra.get("aux_cal_paths", {}))
+                )
+                or "none",
                 "polarizations": (
                     "all"
                     if self.config.extra.get("polarizations") == "all"
@@ -952,25 +1119,127 @@ class S1Stack(Stack):
         """Sentinel-1 NESD apply requires inverted date constants (F11)."""
         return self.config.coreg_mode == "nesd"
 
+    # ------------------------------------------------------------------
+    # Track-axis metadata provider (stage 5 sel() support)
+    # ------------------------------------------------------------------
+
+    def _track_metadata(self) -> dict[str, object] | None:
+        """Resolve each catalog date's track metadata for sel().
+
+        Reads the persisted ``science_extra.track_metadata`` first so a
+        reopened Stack keeps the recorded track map without reopening
+        SAFEs; otherwise resolves from staged path-SAFE layout and
+        annotation parsing through
+        :func:`~faninsar.missions.s1.track_map.resolve_track_acquisition`.
+        The result is cached per session.
+        """
+        cached = getattr(self, "_track_metadata_cache", None)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        persisted = self.config.extra.get("track_metadata")
+        persisted_dates = (
+            persisted.get("dates") if isinstance(persisted, dict) else None
+        )
+        if isinstance(persisted_dates, dict) and persisted_dates:
+            from faninsar.missions.s1.track_map import (
+                decode_track_metadata_dates,
+            )
+
+            result = {"dates": decode_track_metadata_dates(persisted_dates)}
+            self._track_metadata_cache = result
+            return result
+        from faninsar.missions.s1.track_map import (
+            disambiguate_track_letters,
+            resolve_track_acquisition,
+        )
+
+        polarizations = self.config.extra.get("polarizations")
+        selected = (
+            None
+            if polarizations in (None, "all")
+            else tuple(str(value) for value in polarizations)
+        )
+        infos: dict[str, Any] = {}
+        for date_id in self.catalog.dates:
+            infos[date_id] = resolve_track_acquisition(
+                self.catalog.paths_for(date_id),
+                polarizations=selected,
+            )
+        infos = disambiguate_track_letters(infos)
+        result = {"dates": infos}
+        self._track_metadata_cache = result
+        # Persist the resolved map into the science ``extra`` so
+        # ``stack.json`` keeps it for later reopens.
+        try:
+            self.config.extra["track_metadata"] = {
+                "dates": {
+                    date_id: {
+                        "track_key": info.track_key,
+                        "direction": info.direction,
+                        "relative_orbit": info.relative_orbit,
+                        "mission_id": info.mission_id,
+                        "polarizations": tuple(info.polarizations),
+                        "absolute_burst_ids": tuple(sorted(info.absolute_burst_ids)),
+                    }
+                    for date_id, info in infos.items()
+                }
+            }
+        except Exception as error:  # pragma: no cover - defensive boundary
+            logger.warning("track metadata could not be serialized: %s", error)
+        return result
+
+    def _date_footprints(self, date_id: str) -> tuple[object, ...]:
+        """Return burst-footprint geometries of one catalog date."""
+        from faninsar.missions.s1.track_map import footprints_for_date
+
+        polarizations = self.config.extra.get("polarizations")
+        selected = (
+            None
+            if polarizations in (None, "all")
+            else tuple(str(value) for value in polarizations)
+        )
+        return footprints_for_date(
+            self.catalog.paths_for(date_id), polarizations=selected
+        )
+
+    def _date_track_key(self, date_id: str) -> str | None:
+        """Return the resolved ``track_key`` of one catalog date, if any."""
+        infos = self._catalog_track_infos()
+        info = infos.get(date_id)
+        return None if info is None else getattr(info, "track_key", None)
+
     def _resolve_s1_roi_burst_selection(
         self,
+        *,
+        polygon: int | None = None,
     ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
         """Resolve swaths/bursts whose footprints intersect the ROI.
 
         No ROI keeps the configured selection (``None`` means all). An ROI
         selects bursts by footprint intersection, including neighboring
         bursts at edges whose footprints overlap the ROI. Geometry apply
-        still crops to the ROI window.
+        still crops to the ROI window. ``polygon`` resolves one part of a
+        multi-polygon ROI instead of the whole union.
         """
-        cached = getattr(self, "_s1_roi_burst_selection", None)
-        if cached is not None:
-            return cached
-        roi = self._effective_roi_with_mask().roi
+        cached_map = getattr(self, "_s1_roi_burst_selection_cache", None)
+        if cached_map is None:
+            cached_map = {}
+            self._s1_roi_burst_selection_cache = cached_map
+        if polygon in cached_map:
+            return cached_map[polygon]
+        polygon_rois = self._roi_polygon_rois()
+        if polygon is not None and polygon_rois is not None:
+            roi = polygon_rois[polygon]
+        else:
+            roi = self._effective_roi_with_mask().roi
         if roi is None:
             result = (self.config.swaths, self.config.bursts)
-            self._s1_roi_burst_selection = result
+            cached_map[polygon] = result
             return result
-        from faninsar.missions.s1.processing import _select_bursts_by_roi
+        from faninsar.missions.s1.processing import (
+            _select_bursts_by_roi,
+            _union_swath_names,
+        )
         from faninsar.missions.s1.safe import open_acquisition_products
 
         logger.info("ROI provided; explicit swaths/bursts selection ignored")
@@ -982,11 +1251,7 @@ class S1Stack(Stack):
         products = open_acquisition_products(
             ref_paths, polarizations=selected_polarizations
         )
-        ordered = sorted(
-            products[0].swaths,
-            key=lambda item: item.slant_range_time_s,
-        )
-        swath_tuple = tuple(item.swath for item in ordered)
+        swath_tuple = _union_swath_names(products)
         ref_orbit = self._orbit_path_for(self.reference)
         orbits = [ref_orbit] * len(products)
         resolved = _select_bursts_by_roi(
@@ -1001,7 +1266,7 @@ class S1Stack(Stack):
         if not swath_tuple:
             reject_pair_configuration("ROI selection contains no bursts")
         result = (swath_tuple, bursts)
-        self._s1_roi_burst_selection = result
+        cached_map[polygon] = result
         return result
 
     def _resolve_s1_nesd_selection(
@@ -1024,6 +1289,7 @@ class S1Stack(Stack):
         if roi is None:
             self._s1_nesd_selection = (swaths, bursts)
             return swaths, bursts
+        from faninsar.missions.s1.processing import _union_swath_names
         from faninsar.missions.s1.safe import open_acquisition_products
 
         ref_paths = list(self.catalog.paths_for(self.reference))
@@ -1034,17 +1300,14 @@ class S1Stack(Stack):
         products = open_acquisition_products(
             ref_paths, polarizations=selected_polarizations
         )
-        swath_tuple = swaths or tuple(
-            item.swath
-            for item in sorted(
-                products[0].swaths,
-                key=lambda item: item.slant_range_time_s,
-            )
-        )
+        swath_tuple = swaths or _union_swath_names(products)
         resolved: dict[tuple[int, str], list[int]] = {}
         for frame_index, product in enumerate(products):
             for swath_name in swath_tuple:
-                swath = product.swath(swath_name)
+                swath = product.find_swath(swath_name)
+                if swath is None:
+                    resolved[(frame_index, swath_name)] = []
+                    continue
                 resolved[(frame_index, swath_name)] = [
                     int(burst.index) for burst in swath.bursts
                 ]
@@ -1071,6 +1334,8 @@ class S1Stack(Stack):
             ampcor_snr_threshold=self.config.ampcor_snr_threshold,
             primary_orbit_path=self._orbit_path_for(primary),
             secondary_orbit_path=self._orbit_path_for(secondary),
+            primary_aux_cal_path=self._aux_cal_path_for(primary),
+            secondary_aux_cal_path=self._aux_cal_path_for(secondary),
             device=self.config.device,
         )
 
@@ -1081,22 +1346,58 @@ class S1Stack(Stack):
             return Path(configured)
         return self.config.work_dir / "cache" / "geo-lut"
 
-    def _prepare_reference_scene(self, *, overwrite: bool) -> Any:
-        """Compute (or reuse) the Reference scene product once per run."""
+    def _prepare_reference_scene(
+        self, *, overwrite: bool, polygon: int | None = None
+    ) -> Any:
+        """Compute (or reuse) the Reference scene product once per run.
+
+        A ``polygon`` that maps to a different track than the Reference's
+        produces no scene units — it is skipped with an explanatory log
+        rather than coregistered against another track's Reference.
+        """
         from faninsar.missions.s1.coregister import prepare_s1_reference
 
-        swaths, bursts = self._resolve_s1_roi_burst_selection()
+        if polygon is not None:
+            reference_track = self._date_track_key(self.reference)
+            polygon_track = self.polygon_tracks.get(polygon)
+            if (
+                reference_track is not None
+                and polygon_track is not None
+                and polygon_track != reference_track
+            ):
+                logger.info(
+                    "ROI polygon %d lies on track %s; the Reference is on %s — "
+                    "no scene units in this subtree, skipped",
+                    polygon,
+                    polygon_track,
+                    reference_track,
+                )
+                # ``InvalidProcessingStateError`` carrying the canonical
+                # "no scene units" phrase is what ``coregister_scenes``
+                # catches to skip the off-track polygon subtree.
+                reject_invalid_state(
+                    f"Reference ROI selection produced no scene units "
+                    f"(polygon {polygon} lies on track {polygon_track!r}, "
+                    f"Reference on {reference_track!r})"
+                )
+        polygon_rois = self._roi_polygon_rois()
+        if polygon is not None and polygon_rois is not None:
+            roi = polygon_rois[polygon]
+        else:
+            roi = self._effective_roi_with_mask().roi
+        swaths, bursts = self._resolve_s1_roi_burst_selection(polygon=polygon)
         return prepare_s1_reference(
             _source_input(self.catalog.paths_for(self.reference)),
-            output_scene=self._scene_dir(self.reference),
+            output_scene=self._scene_dir(self.reference, polygon),
             swaths=swaths,
             bursts=bursts,
-            roi=self._effective_roi_with_mask().roi,
+            roi=roi,
             dem=self._geometry_dem(),
             coregistration_grid=self.config.coregistration_grid,
             geo_grid=self.config.geo_grid,
             geo_lut_cache_dir=self._geo_lut_cache_dir(),
             orbit_path=self._orbit_path_for(self.reference),
+            aux_cal_path=self._aux_cal_path_for(self.reference),
             device=self.config.device,
             overwrite=overwrite,
         )
@@ -1112,12 +1413,34 @@ class S1Stack(Stack):
         reference_context: Any = None,
         inputs: Mapping[str, str] | None = None,
         properties: Mapping[str, object] | None = None,
+        polygon: int | None = None,
     ) -> Any:
-        """Resample one secondary onto the once-prepared Reference context."""
+        """Resample one secondary onto the once-prepared Reference context.
+
+        The single-track constraint is enforced before any pixel work: a
+        secondary whose resolved track differs from the Reference's fails
+        closed with a message naming both tracks — Sentinel-1 pairs never
+        span two orbit groups.
+        """
         from faninsar.missions.s1.coregister import coregister_s1_secondary
 
+        reference_track = self._date_track_key(self.reference)
+        secondary_track = self._date_track_key(date_id)
+        if (
+            reference_track is not None
+            and secondary_track is not None
+            and secondary_track != reference_track
+        ):
+            reject_invalid_state(
+                f"cannot coregister {date_id} onto Reference {self.reference}: "
+                f"{date_id} lies on track {secondary_track!r} but the "
+                f"Reference is on {reference_track!r}; different tracks "
+                "cannot form a pair"
+            )
         if reference_context is None:
-            reference_context = self._prepare_reference_scene(overwrite=False)
+            reference_context = self._prepare_reference_scene(
+                overwrite=False, polygon=polygon
+            )
         coregister_s1_secondary(
             reference_context,
             _source_input(self.catalog.paths_for(date_id)),
@@ -1125,12 +1448,47 @@ class S1Stack(Stack):
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
             secondary_orbit_path=self._orbit_path_for(date_id),
+            secondary_aux_cal_path=self._aux_cal_path_for(date_id),
             device=self.config.device,
             inputs=inputs,
             properties=properties,
             overwrite=overwrite,
         )
         return None
+
+
+def _cap_per_mission(
+    bindings: Sequence[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep at most ``limit`` products per satellite among CDSE bindings.
+
+    CDSE re-discovery on one track returns every satellite flying that
+    orbit (S1A/C/D interleaved ~6 days apart).  Each binding is one
+    ``(product, swath, polarization)`` measurement, so products — not
+    bindings — are the unit being limited: the ``limit`` most recent
+    ``product_id`` groups per mission keep all of their swath bindings.
+    """
+    import re
+
+    def _product_key(binding: Mapping[str, Any]) -> tuple[str, str, str]:
+        product_id = str(binding.get("product_id", ""))
+        mission = str(binding.get("mission_id", ""))
+        match = re.search(r"_(\d{8})T", product_id)
+        return mission, (match.group(1) if match else ""), product_id
+
+    # mission -> {product_id: latest-date}
+    by_mission: dict[str, dict[str, str]] = {}
+    for binding in bindings:
+        mission, date, product_id = _product_key(binding)
+        by_mission.setdefault(mission, {})[product_id] = max(
+            date, by_mission.setdefault(mission, {}).get(product_id, "")
+        )
+    keep: set[str] = set()
+    for products in by_mission.values():
+        ranked = sorted(products.items(), key=lambda kv: kv[1], reverse=True)
+        keep.update(product_id for product_id, _ in ranked[:limit])
+    return [b for b in bindings if str(b.get("product_id", "")) in keep]
 
 
 def _source_input(paths: tuple[Path, ...]) -> Path | tuple[Path, ...]:

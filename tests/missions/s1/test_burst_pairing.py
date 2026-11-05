@@ -8,7 +8,9 @@ index offset (ISCE2 ``getBurstOffset`` model) so the same ground is paired.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -161,3 +163,222 @@ def test_common_burst_pairs_drops_unmatched_ground() -> None:
     pairs = _common_burst_pairs(ref, sec)
     assert set(pairs.values()) == {0, 1, 2}
     assert set(pairs) == {5, 6, 7}
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: exact absolute_burst_id pairing + cross-product swath lookup
+# ---------------------------------------------------------------------------
+
+
+def _with_absolute_ids(swath: S1Swath, first_id: int) -> S1Swath:
+    """Return ``swath`` with ``absolute_burst_id`` = first_id + index."""
+    return replace(
+        swath,
+        bursts=tuple(
+            replace(burst, absolute_burst_id=first_id + i)
+            for i, burst in enumerate(swath.bursts)
+        ),
+    )
+
+
+def test_absolute_id_pairs_across_shifted_grids() -> None:
+    """Same ids pair exactly even when ANX positions disagree."""
+    primary = _with_absolute_ids(
+        _offset_swath(
+            4,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC),
+            anx_origin=100.0,
+        ),
+        5000,
+    )
+    # Secondary bursts carry the same ids but sit two grid steps later on
+    # the orbit axis — ANX alone would offset the pairing; ids resolve it.
+    secondary = _with_absolute_ids(
+        _offset_swath(
+            4,
+            first_burst=2,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=100.0 + 2 * _BURST_STEP_S,
+        ),
+        5000,
+    )
+    # primary[i] and secondary[i] share id 5000+i → identity pairing by id.
+    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_absolute_id_leaves_unmatched_primary_unpaired() -> None:
+    """An id-carrying primary without the same id is never guessed."""
+    primary = _with_absolute_ids(
+        _offset_swath(
+            3,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC),
+            anx_origin=0.0,
+        ),
+        9000,
+    )
+    secondary = _with_absolute_ids(
+        _offset_swath(
+            3,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=0.0,
+        ),
+        7000,
+    )
+    assert _common_burst_pairs(primary, secondary) == {}
+
+
+def test_mixed_id_presence_falls_back_per_burst() -> None:
+    """Id-less primaries still resolve through ANX beside exact id pairs."""
+    primary = _with_absolute_ids(
+        _offset_swath(
+            3,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC),
+            anx_origin=300.0,
+        ),
+        6000,
+    )
+    # Strip the id off primary burst 2 → it must pair through ANX.
+    primary = replace(
+        primary,
+        bursts=tuple(
+            replace(burst, absolute_burst_id=None) if i == 2 else burst
+            for i, burst in enumerate(primary.bursts)
+        ),
+    )
+    secondary = _with_absolute_ids(
+        _offset_swath(
+            3,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=300.0,
+        ),
+        6000,
+    )
+    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1, 2: 2}
+
+
+def test_id_primary_against_idless_secondary_falls_back() -> None:
+    """Backward compat: an id-carrying primary still pairs with an
+    annotation-only secondary through ANX — legacy products carry no ids."""
+    primary = _with_absolute_ids(
+        _offset_swath(
+            3,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC),
+            anx_origin=400.0,
+        ),
+        8000,
+    )
+    secondary = _offset_swath(
+        3,
+        first_burst=0,
+        azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+        anx_origin=400.0,
+    )
+    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1, 2: 2}
+
+
+def _unit_for(
+    frame_index: int,
+    swath_name: str,
+    burst_index: int,
+    first_id: int,
+) -> object:
+    """Minimal S1ReferenceUnit for ``_secondary_burst_match`` tests."""
+    from unittest.mock import MagicMock
+
+    from faninsar.missions.s1.coregister import S1ReferenceUnit
+
+    scene = MagicMock()
+    scene.swath = _with_absolute_ids(
+        _offset_swath(
+            2,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC),
+            anx_origin=0.0,
+        ),
+        first_id,
+    )
+    return S1ReferenceUnit(
+        tag=f"f{frame_index}_{swath_name}_b{burst_index}",
+        frame_index=frame_index,
+        swath=swath_name,
+        burst_index=burst_index,
+        scene=scene,
+        native_shape=(_LINES, _SAMPLES),
+    )
+
+
+def _product_for(name: str, swaths: tuple[S1Swath, ...]) -> object:
+    """Minimal S1Product over ``swaths``."""
+    from faninsar.missions.s1.types import S1Product
+
+    return S1Product(
+        product_id=name,
+        source_path=Path(name),
+        mission_id="S1A",
+        product_type="SLC",
+        mode="IW",
+        absolute_orbit=1,
+        polarizations=("VV",),
+        swaths=swaths,
+    )
+
+
+def test_secondary_burst_match_finds_swath_in_sibling_product() -> None:
+    """Stage-3 layout: frame-slot product lacks the swath; sibling has it."""
+    from faninsar.missions.s1.coregister import _secondary_burst_match
+
+    iw1 = _with_absolute_ids(
+        _offset_swath(
+            1,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=0.0,
+        ),
+        77,
+    )
+    iw1 = replace(iw1, swath="IW1")
+    iw3 = _with_absolute_ids(
+        _offset_swath(
+            1,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=_BURST_STEP_S,
+        ),
+        1001,
+    )
+    iw3 = replace(iw3, swath="IW3")
+    products = (
+        _product_for("frame0.SAFE", (iw1,)),
+        _product_for("frame1.SAFE", (iw3,)),
+    )
+    unit = _unit_for(0, "IW3", 1, 1000)
+    match = _secondary_burst_match(unit, products, unit.tag, "20260903")
+    assert match is not None
+    burst_index, product = match
+    assert product is products[1]
+    assert burst_index == 0
+
+
+def test_secondary_burst_match_missing_swath_returns_none() -> None:
+    """A swath absent from every secondary product yields ``None``."""
+    from faninsar.missions.s1.coregister import _secondary_burst_match
+
+    iw1 = _with_absolute_ids(
+        _offset_swath(
+            1,
+            first_burst=0,
+            azimuth_origin=datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC),
+            anx_origin=0.0,
+        ),
+        77,
+    )
+    iw1 = replace(iw1, swath="IW1")
+    products = (_product_for("frame0.SAFE", (iw1,)),)
+    unit = _unit_for(0, "IW3", 0, 1000)
+    assert _secondary_burst_match(unit, products, unit.tag, "20260903") is None

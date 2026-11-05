@@ -20,6 +20,7 @@ import numpy as np
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import reject, setup_logger
 from faninsar.missions.base import Sensor, register
+from faninsar.missions.nisar.selection import decode_nisar_selection
 from faninsar.missions.protocols import (
     DopplerCentroidPolynomial,
     SLCReadResult,
@@ -531,6 +532,7 @@ class NisarSensor(Sensor):
     """
 
     name = "nisar"
+    decode_selection = staticmethod(decode_nisar_selection)
 
     def admit_source(
         self,

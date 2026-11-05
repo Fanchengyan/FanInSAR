@@ -323,11 +323,11 @@ def _mosaic_arrays(
                 dst_nodata=np.nan,
                 resampling=resampling,
             )
-            known = (
-                np.isfinite(dst)
-                if src_nodata is not None
-                else np.ones_like(dst, dtype=bool)
-            )
+            # ``dst_nodata=np.nan`` already marks every cell the source
+            # tile did not cover; restricting ``known`` to finite cells
+            # keeps earlier tiles' samples instead of overwriting them
+            # with NaN when ``src_nodata`` is None.
+            known = np.isfinite(dst)
             mosaic[known] = dst[known]
     finally:
         for dataset, _target in opened:

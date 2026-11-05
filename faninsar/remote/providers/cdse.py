@@ -609,6 +609,10 @@ class CDSESearchAdapter:
             )
             return None
         unique_pols = tuple(dict.fromkeys(polarizations))
+        software = properties.get("processing:software")
+        ipf_version = (
+            software.get("Sentinel-1 IPF") if isinstance(software, Mapping) else None
+        )
         return {
             "id": item_id,
             "collection": self.collection,
@@ -617,6 +621,9 @@ class CDSESearchAdapter:
             "end": end,
             "platform": properties.get("platform"),
             "polarization": unique_pols[0] if unique_pols else "VV",
+            "relative_orbit": relative,
+            "orbit_direction": properties.get("sat:orbit_state"),
+            "ipf_version": str(ipf_version) if ipf_version else None,
             "assets": rewritten,
         }
 

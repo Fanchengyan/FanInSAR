@@ -38,6 +38,7 @@ from faninsar.missions.s1.search import (
     normalize_polarizations,
     product_filters,
 )
+from faninsar.missions.s1.selection import decode_s1_selection, select_s1_acquisitions
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 
 SPEED_OF_LIGHT_M_S: float = 299_792_458.0
@@ -75,6 +76,8 @@ class Sentinel1Sensor(Sensor):
 
     name = "sentinel1"
     wavelength_m: float = S1_C_BAND_WAVELENGTH_M
+    decode_selection = staticmethod(decode_s1_selection)
+    select_acquisitions = staticmethod(select_s1_acquisitions)
 
     def open_product(self, uri: str, **kwargs: Any) -> Any:
         """Open a SAFE directory or ZIP."""

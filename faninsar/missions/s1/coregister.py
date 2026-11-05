@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -30,11 +31,13 @@ from faninsar.missions.s1.processing import (
     ProductionPairState,
     _as_frame_paths,
     _common_burst_pairs,
+    _first_swath,
     _phase_state_manifest,
     _roi_burst_window,
     _scene_id,
     _select_bursts_by_roi,
     _swath_range_offsets,
+    _union_swath_names,
     build_reference_geo_lut,
     load_production_scene,
     reference_window_crop,
@@ -161,6 +164,7 @@ def prepare_s1_reference(
     geo_grid: GeoGridSpec | None = None,
     geo_lut_cache_dir: Path | None = None,
     orbit_path: Path | None = None,
+    aux_cal_path: Path | None = None,
     device: str = "auto",
     overwrite: bool = False,
 ) -> S1ReferenceContext:
@@ -192,6 +196,8 @@ def prepare_s1_reference(
         Shared content-addressed LUT cache (geo).
     orbit_path : pathlib.Path, optional
         Precise orbit of the Reference.
+    aux_cal_path : pathlib.Path, optional
+        AUX_CAL file of the Reference; required for IPF 002.36 products.
     device : str, optional
         Numerical device.
     overwrite : bool, optional
@@ -233,41 +239,71 @@ def prepare_s1_reference(
     reference_id = _scene_id(primary_paths[0])
     output_scene = Path(output_scene)
     reuse = (output_scene / "item.json").is_file() and not overwrite
+    scene_row0 = 0
+    scene_col0 = 0
     if coregistration_grid == "geo":
         grid_shape = (int(geo_grid.shape[0]), int(geo_grid.shape[1]))  # type: ignore[union-attr]
         header = _geo_header(geo_grid)  # type: ignore[arg-type]
+    elif roi is not None:
+        # Pass 1: resolve every unit's Reference crop without reading pixels so
+        # the scene grid is bounded by the union of the ROI crops rather than
+        # the nominal burst placement.
+        units, grid_shape, scene_row0, scene_col0 = _radar_roi_units(
+            primary_products,
+            primary_paths,
+            ref_orbits,
+            units_by_swath,
+            range_offsets,
+            swath_tuple,
+            roi=roi,
+            dem=dem,
+            device=device,
+        )
+        header = {}
     else:
         grid_shape = (int(frame_rows), int(frame_cols))
         header = {}
     work_root = output_scene.parent / f".{output_scene.name}.work"
     writer: SceneWriter | None = None
-    units: dict[str, S1ReferenceUnit] = {}
+    roi_units_resolved = coregistration_grid == "radar" and roi is not None
+    if not roi_units_resolved:
+        units = {}
+    ordered = (
+        (f"f{frame_index}_{swath}_b{burst_index}", frame_index)
+        for swath in swath_tuple
+        for frame_index, burst_index, _azimuth_offset in units_by_swath[swath]
+    )
     try:
-        for swath in swath_tuple:
-            for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
-                tag = f"f{frame_index}_{swath}_b{burst_index}"
-                scene = load_production_scene(
-                    primary_paths[min(frame_index, len(primary_paths) - 1)],
-                    swath=swath,
-                    burst_index=burst_index,
-                    dem=dem,
-                    orbit_path=ref_orbits[frame_index],
-                    coregistration_grid=coregistration_grid,
-                    full_range=True,
-                    read_samples=not reuse,
-                    product=primary_products[frame_index],
+        for tag, frame_index in ordered:
+            if roi_units_resolved and tag not in units:
+                continue
+            swath = tag.split("_")[1]
+            burst_index = int(tag.rsplit("_b", 1)[1])
+            scene = load_production_scene(
+                primary_paths[min(frame_index, len(primary_paths) - 1)],
+                swath=swath,
+                burst_index=burst_index,
+                dem=dem,
+                orbit_path=ref_orbits[frame_index],
+                aux_cal_path=aux_cal_path,
+                coregistration_grid=coregistration_grid,
+                full_range=True,
+                read_samples=not reuse,
+                product=primary_products[frame_index],
+            )
+            if writer is None and not reuse:
+                writer = SceneWriter(
+                    output_scene,
+                    date_id=reference_id,
+                    reference_id=reference_id,
+                    domain=coregistration_grid,
+                    grid_shape=grid_shape,
+                    wavelength_m=float(scene.geometry.wavelength_m),
+                    overwrite=overwrite,
+                    **header,
                 )
-                if writer is None and not reuse:
-                    writer = SceneWriter(
-                        output_scene,
-                        date_id=reference_id,
-                        reference_id=reference_id,
-                        domain=coregistration_grid,
-                        grid_shape=grid_shape,
-                        wavelength_m=float(scene.geometry.wavelength_m),
-                        overwrite=overwrite,
-                        **header,
-                    )
+            unit = units.get(tag)
+            if unit is None:
                 unit = S1ReferenceUnit(
                     tag=tag,
                     frame_index=frame_index,
@@ -278,43 +314,51 @@ def prepare_s1_reference(
                         int(scene.array.samples.shape[0]),
                         int(scene.array.samples.shape[1]),
                     ),
-                    row_origin=int(azimuth_offset),
-                    col_origin=int(range_offsets[swath]),
+                    row_origin=int(
+                        next(
+                            azimuth_offset
+                            for f_i, b_i, azimuth_offset in units_by_swath[swath]
+                            if f_i == frame_index and b_i == burst_index
+                        )
+                        - scene_row0
+                    ),
+                    col_origin=int(range_offsets[swath] - scene_col0),
                 )
-                if coregistration_grid == "radar":
-                    payload = _prepare_radar_unit(
-                        unit, roi=roi, dem=dem, compute=not reuse, device=device
-                    )
-                else:
-                    payload = _prepare_geo_unit(
-                        unit,
-                        dem=dem,
-                        geo_grid=geo_grid,  # type: ignore[arg-type]
-                        geo_lut_cache_dir=geo_lut_cache_dir,
-                        work_dir=work_root / tag,
-                        roi=roi,
-                        compute=not reuse,
-                        device=device,
-                    )
-                    if unit.lut is None:
-                        logger.warning("%s: empty geocoded footprint; skipped", tag)
-                        continue
-                unit.scene = _without_pixels(scene)
-                units[tag] = unit
-                if writer is not None and payload is not None:
-                    writer.add_unit(
-                        tag=tag,
-                        payload=payload,
-                        row_origin=unit.row_origin,
-                        col_origin=unit.col_origin,
-                        scientific_lineage=[
-                            {
-                                "stage": "s1_reference_burst",
-                                "source": str(primary_paths[frame_index]),
-                            }
-                        ],
-                    )
-                del payload, scene
+            unit.scene = scene
+            if coregistration_grid == "radar":
+                payload = _prepare_radar_unit(
+                    unit, roi=roi, dem=dem, compute=not reuse, device=device
+                )
+            else:
+                payload = _prepare_geo_unit(
+                    unit,
+                    dem=dem,
+                    geo_grid=geo_grid,  # type: ignore[arg-type]
+                    geo_lut_cache_dir=geo_lut_cache_dir,
+                    work_dir=work_root / tag,
+                    roi=roi,
+                    compute=not reuse,
+                    device=device,
+                )
+                if unit.lut is None:
+                    logger.warning("%s: empty geocoded footprint; skipped", tag)
+                    continue
+            unit.scene = _without_pixels(scene)
+            units[tag] = unit
+            if writer is not None and payload is not None:
+                writer.add_unit(
+                    tag=tag,
+                    payload=payload,
+                    row_origin=unit.row_origin,
+                    col_origin=unit.col_origin,
+                    scientific_lineage=[
+                        {
+                            "stage": "s1_reference_burst",
+                            "source": str(primary_paths[frame_index]),
+                        }
+                    ],
+                )
+            del payload, scene
         if not units:
             reject_invalid_state("Reference selection produced no scene units")
         if writer is not None:
@@ -326,6 +370,7 @@ def prepare_s1_reference(
                     swath_tuple,
                     range_offsets,
                     grid_shape,
+                    scene_offset=(scene_row0, scene_col0),
                     orbit=next(iter(units.values())).scene.swath.orbit,
                 )
             # The Reference is its own baseline origin (PROPOSAL-0065).
@@ -359,6 +404,85 @@ def prepare_s1_reference(
     )
 
 
+def _radar_roi_units(
+    primary_products: Sequence[S1Product],
+    primary_paths: Sequence[Path],
+    ref_orbits: Sequence[Path | None],
+    units_by_swath: Mapping[str, list[tuple[int, int, int]]],
+    range_offsets: Mapping[str, int],
+    swath_tuple: tuple[str, ...],
+    *,
+    roi: BoundingBox | Polygons,
+    dem: DEM,
+    device: str,
+) -> tuple[dict[str, S1ReferenceUnit], tuple[int, int], int, int]:
+    """Resolve every Reference unit's ROI crop without reading burst pixels.
+
+    Returns the metadata-only units keyed by tag, the ROI-bounded scene grid
+    shape, and the scene-grid origin ``(row0, col0)`` in absolute placement
+    coordinates.  Units whose ROI window resolves to ``None`` keep the full
+    burst crop; the scene grid then still covers every unit.
+
+    """
+    units: dict[str, S1ReferenceUnit] = {}
+    scene_r0 = scene_c0 = np.iinfo(np.int64).max
+    scene_r1 = scene_c1 = 0
+    for swath in swath_tuple:
+        for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
+            tag = f"f{frame_index}_{swath}_b{burst_index}"
+            scene = load_production_scene(
+                primary_paths[min(frame_index, len(primary_paths) - 1)],
+                swath=swath,
+                burst_index=burst_index,
+                dem=dem,
+                orbit_path=ref_orbits[frame_index],
+                coregistration_grid="radar",
+                full_range=True,
+                read_samples=False,
+                product=primary_products[frame_index],
+            )
+            native_shape = (
+                int(scene.array.samples.shape[0]),
+                int(scene.array.samples.shape[1]),
+            )
+            unit = S1ReferenceUnit(
+                tag=tag,
+                frame_index=frame_index,
+                swath=swath,
+                burst_index=burst_index,
+                scene=scene,
+                native_shape=native_shape,
+                row_origin=int(azimuth_offset),
+                col_origin=int(range_offsets[swath]),
+            )
+            unit.roi_window = _roi_burst_window(
+                roi,
+                scene.geometry,
+                dem,
+                native_shape,
+                device=device,
+                first_valid_sample=scene.burst.first_valid_sample,
+                last_valid_sample=scene.burst.last_valid_sample,
+            )
+            if unit.roi_window is None:
+                logger.info("%s: ROI does not intersect this burst; skipped", tag)
+                continue
+            unit.crop = reference_window_crop(unit.roi_window, native_shape)
+            scene_r0 = min(scene_r0, unit.row_origin + unit.crop[0])
+            scene_r1 = max(scene_r1, unit.row_origin + unit.crop[1])
+            scene_c0 = min(scene_c0, unit.col_origin + unit.crop[2])
+            scene_c1 = max(scene_c1, unit.col_origin + unit.crop[3])
+            unit.scene = _without_pixels(scene)
+            units[tag] = unit
+    if not units or scene_r1 <= scene_r0 or scene_c1 <= scene_c0:
+        reject_invalid_state("Reference ROI selection produced no scene units")
+    for unit in units.values():
+        unit.row_origin += unit.crop[0] - scene_r0  # type: ignore[index]
+        unit.col_origin += unit.crop[2] - scene_c0  # type: ignore[index]
+    grid_shape = (int(scene_r1 - scene_r0), int(scene_c1 - scene_c0))
+    return units, grid_shape, int(scene_r0), int(scene_c0)
+
+
 def _prepare_radar_unit(
     unit: S1ReferenceUnit,
     *,
@@ -374,9 +498,15 @@ def _prepare_radar_unit(
     ``compute`` is false (the persisted product is reused).
     """
     scene = unit.scene
-    if roi is not None:
+    if roi is not None and unit.crop is None:
         unit.roi_window = _roi_burst_window(
-            roi, scene.geometry, dem, unit.native_shape, device=device
+            roi,
+            scene.geometry,
+            dem,
+            unit.native_shape,
+            device=device,
+            first_valid_sample=scene.burst.first_valid_sample,
+            last_valid_sample=scene.burst.last_valid_sample,
         )
         if unit.roi_window is not None:
             unit.crop = reference_window_crop(unit.roi_window, unit.native_shape)
@@ -502,6 +632,16 @@ def _check_reused_reference(
                 f"persisted Reference unit {tag!r} is placed differently from "
                 "the current selection; recoregister with overwrite=True"
             )
+        expected_shape = (
+            (unit.crop[1] - unit.crop[0], unit.crop[3] - unit.crop[2])
+            if unit.crop is not None
+            else unit.native_shape
+        )
+        if tuple(placed.shape) != tuple(expected_shape):
+            reject_invalid_state(
+                f"persisted Reference unit {tag!r} has shape {tuple(placed.shape)}, "
+                f"expected {tuple(expected_shape)}; recoregister with overwrite=True"
+            )
 
 
 def coregister_s1_secondary(
@@ -512,6 +652,7 @@ def coregister_s1_secondary(
     misreg_az_px: float,
     misreg_rg_px: float,
     secondary_orbit_path: Path | None = None,
+    secondary_aux_cal_path: Path | None = None,
     device: str = "auto",
     inputs: Mapping[str, Product | str] | None = None,
     properties: Mapping[str, object] | None = None,
@@ -535,6 +676,8 @@ def coregister_s1_secondary(
         Inverted date constants (0 for geometry-only). Must be finite.
     secondary_orbit_path : pathlib.Path, optional
         Precise orbit of the secondary.
+    secondary_aux_cal_path : pathlib.Path, optional
+        AUX_CAL file of the secondary; required for IPF 002.36 products.
     device : str, optional
         Numerical device.
     inputs : mapping, optional
@@ -584,23 +727,23 @@ def coregister_s1_secondary(
             **header,
         ) as writer:
             for tag, unit in context.units.items():
-                secondary_burst_index = _secondary_burst_index(
-                    unit, secondary_products, tag, date_id
-                )
-                if secondary_burst_index is None:
+                match = _secondary_burst_match(unit, secondary_products, tag, date_id)
+                if match is None:
                     continue
+                secondary_burst_index, secondary_product = match
                 payload, state = _coregister_unit(
                     context,
                     unit,
-                    secondary_paths[min(unit.frame_index, len(secondary_paths) - 1)],
+                    secondary_product.source_path,
                     secondary_burst_index=secondary_burst_index,
                     reference=reference,
                     misreg_az_px=float(misreg_az_px),
                     misreg_rg_px=float(misreg_rg_px),
                     secondary_orbit_path=secondary_orbit_path,
+                    secondary_aux_cal_path=secondary_aux_cal_path,
                     work_dir=work_root / tag,
                     device=device,
-                    product=secondary_products[unit.frame_index],
+                    product=secondary_product,
                 )
                 placed = reference_units[tag]
                 if payload.shape != placed.shape:
@@ -695,32 +838,49 @@ def _unit_scene_baseline(state: ProductionPairState) -> tuple[float, float]:
     return parallel, perpendicular
 
 
-def _secondary_burst_index(
+def _secondary_burst_match(
     unit: S1ReferenceUnit,
     secondary_products: Sequence[S1Product],
     tag: str,
     date_id: str,
-) -> int | None:
-    """Return the secondary-grid index of the unit's burst, or ``None``.
+) -> tuple[int, S1Product] | None:
+    """Return ``(burst_index, product)`` for the unit in the secondary date.
 
     The reference ``unit.burst_index`` is matched to the secondary product's
     own burst grid by along-track position, so products clipped to different
     start lines (e.g. Sentinel-1C vs Sentinel-1D) still resolve.
+
+    The secondary swath is searched across *every* product in
+    ``secondary_products`` rather than indexed by ``unit.frame_index``:
+    same-date products may hold disjoint swaths or single-burst groups of
+    one frame (stage-3 path-SAFEs list one burst per annotation file), so
+    the product at the unit's frame slot can legitimately lack
+    ``unit.swath`` while a sibling product carries it.  The preferred
+    ``unit.frame_index`` slot is tried first so multi-frame products keep
+    their original same-frame correspondence.
     """
-    if unit.frame_index >= len(secondary_products):
-        logger.info("%s: secondary %s has no frame %d", tag, date_id, unit.frame_index)
-        return None
-    names = {item.swath for item in secondary_products[unit.frame_index].swaths}
-    if unit.swath not in names:
+    candidates = list(secondary_products)
+    if 0 <= unit.frame_index < len(candidates):
+        candidates.insert(0, candidates.pop(unit.frame_index))
+    secondary_swath = None
+    secondary_product: S1Product | None = None
+    for product in candidates:
+        candidate = next(
+            (item for item in product.swaths if item.swath == unit.swath), None
+        )
+        if candidate is not None:
+            secondary_swath = candidate
+            secondary_product = product
+            break
+    if secondary_swath is None or secondary_product is None:
         logger.info("%s: secondary %s has no sub-swath %s", tag, date_id, unit.swath)
         return None
-    secondary_swath = secondary_products[unit.frame_index].swath(unit.swath)
     pairs = _common_burst_pairs(unit.scene.swath, secondary_swath)
     secondary_index = pairs.get(unit.burst_index)
     if secondary_index is None:
         logger.info("%s: secondary %s does not cover this burst", tag, date_id)
         return None
-    return secondary_index
+    return secondary_index, secondary_product
 
 
 def _coregister_unit(
@@ -736,6 +896,7 @@ def _coregister_unit(
     work_dir: Path,
     device: str,
     product: S1Product | None = None,
+    secondary_aux_cal_path: Path | None = None,
 ) -> tuple[np.ndarray, ProductionPairState]:
     """Resample one secondary burst onto its Reference unit."""
     domain = context.coregistration_grid
@@ -745,6 +906,7 @@ def _coregister_unit(
         burst_index=secondary_burst_index,
         dem=context.dem,
         orbit_path=secondary_orbit_path,
+        aux_cal_path=secondary_aux_cal_path,
         coregistration_grid=domain,
         full_range=True,
         product=product,
@@ -825,6 +987,8 @@ def coregister_s1_scene(
     geo_lut_cache_dir: Path | None = None,
     primary_orbit_path: Path | None = None,
     secondary_orbit_path: Path | None = None,
+    primary_aux_cal_path: Path | None = None,
+    secondary_aux_cal_path: Path | None = None,
     device: str = "auto",
 ) -> CoregisteredSceneStore:
     """Coregister one secondary acquisition onto a Reference scene product.
@@ -846,6 +1010,8 @@ def coregister_s1_scene(
         Inverted date constants (0 for geometry-only).
     primary_orbit_path, secondary_orbit_path : pathlib.Path, optional
         Precise orbits.
+    primary_aux_cal_path, secondary_aux_cal_path : pathlib.Path, optional
+        AUX_CAL files; required for IPF 002.36 products.
     device : str, optional
         Numerical device.
 
@@ -868,6 +1034,7 @@ def coregister_s1_scene(
         geo_grid=geo_grid,
         geo_lut_cache_dir=geo_lut_cache_dir,
         orbit_path=primary_orbit_path,
+        aux_cal_path=primary_aux_cal_path,
         device=device,
     )
     return coregister_s1_secondary(
@@ -877,6 +1044,7 @@ def coregister_s1_scene(
         misreg_az_px=misreg_az_px,
         misreg_rg_px=misreg_rg_px,
         secondary_orbit_path=secondary_orbit_path,
+        secondary_aux_cal_path=secondary_aux_cal_path,
         device=device,
     )
 
@@ -888,6 +1056,7 @@ def frame_geometry_record(
     range_offsets: Mapping[str, int],
     grid_shape: tuple[int, int],
     *,
+    scene_offset: tuple[int, int] = (0, 0),
     orbit: OrbitMetadata,
 ) -> dict[str, object]:
     """Return the merged Reference frame radar geometry as the units are placed.
@@ -910,6 +1079,9 @@ def frame_geometry_record(
         Integer column offset of each sub-swath.
     grid_shape : tuple[int, int]
         Merged frame shape.
+    scene_offset : tuple[int, int], optional
+        Scene-grid ``(row0, col0)`` in absolute placement coordinates when the
+        grid is bounded by an ROI crop rather than the burst placement.
     orbit : OrbitMetadata
         Reference orbit (precise when configured).
 
@@ -920,16 +1092,17 @@ def frame_geometry_record(
         :func:`~faninsar.processing.geometry.record.radar_geometry_from_record`.
 
     """
-    swath0 = primary_products[0].swath(swath_tuple[0])
+    swath0 = _first_swath(primary_products, swath_tuple[0])
     sensing_start = min(
         primary_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
         for (frame_index, swath), indices in resolved.items()
         for burst_index in indices
-    )
+    ) + timedelta(seconds=float(scene_offset[0]) * swath0.azimuth_time_interval_s)
     grid = RadarGrid(
         shape=(int(grid_shape[0]), int(grid_shape[1])),
         starting_slant_range_m=float(
             swath0.slant_range_time_s * SPEED_OF_LIGHT_M_S / 2.0
+            + float(scene_offset[1]) * swath0.range_pixel_spacing_m
         ),
         range_spacing_m=float(swath0.range_pixel_spacing_m),
         sensing_start=sensing_start,
@@ -988,11 +1161,7 @@ def _resolve_apply_selection(
         )
         return swath_tuple, resolved
     if roi is not None:
-        ordered = sorted(
-            primary_products[0].swaths,
-            key=lambda item: item.slant_range_time_s,
-        )
-        swath_tuple = tuple(item.swath for item in ordered)
+        swath_tuple = _union_swath_names(primary_products)
         resolved = _select_bursts_by_roi(
             roi,
             list(primary_paths),
@@ -1003,8 +1172,14 @@ def _resolve_apply_selection(
         common: dict[tuple[int, str], list[int]] = {}
         for frame_index in range(len(primary_products)):
             for swath in swath_tuple:
-                primary_swath = primary_products[frame_index].swath(swath)
-                secondary_swath = secondary_products[frame_index].swath(swath)
+                primary_swath = primary_products[frame_index].find_swath(swath)
+                secondary_swath = (
+                    secondary_products[frame_index].find_swath(swath)
+                    if frame_index < len(secondary_products)
+                    else None
+                )
+                if primary_swath is None or secondary_swath is None:
+                    continue
                 shared = set(_common_burst_pairs(primary_swath, secondary_swath))
                 selected = [
                     index
@@ -1041,13 +1216,14 @@ def _unit_placement(
     range_offsets: dict[str, int],
 ) -> tuple[dict[str, list[tuple[int, int, int]]], int, int]:
     """Place selected bursts on one shared absolute radar grid."""
-    primary_swath0 = primary_products[0].swath(swath_tuple[0])
+    primary_swath0 = _first_swath(primary_products, swath_tuple[0])
     dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
-        swath: primary_products[0].swath(swath).lines_per_burst for swath in swath_tuple
+        swath: _first_swath(primary_products, swath).lines_per_burst
+        for swath in swath_tuple
     }
     burst_width = {
-        swath: primary_products[0].swath(swath).samples_per_burst
+        swath: _first_swath(primary_products, swath).samples_per_burst
         for swath in swath_tuple
     }
     azimuth_origin = min(

@@ -20,7 +20,16 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Self, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    NoReturn,
+    ParamSpec,
+    Self,
+    TypeVar,
+)
 
 import numpy as np
 
@@ -85,11 +94,7 @@ if TYPE_CHECKING:
     from faninsar.data.query import BoundingBox, Points, Polygons
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
     from faninsar.io.storage.product import Product
-    from faninsar.missions.s1.processing import (
-        BurstSelection,
-        CoregistrationGrid,
-        ProductionPairState,
-    )
+    from faninsar.missions.protocols import BurstSelection, CoregistrationGrid
     from faninsar.network.layers import ProductLayer
     from faninsar.network.readers.stack import (
         StackInterferogramCollection,
@@ -107,6 +112,7 @@ if TYPE_CHECKING:
     from faninsar.stack.masks import StackMasks
     from faninsar.stack.misreg import MisregRecord
     from faninsar.stack.provider import StackSceneProvider
+    from faninsar.stack.selection import AcquisitionFacts
     from faninsar.timeseries.results import TimeSeries
 
 logger = setup_logger(__name__)
@@ -226,6 +232,12 @@ Polygons` wrapping the subtracted geometry when reshaped, or ``None``
     geometry
         EPSG:4326 shapely geometry of the effective ROI (canonical coreg
         identity input), or ``None`` when the ROI was not reshaped.
+    parts
+        Ordered polygonal parts of the effective ROI, in EPSG:4326.  Always
+        non-empty when ``roi`` is set; ``len(parts) == 1`` for
+        :class:`Points`, :class:`BoundingBox`, and single-polygon
+        ``Polygons``, and ``> 1`` only for a multi-polygon ``Polygons``.
+        ``parts[0]`` equals ``geometry`` for the single-polygon case.
     lineage
         Run-manifest record: ``{}`` for unmasked runs, ``{"mask": "absent",
         "reason": ...}`` after a degraded resolution, and ``{"mask":
@@ -235,7 +247,13 @@ Polygons` wrapping the subtracted geometry when reshaped, or ``None``
 
     roi: object | None
     geometry: object | None
-    lineage: dict[str, object]
+    parts: tuple[object, ...] = ()
+    lineage: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def is_multi_polygon(self) -> bool:
+        """True when the effective ROI decomposes to more than one polygon."""
+        return len(self.parts) > 1
 
 
 def _roi_to_geometry(roi: object) -> Any:
@@ -262,18 +280,30 @@ def _roi_to_geometry(roi: object) -> Any:
 
 
 def _polygonal_parts(geometry: Any) -> list[Any]:
-    """Return the non-empty polygonal parts of a difference result."""
+    """Return the non-empty polygonal parts of a difference result.
+
+    ``Polygon`` returns ``[geometry]``; ``MultiPolygon`` explodes into its
+    member polygons; a ``GeometryCollection`` keeps only the polygonal
+    members.  The order follows the geometry's member order so parts are
+    stable across calls on the same input.
+    """
     from shapely.geometry import MultiPolygon, Polygon
 
     if geometry is None or geometry.is_empty:
         return []
-    if isinstance(geometry, (Polygon, MultiPolygon)):
+    if isinstance(geometry, Polygon):
         return [geometry]
-    return [
-        part
-        for part in getattr(geometry, "geoms", ())
-        if isinstance(part, (Polygon, MultiPolygon)) and not part.is_empty
-    ]
+    if isinstance(geometry, MultiPolygon):
+        return [part for part in geometry.geoms if not part.is_empty]
+    parts: list[Any] = []
+    for part in getattr(geometry, "geoms", ()):
+        if part.is_empty:
+            continue
+        if isinstance(part, Polygon):
+            parts.append(part)
+        elif isinstance(part, MultiPolygon):
+            parts.extend(sub for sub in part.geoms if not sub.is_empty)
+    return parts
 
 
 def _effective_roi_polygons(parts: list[Any]) -> object:
@@ -350,14 +380,28 @@ def _resolve_effective_roi(
     mask_plan: MaskPlan,
 ) -> _EffectiveRoi:
     """Subtract only explicitly excluded ROI-stage geometry from the ROI."""
-    if roi is None or not mask_plan.references("roi"):
-        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
+    if roi is None:
+        return _EffectiveRoi(roi=None, geometry=None, parts=(), lineage={})
+    roi_geometry = _roi_to_geometry(roi)
+    if not mask_plan.references("roi"):
+        parts = tuple(_polygonal_parts(roi_geometry)) or (roi_geometry,)
+        return _EffectiveRoi(
+            roi=roi,
+            geometry=roi_geometry,
+            parts=parts,
+            lineage={},
+        )
     import shapely
 
-    roi_geometry = _roi_to_geometry(roi)
     excluded = _mask_vector_for_roi(mask_plan, roi)
     if excluded is None or not excluded.geometry:
-        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
+        parts = tuple(_polygonal_parts(roi_geometry)) or (roi_geometry,)
+        return _EffectiveRoi(
+            roi=roi,
+            geometry=roi_geometry,
+            parts=parts,
+            lineage={},
+        )
     geometries = [
         geometry
         for geometry, role in zip(excluded.geometry, excluded.roles, strict=True)
@@ -370,6 +414,7 @@ def _resolve_effective_roi(
     return _EffectiveRoi(
         roi=_effective_roi_polygons(parts),
         geometry=parts[0] if len(parts) == 1 else shapely.union_all(parts),
+        parts=tuple(parts),
         lineage={"mask_plan": mask_plan.identity},
     )
 
@@ -923,6 +968,11 @@ class Stack(NetworkContract):
 
     """
 
+    _sensor_registry_key: ClassVar[str | None] = None
+    _selection_facts_cache: tuple[AcquisitionFacts, ...] | None = field(
+        default=None, init=False, repr=False
+    )
+
     catalog: SceneCatalog
     config: StackConfig
     pairs: Pairs
@@ -934,7 +984,7 @@ class Stack(NetworkContract):
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
     _nesd_skipped_no_windows: bool = False
-    pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
+    pair_states: dict[str, Any] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
     timeseries: TimeSeries | None = None
     _prepared: bool = False
@@ -977,9 +1027,16 @@ class Stack(NetworkContract):
         self._product_index = None
         self._capture_dem_source()
 
-    def _scene_dir(self, date_id: str) -> Path:
-        """Return the scene product directory of one acquisition."""
-        return self.config.work_dir / "coreg" / date_id
+    def _scene_dir(self, date_id: str, polygon: int | None = None) -> Path:
+        """Return the scene product directory of one acquisition.
+
+        ``polygon`` selects the ``p<i>`` subtree written for a multi-polygon
+        ROI; ``None`` keeps the un-suffixed single-polygon layout.
+        """
+        base = self.config.work_dir / "coreg" / date_id
+        if polygon is None:
+            return base
+        return base / f"p{polygon}"
 
     @property
     def scenes(self) -> StackSceneCollection:
@@ -1006,10 +1063,39 @@ class Stack(NetworkContract):
             found[store.date_id] = store
         return StackSceneCollection(self, dict(sorted(found.items())))
 
+    def _scene_stores(
+        self, polygon: int | None = None
+    ) -> dict[str, CoregisteredSceneStore]:
+        """Return committed scene stores of one ROI polygon subtree.
+
+        ``polygon=None`` discovers the un-suffixed ``coreg/<date>`` products
+        (the single-polygon or no-ROI layout); a multi-polygon index reads
+        ``coreg/<date>/p<i>``.
+        """
+        found: dict[str, CoregisteredSceneStore] = {}
+        coreg_root = self.config.work_dir / "coreg"
+        if not coreg_root.is_dir():
+            return found
+        for date_dir in sorted(coreg_root.iterdir()):
+            if not date_dir.is_dir() or date_dir.name.startswith("."):
+                continue
+            scene_root = date_dir if polygon is None else date_dir / f"p{polygon}"
+            if not (scene_root / "item.json").is_file():
+                continue
+            store = CoregisteredSceneStore.open(scene_root)
+            found[store.date_id] = store
+        return found
+
     @property
     def reference_scene(self) -> CoregisteredSceneStore | None:
         """Return the committed Reference scene product, if any."""
-        path = self._scene_dir(self.reference)
+        return self._reference_scene_for(None)
+
+    def _reference_scene_for(
+        self, polygon: int | None
+    ) -> CoregisteredSceneStore | None:
+        """Return the Reference scene product of one ROI polygon subtree."""
+        path = self._scene_dir(self.reference, polygon)
         if not (path / "item.json").is_file():
             return None
         store = CoregisteredSceneStore.open(path)
@@ -1810,16 +1896,26 @@ class Stack(NetworkContract):
         return self.config.roi is not None or self._selected_footprint_roi() is not None
 
     def _stack_dem_raster_path(self) -> Path:
-        """Return the durable raster path owned by this Stack."""
-        return self.config.work_dir / "dem" / "stack.tif"
+        """Return the durable raster path owned by this Stack.
+
+        New workspaces persist ``dem.tif`` at the work-directory root;
+        workspaces staged before the flat layout keep ``dem/stack.tif``.
+        """
+        from faninsar.stack.layout import dem_raster_path
+
+        return dem_raster_path(self.config.work_dir)
 
     def _stack_dem_sidecar_path(self) -> Path:
         """Return the sidecar that records source and raster identity."""
-        return self.config.work_dir / "dem" / "stack.json"
+        from faninsar.stack.layout import dem_sidecar_path
+
+        return dem_sidecar_path(self.config.work_dir)
 
     def _stack_wgs84_raster_path(self) -> Path:
         """Return the geographic DEM used by rdr2geo."""
-        return self.config.work_dir / "dem" / "stack_wgs84.tif"
+        from faninsar.stack.layout import dem_wgs84_path
+
+        return dem_wgs84_path(self.config.work_dir)
 
     def _geometry_dem(self) -> RasterDEM | object | None:
         """Return the DEM passed to radar geometry.
@@ -2100,6 +2196,14 @@ class Stack(NetworkContract):
         self.config.dem = persisted if persisted is not None else raster
         return self.config.dem
 
+    def _restore_local_inputs(self) -> None:
+        """Restore persisted local DEMs without preparing missing inputs."""
+        self._capture_dem_source()
+        raster = self._load_persisted_raster_dem()
+        if raster is not None:
+            self.config.dem = raster
+        self._dem_wgs84 = self._load_persisted_wgs84_dem()
+
     @classmethod
     def _search_profile(cls) -> MissionSearchProfile:
         """Return the mission profile used by :meth:`search`.
@@ -2114,7 +2218,7 @@ class Stack(NetworkContract):
     @classmethod
     def search(
         cls,
-        spatial: Points | BoundingBox | Polygons,
+        roi: Points | BoundingBox | Polygons,
         *,
         datetime_range: tuple[datetime, datetime] | None = None,
         flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
@@ -2127,7 +2231,7 @@ class Stack(NetworkContract):
 
         Parameters
         ----------
-        spatial : Points, BoundingBox, or Polygons
+        roi : Points, BoundingBox, or Polygons
             FanInSAR spatial query.
         datetime_range : tuple of datetime, optional
             Inclusive acquisition interval.
@@ -2157,7 +2261,7 @@ class Stack(NetworkContract):
         from faninsar.remote import search as remote_search
 
         items = remote_search(
-            spatial,
+            roi,
             catalog=profile.catalog,
             collections=profile.collections or None,
             datetime_range=datetime_range,
@@ -2179,7 +2283,7 @@ class Stack(NetworkContract):
     def _prepare_mission(self) -> MissionPreparedInputs:
         """Return mission-owned local inputs for shared preparation.
 
-        Local-only stacks have no additional orbit or calibration inputs. A
+        Local-only stacks have no additional orbit or AUX_CAL inputs. A
         mission adapter may override this hook after constructing a valid
         local Stack; the result is validated before shared state is published.
         """
@@ -2198,7 +2302,7 @@ class Stack(NetworkContract):
             reject(message, TypeError, logger=logger)
         paths = (
             *prepared.orbit_paths_by_acquisition.values(),
-            *prepared.calibration_paths,
+            *prepared.aux_cal_paths_by_acquisition.values(),
         )
         for path in paths:
             if not Path(path).is_file():
@@ -2209,8 +2313,8 @@ class Stack(NetworkContract):
     def prepare(self) -> Self:
         """Prepare shared Stack inputs and save the Stack identity.
 
-        Mission preparation resolves local orbit and calibration bindings
-        (downloading missing orbits is allowed here, never on reopen), the
+        Mission preparation resolves local orbit and AUX_CAL bindings
+        (downloading missing files is allowed here, never on reopen), the
         output grid is resolved and recorded, and the DEM recipe is
         materialized onto it. The identity is then saved as ``stack.json``;
         reopen goes through :meth:`Stack.open`, which never touches the
@@ -2322,9 +2426,10 @@ class Stack(NetworkContract):
             date: _check_input(entry)
             for date, entry in document["inputs"].get("orbits", {}).items()
         }
-        calibrations = [
-            _check_input(entry) for entry in document["inputs"].get("calibrations", [])
-        ]
+        aux_cal = {
+            date: _check_input(entry)
+            for date, entry in document["inputs"].get("aux_cal", {}).items()
+        }
 
         science = {
             name: decode_value(value) for name, value in document["science"].items()
@@ -2351,8 +2456,8 @@ class Stack(NetworkContract):
         }
         if orbits:
             extra["orbit_paths"] = orbits
-        if calibrations:
-            extra["calibration_paths"] = calibrations
+        if aux_cal:
+            extra["aux_cal_paths"] = aux_cal
         science["extra"] = extra
         config = StackConfig(**science)
 
@@ -2370,9 +2475,7 @@ class Stack(NetworkContract):
         stack.scene_provider = (
             runtime.get("scene_provider") or stack_cls._default_scene_provider()
         )
-        stack.prepare_scenes()
-        stack._capture_dem_source()
-        stack._ensure_raster_dem()
+        stack._restore_local_inputs()
         stack._prepared = True
         stack._refresh_network()
         return stack
@@ -2526,6 +2629,11 @@ class Stack(NetworkContract):
         # Product roots appear as their first product is committed.
         if self.reference not in self.catalog.paths:
             reject_invalid_state(f"reference {self.reference} missing from catalog")
+        # Resolve the mission's track map once up front so the recorded
+        # ``track_metadata`` is settled before any resume identity digest
+        # is computed — resolving lazily mid-stage would mutate ``extra``
+        # and stale every scene committed under the earlier config.
+        self._track_metadata()
         self._prepared = True
         logger.info(
             "Stack prepared reference=%s n_scenes=%s n_pairs=%s "
@@ -2558,6 +2666,224 @@ class Stack(NetworkContract):
                 self.config.roi, mask_plan=self.config.mask_plan
             )
         return self._effective_roi_resolution
+
+    @property
+    def roi_polygon_count(self) -> int:
+        """Number of polygonal parts in the effective ROI.
+
+        ``1`` for :class:`Points`, :class:`BoundingBox`, and a single-polygon
+        :class:`Polygons`; ``> 1`` only when the effective ROI is a
+        multi-polygon. ``0`` when no ROI was configured.
+        """
+        return len(self._effective_roi_with_mask().parts)
+
+    def _roi_polygon_rois(self) -> list[object] | None:
+        """Return one single-polygon ``Polygons`` per effective-ROI part.
+
+        ``None`` when the effective ROI is absent, a point, a bounding box, or
+        a single polygon — the whole run then uses the un-suffixed layout.
+        A multi-polygon ROI returns one ``Polygons`` per part, in
+        ``_EffectiveRoi.parts`` order, so ``list`` index ``i`` is the polygon
+        selected by ``sel(polygon=i)``.
+        """
+        parts = self._effective_roi_with_mask().parts
+        if len(parts) <= 1:
+            return None
+        return [_effective_roi_polygons([part]) for part in parts]
+
+    # ------------------------------------------------------------------
+    # Track-axis selectors (orbitalized workspaces, stage 5)
+    # ------------------------------------------------------------------
+
+    def _track_metadata(self) -> dict[str, object] | None:
+        """Return per-date track metadata supplied by the mission provider.
+
+        The base Stack has no orbital vocabulary; a mission adapter (e.g.
+        :class:`~faninsar.missions.s1.stack.S1Stack`) overrides this hook
+        and returns ``{"dates": {date_id: TrackAcquisitionInfo}}`` or
+        ``None``.  The result is cached per session; persisted metadata
+        recorded in ``stack.json``'s ``science_extra`` is read first so a
+        reopened Stack keeps the same track map without reopening SAFEs.
+        """
+        persisted = self.config.extra.get("track_metadata")
+        return persisted if isinstance(persisted, dict) else None
+
+    def _selection_facts(self) -> tuple[AcquisitionFacts, ...]:
+        """Return cached facts decoded only from this workspace's mission record.
+
+        No source product, preparation hook, or remote operation is consulted.
+        Missing metadata remains unknown; it is never filled by preparing a
+        reopened Stack as a side effect of inspecting its products.
+        """
+        if self._selection_facts_cache is None:
+            from faninsar.missions.base import get_mission
+
+            key = self._sensor_registry_key
+            decoder = None if key is None else get_mission(key).decode_selection
+            self._selection_facts_cache = (
+                () if decoder is None else decoder(self.config.extra)
+            )
+        return self._selection_facts_cache
+
+    def _catalog_track_infos(self) -> dict[str, object]:
+        """Return ``{date_id: TrackAcquisitionInfo}`` for catalog dates."""
+        metadata = self._track_metadata() or {}
+        dates = metadata.get("dates")
+        return dict(dates) if isinstance(dates, dict) else {}
+
+    @property
+    def track_groups(self) -> tuple[str, ...]:
+        """Return the sorted track labels this Stack's catalog occupies.
+
+        Empty when no mission track metadata is available (the base
+        ``Stack`` and catalogs whose track could not be resolved).
+        """
+        return tuple(
+            sorted(
+                {item.group_key for item in self._selection_facts() if item.group_key}
+            )
+        )
+
+    @property
+    def polygon_tracks(self) -> dict[int, str]:
+        """Return ``{polygon_index: track_key}`` for the effective ROI.
+
+        Each multi-polygon part is assigned to the track whose union of
+        burst footprints covers it best; ``{}`` when the effective ROI is
+        not multi-polygon or track metadata is unavailable.  The mapping
+        is deterministic (best-area, then lexicographic tie-break) so a
+        wrong-track ``sel(polygon=)`` error always names the same
+        correction.
+        """
+        cached = getattr(self, "_polygon_tracks_cache", None)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        parts = self._effective_roi_with_mask().parts
+        result: dict[int, str] = {}
+        if len(parts) > 1:
+            groups = {
+                item.acquisition_key: item.group_key for item in self._selection_facts()
+            }
+            if groups:
+                footprints = self._catalog_footprints(groups)
+                if footprints:
+                    from faninsar.stack.selection import polygon_track_assignment
+
+                    result = polygon_track_assignment(list(parts), footprints, groups)
+        self._polygon_tracks_cache = result
+        return result
+
+    def _catalog_footprints(
+        self, infos: dict[str, object]
+    ) -> dict[str, tuple[object, ...]]:
+        """Return ``{date_id: (footprint geometry, ...)}`` for polygon mapping.
+
+        Burst footprints come from ``config.extra`` first (recorded by
+        :meth:`_prepare_mission`); dates without recorded footprints fall
+        back to the mission's own reader through the provider hook.
+        """
+        cached = getattr(self, "_catalog_footprints_cache", None)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        result: dict[str, tuple[object, ...]] = {}
+        resolver = getattr(self, "_date_footprints", None)
+        for date_id in infos:
+            footprints: tuple[object, ...] = ()
+            if callable(resolver):
+                footprints = tuple(resolver(date_id) or ())
+            if footprints:
+                result[date_id] = footprints
+        self._catalog_footprints_cache = result
+        return result
+
+    def _date_footprints(self, date_id: str) -> tuple[object, ...]:
+        """Return burst-footprint geometries of one catalog date.
+
+        Mission adapters override this hook (Sentinel-1 reads the parsed
+        burst footprints); the default returns none so polygon→track
+        mapping degrades to no-op instead of guessing.
+        """
+        del date_id
+        return ()
+
+    def _catalog_dates_for_track(
+        self,
+        *,
+        track: str | None = None,
+        direction: str | None = None,
+        pol: str | Sequence[str] | None = None,
+        burst: int | Sequence[int] | None = None,
+    ) -> tuple[str, ...]:
+        """Return catalog identities matching registered mission selection.
+
+        Shared readers pass their existing selectors through this one seam;
+        only the mission adapter interprets its native aliases. No configured
+        channel default substitutes for unknown persisted acquisition facts.
+        """
+        from faninsar.missions.base import get_mission
+
+        if all(value is None for value in (track, direction, pol, burst)):
+            return self.catalog.dates
+        key = self._sensor_registry_key
+        sensor = None if key is None else get_mission(key)
+        if sensor is None or sensor.decode_selection is None:
+            message = (
+                f"{type(self).__name__} does not support constrained selection: "
+                "no registered mission selection decoder"
+            )
+            reject(message, NotImplementedError, logger=logger)
+        selected = sensor.select_acquisitions(
+            self._selection_facts(),
+            track=track,
+            direction=direction,
+            pol=pol,
+            burst=burst,
+        )
+        catalog = set(self.catalog.dates)
+        return tuple(value for value in selected if value in catalog)
+
+    def _normalize_track_selector(self, track: str | None) -> str | None:
+        """Resolve a mission alias to one known group for a reader view."""
+        if track is None:
+            return None
+        text = str(track).strip().upper()
+        selected = set(self._catalog_dates_for_track(track=text))
+        groups = sorted(
+            {
+                item.group_key
+                for item in self._selection_facts()
+                if item.acquisition_key in selected and item.group_key is not None
+            }
+        )
+        if len(groups) > 1:
+            message = f"track {track!r} is ambiguous across tracks: {groups!r}"
+            reject(message, ValueError, logger=logger)
+        if groups:
+            return groups[0]
+        if not text or self.track_groups:
+            message = (
+                f"track {track!r} is not one of this Stack's tracks: "
+                f"{list(self.track_groups)!r}"
+            )
+            reject(message, ValueError, logger=logger)
+        return text
+
+    def _select_pairs_for_track(self, dates: tuple[str, ...]) -> Pairs:
+        """Return the planned pairs whose endpoints both lie in ``dates``.
+
+        The single-track rule: a pair is kept only when *both* its
+        acquisitions sit on the selected track set, so cross-track pairs
+        are never produced by a track-narrowed view.
+        """
+        from faninsar.core.pair import Pairs as PairsType
+
+        selected = set(dates)
+        names = [
+            f"{first}_{second}"
+            for first, second in _iter_pair_dates(self.pairs)
+            if first in selected and second in selected
+        ]
+        return PairsType.from_names(names)
 
     def _mask_lineage_record(self) -> dict[str, object]:
         """Return normalized mask-plan lineage for run manifests."""
@@ -3244,12 +3570,22 @@ class Stack(NetworkContract):
         """Explicitly return unused accelerator slabs before yielding the GPU."""
         self._reclaim_accelerator("explicit")
 
+    def _source_processing_identity(self, date_id: str) -> Mapping[str, object]:
+        """Return mission-owned source corrections qualifying scene reuse.
+
+        The default adds no interpretation. Missions with source calibration
+        or phase corrections provide their local content/version identity here.
+        """
+        del date_id
+        return {}
+
     def _coreg_resume_identity(
         self,
         date_id: str,
         *,
         misreg_az_px: float,
         misreg_rg_px: float,
+        polygon: int | None = None,
     ) -> str:
         """Return the canonical identity of one coregistration request.
 
@@ -3290,13 +3626,20 @@ class Stack(NetworkContract):
                 )
             return hashlib.sha256(encoded).hexdigest()
 
-        reference = self.reference_scene
+        reference = self._reference_scene_for(polygon)
         payload = {
             "schema": "stack_coreg_request_v1",
             "reference_id": self.reference,
             "date_id": date_id,
+            "polygon": polygon,
             "reference_source": source_identity(self.catalog.paths_for(self.reference)),
             "secondary_source": source_identity(self.catalog.paths_for(date_id)),
+            "reference_source_processing": dict(
+                self._source_processing_identity(self.reference)
+            ),
+            "secondary_source_processing": dict(
+                self._source_processing_identity(date_id)
+            ),
             "science": self._coreg_science_config(),
             "misreg_az_px": float(misreg_az_px),
             "misreg_rg_px": float(misreg_rg_px),
@@ -3428,6 +3771,14 @@ class Stack(NetworkContract):
         value = orbit_paths.get(date_id)
         return None if value is None else Path(value)
 
+    def _aux_cal_path_for(self, date_id: str) -> Path | None:
+        """Return the AUX_CAL file bound to ``date_id``, if any."""
+        aux_cal_paths = self.config.extra.get("aux_cal_paths")
+        if not isinstance(aux_cal_paths, dict):
+            return None
+        value = aux_cal_paths.get(date_id)
+        return None if value is None else Path(value)
+
     def _measure_pair_misreg(self, primary: str, secondary: str) -> MisregArc:
         """Measure one misreg pair through the mission scene provider.
 
@@ -3463,16 +3814,19 @@ class Stack(NetworkContract):
             n_valid=n_valid,
         )
 
-    def _prepare_reference_scene(self, *, overwrite: bool) -> object | None:
+    def _prepare_reference_scene(
+        self, *, overwrite: bool, polygon: int | None = None
+    ) -> object | None:
         """Compute the Reference scene product once for this run.
 
         Missions that split Reference preparation from secondary resampling
         (Sentinel-1) return a Reference context reused by every
         :meth:`_coregister_one_scene` call. The default provider path
         publishes the Reference inside its first pair call and returns
-        ``None``.
+        ``None``. ``polygon`` selects the ``p<i>`` subtree of a multi-polygon
+        ROI; ``None`` is the un-suffixed single-polygon layout.
         """
-        del overwrite
+        del overwrite, polygon
         return None
 
     def _coregister_one_scene(
@@ -3486,6 +3840,7 @@ class Stack(NetworkContract):
         reference_context: object | None = None,
         inputs: Mapping[str, str] | None = None,
         properties: Mapping[str, object] | None = None,
+        polygon: int | None = None,
     ) -> Any:
         """Resample one secondary date onto the Reference scene product.
 
@@ -3506,6 +3861,14 @@ class Stack(NetworkContract):
                 pair_kwargs["primary_orbit_path"] = reference_orbit
             if date_orbit is not None:
                 pair_kwargs["secondary_orbit_path"] = date_orbit
+        aux_cal_paths = self.config.extra.get("aux_cal_paths")
+        if isinstance(aux_cal_paths, dict):
+            reference_aux = aux_cal_paths.get(self.reference)
+            date_aux = aux_cal_paths.get(date_id)
+            if reference_aux is not None:
+                pair_kwargs["primary_aux_cal_path"] = reference_aux
+            if date_aux is not None:
+                pair_kwargs["secondary_aux_cal_path"] = date_aux
         for extra_key in (
             "geoid_correction",
             "geo_lut_cache_dir",
@@ -3527,7 +3890,7 @@ class Stack(NetworkContract):
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
             scene_dir=output_dir,
-            reference_scene_dir=self._scene_dir(self.reference),
+            reference_scene_dir=self._scene_dir(self.reference, polygon),
             scene_inputs=dict(inputs or {}),
             scene_properties=dict(properties or {}),
             **pair_kwargs,
@@ -3652,51 +4015,106 @@ class Stack(NetworkContract):
             reject_invalid_state(
                 "Stack extra orbit_paths must be a date-to-path mapping"
             )
-        reference_context = (
-            self._prepare_reference_scene(overwrite=overwrite) if target_dates else None
+        polygon_rois = self._roi_polygon_rois()
+        polygons: list[int | None] = (
+            list(range(len(polygon_rois))) if polygon_rois is not None else [None]
         )
-        for date_id in target_dates:
-            out = self._scene_dir(date_id)
-            misreg_az, misreg_rg = self._apply_misreg_constants(date_id)
-            coreg_identity = self._coreg_resume_identity(
-                date_id,
-                misreg_az_px=misreg_az,
-                misreg_rg_px=misreg_rg,
-            )
-            if not overwrite and self._reuse_scene(date_id, coreg_identity):
-                continue
-            self._reject_nesd_apply_without_constants()
-            properties: dict[str, object] = {
-                "faninsar:coreg_identity": coreg_identity,
-                "faninsar:coreg_mode": self.config.coreg_mode,
-                "faninsar:geometric_phase_removed": (
-                    "topo" if self.config.dem is not None else "flat"
-                ),
-                "faninsar:mask_lineage": self._mask_lineage_record(),
-            }
-            inputs = self._scene_misreg_inputs()
-            state = self._coregister_one_scene(
-                date_id,
-                output_dir=out,
-                misreg_az_px=misreg_az,
-                misreg_rg_px=misreg_rg,
-                overwrite=True,
-                reference_context=reference_context,
-                inputs=inputs,
-                properties=properties,
-            )
-            reference = self.reference_scene
-            if reference is None:
-                reject_invalid_state(
-                    "scene provider did not publish the Reference scene product"
+        for polygon in polygons:
+            try:
+                reference_context = (
+                    self._prepare_reference_scene(overwrite=overwrite, polygon=polygon)
+                    if target_dates
+                    else None
                 )
-            validate_reference_binding(reference, CoregisteredSceneStore.open(out))
-            if state is not None and self.config.retain_pair_states:
-                self.pair_states[f"{self.reference}_{date_id}"] = state
-            logger.info("Coregistered %s → Reference %s", date_id, self.reference)
-            del state
-            gc.collect()
-            self._reclaim_accelerator("persist")
+            except InvalidProcessingStateError as error:
+                # A polygon may intersect a burst's radar frame yet project
+                # onto lines the canvas never fetched; it then has no scene
+                # units in this subtree and is skipped, not fatal.
+                if polygon is not None and "no scene units" in str(error):
+                    logger.info(
+                        "ROI polygon %d produced no scene units; skipped",
+                        polygon,
+                    )
+                    continue
+                raise
+            except RuntimeError as error:
+                # A multi-polygon part may fall between every Reference burst;
+                # it owns no scene subtree and is skipped rather than failing
+                # the whole run. A single-polygon ROI still fails loudly.
+                if polygon is not None and "contains no bursts" in str(error):
+                    logger.info(
+                        "ROI polygon %d selects no Reference burst; skipped",
+                        polygon,
+                    )
+                    continue
+                raise
+            for date_id in target_dates:
+                out = self._scene_dir(date_id, polygon)
+                misreg_az, misreg_rg = self._apply_misreg_constants(date_id)
+                coreg_identity = self._coreg_resume_identity(
+                    date_id,
+                    misreg_az_px=misreg_az,
+                    misreg_rg_px=misreg_rg,
+                    polygon=polygon,
+                )
+                if not overwrite and self._reuse_scene(
+                    date_id, coreg_identity, polygon=polygon
+                ):
+                    continue
+                self._reject_nesd_apply_without_constants()
+                properties: dict[str, object] = {
+                    "faninsar:coreg_identity": coreg_identity,
+                    "faninsar:coreg_mode": self.config.coreg_mode,
+                    "faninsar:geometric_phase_removed": (
+                        "topo" if self.config.dem is not None else "flat"
+                    ),
+                    "faninsar:mask_lineage": self._mask_lineage_record(),
+                }
+                inputs = self._scene_misreg_inputs()
+                try:
+                    state = self._coregister_one_scene(
+                        date_id,
+                        output_dir=out,
+                        misreg_az_px=misreg_az,
+                        misreg_rg_px=misreg_rg,
+                        overwrite=True,
+                        reference_context=reference_context,
+                        inputs=inputs,
+                        properties=properties,
+                        polygon=polygon,
+                    )
+                except InvalidProcessingStateError as error:
+                    # A secondary that covers no Reference unit of this polygon
+                    # simply has no product under that subtree; it is not a run
+                    # failure when the ROI holds more than one polygon.
+                    if polygon is not None and "covers no Reference unit" in str(error):
+                        logger.info(
+                            "Scene %s covers no unit of polygon %d; skipped",
+                            date_id,
+                            polygon,
+                        )
+                        continue
+                    raise
+                reference = self._reference_scene_for(polygon)
+                if reference is None:
+                    reject_invalid_state(
+                        "scene provider did not publish the Reference scene product"
+                    )
+                validate_reference_binding(reference, CoregisteredSceneStore.open(out))
+                if state is not None and self.config.retain_pair_states:
+                    key = f"{self.reference}_{date_id}"
+                    if polygon is not None:
+                        key = f"{key}_p{polygon}"
+                    self.pair_states[key] = state
+                logger.info(
+                    "Coregistered %s → Reference %s%s",
+                    date_id,
+                    self.reference,
+                    "" if polygon is None else f" (polygon {polygon})",
+                )
+                del state
+                gc.collect()
+                self._reclaim_accelerator("persist")
         return self
 
     def _scene_misreg_inputs(self) -> dict[str, str]:
@@ -3704,12 +4122,14 @@ class Stack(NetworkContract):
         misreg = self._misreg_write_id
         return {} if misreg is None else {"misreg": misreg}
 
-    def _reuse_scene(self, date_id: str, coreg_identity: str) -> bool:
+    def _reuse_scene(
+        self, date_id: str, coreg_identity: str, *, polygon: int | None = None
+    ) -> bool:
         """Return whether the persisted secondary scene is current."""
-        out = self._scene_dir(date_id)
+        out = self._scene_dir(date_id, polygon)
         if not (out / "item.json").is_file():
             return False
-        reference = self.reference_scene
+        reference = self._reference_scene_for(polygon)
         if reference is None:
             return False
         store = CoregisteredSceneStore.open(out)
@@ -3726,6 +4146,24 @@ class Stack(NetworkContract):
         validate_reference_binding(reference, store)
         logger.info("Reusing coregistered scene %s", date_id)
         return True
+
+    def _bind_multilook(self, looks: tuple[int, int]) -> None:
+        """Adopt one look pair as the session default and persist it.
+
+        ``form_interferograms(multilook=...)`` is a per-call override that
+        used to leave :attr:`StackConfig.multilook` (and ``stack.json``) on
+        the construction default.  Reopen then looks for ``ifg/ml_5x2``
+        while products live under ``ml_10x2``.  A single explicit look pair
+        becomes the science value for later unwrap, inversion, and identity.
+        """
+        adopted = (int(looks[0]), int(looks[1]))
+        current = (int(self.config.multilook[0]), int(self.config.multilook[1]))
+        if adopted == current:
+            return
+        self.config.multilook = adopted
+        from faninsar.stack.identity import save_stack_identity
+
+        save_stack_identity(self)
 
     @_reclaim_after_stage
     def form_interferograms(
@@ -3835,6 +4273,8 @@ class Stack(NetworkContract):
         else:
             use_pairs = self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
+        if multilook is not None and len(looks_list) == 1:
+            self._bind_multilook(looks_list[0])
         # ``goldstein_alpha`` remains an internal transition path for existing
         # callers.  The public MVP API is ``phase_filter``; an explicit filter
         # (including None) always takes precedence over the old scalar option.
@@ -3852,188 +4292,203 @@ class Stack(NetworkContract):
             else None
         )
 
-        scenes = self.scenes
+        polygon_rois = self._roi_polygon_rois()
+        polygons: list[int | None] = (
+            list(range(len(polygon_rois))) if polygon_rois is not None else [None]
+        )
+        scenes_by_polygon = {
+            polygon: self._scene_stores(polygon) for polygon in polygons
+        }
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
                 continue
             for looks in looks_list:
                 az_l, rg_l = looks
-                sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
-                if primary not in scenes or secondary not in scenes:
-                    reject_invalid_state(
-                        f"scene product missing for {primary}_{secondary}; run "
-                        "coregister_scenes first"
-                    )
-                primary_store = scenes[primary]
-                secondary_store = scenes[secondary]
-                if primary_store.flatten_stage != secondary_store.flatten_stage:
-                    reject_invalid_state("scene artifacts mix flattening stages")
-                flatten_stage = primary_store.flatten_stage
-                phase_screen_model, phase_screen_digests = _phase_screen_lineage(
-                    primary_store,
-                    secondary_store,
-                    flatten_stage,
-                )
-                expected_sources = {
-                    "primary": primary_store.manifest_digest,
-                    "secondary": secondary_store.manifest_digest,
-                }
-                mask_plan_identity = self.config.mask_plan.identity
-                mask_identity = None
-                if self.config.mask_plan.references("interferogram"):
-                    mask_grid = self._ifg_geo_grid(looks)
-                    if mask_grid is not None:
-                        from faninsar.processing.masking.mask import GridSpec
-
-                        mask_identity = self._materialize_stage_mask(
-                            "interferogram",
-                            GridSpec("EPSG:4326", mask_grid[0], shape=mask_grid[1]),
-                        ).identity
-                expected_filter_name = filter_name
-                expected_filter_parameters = filter_parameters
-                if (sub / "item.json").exists() and not overwrite:
-                    from faninsar.io.storage.ifg_store import (
-                        InterferogramArtifactStore,
-                    )
-
-                    existing_store = InterferogramArtifactStore.open(sub)
-                    observed = {
-                        "pair": existing_store.pair,
-                        "looks": existing_store.looks,
-                        "domain": existing_store.domain,
-                        "wavelength_m": existing_store.wavelength_m,
-                        "grid_identity": existing_store.grid_identity,
-                        "filter_name": existing_store.filter_name,
-                        "filter_parameters": existing_store.filter_parameters,
-                        # Products written before the runtime fingerprint was
-                        # removed still carry a ``runtime`` entry next to the
-                        # real scene digests; it is not a source, so it does
-                        # not participate in the lineage comparison.
-                        "sources": {
-                            role: digest
-                            for role, digest in (
-                                existing_store.source_manifest_digests.items()
-                            )
-                            if role != "runtime"
-                        },
-                        "flatten_stage": existing_store.flatten_stage,
-                        "phase_screen_model": existing_store.phase_screen_model,
-                        "phase_screen_digests": existing_store.phase_screen_digests,
-                        "phase_screen_domain": existing_store.phase_screen_domain,
-                        "phase_screen_grid_identity": (
-                            existing_store.phase_screen_grid_identity
-                        ),
-                        "mask_plan_identity": existing_store.mask_plan_identity,
-                        "mask_identity": existing_store.mask_identity,
-                    }
-                    expected = {
-                        "pair": (primary, secondary),
-                        "looks": looks,
-                        "domain": primary_store.domain,
-                        "wavelength_m": primary_store.wavelength_m,
-                        "grid_identity": primary_store.grid_identity,
-                        "filter_name": expected_filter_name,
-                        "filter_parameters": expected_filter_parameters,
-                        "sources": expected_sources,
-                        "flatten_stage": flatten_stage,
-                        "phase_screen_model": phase_screen_model,
-                        "phase_screen_digests": phase_screen_digests,
-                        "phase_screen_domain": primary_store.domain,
-                        "phase_screen_grid_identity": primary_store.grid_identity,
-                        "mask_plan_identity": mask_plan_identity,
-                        "mask_identity": mask_identity,
-                    }
-                    mismatched = [
-                        name
-                        for name, expected_value in expected.items()
-                        if observed[name] != expected_value
-                    ]
-                    if mismatched:
+                for polygon in polygons:
+                    scenes = scenes_by_polygon[polygon]
+                    sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
+                    if polygon is not None:
+                        sub = sub / f"p{polygon}"
+                    if primary not in scenes or secondary not in scenes:
+                        if polygon is not None:
+                            # A secondary that covers none of this polygon's
+                            # Reference units has no product in its subtree.
+                            continue
                         reject_invalid_state(
-                            "persisted IFG artifact does not match current scene "
-                            "lineage or processing parameters: "
-                            f"{', '.join(sorted(mismatched))} differ"
+                            f"scene product missing for {primary}_{secondary}; run "
+                            "coregister_scenes first"
                         )
-                    existing_store.read()
-                    self.ifg_dirs.append(sub)
-                    continue
-                if sub.exists() and not overwrite:
-                    reject_invalid_state(
-                        f"{sub} exists without item.json; it is not an IFG product "
-                        "of this FanInSAR version (pass overwrite=True to replace it)"
-                    )
-                reservation = None
-                if formation_ledger is not None:
-                    estimate = estimate_formation_resources(
-                        shape=primary_store.grid_shape,
-                        multilook=looks,
-                        coherence_window=selected_coherence_window,
-                        phase_filter=selected_filter,
-                    )
-                    reservation = reserve_estimate(formation_ledger, estimate)
-                try:
-                    product = form_merged_scene_interferogram(
+                    primary_store = scenes[primary]
+                    secondary_store = scenes[secondary]
+                    if primary_store.flatten_stage != secondary_store.flatten_stage:
+                        reject_invalid_state("scene artifacts mix flattening stages")
+                    flatten_stage = primary_store.flatten_stage
+                    phase_screen_model, phase_screen_digests = _phase_screen_lineage(
                         primary_store,
                         secondary_store,
-                        multilook=looks,
-                        goldstein_alpha=alpha,
-                        coherence_window=selected_coherence_window,
-                        phase_filter=selected_filter,
-                        device=self.config.device,
-                        dask_client=self.dask_client,
-                        flatten_stage=flatten_stage,
+                        flatten_stage,
                     )
-                finally:
-                    if reservation is not None:
-                        reservation.release()
-                from faninsar.io.storage.ifg_store import write_ifg_artifact
+                    expected_sources = {
+                        "primary": primary_store.manifest_digest,
+                        "secondary": secondary_store.manifest_digest,
+                    }
+                    mask_plan_identity = self.config.mask_plan.identity
+                    mask_identity = None
+                    if self.config.mask_plan.references("interferogram"):
+                        mask_grid = self._ifg_geo_grid(looks)
+                        if mask_grid is not None:
+                            from faninsar.processing.masking.mask import GridSpec
 
-                # PROPOSAL-0039 (AC-5): the active mask is a support input
-                # intersected into the persisted valid_mask AFTER formation
-                # and filtering. It never routes through the PhaseFilter and
-                # never touches the complex/phase numerics.
-                valid_mask = product.valid_mask
-                mask_plane = self._ifg_mask_plane(
-                    domain=primary_store.domain,
-                    looks=looks,
-                    expected_shape=(
-                        valid_mask.shape
-                        if valid_mask is not None
-                        else product.complex.shape
-                    ),
-                )
-                if mask_plane is not None:
-                    if valid_mask is None:
-                        valid_mask = np.isfinite(product.complex)
-                    valid_mask = _apply_mask_to_valid_mask(valid_mask, mask_plane)
+                            mask_identity = self._materialize_stage_mask(
+                                "interferogram",
+                                GridSpec("EPSG:4326", mask_grid[0], shape=mask_grid[1]),
+                            ).identity
+                    expected_filter_name = filter_name
+                    expected_filter_parameters = filter_parameters
+                    if (sub / "item.json").exists() and not overwrite:
+                        from faninsar.io.storage.ifg_store import (
+                            InterferogramArtifactStore,
+                        )
 
-                write_ifg_artifact(
-                    sub,
-                    pair=(primary, secondary),
-                    looks=looks,
-                    domain=primary_store.domain,
-                    wavelength_m=primary_store.wavelength_m,
-                    grid_identity=primary_store.grid_identity,
-                    crs=primary_store.crs,
-                    transform=_scale_geo_artifact_transform(
-                        primary_store.transform, looks
-                    ),
-                    filter_name=expected_filter_name,
-                    filter_parameters=expected_filter_parameters,
-                    source_manifest_digests=expected_sources,
-                    mask_plan_identity=mask_plan_identity,
-                    mask_identity=mask_identity,
-                    flatten_stage=flatten_stage,
-                    phase_screen_model=phase_screen_model,
-                    phase_screen_digests=phase_screen_digests,
-                    phase_screen_domain=primary_store.domain,
-                    phase_screen_grid_identity=primary_store.grid_identity,
-                    complex_ifg=product.complex,
-                    coherence=product.coherence,
-                    valid_mask=valid_mask,
-                    replace_existing=overwrite,
-                )
-                self.ifg_dirs.append(sub)
+                        existing_store = InterferogramArtifactStore.open(sub)
+                        observed = {
+                            "pair": existing_store.pair,
+                            "looks": existing_store.looks,
+                            "domain": existing_store.domain,
+                            "wavelength_m": existing_store.wavelength_m,
+                            "grid_identity": existing_store.grid_identity,
+                            "filter_name": existing_store.filter_name,
+                            "filter_parameters": existing_store.filter_parameters,
+                            # Products written before the runtime fingerprint was
+                            # removed still carry a ``runtime`` entry next to the
+                            # real scene digests; it is not a source, so it does
+                            # not participate in the lineage comparison.
+                            "sources": {
+                                role: digest
+                                for role, digest in (
+                                    existing_store.source_manifest_digests.items()
+                                )
+                                if role != "runtime"
+                            },
+                            "flatten_stage": existing_store.flatten_stage,
+                            "phase_screen_model": existing_store.phase_screen_model,
+                            "phase_screen_digests": existing_store.phase_screen_digests,
+                            "phase_screen_domain": existing_store.phase_screen_domain,
+                            "phase_screen_grid_identity": (
+                                existing_store.phase_screen_grid_identity
+                            ),
+                            "mask_plan_identity": existing_store.mask_plan_identity,
+                            "mask_identity": existing_store.mask_identity,
+                        }
+                        expected = {
+                            "pair": (primary, secondary),
+                            "looks": looks,
+                            "domain": primary_store.domain,
+                            "wavelength_m": primary_store.wavelength_m,
+                            "grid_identity": primary_store.grid_identity,
+                            "filter_name": expected_filter_name,
+                            "filter_parameters": expected_filter_parameters,
+                            "sources": expected_sources,
+                            "flatten_stage": flatten_stage,
+                            "phase_screen_model": phase_screen_model,
+                            "phase_screen_digests": phase_screen_digests,
+                            "phase_screen_domain": primary_store.domain,
+                            "phase_screen_grid_identity": primary_store.grid_identity,
+                            "mask_plan_identity": mask_plan_identity,
+                            "mask_identity": mask_identity,
+                        }
+                        mismatched = [
+                            name
+                            for name, expected_value in expected.items()
+                            if observed[name] != expected_value
+                        ]
+                        if mismatched:
+                            reject_invalid_state(
+                                "persisted IFG artifact does not match current scene "
+                                "lineage or processing parameters: "
+                                f"{', '.join(sorted(mismatched))} differ"
+                            )
+                        existing_store.read()
+                        self.ifg_dirs.append(sub)
+                        continue
+                    if sub.exists() and not overwrite:
+                        reject_invalid_state(
+                            f"{sub} exists without item.json; it is not an IFG "
+                            "product of this FanInSAR version "
+                            "(pass overwrite=True to replace it)"
+                        )
+                    reservation = None
+                    if formation_ledger is not None:
+                        estimate = estimate_formation_resources(
+                            shape=primary_store.grid_shape,
+                            multilook=looks,
+                            coherence_window=selected_coherence_window,
+                            phase_filter=selected_filter,
+                        )
+                        reservation = reserve_estimate(formation_ledger, estimate)
+                    try:
+                        product = form_merged_scene_interferogram(
+                            primary_store,
+                            secondary_store,
+                            multilook=looks,
+                            goldstein_alpha=alpha,
+                            coherence_window=selected_coherence_window,
+                            phase_filter=selected_filter,
+                            device=self.config.device,
+                            dask_client=self.dask_client,
+                            flatten_stage=flatten_stage,
+                        )
+                    finally:
+                        if reservation is not None:
+                            reservation.release()
+                    from faninsar.io.storage.ifg_store import write_ifg_artifact
+
+                    # PROPOSAL-0039 (AC-5): the active mask is a support input
+                    # intersected into the persisted valid_mask AFTER formation
+                    # and filtering. It never routes through the PhaseFilter and
+                    # never touches the complex/phase numerics.
+                    valid_mask = product.valid_mask
+                    mask_plane = self._ifg_mask_plane(
+                        domain=primary_store.domain,
+                        looks=looks,
+                        expected_shape=(
+                            valid_mask.shape
+                            if valid_mask is not None
+                            else product.complex.shape
+                        ),
+                    )
+                    if mask_plane is not None:
+                        if valid_mask is None:
+                            valid_mask = np.isfinite(product.complex)
+                        valid_mask = _apply_mask_to_valid_mask(valid_mask, mask_plane)
+
+                    write_ifg_artifact(
+                        sub,
+                        pair=(primary, secondary),
+                        looks=looks,
+                        domain=primary_store.domain,
+                        wavelength_m=primary_store.wavelength_m,
+                        grid_identity=primary_store.grid_identity,
+                        crs=primary_store.crs,
+                        transform=_scale_geo_artifact_transform(
+                            primary_store.transform, looks
+                        ),
+                        filter_name=expected_filter_name,
+                        filter_parameters=expected_filter_parameters,
+                        source_manifest_digests=expected_sources,
+                        mask_plan_identity=mask_plan_identity,
+                        mask_identity=mask_identity,
+                        flatten_stage=flatten_stage,
+                        phase_screen_model=phase_screen_model,
+                        phase_screen_digests=phase_screen_digests,
+                        phase_screen_domain=primary_store.domain,
+                        phase_screen_grid_identity=primary_store.grid_identity,
+                        complex_ifg=product.complex,
+                        coherence=product.coherence,
+                        valid_mask=valid_mask,
+                        replace_existing=overwrite,
+                    )
+                    self.ifg_dirs.append(sub)
         return self
 
     def _extend_plan(self, pairs: Pairs) -> None:
@@ -4706,8 +5161,12 @@ class Stack(NetworkContract):
         self,
         *,
         looks: tuple[int, int],
+        polygon: int | None = None,
     ) -> list[InterferogramArtifactStore]:
         """Open the exact planned IFG product set of one multilook view.
+
+        ``polygon`` selects the ``p<i>`` subtree written for a multi-polygon
+        ROI; ``None`` reads the un-suffixed single-polygon layout.
 
         Raises
         ------
@@ -4726,16 +5185,32 @@ class Stack(NetworkContract):
         ]
         if not root.is_dir():
             reject_invalid_state(f"Stack IFG product view is missing: {root}")
-        discovered_ids = sorted(path.parent.name for path in root.glob("*/item.json"))
+        if polygon is None:
+            discovered_ids = sorted(
+                path.parent.name for path in root.glob("*/item.json")
+            )
+            pair_dir = root
+        else:
+            discovered_ids = sorted(
+                path.parent.parent.name for path in root.glob(f"*/p{polygon}/item.json")
+            )
+            pair_dir = None
         if sorted(expected_ids) != discovered_ids:
             reject_invalid_state(
                 "Stack IFG product Pair set does not exactly match the planned "
                 f"network: expected={sorted(expected_ids)!r}, "
                 f"discovered={discovered_ids!r}"
             )
-        stores = [
-            InterferogramArtifactStore.open(root / pair_id) for pair_id in expected_ids
-        ]
+        if pair_dir is None:
+            stores = [
+                InterferogramArtifactStore.open(root / pair_id / f"p{polygon}")
+                for pair_id in expected_ids
+            ]
+        else:
+            stores = [
+                InterferogramArtifactStore.open(pair_dir / pair_id)
+                for pair_id in expected_ids
+            ]
         shapes = {store.shape for store in stores}
         artifact_looks = {store.looks for store in stores}
         artifact_domains = {store.domain for store in stores}
@@ -5032,9 +5507,7 @@ def _recover_document(
     stack.scene_provider = (
         runtime.get("scene_provider") or stack_cls._default_scene_provider()
     )
-    stack.prepare_scenes()
-    stack._capture_dem_source()
-    stack._ensure_raster_dem()
+    stack._restore_local_inputs()
     stack._prepared = True
     stack._refresh_network()
     return _RecoveredOpen(stack, report)
@@ -5080,16 +5553,13 @@ def _mission_class(mission: str) -> type[Stack]:
     """
     if mission == "Stack":
         return Stack
-    if mission == "S1Stack":
-        from faninsar.missions.s1 import S1Stack
+    from faninsar.missions.base import get_mission_stack
 
-        return S1Stack
-    if mission == "NISARStack":
-        from faninsar.missions.nisar import NISARStack
-
-        return NISARStack
-    message = (
-        f"stack.json mission {mission!r} is not a known Stack subclass; rebuild "
-        "this work directory with the FanInSAR version that created it"
-    )
-    return reject(message, InvalidProcessingStateError, logger=logger)
+    try:
+        return get_mission_stack(mission)
+    except KeyError:
+        message = (
+            f"stack.json mission {mission!r} is not a known Stack subclass; rebuild "
+            "this work directory with the FanInSAR version that created it"
+        )
+        return reject(message, InvalidProcessingStateError, logger=logger)

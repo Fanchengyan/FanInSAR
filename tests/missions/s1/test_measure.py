@@ -16,6 +16,8 @@ from faninsar.missions.s1.measure import (
     _ampcor_one_strip,
     _fit_ampcor_chip,
     _resample_window_strip,
+    _resolve_common_bursts,
+    _resolve_swaths,
     measure_s1_pair_misreg,
 )
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
@@ -135,6 +137,8 @@ def test_measure_s1_pair_misreg_public_signature() -> None:
         "ampcor_snr_threshold",
         "primary_orbit_path",
         "secondary_orbit_path",
+        "primary_aux_cal_path",
+        "secondary_aux_cal_path",
         "device",
     ]
     assert parameters["dem"].kind is inspect.Parameter.KEYWORD_ONLY
@@ -171,6 +175,61 @@ def test_measure_s1_pair_misreg_no_windows_omits_both_axes(
     assert arc.range_shift_px is None
     assert arc.method == "overlap"
     assert arc.n_valid == 0
+
+
+def test_resolve_swaths_unions_across_partial_frames() -> None:
+    """An IW1-only neighbour frame does not hide IW2/IW3 of the next parent."""
+    from dataclasses import replace
+
+    iw1_only = _product(Path("frame0.SAFE"), _burst(0, start_line=0))
+    iw2 = replace(
+        _swath(_burst(0, start_line=0), _burst(1, start_line=80)),
+        swath="IW2",
+        slant_range_time_s=0.006,
+    )
+    mixed = replace(
+        _product(
+            Path("frame1.SAFE"),
+            _burst(0, start_line=0),
+            _burst(1, start_line=80),
+        ),
+        swaths=(_swath(_burst(0, start_line=0), _burst(1, start_line=80)), iw2),
+    )
+
+    names = _resolve_swaths([iw1_only, mixed], [iw1_only, mixed], None)
+    assert names == ("IW1", "IW2")
+
+
+def test_resolve_common_bursts_skips_frames_missing_a_swath() -> None:
+    """Frame 0 lacking IW2 does not raise; only the parent that has IW2 is kept."""
+    from dataclasses import replace
+
+    iw1_only = _product(Path("frame0.SAFE"), _burst(0, start_line=0))
+    iw2 = replace(
+        _swath(_burst(0, start_line=0), _burst(1, start_line=80)),
+        swath="IW2",
+        slant_range_time_s=0.006,
+    )
+    mixed = replace(
+        _product(
+            Path("frame1.SAFE"),
+            _burst(0, start_line=0),
+            _burst(1, start_line=80),
+        ),
+        swaths=(_swath(_burst(0, start_line=0), _burst(1, start_line=80)), iw2),
+    )
+
+    aligned, mapping = _resolve_common_bursts(
+        [iw1_only, mixed],
+        [iw1_only, mixed],
+        ("IW1", "IW2"),
+        None,
+    )
+    assert (0, "IW1") in aligned
+    assert (0, "IW2") not in aligned
+    assert (1, "IW1") in aligned
+    assert (1, "IW2") in aligned
+    assert mapping[(1, "IW2")]
 
 
 def test_measure_s1_pair_misreg_empty_ampcor_omits_range_keeps_azimuth(

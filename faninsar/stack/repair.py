@@ -68,7 +68,7 @@ class RepairReport:
     """``StackConfig`` science fields absent from ``science`` (defaults used)."""
 
     inputs_ok: list[str] = field(default_factory=list)
-    """Input records (sources/orbits/calibrations) that pass ``_check_input``."""
+    """Input records (sources/orbits/aux_cal) that pass ``_check_input``."""
 
     inputs_changed: list[str] = field(default_factory=list)
     """Input records that fail ``_check_input`` (missing or size-changed)."""
@@ -193,9 +193,9 @@ def _check_inputs(document: dict[str, object] | None) -> tuple[list[str], list[s
             if isinstance(entries, list):
                 records.extend(entries)
         records.extend(inputs.get("orbits", {}).values())
-        calibrations = inputs.get("calibrations", [])
-        if isinstance(calibrations, list):
-            records.extend(calibrations)
+        aux_cal = inputs.get("aux_cal", {})
+        if isinstance(aux_cal, dict):
+            records.extend(aux_cal.values())
 
     inputs_ok: list[str] = []
     inputs_changed: list[str] = []
@@ -394,7 +394,7 @@ def repair(
     science["work_dir"] = root
     science.update({name: v for name, v in runtime.items() if name != "scene_provider"})
     # Runtime fields are never persisted; the recovered extras merge back so
-    # orbit/calibration paths recorded in stack.json survive the rebuild.
+    # orbit/AUX_CAL paths recorded in stack.json survive the rebuild.
     science["extra"] = _recovered_extra(document)
     config = StackConfig(**science)
 
@@ -429,7 +429,7 @@ def repair(
 
 
 def _recovered_extra(document: dict[str, object]) -> dict[str, Any]:
-    """Decode ``science_extra`` plus re-persisted orbit/calibration inputs."""
+    """Decode ``science_extra`` plus re-persisted orbit/AUX_CAL inputs."""
     extra = {
         key: decode_value(value)
         for key, value in (document.get("science_extra") or {}).items()
@@ -443,13 +443,13 @@ def _recovered_extra(document: dict[str, object]) -> dict[str, Any]:
                 for date, entry in orbits.items()
                 if isinstance(entry, dict) and "path" in entry
             }
-        calibrations = inputs.get("calibrations")
-        if isinstance(calibrations, list) and calibrations:
-            extra["calibration_paths"] = [
-                Path(str(entry["path"]))
-                for entry in calibrations
+        aux_cal = inputs.get("aux_cal")
+        if isinstance(aux_cal, dict) and aux_cal:
+            extra["aux_cal_paths"] = {
+                date: Path(str(entry["path"]))
+                for date, entry in aux_cal.items()
                 if isinstance(entry, dict) and "path" in entry
-            ]
+            }
     return extra
 
 

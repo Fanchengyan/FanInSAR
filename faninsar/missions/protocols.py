@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 from faninsar.logging import reject
 from faninsar.processing.errors import InvalidProcessingStateError
@@ -11,6 +11,13 @@ from faninsar.processing.errors import InvalidProcessingStateError
 if TYPE_CHECKING:
     from faninsar.processing.geometry.coordinates import Shape2D
     from faninsar.processing.slc.products import SLCProduct
+
+
+CoregistrationGrid: TypeAlias = Literal["radar", "geo"]
+# Segmented source selection: one mapping per source frame when needed.
+BurstSelection: TypeAlias = (
+    dict[str, list[int] | range | str] | list[dict[str, list[int] | range | str]]
+)
 
 
 @runtime_checkable

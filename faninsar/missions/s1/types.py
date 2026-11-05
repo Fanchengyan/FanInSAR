@@ -22,6 +22,12 @@ class S1Burst:
 
     ``measurement_path`` is set when a merged one-burst extract keeps its
     own TIFF instead of sharing the parent swath measurement.
+
+    ``absolute_burst_id`` is the mission-independent ESA burst identifier
+    when it is known (e.g. from the ASF ``BURST_ID_ABSOLUTE`` catalog
+    attribute).  SAFE annotation XML does not carry it, so annotation
+    parsing leaves it ``None``; ``azimuth_anx_time_s`` and
+    ``sensing_time`` remain the annotation-derived matching keys.
     """
 
     index: int
@@ -35,6 +41,7 @@ class S1Burst:
     last_valid_sample: tuple[int, ...]
     footprint: tuple[tuple[float, float], ...] | None = None
     measurement_path: str | None = None
+    absolute_burst_id: int | None = None
 
     @property
     def valid_samples(self) -> ValidSampleMask:
@@ -45,6 +52,20 @@ class S1Burst:
             first_valid_sample=self.first_valid_sample,
             last_valid_sample=self.last_valid_sample,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ElevationAngleRecord:
+    """One annotation ``antennaPattern`` record: elevation angle vs. range time.
+
+    Sentinel-1 annotation lists one record per burst.  The elevation angle
+    of each slant-range time locates a range sample on the two-way
+    elevation antenna pattern (used by the IPF 002.36 EAP phase correction).
+    """
+
+    azimuth_time: datetime
+    slant_range_time_s: tuple[float, ...]
+    elevation_angle_deg: tuple[float, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +93,37 @@ class S1Swath:
     doppler_centroid: tuple[DopplerCentroidPolynomial, ...]
     azimuth_fm_rate: tuple[tuple[datetime, float, tuple[float, ...]], ...]
     azimuth_steering_rate_rad_s: float
+    ascending_node_time: datetime | None = None
+    elevation_angle_records: tuple[ElevationAngleRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class S1SourcePhase:
+    """Qualified source-load phase binding retained by persisted SLC products.
+
+    ``input_phase`` names the materialized source convention. ``phase_state``
+    records the load-time result before carrier removal or registration.
+    Only the small AUX_CAL XML is hashed; SLC samples are never hashed here.
+    """
+
+    product_id: str
+    ipf_version: str | None
+    eap_applicable: bool
+    aux_cal_id: str | None
+    aux_cal_digest: str | None
+    correction_version: str
+    phase_state: Literal["raw", "eap_corrected"]
+    input_phase: Literal["raw"] = "raw"
 
 
 @dataclass(frozen=True, slots=True)
 class S1Product:
-    """SAFE or EOPF Sentinel-1 Level-1 SLC product handle."""
+    """SAFE or EOPF Sentinel-1 Level-1 SLC product handle.
+
+    ``ipf_version`` is the Instrument Processing Facility version recorded
+    in ``manifest.safe`` (for example ``"002.36"``), or ``None`` when the
+    product carries no processing record.
+    """
 
     product_id: str
     source_path: Path
@@ -86,6 +133,25 @@ class S1Product:
     absolute_orbit: int
     polarizations: tuple[str, ...]
     swaths: tuple[S1Swath, ...]
+    ipf_version: str | None = None
+
+    def find_swath(
+        self,
+        name: str,
+        polarization: str | None = None,
+    ) -> S1Swath | None:
+        """Return one sub-swath, or ``None`` when this product does not carry it.
+
+        ROI canvases and adjacent along-track frames may hold a subset of the
+        IW/EW sub-swaths of a date.  Callers that walk a shared swath list
+        should use this instead of :meth:`swath`, which rejects a missing name.
+        """
+        matches = [item for item in self.swaths if item.swath == name]
+        if polarization is not None:
+            matches = [item for item in matches if item.polarization == polarization]
+        if not matches:
+            return None
+        return matches[0]
 
     def swath(
         self,
@@ -95,15 +161,98 @@ class S1Product:
         """Return one sub-swath by name and optional polarization."""
         from .errors import reject_product
 
-        matches = [item for item in self.swaths if item.swath == name]
-        if polarization is not None:
-            matches = [item for item in matches if item.polarization == polarization]
-        if not matches:
-            if polarization is not None and polarization not in self.polarizations:
-                message = (
-                    f"unsupported polarization {polarization!r} in product "
-                    f"{self.source_path}; available={self.polarizations}"
-                )
-                raise ValueError(message)
-            reject_product(f"swath {name!r} not found in product {self.source_path}")
-        return matches[0]
+        found = self.find_swath(name, polarization)
+        if found is not None:
+            return found
+        if polarization is not None and polarization not in self.polarizations:
+            message = (
+                f"unsupported polarization {polarization!r} in product "
+                f"{self.source_path}; available={self.polarizations}"
+            )
+            raise ValueError(message)
+        return reject_product(f"swath {name!r} not found in product {self.source_path}")
+
+
+_MISSION_LETTERS = frozenset({"A", "B", "C", "D"})
+
+
+def _mission_letter(mission_id: str) -> str:
+    """Return the Sentinel-1 unit letter for ``"S1A"``- or ``"A"``-style ids."""
+    text = str(mission_id or "").strip().upper().replace("-", "")
+    if text.startswith("SENTINEL"):
+        text = text[-1:]
+    text = text.removeprefix("S1")
+    return text if text in _MISSION_LETTERS else ""
+
+
+def track_group_key(
+    mission_id: str,
+    relative_orbit: int | str | None,
+    orbit_direction: str,
+) -> str | None:
+    """Return the compact track label ``"<rel-orbit><letter>"``.
+
+    The label is a concise single-track grouping key of the form ``"88A"``
+    or ``"88D"``: the relative-orbit number plus the pass-direction letter
+    (``A`` = ascending, ``D`` = descending).  ``mission_id`` only supplies
+    the fallback letter when ``orbit_direction`` is empty or unrecognized;
+    within one direction the same relative orbit flown by S1A and S1C
+    therefore shares one label, matching cross-mission stack grouping.
+
+    Parameters
+    ----------
+    mission_id : str
+        SAFE mission id; both ``"S1A"`` and ``"A"`` spellings are accepted.
+    relative_orbit : int or str or None
+        Relative orbit (track) number; strings are coerced to ``int``.
+    orbit_direction : str
+        ``"ASCENDING"``/``"DESCENDING"`` (case-insensitive, ``"A"``/``"D"``
+        accepted); unknown or empty values fall back to the mission letter.
+
+    Returns
+    -------
+    str or None
+        ``"88A"``-style key, or ``None`` when ``relative_orbit`` is missing
+        or unparseable and no stable key exists.
+
+    """
+    try:
+        orbit = int(str(relative_orbit).strip())
+    except (TypeError, ValueError):
+        return None
+    if orbit <= 0:
+        return None
+    direction = str(orbit_direction or "").strip().upper()
+    if direction.startswith("A"):
+        suffix = "A"
+    elif direction.startswith("D"):
+        suffix = "D"
+    else:
+        suffix = _mission_letter(mission_id) or "?"
+    return f"{orbit}{suffix}"
+
+
+def track_group_parts(key: str) -> tuple[int | None, str]:
+    """Split a :func:`track_group_key` label back into ``(orbit, suffix)``.
+
+    Returns ``(None, key)`` when ``key`` does not start with digits.
+    """
+    text = str(key or "").strip().upper()
+    digits = ""
+    for char in text:
+        if not char.isdigit():
+            break
+        digits += char
+    if not digits:
+        return None, text
+    return int(digits), text[len(digits) :]
+
+
+__all__ = [
+    "ElevationAngleRecord",
+    "S1Burst",
+    "S1Product",
+    "S1Swath",
+    "track_group_key",
+    "track_group_parts",
+]

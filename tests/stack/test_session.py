@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -534,6 +535,11 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
         )
 
     stack.form_interferograms(multilook=(1, 1))
+    assert stack.config.multilook == (1, 1)
+    identity = json.loads(
+        (stack.config.work_dir / "stack.json").read_text(encoding="utf-8")
+    )
+    assert identity["science"]["multilook"] == {"faninsar:tuple": [1, 1]}
     output_root = stack.ifg_dirs[0]
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 

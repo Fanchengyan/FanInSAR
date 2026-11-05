@@ -30,6 +30,7 @@ from faninsar.missions.s1.io.canvas import BurstFetchedWindow, RoiSafeCanvas
 from faninsar.missions.s1.overlap import BurstOverlapWindow
 from faninsar.missions.s1.s1search import S1Search
 from faninsar.missions.s1.stack import S1Stack
+from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.remote.errors import RemoteAccessError
 
 if TYPE_CHECKING:
@@ -239,6 +240,90 @@ def parent_swath() -> Iterator[tuple[S1Swath, MemoryFile, str, np.ndarray]]:
     memfile.close()
 
 
+@pytest.fixture
+def planned_cdse_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Any:
+    """Install synthetic window plans and disk-backed, network-free transfer."""
+
+    def install(
+        swath: S1Swath,
+        windows: list[BurstFetchedWindow],
+        xml_text: str,
+        data: np.ndarray,
+    ) -> None:
+        payload = _complex_int16_bytes(data)
+        row_stride = data.shape[1] * 4
+
+        def fake_plan(*_args: Any, **_kwargs: Any) -> Any:
+            plans = [
+                acquisition_mod._WindowPlan(
+                    burst_index=window.burst_index,
+                    line0=window.row0,
+                    col0=window.col0,
+                    n_lines=window.samples.shape[0],
+                    n_samples=window.samples.shape[1],
+                    lines_per_burst=int(swath.lines_per_burst),
+                    line_valid=window.line_valid,
+                )
+                for window in windows
+            ]
+            return swath, plans, xml_text
+
+        def fake_tables(*_args: Any, **_kwargs: Any) -> Any:
+            return (
+                [line * row_stride for line in range(data.shape[0])],
+                [row_stride] * data.shape[0],
+                1,
+            )
+
+        class FakeRangeFetcher:
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                pass
+
+            async def fetch(self, spans: Any) -> dict[str, bytes]:
+                return {
+                    span.label: payload[span.start : span.end + 1] for span in spans
+                }
+
+            async def fetch_into(
+                self, span: Any, sink: Any, *, on_bytes: Any = None
+            ) -> int:
+                body = payload[span.start : span.end + 1]
+                assert len(body) == span.end - span.start + 1
+                path = Path(sink)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                received = path.stat().st_size if path.exists() else 0
+                with path.open("ab") as stream:
+                    stream.write(body[received:])
+                if on_bytes is not None:
+                    on_bytes(len(body) - received)
+                return len(body)
+
+        monkeypatch.setattr(acquisition_mod, "_plan_cdse_windows", fake_plan)
+        monkeypatch.setattr(acquisition_mod, "_strip_tables_for", fake_tables)
+        monkeypatch.setattr(
+            acquisition_mod,
+            "_span_fetcher_cm",
+            lambda *_args, **_kwargs: FakeRangeFetcher(),
+        )
+        # The canvas fingerprint stats the DEM file, so hand back a real
+        # local RasterDEM; the stubbed planner never samples its heights.
+        dem_path = tmp_path_factory.mktemp("dem") / "dem.tif"
+        dem_path.write_bytes(b"stub-dem")
+        monkeypatch.setattr(
+            acquisition_mod,
+            "_fetch_dem_for_roi",
+            lambda *_args, **_kwargs: RasterDEM(path=dem_path),
+        )
+
+    return install
+
+
 def _resolve_roi_acquisition(**kwargs: Any) -> tuple[str, str]:
     """Call the mission resolver; fail as an assertion if it is missing."""
     resolver = getattr(acquisition_mod, "resolve_roi_acquisition", None)
@@ -366,21 +451,23 @@ def test_from_search_signature_matches_proposal() -> None:
     parameters = inspect.signature(constructor).parameters
     assert next(iter(parameters)) == "search"
     for name in (
-        "roi",
-        "polarizations",
         "work_dir",
+        "roi",
+        "provider",
         "granularity",
-        "product_type",
+        "polarizations",
         "coreg_mode",
         "orbit_paths",
-        "calibration_paths",
+        "aux_cal_paths",
     ):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["roi"].default is None
+    assert parameters["provider"].default == "cdse"
     assert parameters["polarizations"].default == ("VV",)
-    assert parameters["granularity"].default is None
-    assert parameters["product_type"].default is None
+    assert parameters["granularity"].default == "roi"
     assert parameters["coreg_mode"].default == "geometry"
+    # work_dir is required (no default) so it stays next to ``search``.
+    assert parameters["work_dir"].default is inspect.Parameter.empty
 
 
 class TestCdseRoiCanvasOrder:
@@ -391,6 +478,7 @@ class TestCdseRoiCanvasOrder:
         parent_swath: tuple[S1Swath, MemoryFile, str, np.ndarray],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        planned_cdse_windows: Any,
     ) -> None:
         """CDSE from_search binds the item, writes canvas, then from_safes."""
         swath, _memfile, xml_text, data = parent_swath
@@ -430,20 +518,47 @@ class TestCdseRoiCanvasOrder:
                     bodies[span.label] = b"\x00" * (span.end - span.start + 1)
             return bodies
 
-        original_write = canvas_mod.write_roi_safe_canvas
-        original_splice = canvas_mod.splice_overlap_into_canvas
+        original_write_burst = canvas_mod._RoiCanvasWriter.write_burst
+        original_finish = canvas_mod._RoiCanvasWriter.finish
+        written_overlap_roles: list[tuple[int, str]] = []
 
-        def tracking_write(*args: Any, **kwargs: Any) -> RoiSafeCanvas:
+        def tracking_write_burst(
+            writer: Any,
+            burst_index: int,
+            windows: Any,
+            overlaps: Any,
+        ) -> str:
             order.append("write_canvas")
-            handle = original_write(*args, **kwargs)
-            with rasterio.open(handle.measurement_path) as dataset:
+            captured: list[Any] = []
+
+            def tee(items: Any) -> Any:
+                for item in items:
+                    captured.append(item)
+                    yield item
+
+            digest = original_write_burst(writer, burst_index, windows, tee(overlaps))
+            for overlap, role, samples in captured:
+                written_overlap_roles.append((burst_index, role))
+                row0 = overlap.top_row0 if role == "top" else overlap.bottom_row0
+                parent_row0 = burst_index * LINES_PER_BURST + row0
+                expected = data[
+                    parent_row0 : parent_row0 + overlap.n_lines,
+                    overlap.col0 : overlap.col0 + overlap.n_samples,
+                ]
+                np.testing.assert_array_equal(samples, expected)
+            with rasterio.open(writer.canvas.measurement_path) as dataset:
                 assert dataset.height == N_BURSTS * LINES_PER_BURST
                 assert dataset.width == SAMPLES_PER_BURST
-            return handle
+            return digest
 
-        def tracking_splice(*args: Any, **kwargs: Any) -> None:
-            order.append("splice_overlap")
-            original_splice(*args, **kwargs)
+        def tracking_finish(writer: Any) -> RoiSafeCanvas:
+            handle = original_finish(writer)
+            order.append("finish_canvas")
+            with rasterio.open(handle.measurement_path) as dataset:
+                raster = dataset.read(1)
+            np.testing.assert_array_equal(raster[44:47, 20:50], data[44:47, 20:50])
+            np.testing.assert_array_equal(raster[50:53, 20:50], data[50:53, 20:50])
+            return handle
 
         class FakeStack:
             def prepare(self) -> None:
@@ -474,19 +589,11 @@ class TestCdseRoiCanvasOrder:
             "fetch_ranges_async",
             fake_fetch_ranges_async,
         )
-        monkeypatch.setattr(canvas_mod, "write_roi_safe_canvas", tracking_write)
         monkeypatch.setattr(
-            "faninsar.missions.s1.acquisition.write_roi_safe_canvas",
-            tracking_write,
+            canvas_mod._RoiCanvasWriter, "write_burst", tracking_write_burst
         )
-        monkeypatch.setattr(canvas_mod, "splice_overlap_into_canvas", tracking_splice)
-        monkeypatch.setattr(
-            "faninsar.missions.s1.acquisition.splice_overlap_into_canvas",
-            tracking_splice,
-        )
-
-        def fake_windows(*_args: Any, **_kwargs: Any) -> Any:
-            return swath, windows, xml_text
+        monkeypatch.setattr(canvas_mod._RoiCanvasWriter, "finish", tracking_finish)
+        planned_cdse_windows(swath, windows, xml_text, data)
 
         def fake_overlaps(
             *_args: Any, **_kwargs: Any
@@ -504,7 +611,6 @@ class TestCdseRoiCanvasOrder:
                 ),
             )
 
-        monkeypatch.setattr(acquisition_mod, "windows_from_cdse_fetch", fake_windows)
         monkeypatch.setattr(
             acquisition_mod,
             "overlap_windows_for_canvas",
@@ -517,16 +623,19 @@ class TestCdseRoiCanvasOrder:
             work_dir=tmp_path,
             granularity="roi",
             coreg_mode="nesd",
+            extra={"orbit_auto_fetch": False},
         )
         assert isinstance(result, FakeStack)
         assert prepared == [True]
         assert captured_paths
         assert all(Path(path).name.endswith(".SAFE") for path in captured_paths[0])
         write_at = order.index("write_canvas")
-        splice_at = order.index("splice_overlap")
         safes_at = order.index("from_safes")
         prepare_at = order.index("prepare")
-        assert write_at < splice_at < safes_at < prepare_at
+        # Overlap rectangles stream into write_burst itself, so all canvas
+        # work finishes before from_safes consumes the SAFE.
+        assert write_at < order.index("finish_canvas") < safes_at < prepare_at
+        assert sorted(written_overlap_roles) == [(4, "top"), (5, "bottom")]
         assert "fetch_ranges" in order
 
 
@@ -1008,6 +1117,7 @@ class TestOverlapSpliceFromFetchedWindows:
         parent_swath: tuple[Any, MemoryFile, str, np.ndarray],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        planned_cdse_windows: Any,
     ) -> None:
         """Covered overlap rectangles keep the fetched burst samples."""
         _swath, _memfile, xml_text, data = parent_swath
@@ -1062,8 +1172,7 @@ class TestOverlapSpliceFromFetchedWindows:
                 raise AssertionError(message)
             return bodies
 
-        def fake_windows(*_args: Any, **_kwargs: Any) -> Any:
-            return _swath, windows, xml_text
+        planned_cdse_windows(_swath, windows, xml_text, data)
 
         def fake_overlaps(
             *_args: Any, **_kwargs: Any
@@ -1072,7 +1181,6 @@ class TestOverlapSpliceFromFetchedWindows:
 
         monkeypatch.setattr(acquisition_mod, "discover_cdse_slc_items", fake_discover)
         monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
-        monkeypatch.setattr(acquisition_mod, "windows_from_cdse_fetch", fake_windows)
         monkeypatch.setattr(
             acquisition_mod, "overlap_windows_for_canvas", fake_overlaps
         )
@@ -1099,6 +1207,7 @@ class TestOverlapSpliceFromFetchedWindows:
         parent_swath: tuple[Any, MemoryFile, str, np.ndarray],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        planned_cdse_windows: Any,
     ) -> None:
         """Default geometry canvases list intersecting bursts and skip splice."""
         _swath, _memfile, xml_text, data = parent_swath
@@ -1140,8 +1249,7 @@ class TestOverlapSpliceFromFetchedWindows:
                 raise AssertionError(message)
             return bodies
 
-        def fake_windows(*_args: Any, **_kwargs: Any) -> Any:
-            return _swath, windows, xml_text
+        planned_cdse_windows(_swath, windows, xml_text, data)
 
         def boom(*_args: Any, **_kwargs: Any) -> None:
             message = "geometry must not splice overlap"
@@ -1149,9 +1257,10 @@ class TestOverlapSpliceFromFetchedWindows:
 
         monkeypatch.setattr(acquisition_mod, "discover_cdse_slc_items", fake_discover)
         monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
-        monkeypatch.setattr(acquisition_mod, "windows_from_cdse_fetch", fake_windows)
         monkeypatch.setattr(acquisition_mod, "overlap_windows_for_canvas", boom)
-        monkeypatch.setattr(acquisition_mod, "splice_overlap_into_canvas", boom)
+        monkeypatch.setattr(
+            "faninsar.missions.s1.io.canvas.splice_overlap_into_canvas", boom
+        )
 
         paths = acquisition_mod.materialize_cdse_roi_safes(
             ROI,
@@ -1291,13 +1400,18 @@ class TestNarrowRoiRule:
         )
 
     def test_rule_engages_below_both_thresholds(self) -> None:
-        """Slow link plus <30% width enables exact-column planning."""
+        """Exact-column planning is disabled by policy even on a slow link.
+
+        Row windows always fetch the merged contiguous block as whole-row
+        ranges; the narrow-ROI heuristic no longer switches to per-row
+        ``[col0, col1)`` spans.
+        """
         context = acquisition_mod._RoiFetchContext()
         context.probed_bytes = 1000
         context.probed_seconds = 1.0  # 1 KB/s << 1.3 MiB/s
         assert (
             acquisition_mod._use_exact_columns(context, n_cols=299, samples=1000)
-            is True
+            is False
         )
 
     def test_rule_stays_off_at_30_percent_width(self) -> None:
@@ -1455,13 +1569,18 @@ class TestRoiFetchContextDedup:
         assert row_requests == [(1000, 1000 + 2 * row_stride - 1)]
         assert second["row-0-2"] == first["row-0-2"]
 
-    def test_exact_column_spans_decode_through_assembly(
+    def test_merged_row_spans_decode_through_assembly(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The narrow-ROI path fetches col spans and assembles them correctly."""
+        """The merged-row path fetches whole-row spans and crops columns.
+
+        Exact-column per-row spans are disabled by policy; a narrow ROI is
+        fetched as whole-row ranges and the polygon's columns are sliced
+        from the downloaded rows during assembly.
+        """
         n_rows = 4
         samples = 1000
-        col0, col1 = 100, 250  # 15% of the row -> narrow
+        col0, col1 = 100, 250  # 15% of the row -> narrow, but still whole-row
         row_stride = samples * 4
         offsets = [500 + index * row_stride for index in range(n_rows)]
         counts = [row_stride] * n_rows
@@ -1480,10 +1599,17 @@ class TestRoiFetchContextDedup:
             for span in spans:
                 if span.label == "tiff-header":
                     bodies[span.label] = header
-                elif span.label.startswith("col-"):
+                elif span.label.startswith("row-"):
                     captured.append(span)
-                    row = int(span.label.split("-")[1])
-                    bodies[span.label] = _complex_int16_bytes(expected[row])
+                    # Whole-row span: build the full row then crop columns.
+                    line0, line1 = (
+                        int(span.label.split("-")[1]),
+                        int(span.label.split("-")[2]),
+                    )
+                    row_block = np.zeros((line1 - line0, samples), dtype=np.complex64)
+                    for line in range(line0, line1):
+                        row_block[line - line0, col0:col1] = expected[line]
+                    bodies[span.label] = _complex_int16_bytes(row_block.reshape(-1))
                 else:
                     bodies[span.label] = b"\x00" * (span.end - span.start + 1)
             return bodies
@@ -1497,7 +1623,7 @@ class TestRoiFetchContextDedup:
         monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
         monkeypatch.setattr(acquisition_mod, "_strip_tables_from_probes", fake_tables)
         context = acquisition_mod._RoiFetchContext()
-        # Seed a slow observed bandwidth so the narrow rule engages.
+        # A slow link still yields whole-row spans (exact-columns disabled).
         context.probed_bytes = 1000
         context.probed_seconds = 1.0
         bodies = acquisition_mod._fetch_measurement_bodies(
@@ -1510,14 +1636,8 @@ class TestRoiFetchContextDedup:
             samples=samples,
             fetch_context=context,
         )
-        assert len(captured) == n_rows
-        for line, span in enumerate(captured):
-            row_start = offsets[line]
-            assert (span.start, span.end) == (
-                row_start + col0 * 4,
-                row_start + col1 * 4 - 1,
-            )
-            assert span.label == f"col-{line}-{col0}-{col1}"
+        assert captured
+        assert all(s.label.startswith("row-") for s in captured)
         assembled = acquisition_mod._assemble_window_samples(
             bodies,
             parent_line0=0,

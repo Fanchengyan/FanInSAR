@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import urllib.parse
-import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,12 +28,56 @@ S1SinglePolarization = Literal["VV", "VH", "HH", "HV"]
 S1DualPolarization = Literal["VV+VH", "HH+HV"]
 S1Polarization = S1SinglePolarization | S1DualPolarization
 S1PolarizationRequest = tuple[S1Polarization, ...] | Literal["all"]
+S1Mission = Literal["S1A", "S1B", "S1C", "S1D"]
 
 _SINGLE_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
 _DUAL_POLARIZATIONS = frozenset({"VV+VH", "HH+HV"})
 _POLARIZATIONS = _SINGLE_POLARIZATIONS | _DUAL_POLARIZATIONS
+_MISSIONS = frozenset({"S1A", "S1B", "S1C", "S1D"})
 _SAFE_SUFFIXES = frozenset({".zip"})
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def normalize_missions(
+    value: str | Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    """Validate a Sentinel-1 satellite selection to ``"A"``..``"D"`` letters.
+
+    Accepts the mission letters — ``"A"``, ``"ACD"``, ``("A", "C", "D")`` —
+    and tolerates the ``"S1"``/``"SENTINEL-1"`` prefixes (``"S1A"``,
+    ``"Sentinel-1D"``), normalizing everything to the bare letters
+    ``("A", "C", "D")``.  ``None`` returns ``None`` (no satellite
+    constraint).  Provider filters translate each letter to the ASF
+    ``platform="Sentinel-1X"`` spelling.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        tokens: tuple[str, ...] = (value,)
+    else:
+        tokens = tuple(str(item) for item in value)
+    normalized: list[str] = []
+    for raw in tokens:
+        text = raw.strip().upper().replace("-", "").replace("_", "")
+        for prefix in ("SENTINEL1", "S1"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :]
+                break
+        if not text or any(letter not in "ABCD" for letter in text):
+            message = f"missions entries must be Sentinel-1 letters A..D; got {raw!r}"
+            reject(message, ValueError, logger=logger)
+        for letter in text:
+            if letter not in normalized:
+                normalized.append(letter)
+    if not normalized:
+        message = "missions must contain at least one satellite"
+        reject(message, ValueError, logger=logger)
+    return tuple(normalized)
+
+
+def mission_platform_filter(missions: Sequence[str]) -> list[str]:
+    """Translate ``"A"``-style mission letters to ASF ``platform`` values."""
+    return [f"Sentinel-1{letter}" for letter in missions]
 
 
 def normalize_polarizations(
@@ -225,17 +268,69 @@ def _metadata_polarizations(value: object) -> set[str]:
     return set()
 
 
+def _item_track_key(item: CatalogItem) -> str | None:
+    """Return the ``track_group_key`` label for one catalog item, if derivable.
+
+    ASF items carry ``relativeOrbit``/``orbitDirection``/``mission`` inside
+    ``acquisition.properties`` (stage-1 pass-through); CDSE items keep
+    ``relative_orbit``/``orbit_direction`` on ``raw_metadata``.  Both
+    shapes reduce to the same ``track_group_key`` inputs.
+    """
+    from faninsar.missions.s1.types import track_group_key
+
+    props = getattr(item.acquisition, "properties", {}) or {}
+    raw = getattr(item, "raw_metadata", {}) or {}
+    relative_orbit = (
+        props.get("relativeOrbit")
+        or props.get("relative_orbit")
+        or raw.get("relative_orbit")
+        or raw.get("sat:relative_orbit")
+    )
+    direction = (
+        props.get("orbitDirection")
+        or props.get("orbit_direction")
+        or raw.get("orbit_direction")
+        or raw.get("sat:orbit_state")
+        or props.get("sat:orbit_state")
+    )
+    mission = (
+        props.get("mission")
+        or getattr(item.acquisition, "platform", "")
+        or raw.get("platform")
+        or ""
+    )
+    return track_group_key(
+        str(mission),
+        relative_orbit,
+        str(direction or ""),
+    )
+
+
 def local_destination(
     work_dir: str | Path,
     item: CatalogItem,
     asset: RemoteAsset,
+    *,
+    track_key: str | None = None,
 ) -> Path:
-    """Build a stable, confined local SAFE destination for one catalog item."""
+    """Build a stable, confined local SAFE destination for one catalog item.
+
+    Track-grouped workspaces stage downloads under
+    ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>``; when the item's orbit
+    group cannot be resolved and no ``track_key`` is passed the legacy
+    ``inputs/`` root is used so older workspaces reopen.
+    """
+    from faninsar.stack.layout import acquisition_staging_dir, staged_acquisition_path
+
+    key = track_key or _item_track_key(item)
     safe_id = _SAFE_NAME.sub("_", item.item_id).strip("._") or "s1-product"
     suffix = Path(urllib.parse.urlsplit(asset.href).path).suffix.casefold()
     if suffix not in _SAFE_SUFFIXES:
         suffix = ".zip"
-    return Path(work_dir) / "inputs" / f"{safe_id}{suffix}"
+    return staged_acquisition_path(
+        acquisition_staging_dir(work_dir, key),
+        f"{safe_id}{suffix}",
+    )
 
 
 def select_orbit_bindings(
@@ -330,34 +425,6 @@ def select_orbit_bindings(
     return selected
 
 
-def safe_requires_aux_cal(path: str | Path) -> bool:
-    """Return whether a SAFE was produced by Sentinel-1 IPF 002.36."""
-    source = Path(path)
-    payload: bytes | None = None
-    if source.is_dir():
-        candidates = [source / "manifest.safe", *source.glob("*.SAFE/manifest.safe")]
-        manifest = next((item for item in candidates if item.is_file()), None)
-        if manifest is not None:
-            payload = manifest.read_bytes()
-    elif source.suffix.casefold() == ".zip":
-        with zipfile.ZipFile(source) as archive:
-            names = [
-                name for name in archive.namelist() if name.endswith("manifest.safe")
-            ]
-            if len(names) == 1:
-                payload = archive.read(names[0])
-    if payload is None:
-        return False
-    from xml.etree import ElementTree as ET
-
-    root = ET.fromstring(payload)
-    return any(
-        element.tag.rsplit("}", 1)[-1] == "software"
-        and "002.36" in str(element.attrib.get("version", ""))
-        for element in root.iter()
-    )
-
-
 def _as_paths(value: object) -> tuple[Path, ...]:
     """Normalize one orbit candidate binding to path values."""
     if isinstance(value, (str, Path)):
@@ -366,20 +433,6 @@ def _as_paths(value: object) -> tuple[Path, ...]:
         return tuple(Path(item) for item in value)
     message = f"unsupported S1 orbit candidate binding: {value!r}"
     return reject(message, TypeError, logger=logger)
-
-
-def validate_calibration_paths(
-    paths: Sequence[str | Path] | None,
-) -> tuple[Path, ...]:
-    """Validate explicitly bound local AUX_CAL/calibration files."""
-    if paths is None:
-        return ()
-    result = tuple(Path(path) for path in paths)
-    missing = [path for path in result if not path.is_file()]
-    if missing:
-        message = f"configured S1 calibration file is missing: {missing[0]}"
-        reject(message, FileNotFoundError, logger=logger)
-    return result
 
 
 def catalog_for_product(product_type: S1ProductType) -> str:
@@ -448,7 +501,5 @@ __all__ = [
     "normalize_polarizations",
     "product_filters",
     "provider_polarization_filter",
-    "safe_requires_aux_cal",
     "select_orbit_bindings",
-    "validate_calibration_paths",
 ]

@@ -58,8 +58,9 @@ class MissionPreparedInputs:
         Mission-selected source footprints.
     orbit_paths_by_acquisition : mapping, optional
         Local orbit files keyed by acquisition identity.
-    calibration_paths : sequence, optional
-        Local calibration files required by the mission.
+    aux_cal_paths_by_acquisition : mapping, optional
+        Local mission auxiliary calibration files keyed by acquisition
+        identity (Sentinel-1 AUX_CAL).
     provenance : mapping, optional
         Scrubbed, human-readable identities. Credentials and signed URLs are
         never accepted as part of this value.
@@ -70,7 +71,9 @@ class MissionPreparedInputs:
     orbit_paths_by_acquisition: Mapping[str, Path] = field(
         default_factory=lambda: MappingProxyType({})
     )
-    calibration_paths: tuple[Path, ...] = ()
+    aux_cal_paths_by_acquisition: Mapping[str, Path] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     provenance: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
@@ -88,8 +91,13 @@ class MissionPreparedInputs:
         )
         object.__setattr__(
             self,
-            "calibration_paths",
-            tuple(Path(value) for value in self.calibration_paths),
+            "aux_cal_paths_by_acquisition",
+            MappingProxyType(
+                {
+                    str(key): Path(value)
+                    for key, value in self.aux_cal_paths_by_acquisition.items()
+                }
+            ),
         )
         scrubbed: dict[str, str] = {}
         for key, value in self.provenance.items():

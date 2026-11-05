@@ -70,8 +70,12 @@ def _stack(
     from faninsar.stack.search import MissionPreparedInputs
 
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
+    # Track resolution would write ``track_metadata`` into ``extra`` during
+    # prepare(), changing the resume digest of the pre-committed scenes;
+    # these tests exercise the identity flow, not the track map.
+    stack._track_metadata = lambda: None  # type: ignore[method-assign]
     stack._prepare_reference_scene = (  # type: ignore[method-assign]
-        lambda *, overwrite: None
+        lambda *, overwrite, polygon=None: None
     )
     stack._prepare_mission = (  # type: ignore[method-assign]
         lambda: MissionPreparedInputs(

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
+from faninsar.missions.s1.aux_cal import correct_eap_phase
 from faninsar.missions.s1.io import BurstArray, read_full_burst
 from faninsar.missions.s1.orbit import read_eof_orbit
 from faninsar.missions.s1.overlap import (
@@ -24,6 +25,7 @@ from faninsar.missions.s1.processing import (
     _normalize_burst_selection,
     _radar_model,
     _scene_id,
+    _union_swath_names,
 )
 from faninsar.missions.s1.safe import open_acquisition_products
 from faninsar.processing.coregistration.ampcor_backend import AmpcorCandidateError
@@ -73,6 +75,8 @@ def measure_s1_pair_misreg(
     ampcor_snr_threshold: float = 6.0,
     primary_orbit_path: Path | None = None,
     secondary_orbit_path: Path | None = None,
+    primary_aux_cal_path: Path | None = None,
+    secondary_aux_cal_path: Path | None = None,
     device: str = "auto",
 ) -> MisregArc:
     """Measure one pair's overlap-ESD azimuth and overlap-Ampcor range residuals.
@@ -105,6 +109,8 @@ def measure_s1_pair_misreg(
         Overlap-Ampcor SNR cull. Default 6.0.
     primary_orbit_path, secondary_orbit_path : path, optional
         Precise ESA EOF orbits. Annotation orbits are used when omitted.
+    primary_aux_cal_path, secondary_aux_cal_path : path, optional
+        AUX_CAL files; required for IPF 002.36 products (EAP correction).
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Numerical device for geometry resampling.
 
@@ -181,6 +187,8 @@ def measure_s1_pair_misreg(
             ampcor_snr_threshold=ampcor_snr_threshold,
             primary_orbit_path=primary_orbit_path,
             secondary_orbit_path=secondary_orbit_path,
+            primary_aux_cal_path=primary_aux_cal_path,
+            secondary_aux_cal_path=secondary_aux_cal_path,
             device=device,
         )
         if esd is not None:
@@ -195,13 +203,15 @@ def _resolve_swaths(
     secondary_products: Sequence[S1Product],
     swaths: tuple[str, ...] | None,
 ) -> tuple[str, ...]:
-    """Return the ordered swath names present on every frame of both dates."""
+    """Return ordered swath names present on the date, not necessarily every frame.
+
+    Adjacent along-track frames of one date may carry different IW/EW subsets
+    (an IW1-only frame beside an IW1/IW2/IW3 parent).  A named swath must
+    exist on at least one frame of each date; frames that lack it are skipped
+    later rather than rejected here.
+    """
     if swaths is None:
-        ordered = sorted(
-            primary_products[0].swaths,
-            key=lambda item: item.slant_range_time_s,
-        )
-        swath_tuple = tuple(item.swath for item in ordered)
+        swath_tuple = _union_swath_names(primary_products)
     else:
         swath_tuple = tuple(swaths)
     if not swath_tuple:
@@ -210,14 +220,12 @@ def _resolve_swaths(
         ("reference", primary_products),
         ("secondary", secondary_products),
     ):
-        for frame_index, product in enumerate(products):
-            present = {item.swath for item in product.swaths}
-            missing = [name for name in swath_tuple if name not in present]
-            if missing:
-                reject_invalid_state(
-                    f"{role} frame {frame_index} missing swaths {missing}; "
-                    f"available={sorted(present)}"
-                )
+        present = {item.swath for product in products for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                f"{role} missing swaths {missing}; available={sorted(present)}"
+            )
     return swath_tuple
 
 
@@ -238,11 +246,13 @@ def _resolve_common_bursts(
     Sentinel-1C vs Sentinel-1D).
     """
     frame_count = len(primary_products)
-    burst_counts = {
-        (frame_index, swath): len(primary_products[frame_index].swath(swath).bursts)
-        for frame_index in range(frame_count)
-        for swath in swath_tuple
-    }
+    burst_counts: dict[tuple[int, str], int] = {}
+    for frame_index in range(frame_count):
+        for swath in swath_tuple:
+            found = primary_products[frame_index].find_swath(swath)
+            burst_counts[(frame_index, swath)] = (
+                0 if found is None else len(found.bursts)
+            )
     resolved = _normalize_burst_selection(
         bursts, frame_count, swath_tuple, burst_counts
     )
@@ -250,21 +260,27 @@ def _resolve_common_bursts(
     secondary_map: dict[tuple[int, str], dict[int, int]] = {}
     for frame_index in range(frame_count):
         for swath in swath_tuple:
-            primary_swath = primary_products[frame_index].swath(swath)
-            secondary_swath = secondary_products[frame_index].swath(swath)
+            primary_swath = primary_products[frame_index].find_swath(swath)
+            secondary_swath = (
+                secondary_products[frame_index].find_swath(swath)
+                if frame_index < len(secondary_products)
+                else None
+            )
+            if primary_swath is None or secondary_swath is None:
+                continue
+            selected_indices = resolved.get((frame_index, swath), [])
+            if not selected_indices:
+                continue
             pairs = _common_burst_pairs(primary_swath, secondary_swath)
-            selected = [
-                index for index in resolved[(frame_index, swath)] if index in pairs
-            ]
+            selected = [index for index in selected_indices if index in pairs]
             if not selected:
-                reject_invalid_state(
-                    "no common bursts between reference/secondary frame "
-                    f"{frame_index} swath {swath}"
-                )
+                continue
             common_aligned[(frame_index, swath)] = selected
             secondary_map[(frame_index, swath)] = {
                 index: pairs[index] for index in selected
             }
+    if not common_aligned:
+        reject_invalid_state("no common bursts between reference and secondary")
     return common_aligned, secondary_map
 
 
@@ -288,8 +304,11 @@ def _collect_overlap_windows(
             selected = resolved.get((frame_index, swath_name), [])
             if len(selected) < 2:
                 continue
+            found = product.find_swath(swath_name)
+            if found is None:
+                continue
             swath = _swath_with_orbit(
-                product.swath(swath_name),
+                found,
                 primary_orbit_path,
             )
             pairing = secondary_map.get((frame_index, swath_name), {})
@@ -333,6 +352,8 @@ def _observe_overlap_window(
     primary_orbit_path: Path | None,
     secondary_orbit_path: Path | None,
     device: str,
+    primary_aux_cal_path: Path | None = None,
+    secondary_aux_cal_path: Path | None = None,
 ) -> tuple[OverlapESDRecord | None, PatchAmplitudeShiftResult | None]:
     """Measure ESD and Ampcor independently on one full overlap strip.
 
@@ -348,6 +369,8 @@ def _observe_overlap_window(
         dem=dem,
         primary_orbit_path=primary_orbit_path,
         secondary_orbit_path=secondary_orbit_path,
+        primary_aux_cal_path=primary_aux_cal_path,
+        secondary_aux_cal_path=secondary_aux_cal_path,
         device=device,
     )
     if data is None:
@@ -373,6 +396,8 @@ def _geometry_resampled_overlap(
     primary_orbit_path: Path | None,
     secondary_orbit_path: Path | None,
     device: str,
+    primary_aux_cal_path: Path | None = None,
+    secondary_aux_cal_path: Path | None = None,
 ) -> OverlapESDInput | None:
     """Geometry-resample full overlap strips in the original focused domain."""
     try:
@@ -382,6 +407,7 @@ def _geometry_resampled_overlap(
             swath_name,
             window.top_index,
             primary_orbit_path,
+            primary_aux_cal_path,
         )
         ref_bot = _load_burst_scene(
             primary_path,
@@ -389,6 +415,7 @@ def _geometry_resampled_overlap(
             swath_name,
             window.bottom_index,
             primary_orbit_path,
+            primary_aux_cal_path,
         )
         sec_top = _load_burst_scene(
             secondary_path,
@@ -396,6 +423,7 @@ def _geometry_resampled_overlap(
             swath_name,
             int(window.secondary_top_index),
             secondary_orbit_path,
+            secondary_aux_cal_path,
         )
         sec_bot = _load_burst_scene(
             secondary_path,
@@ -403,6 +431,7 @@ def _geometry_resampled_overlap(
             swath_name,
             int(window.secondary_bottom_index),
             secondary_orbit_path,
+            secondary_aux_cal_path,
         )
     except (OSError, InvalidProcessingStateError) as error:
         logger.warning(
@@ -547,10 +576,16 @@ def _load_burst_scene(
     swath_name: str,
     burst_index: int,
     orbit_path: Path | None,
+    aux_cal_path: Path | None = None,
 ) -> ProductionScene:
     """Load one full-range burst with carrier and radar geometry."""
     swath = _swath_with_orbit(product.swath(swath_name), orbit_path)
-    array = read_full_burst(swath, burst_index=burst_index, full_range=True)
+    (array,) = correct_eap_phase(
+        product,
+        swath,
+        [read_full_burst(swath, burst_index=burst_index, full_range=True)],
+        aux_cal_path=aux_cal_path,
+    )
     burst = swath.bursts[burst_index]
     carrier = carrier_from_swath(swath, burst, first_range_sample=array.col0)
     geometry = _radar_model(

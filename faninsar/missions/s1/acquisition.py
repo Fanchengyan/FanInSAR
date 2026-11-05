@@ -1,10 +1,11 @@
-"""Mission-owned Sentinel-1 ROI acquisition and row-to-byte span planning.
+"""Mission-owned Sentinel-1 physical sample demand and acquisition orchestration.
 
 PROPOSAL-0061 splits the concern: :mod:`faninsar.remote` transports
 already-sized :class:`~faninsar.remote.fetch.RangeSpan` objects and knows
-nothing about TIFF geometry, while the mission layer owns the row-to-byte
-mapping, provider dispatch, and SAFE-subset materialization.  This module
-does not implement HTTP or authentication; it orchestrates remote fetch
+nothing about TIFF geometry, while :mod:`faninsar.io.tiff` owns storage
+mapping and decoding. The mission layer owns physical sample demand,
+provider dispatch, and SAFE materialization.  This module does not
+implement HTTP or authentication; it orchestrates remote fetch
 primitives.
 
 The planner reads ``StripOffsets`` / ``StripByteCounts`` / ``RowsPerStrip``
@@ -25,11 +26,10 @@ Contract (PROPOSAL-0061):
   may instead emit exact-column per-row spans; each such span covers
   only ``[col0, col1)`` of one row and is labeled ``col-{line}-{col0}-
   {col1}`` so assembly can place the tight payload;
-- any contiguous whole-row range is split into spans of at most
-  :data:`MAX_SPAN_BYTES` (4 MiB) that end on row boundaries using the
-  known row stride; a single row wider than the cap is the only
-  exception and is emitted whole.  Large full-burst CDSE selections
-  therefore split into parallel sub-spans fetched concurrently;
+- generic planning defaults to row-aligned spans of at most
+  :data:`MAX_SPAN_BYTES`; ROI materialization instead unions spatial row
+  requirements without artificial subdivision and shares concurrency
+  across selected dates, bursts, and tracks;
 - identical ``(url, start, end)`` byte ranges are fetched once per
   :class:`_RoiFetchContext`; ROI windows and NESD overlap rectangles
   share the context so repeated probes and identical ranges are not
@@ -50,15 +50,15 @@ import json
 import math
 import re
 import shutil
-import struct
 import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 import numpy as np
 from pyproj import Transformer
@@ -66,27 +66,25 @@ from pyproj.crs import CRS
 from pyproj.exceptions import CRSError
 
 from faninsar.data.query import BoundingBox, Points, Polygons
+from faninsar.io import tiff
 from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1.annotation import parse_annotation_xml
 from faninsar.missions.s1.errors import reject_product
-from faninsar.missions.s1.io.canvas import (
-    BurstFetchedWindow,
-    splice_overlap_into_canvas,
-    write_roi_safe_canvas,
-)
+from faninsar.missions.s1.io.canvas import BurstFetchedWindow
 from faninsar.missions.s1.overlap import burst_overlap_windows
+from faninsar.missions.s1.types import track_group_key
 from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.remote.errors import RemoteAccessError
 from faninsar.remote.fetch import RangeFetcher, RangeSpan, fetch_ranges_async
-
-try:
-    from faninsar.remote.providers.cdse import cdse_range_fetcher as _cdse_range_fetcher
-except ImportError:  # remote-side seam may lag behind this slice
-    _cdse_range_fetcher = None
+from faninsar.remote.fetch.span_cache import (
+    SpanCache,
+    _atomic_write_json,
+)
+from faninsar.remote.providers.cdse import cdse_range_fetcher as _cdse_range_fetcher
+from faninsar.stack.layout import staged_acquisition_path, track_acquisitions_dir
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
-    from typing import TypeAlias
+    from collections.abc import Awaitable, Sequence
 
     from faninsar.missions.s1.io.canvas import RoiSafeCanvas
     from faninsar.missions.s1.overlap import BurstOverlapWindow
@@ -95,6 +93,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 MAX_SPAN_BYTES = 4 * 1024 * 1024
+_RATE_LIMIT_RETRY_BACKOFF_S = 2.0
 """Retry quantum (PROPOSAL-0061): no span exceeds 4 MiB unless one row does."""
 
 HEADER_PROBE_BYTES = 16
@@ -104,12 +103,6 @@ POINT_BUFFER_M = 1000.0
 """Ground half-width applied to a point ROI before geolocation inversion."""
 
 _WGS84 = CRS.from_epsg(4326)
-
-_RowGroup: TypeAlias = tuple[int, int, int, int]
-"""Half-open row group ``(line0, line1, byte_start, byte_end)``."""
-
-_RowInterval: TypeAlias = tuple[int, int]
-"""Half-open byte interval ``(start, end)`` of one ROI row."""
 
 _BYTES_PER_COMPLEX_INT16 = 4
 """Storage bytes per Sentinel-1 complex-int16 sample."""
@@ -138,42 +131,17 @@ bandwidth-regime or planner-constant change produces a different
 fingerprint and forces re-materialization.
 """
 
-_CANVAS_MANIFEST_NAME = ".canvas_manifest.json"
-"""Completion record inside each materialized item SAFE dir."""
+_CANVAS_MANIFEST_NAME = "coverage.json"
+"""Visible canvas coverage record inside each materialized item SAFE."""
+
+_LEGACY_CANVAS_MANIFEST_NAME = ".canvas_manifest.json"
+"""Pre-coverage completion marker, still honored then promoted."""
+
+_LEGACY_PROGRESS_NAME = ".canvas_progress.json"
+"""Pre-coverage in-SAFE burst checkpoint, stripped on promote."""
 
 _SPAN_CACHE_DIRNAME = ".span-cache"
-"""Per-item span cache root inside each materialized item SAFE dir."""
-
-_TIFF_TYPE_SIZE = {
-    1: 1,  # BYTE
-    2: 1,  # ASCII
-    3: 2,  # SHORT
-    4: 4,  # LONG
-    5: 8,  # RATIONAL
-    7: 1,  # UNDEFINED
-    12: 8,  # DOUBLE
-    16: 8,  # LONG8
-    17: 8,  # SLONG8
-    18: 8,  # IFD8
-}
-_TIFF_INT_FORMAT = {1: "B", 3: "H", 4: "I", 16: "Q"}
-_TAG_COMPRESSION = 259
-_TAG_STRIP_OFFSETS = 273
-_TAG_ROWS_PER_STRIP = 278
-_TAG_STRIP_BYTE_COUNTS = 279
-_TAG_TILE_WIDTH = 322
-_TAG_TILE_LENGTH = 323
-_TAG_TILE_OFFSETS = 324
-_TAG_TILE_BYTE_COUNTS = 325
-_TILE_TAGS = frozenset(
-    {
-        _TAG_TILE_WIDTH,
-        _TAG_TILE_LENGTH,
-        _TAG_TILE_OFFSETS,
-        _TAG_TILE_BYTE_COUNTS,
-    }
-)
-_MAX_IFD_ENTRIES = 512
+"""Legacy in-SAFE range scratch; new runs keep parts under ``tmp/s1-transfer``."""
 
 
 def plan_measurement_spans(
@@ -191,186 +159,56 @@ def plan_measurement_spans(
     compressed: bool = False,
     tiled: bool = False,
     exact_columns: bool = False,
+    max_span_bytes: int | None = MAX_SPAN_BYTES,
 ) -> tuple[RangeSpan, ...]:
-    """Plan bounded, row-aligned byte spans for one ROI of a strip TIFF.
+    """Map S1 whole-row demand through provider-free TIFF storage planning.
 
-    Rows are mapped to bytes through the strip tables: row ``line`` lives in
-    strip ``line // rows_per_strip`` at ``strip_offsets[strip] +
-    (line % rows_per_strip) * row_stride``.  The row stride is
-    ``samples * bytes_per_sample``.  Labels are stable planner-generated
-    ``row-{line0}-{line1}`` strings; the fetcher treats them as opaque.
-
-    With ``exact_columns=True`` the planner instead emits one tight span per
-    ROI row covering only ``[col0, col1)``, labeled
-    ``col-{line}-{col0}-{col1}``.  Exact-column spans never merge across
-    rows (inter-slice gaps are fetched nowhere), so they trade request
-    count for bytes saved; callers enable them only when the probe-based
-    narrow-ROI rule says the saved bytes beat the per-request cost.
-
-    Parameters
-    ----------
-    url : str
-        Object URL each span requests.
-    strip_offsets : sequence of int
-        TIFF ``StripOffsets``: byte offset of each strip.
-    strip_byte_counts : sequence of int
-        TIFF ``StripByteCounts``: byte length of each strip.  Every strip
-        except the last must hold ``rows_per_strip`` whole rows; the last
-        may hold fewer.
-    rows_per_strip : int
-        TIFF ``RowsPerStrip``.
-    samples : int
-        Samples per row.
-    bytes_per_sample : int
-        Storage bytes per sample (4 for Sentinel-1 complex-int16).
-    line0, line1 : int
-        ROI row bounds; ``line1`` is exclusive.
-    col0, col1 : int
-        ROI column bounds; ``col1`` is exclusive.
-    compressed : bool, optional
-        True for a compressed TIFF; rejected (default False).
-    tiled : bool, optional
-        True for a tiled TIFF; rejected (default False).
-    exact_columns : bool, optional
-        True to emit one tight ``[col0, col1)`` span per ROI row instead
-        of whole-row blocks (default False; used by the probe-based
-        narrow-ROI rule).
-
-    Returns
-    -------
-    tuple of RangeSpan
-        Bounded whole-row spans whose union covers every ROI row.  Each span
-        is at most :data:`MAX_SPAN_BYTES`, ends on a row boundary, and
-        consecutive spans stay byte-adjacent within a group.  Column bounds
-        are validated here and sliced after download; they do not trim the
-        HTTP range.  With ``exact_columns=True`` the return is one
-        ``col-{line}-{col0}-{col1}`` span per ROI row instead.
-
-    Raises
-    ------
-    Sentinel1ProductError
-        If the TIFF is compressed or tiled, the strip tables are missing,
-        inconsistent with the row stride, or the ROI falls outside them.
-
-    Examples
-    --------
-    >>> from faninsar.missions.s1.acquisition import plan_measurement_spans
-    >>> offsets = [1000 + i * 4000 for i in range(8)]
-    >>> spans = plan_measurement_spans(
-    ...     url="https://example.test/measurement.tiff",
-    ...     strip_offsets=offsets,
-    ...     strip_byte_counts=[4000] * 8,
-    ...     rows_per_strip=1,
-    ...     samples=1000,
-    ...     bytes_per_sample=4,
-    ...     line0=3,
-    ...     line1=7,
-    ...     col0=0,
-    ...     col1=1000,
-    ... )
-    >>> [(span.start, span.end) for span in spans]
-    [(13000, 28999)]
-
+    Pixel bounds are half-open; HTTP spans are inclusive. Scientific policy
+    selects whole rows unless the explicit exact-column compatibility option
+    is requested. Strip gaps and the short final strip remain physical facts.
     """
-    if compressed:
+    if compressed or tiled:
         reject_product(
-            "compressed measurement TIFF cannot be planned for range fetch; "
-            "strip rows have no fixed byte stride"
-        )
-    if tiled:
-        reject_product(
-            "tiled measurement TIFF cannot be planned for range fetch; "
-            "row-aligned spans require stripped organization"
+            "compressed or tiled measurement TIFF cannot be planned for range fetch"
         )
     if not url:
         reject_product("range span planning requires a non-empty object URL")
-    if samples <= 0 or bytes_per_sample <= 0:
-        reject_product(
-            f"invalid sample geometry: samples={samples}, "
-            f"bytes_per_sample={bytes_per_sample}"
-        )
-    row_stride = samples * bytes_per_sample
-    total_rows = _validate_strip_tables(
-        strip_offsets,
-        strip_byte_counts,
-        rows_per_strip=rows_per_strip,
-        row_stride=row_stride,
-    )
-    if not 0 <= line0 < line1 <= total_rows:
-        reject_product(
-            f"ROI lines [{line0}, {line1}) fall outside the {total_rows} "
-            "rows described by the strip tables"
-        )
-    if not 0 <= col0 < col1 <= samples:
-        reject_product(
-            f"ROI columns [{col0}, {col1}) fall outside {samples} samples per row"
-        )
-
-    intervals: list[_RowInterval] = [
-        _row_byte_interval(
-            line,
-            strip_offsets=strip_offsets,
-            rows_per_strip=rows_per_strip,
-            row_stride=row_stride,
-        )
-        for line in range(line0, line1)
-    ]
-    if exact_columns:
-        return _exact_column_spans(
-            url,
-            intervals,
-            line0=line0,
-            col0=col0,
-            col1=col1,
+    try:
+        layout = tiff.layout_from_tables(
+            strip_offsets,
+            strip_byte_counts,
+            rows_per_strip,
+            samples=samples,
             bytes_per_sample=bytes_per_sample,
         )
-    spans: list[RangeSpan] = []
-    for group in _merge_row_groups(intervals, line0):
-        spans.extend(_split_group(url, group, intervals, line0))
-    return tuple(spans)
-
-
-def _exact_column_spans(
-    url: str,
-    intervals: Sequence[_RowInterval],
-    *,
-    line0: int,
-    col0: int,
-    col1: int,
-    bytes_per_sample: int,
-) -> tuple[RangeSpan, ...]:
-    """Emit one tight ``[col0, col1)`` span per ROI row.
-
-    Each span is bounded by strip-table arithmetic (the row interval) plus
-    the validated column slice, so no span ever escapes the strip tables.
-    Spans are never merged across rows: the inter-slice gap is bytes the
-    narrow-ROI rule decided not to fetch.
-
-    Parameters
-    ----------
-    url : str
-        Object URL each span requests.
-    intervals : sequence of _RowInterval
-        Whole-row byte interval of every ROI row, indexed from ``line0``.
-    line0 : int
-        First ROI row index (labels are row-based).
-    col0, col1 : int
-        ROI column bounds; ``col1`` is exclusive.
-    bytes_per_sample : int
-        Storage bytes per sample.
-
-    Returns
-    -------
-    tuple of RangeSpan
-        One span per ROI row labeled ``col-{line}-{col0}-{col1}``.
-
-    """
-    spans: list[RangeSpan] = []
-    for index, (row_start, _row_end) in enumerate(intervals):
-        start = row_start + col0 * bytes_per_sample
-        end = row_start + col1 * bytes_per_sample - 1
-        spans.append(RangeSpan(url, start, end, f"col-{line0 + index}-{col0}-{col1}"))
-    return tuple(spans)
+        if not 0 <= col0 < col1 <= samples:
+            reject_product("ROI columns fall outside samples per row")
+        plan = tiff.plan_tiff_windows(
+            layout,
+            (
+                tiff.PixelWindow(
+                    line0,
+                    line1,
+                    col0 if exact_columns else 0,
+                    col1 if exact_columns else samples,
+                ),
+            ),
+            max_extent_bytes=max_span_bytes,
+            exact_columns=exact_columns,
+        )
+    except ValueError as error:
+        reject_product(str(error))
+    return tuple(
+        RangeSpan(
+            url,
+            r.extent.offset,
+            r.extent.offset + r.extent.length - 1,
+            f"col-{r.window.row0}-{col0}-{col1}"
+            if exact_columns
+            else f"row-{r.window.row0}-{r.window.row1}",
+        )
+        for r in plan.regions
+    )
 
 
 def plan_ifd_probe_spans(
@@ -464,195 +302,6 @@ def plan_ifd_probe_spans(
             )
         )
     return tuple(spans)
-
-
-def _validate_strip_tables(
-    strip_offsets: Sequence[int],
-    strip_byte_counts: Sequence[int],
-    *,
-    rows_per_strip: int,
-    row_stride: int,
-) -> int:
-    """Validate the strip tables against the row stride and count the rows.
-
-    Parameters
-    ----------
-    strip_offsets, strip_byte_counts : sequence of int
-        TIFF strip tables.
-    rows_per_strip, row_stride : int
-        Declared rows per strip and derived bytes per row.
-
-    Returns
-    -------
-    int
-        Total number of whole rows the tables describe.
-
-    Raises
-    ------
-    Sentinel1ProductError
-        If the tables are empty, mismatched in length, negatively offset,
-        or inconsistent with whole rows of the declared stride.
-
-    """
-    strip_count = len(strip_offsets)
-    if strip_count == 0:
-        reject_product("strip tables are empty; cannot plan range spans")
-    if len(strip_byte_counts) != strip_count:
-        reject_product(
-            f"strip table length mismatch: {strip_count} offsets vs "
-            f"{len(strip_byte_counts)} byte counts"
-        )
-    total_rows = 0
-    for index, (offset, count) in enumerate(
-        zip(strip_offsets, strip_byte_counts, strict=True)
-    ):
-        if offset < 0:
-            reject_product(f"strip {index} has a negative offset ({offset})")
-        if count <= 0:
-            reject_product(f"strip {index} has a non-positive byte count ({count})")
-        if count % row_stride != 0:
-            reject_product(
-                f"strip {index} byte count {count} is not a multiple of the "
-                f"row stride {row_stride}"
-            )
-        rows = count // row_stride
-        if index < strip_count - 1 and rows != rows_per_strip:
-            reject_product(
-                f"strip {index} holds {rows} rows, expected {rows_per_strip} "
-                "(only the last strip may be partial)"
-            )
-        if index == strip_count - 1 and rows > rows_per_strip:
-            reject_product(
-                f"final strip holds {rows} rows, more than RowsPerStrip "
-                f"{rows_per_strip}"
-            )
-        total_rows += rows
-    return total_rows
-
-
-def _row_byte_interval(
-    line: int,
-    *,
-    strip_offsets: Sequence[int],
-    rows_per_strip: int,
-    row_stride: int,
-) -> _RowInterval:
-    """Return the half-open whole-row byte interval of one ROI row.
-
-    Parameters
-    ----------
-    line : int
-        ROI row index.
-    strip_offsets : sequence of int
-        TIFF ``StripOffsets``.
-    rows_per_strip, row_stride : int
-        Rows per strip and bytes per row.
-
-    Returns
-    -------
-    _RowInterval
-        Half-open ``(start, end)`` covering the full row stride.
-
-    """
-    row_start = (
-        strip_offsets[line // rows_per_strip] + (line % rows_per_strip) * row_stride
-    )
-    return row_start, row_start + row_stride
-
-
-def _merge_row_groups(
-    intervals: Sequence[_RowInterval],
-    line0: int,
-) -> list[_RowGroup]:
-    """Coalesce per-row intervals into byte ranges.
-
-    Byte-adjacent whole rows continue the current group.  A gap between
-    rows starts a new range so each span stays a contiguous byte interval.
-
-    Parameters
-    ----------
-    intervals : sequence of _RowInterval
-        Half-open byte intervals, one per ROI row in row order.
-    line0 : int
-        First ROI row index (labels and group bounds are row-based).
-
-    Returns
-    -------
-    list of _RowGroup
-        Groups as ``(line0, line1, byte_start, byte_end)`` with ``line1``
-        exclusive.
-
-    """
-    groups: list[_RowGroup] = []
-    for index, (start, end) in enumerate(intervals):
-        if not groups:
-            groups.append((line0 + index, line0 + index + 1, start, end))
-            continue
-        group_line0, group_line1, group_start, group_end = groups[-1]
-        if group_end == start:
-            groups[-1] = (group_line0, group_line1 + 1, group_start, end)
-        else:
-            groups.append((line0 + index, line0 + index + 1, start, end))
-    return groups
-
-
-def _split_group(
-    url: str,
-    group: _RowGroup,
-    intervals: Sequence[_RowInterval],
-    line0: int,
-) -> list[RangeSpan]:
-    """Split one group into spans of at most :data:`MAX_SPAN_BYTES`.
-
-    Splits happen only between rows, so every span ends on a row boundary.
-    A single row wider than the cap cannot satisfy both constraints and is
-    emitted whole with a warning.
-
-    Parameters
-    ----------
-    url : str
-        Object URL for the emitted spans.
-    group : _RowGroup
-        Group to split as ``(line0, line1, byte_start, byte_end)``.
-    intervals : sequence of _RowInterval
-        Byte interval of every ROI row, indexed from ``line0``.
-    line0 : int
-        First ROI row index.
-
-    Returns
-    -------
-    list of RangeSpan
-        Row-aligned spans labeled ``row-{line0}-{line1}`` (``line1``
-        exclusive).
-
-    """
-    group_line0, group_line1, group_start, _ = group
-    spans: list[RangeSpan] = []
-    span_line0 = group_line0
-    span_start = group_start
-    prev_row_end = group_start
-    for line in range(group_line0, group_line1):
-        row_start, row_end = intervals[line - line0]
-        if line > group_line0 and row_end - span_start > MAX_SPAN_BYTES:
-            spans.append(
-                RangeSpan(url, span_start, prev_row_end - 1, f"row-{span_line0}-{line}")
-            )
-            span_line0 = line
-            span_start = row_start
-        prev_row_end = row_end
-    if prev_row_end - span_start > MAX_SPAN_BYTES:
-        logger.warning(
-            "row %s-%s needs %d bytes; emitted as one span above the %d "
-            "byte cap because spans must end on row boundaries",
-            span_line0,
-            group_line1,
-            prev_row_end - span_start,
-            MAX_SPAN_BYTES,
-        )
-    spans.append(
-        RangeSpan(url, span_start, prev_row_end - 1, f"row-{span_line0}-{group_line1}")
-    )
-    return spans
 
 
 RoiGranularity = Literal["roi", "burst", "scene"]
@@ -881,19 +530,21 @@ def windows_from_cdse_fetch(
     item : mapping
         Binding from :func:`discover_cdse_slc_items`.
     roi : BoundingBox, Points, or Polygons
-        Spatial query inverted through the geolocation grid.
+        Spatial query inverted through the geolocation grid (burst
+        granularity) or terrain-aware geo2rdr (roi granularity).
     xml_text : str
         Annotation XML already fetched for this measurement.
     granularity : {"roi", "burst"}, optional
-        ``burst`` fetches full-burst row ranges; ``roi`` uses the inverted
+        ``burst`` fetches full-burst row ranges; ``roi`` uses the geo2rdr
         line/pixel envelope.
     fetch_context : _RoiFetchContext or None, optional
         Shared per-measurement fetch context.  When supplied by
         :func:`materialize_cdse_roi_safes`, probe results and identical
         byte ranges are shared with later NESD overlap fetches.
     dem : RasterDEM or None, optional
-        DEM used by the multi-polygon geo2rdr inversion.  Required when
-        ``roi`` is a multi-desired-polygon :class:`Polygons`.
+        DEM used by the geo2rdr inversion on the ``"roi"`` granularity.
+        Required whenever ``granularity == "roi"`` and ``roi`` is set —
+        every ROI shape now inverts through :func:`_roi_envelopes`.
     **kwargs : Any
         Unused; accepted so tests can add seams without breaking callers.
 
@@ -905,43 +556,60 @@ def windows_from_cdse_fetch(
 
     """
     del kwargs
+    swath, plans, xml_text = _plan_cdse_windows(
+        item,
+        roi,
+        xml_text=xml_text,
+        granularity=granularity,
+        fetch_context=fetch_context,
+        dem=dem,
+    )
+    windows = _fetch_planned_windows(
+        plans,
+        url=str(item.get("measurement_url", "")),
+        file_size=int(item.get("measurement_size") or 0),
+        samples_per_row=int(swath.samples_per_burst),
+        fetch_context=fetch_context,
+    )
+    return swath, windows, xml_text
+
+
+def _plan_cdse_windows(
+    item: Mapping[str, Any],
+    roi: BoundingBox | Points | Polygons,
+    *,
+    xml_text: str,
+    granularity: str = "roi",
+    fetch_context: _RoiFetchContext | None = None,
+    dem: RasterDEM | None = None,
+) -> tuple[S1Swath, list[_WindowPlan], str]:
+    """Plan ROI placement without fetching TIFF probes or measurement data.
+
+    Geometry needs annotation XML and, at ROI granularity, a DEM.  Source
+    strip tables and transfer spans are deliberately planned separately so
+    ROI and NESD physical row requirements can share one source transfer.
+    """
+    del fetch_context
     swath = parse_annotation_xml(
         xml_text,
         annotation_path=str(item.get("annotation_url", "cdse://annotation.xml")),
         measurement_path=str(item.get("measurement_url", "cdse://measurement.tiff")),
     )
-    if (
-        isinstance(roi, Polygons)
-        and granularity == "roi"
-        and len(roi.to_desired().geodataframe) > 1
-    ):
+    if roi is not None and granularity == "roi":
         if dem is None:
-            reject_product("multi-polygon ROI requires a DEM for per-polygon geo2rdr")
-        envelopes = _polygon_envelopes(roi, swath, dem)
-        windows = _windows_for_polygons(
-            swath,
-            envelopes,
-            url=str(item.get("measurement_url", "")),
-            file_size=int(item.get("measurement_size") or 0),
-            fetch_context=fetch_context,
+            reject_product(
+                "ROI-scoped acquisition requires a DEM for geo2rdr inversion"
+            )
+        plans = _plan_windows_for_polygons(swath, _roi_envelopes(roi, swath, dem))
+    else:
+        line0, line1, col0, col1 = invert_geolocation_grid(xml_text, roi)
+        if granularity == "burst":
+            line0, line1 = _full_intersecting_burst_lines(swath, line0, line1)
+            col0, col1 = 0, int(swath.samples_per_burst)
+        plans = _plan_windows_for_lines(
+            swath, line0=line0, line1=line1, col0=col0, col1=col1
         )
-        return swath, windows, xml_text
-
-    line0, line1, col0, col1 = invert_geolocation_grid(xml_text, roi)
-    if granularity == "burst":
-        line0, line1 = _full_intersecting_burst_lines(swath, line0, line1)
-        col0, col1 = 0, int(swath.samples_per_burst)
-    windows = _windows_for_lines(
-        swath,
-        line0=line0,
-        line1=line1,
-        col0=col0,
-        col1=col1,
-        url=str(item.get("measurement_url", "")),
-        file_size=int(item.get("measurement_size") or 0),
-        fetch_context=fetch_context,
-    )
-    return swath, windows, xml_text
+    return swath, plans, xml_text
 
 
 def overlap_windows_for_canvas(
@@ -1173,23 +841,28 @@ def materialize_cdse_roi_safes(
     coreg_mode: Literal["geometry", "nesd"] = "geometry",
     dem: RasterDEM | None = None,
     items: Sequence[dict[str, Any]] | None = None,
+    orbit_group: str | None = "auto",
     **kwargs: Any,
 ) -> list[Path]:
     """Materialize CDSE ROI/burst SAFE-subset canvases under ``work_dir``.
 
-    Order (PROPOSAL-0061): fetch annotation ranges, assemble windows,
-    :func:`write_roi_safe_canvas`, optionally splice parent overlap
-    rectangles, then return the ``.SAFE`` roots for ``from_safes``.
-    Geometry canvases keep intersecting bursts and skip overlap fetch.
-    NESD canvases list every parent burst of the swath and splice that
-    frame's overlap strips.
+    Each annotation XML is fetched on the shared asyncio session; as soon
+    as one document is complete it is planned and its measurement spans are
+    queued, so later products do not block the first downloads.  Ready
+    bursts are written and checkpointed while other downloads continue;
+    their raw span bytes are then released.  Whole-SAFE completion follows
+    every listed burst and its overlap writes.  Geometry canvases list
+    intersecting bursts; NESD canvases list all parent bursts.
 
     Parameters
     ----------
     roi, datetime_range, polarizations
         Search envelope forwarded to :func:`discover_cdse_slc_items`.
     work_dir : path-like
-        Stack work directory; canvases are written under ``inputs/``.
+        Stack work directory; canvases are written under
+        ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` when the items
+        carry a full orbit-group identity, else under
+        ``inputs/<YYYYMMDD>/<parentBox>``.
     granularity : {"roi", "burst"}, optional
         CDSE acquisition granularity.
     coreg_mode : {"geometry", "nesd"}, optional
@@ -1200,8 +873,17 @@ def materialize_cdse_roi_safes(
         skipped and these bindings are materialized directly — the
         ``from_search`` path.
     dem : RasterDEM, optional
-        DEM used for per-polygon geo2rdr inversion when ``roi`` holds
-        multiple desired polygons.  Fetched automatically when omitted.
+        DEM used by the terrain-aware geo2rdr inversion that maps every
+        ROI shape (BoundingBox, Points, Polygons) to its radar envelope on
+        the ``"roi"`` granularity.  Fetched automatically when omitted.
+    orbit_group : {"auto", "require"} or str, optional
+        How to handle items spanning multiple ``(mission_id, relative_orbit,
+        orbit_direction)`` groups.  ``"auto"`` (default) picks the group with
+        the most items and skips the rest with a warning.  ``"require"``
+        raises ``ValueError`` whenever the selection mixes groups so callers
+        must pick one explicitly.  An explicit string like
+        ``"S1D/88/ASCENDING"`` keeps only items in that group.  ``None``
+        disables grouping entirely (legacy behaviour).
     **kwargs : Any
         Forwarded to discovery (ignored when ``items`` is given).
 
@@ -1213,22 +895,19 @@ def materialize_cdse_roi_safes(
     Raises
     ------
     ValueError
-        If ``roi`` has no CRS, ``coreg_mode`` is unknown, or discovery
-        returns no products.
+        If ``roi`` has no CRS, ``coreg_mode`` is unknown, discovery
+        returns no products, or ``orbit_group="require"`` and the items
+        span multiple orbit groups.
 
     """
     if coreg_mode not in {"geometry", "nesd"}:
         message = f"coreg_mode must be 'geometry' or 'nesd'; got {coreg_mode!r}"
         reject(message, ValueError, logger=logger)
     roi = normalize_roi_wgs84(roi)
-    # Multi-polygon ROI needs DEM for per-polygon geo2rdr inversion.
-    if (
-        isinstance(roi, Polygons)
-        and granularity == "roi"
-        and len(roi.to_desired().geodataframe) > 1
-        and dem is None
-    ):
-        dem = _fetch_dem_for_polygons(roi, work_dir=work_dir)
+    # Every ROI shape inverts through geo2rdr on the roi granularity, so a
+    # DEM is required whenever a spatial bound is given.
+    if roi is not None and granularity == "roi" and dem is None:
+        dem = _fetch_dem_for_roi(roi, work_dir=work_dir)
     if items is None:
         items = discover_cdse_slc_items(
             roi,
@@ -1248,15 +927,36 @@ def materialize_cdse_roi_safes(
     if not items:
         message = "Sentinel-1 CDSE search returned no products"
         reject(message, ValueError, logger=logger)
-    out_dir = Path(work_dir) / "inputs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dem_id = _canvas_dem_id(roi, granularity=granularity, dem=dem)
+    items = _select_orbit_group(items, orbit_group)
+    if not items:
+        message = (
+            "Sentinel-1 CDSE search returned no products in the selected "
+            f"orbit group {orbit_group!r}"
+        )
+        reject(message, ValueError, logger=logger)
+    from faninsar.missions.s1.roi_transfer import stream_owners
+
+    dem_id = "dem:executed-plan" if granularity == "roi" else "dem:none"
     paths: list[Path] = []
+    pending = []
+    order: dict[Path, int] = {}
     for item in items:
         product_id = str(item.get("product_id", "S1_ROI"))
         swath_name = str(item.get("swath", "IW1"))
         polarization = str(item.get("polarization", "VV"))
-        safe_dir = out_dir / f"{product_id}-{swath_name}-{polarization}.SAFE"
+        track_key = _binding_track_key(item)
+        out_dir = (
+            track_acquisitions_dir(work_dir, track_key)
+            if track_key is not None
+            else Path(work_dir) / "inputs"
+        )
+        safe_dir = staged_acquisition_path(
+            out_dir,
+            f"{product_id}-{swath_name}-{polarization}.SAFE",
+        )
+        if safe_dir in order:
+            continue
+        order[safe_dir] = len(order)
         fingerprint = _canvas_fingerprint(
             item,
             roi,
@@ -1264,95 +964,140 @@ def materialize_cdse_roi_safes(
             granularity=granularity,
             dem_id=dem_id,
         )
-        manifest_path = safe_dir / _CANVAS_MANIFEST_NAME
-        if _canvas_manifest_complete(
-            manifest_path, fingerprint
-        ) and _safe_canvas_intact(safe_dir):
-            logger.info(
-                "Skipping CDSE measurement %s %s %s: complete canvas manifest",
-                product_id,
-                swath_name,
-                polarization,
-            )
-            paths.append(safe_dir)
-            continue
-        fetch_context = _RoiFetchContext(
-            span_cache=_SpanCache(safe_dir / _SPAN_CACHE_DIRNAME, fingerprint)
-        )
-        xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
-        if not _roi_overlaps_geolocation(xml_text, roi):
-            logger.warning(
-                "Skipping CDSE measurement %s %s %s: "
-                "ROI is outside the geolocation envelope",
-                item.get("product_id", "?"),
-                item.get("swath", "?"),
-                item.get("polarization", "?"),
-            )
-            continue
-        swath, windows, xml_text = windows_from_cdse_fetch(
-            item,
-            roi,
-            xml_text=xml_text,
-            granularity=granularity,
-            fetch_context=fetch_context,
-            dem=dem,
-        )
-        if not windows:
-            continue
-        listed_indices = (
-            tuple(int(burst.index) for burst in swath.bursts)
-            if coreg_mode == "nesd"
-            else None
-        )
-        canvas = write_roi_safe_canvas(
-            swath,
-            windows,
-            out_dir,
-            annotation_xml=xml_text,
-            product_id=f"{product_id}-{swath_name}-{polarization}",
-            listed_indices=listed_indices,
-        )
-        if coreg_mode == "nesd":
-            by_index = {int(window.burst_index): window for window in windows}
-            overlaps = overlap_windows_for_canvas(
-                swath,
-                windows,
-                canvas,
-                listed_indices=listed_indices,
-            )
-            rectangles = _fetch_overlap_rectangles(
-                item,
-                swath,
-                overlaps,
-                by_index=by_index,
-                fetch_context=fetch_context,
-            )
-            for overlap, (top, bottom) in zip(overlaps, rectangles, strict=True):
-                splice_overlap_into_canvas(canvas, overlap, role="top", samples=top)
-                splice_overlap_into_canvas(
-                    canvas, overlap, role="bottom", samples=bottom
+        pending.append((item, safe_dir, fingerprint))
+    if pending:
+        paths.extend(
+            owner.safe_dir
+            for owner in run_sync(
+                stream_owners(
+                    pending,
+                    roi,
+                    work_dir=work_dir,
+                    coreg_mode=coreg_mode,
+                    granularity=granularity,
+                    dem=dem,
                 )
-        _atomic_write_json(
-            manifest_path,
-            {
-                "fingerprint": fingerprint,
-                "complete": True,
-                "item": {
-                    "product": product_id,
-                    "swath": swath_name,
-                    "pol": polarization,
-                    "n_bursts": len(canvas.kept_indices),
-                },
-                "created": datetime.now(UTC).isoformat(),
-            },
+            )
         )
-        if fetch_context.span_cache is not None:
-            fetch_context.span_cache.finalize()
-        paths.append(canvas.safe_root)
     if not paths:
         message = "Sentinel-1 CDSE search returned no products intersecting the ROI"
         reject(message, ValueError, logger=logger)
-    return paths
+    return sorted(paths, key=order.__getitem__)
+
+
+def _orbit_group_key(item: Mapping[str, Any]) -> tuple[int | None, str]:
+    """Return ``(relative_orbit, orbit_direction)`` for an item.
+
+    The orbit group is the *track* — one relative orbit flown in one
+    direction.  ``mission_id`` is intentionally dropped so S1A/C/D sharing
+    one orbit land in the same group (``track_group_key`` already folds
+    them onto one ``"<rel><A|D>"`` key); a mission-qualified group would
+    split a single track and drop every satellite but the largest on
+    ``"auto"``.
+    """
+    return (
+        item.get("relative_orbit"),
+        str(item.get("orbit_direction") or "").upper(),
+    )
+
+
+def _orbit_group_label(key: tuple[int | None, str]) -> str:
+    """Return a readable ``"117/ASCENDING"`` label for a group key."""
+    rel_orbit, direction = key
+    rel = "?" if rel_orbit is None else str(rel_orbit)
+    return f"{rel}/{direction or '?'}"
+
+
+def _normalize_orbit_selector(text: str) -> str:
+    """Normalize a selector to the ``"<REL>/<DIRECTION>"`` group label.
+
+    A leading ``"<MISSION>/"`` token (``"S1A/"``, ``"C/"``, ``"sentinel-1d/"``)
+    is dropped because the orbit group is mission-agnostic; the remaining
+    two tokens are matched verbatim.
+    """
+    tokens = [token for token in str(text).strip().upper().split("/") if token]
+    # Three tokens mean a mission-prefixed selector ("S1A/117/ASCENDING");
+    # drop the mission token and keep "<REL>/<DIR>".  A bare two-token
+    # selector is already "<REL>/<DIR>".
+    if len(tokens) > 2:
+        tokens = tokens[-2:]
+    return "/".join(tokens)
+
+
+def _select_orbit_group(
+    items: Sequence[dict[str, Any]],
+    orbit_group: str | None,
+) -> list[dict[str, Any]]:
+    """Return items filtered to one ``(relOrbit, direction)`` track group.
+
+    ``orbit_group`` behaviour:
+
+    - ``None``: return items unchanged (legacy).
+    - ``"auto"``: pick the group holding the most items; log a warning when
+      other groups are skipped.
+    - ``"require"``: raise ``ValueError`` when more than one group is present;
+      callers must narrow the search or pass an explicit selector.
+    - explicit ``"<REL_ORBIT>/<DIRECTION>"`` (a leading ``"<MISSION>/"`` token
+      is ignored): keep only items in that track group.  Matching is
+      case-insensitive and tolerant to spaces, so both ``"117/ASCENDING"``
+      and ``"S1C/117/ASCENDING"`` select the same group.
+    """
+    if orbit_group is None:
+        return list(items)
+    groups: dict[tuple[int | None, str], list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(_orbit_group_key(item), []).append(item)
+    if len(groups) <= 1:
+        return list(items)
+    if isinstance(orbit_group, str) and orbit_group not in ("auto", "require"):
+        selector = _normalize_orbit_selector(orbit_group)
+        for key, members in groups.items():
+            if _orbit_group_label(key) == selector:
+                logger.info(
+                    "Selected orbit group %s: %d item(s)",
+                    _orbit_group_label(key),
+                    len(members),
+                )
+                return members
+        labels = sorted(_orbit_group_label(k) for k in groups)
+        message = (
+            f"orbit_group {orbit_group!r} matches no item; available groups: {labels}"
+        )
+        reject(message, ValueError, logger=logger)
+    if orbit_group == "require":
+        labels = sorted(_orbit_group_label(k) for k in groups)
+        message = (
+            "items span multiple orbit groups "
+            f"{labels}; pass orbit_group='<REL_ORBIT>/<DIRECTION>' "
+            "to pick one"
+        )
+        reject(message, ValueError, logger=logger)
+    # auto
+    key, members = max(groups.items(), key=lambda pair: len(pair[1]))
+    skipped = sorted(_orbit_group_label(k) for k in groups if k != key)
+    logger.warning(
+        "Selected orbit group %s (%d item(s)); skipped other groups %s",
+        _orbit_group_label(key),
+        len(members),
+        skipped,
+    )
+    return members
+
+
+def _ensure_canvas_ipf_manifest(safe_dir: Path, item: Mapping[str, Any]) -> None:
+    """Record the source IPF version on a reused canvas that lacks it."""
+    ipf_version = item.get("ipf_version")
+    if not ipf_version or (safe_dir / "manifest.safe").is_file():
+        return
+    from faninsar.missions.s1.io.path_safe import write_minimal_manifest
+
+    names = sorted(
+        path.relative_to(safe_dir).as_posix()
+        for folder in ("measurement", "annotation")
+        for path in (safe_dir / folder).glob("*")
+        if path.is_file()
+    )
+    write_minimal_manifest(safe_dir, safe_dir.name, names, ipf_version=str(ipf_version))
 
 
 def _canvas_manifest_complete(manifest_path: Path, fingerprint: str) -> bool:
@@ -1366,6 +1111,88 @@ def _canvas_manifest_complete(manifest_path: Path, fingerprint: str) -> bool:
         and raw.get("fingerprint") == fingerprint
         and raw.get("complete") is True
     )
+
+
+def _canvas_coverage_complete(safe_dir: Path, fingerprint: str) -> bool:
+    """Return True when coverage or a legacy canvas manifest is complete."""
+    return any(
+        _canvas_manifest_complete(safe_dir / name, fingerprint)
+        for name in (_CANVAS_MANIFEST_NAME, _LEGACY_CANVAS_MANIFEST_NAME)
+    )
+
+
+def _strip_in_safe_scratch(safe_dir: Path) -> None:
+    """Remove leftover in-SAFE transfer files from the pre-coverage layout."""
+    shutil.rmtree(safe_dir / _SPAN_CACHE_DIRNAME, ignore_errors=True)
+    (safe_dir / _LEGACY_PROGRESS_NAME).unlink(missing_ok=True)
+    (safe_dir / _LEGACY_CANVAS_MANIFEST_NAME).unlink(missing_ok=True)
+
+
+def _annotation_burst_coverage(safe_dir: Path) -> list[dict[str, Any]]:
+    """Return kept-burst records from canvas annotation XML."""
+    annotation_dir = safe_dir / "annotation"
+    if not annotation_dir.is_dir():
+        return []
+    bursts: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for annotation in sorted(annotation_dir.glob("*.xml")):
+        if not annotation.is_file() or "calibration" in annotation.parts:
+            continue
+        swath = parse_annotation_xml(
+            annotation.read_text(encoding="utf-8"),
+            annotation_path=str(annotation),
+            measurement_path="",
+        )
+        for burst in swath.bursts:
+            index = int(burst.index)
+            if index in seen:
+                continue
+            seen.add(index)
+            record: dict[str, Any] = {
+                "index": index,
+                "sensing_time": burst.sensing_time.isoformat(),
+            }
+            if burst.absolute_burst_id is not None:
+                record["absolute_burst_id"] = int(burst.absolute_burst_id)
+            bursts.append(record)
+    bursts.sort(key=lambda record: int(record["index"]))
+    return bursts
+
+
+def _promote_canvas_coverage(
+    safe_dir: Path,
+    fingerprint: str,
+    item: Mapping[str, Any],
+) -> None:
+    """Write ``coverage.json`` and drop hidden in-SAFE transfer leftovers."""
+    coverage_path = safe_dir / _CANVAS_MANIFEST_NAME
+    if not coverage_path.is_file():
+        legacy_path = safe_dir / _LEGACY_CANVAS_MANIFEST_NAME
+        created = datetime.now(UTC).isoformat()
+        try:
+            raw = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict) and isinstance(raw.get("created"), str):
+            created = raw["created"]
+        legacy_item = raw.get("item") if isinstance(raw, dict) else None
+        if not isinstance(legacy_item, dict):
+            legacy_item = {}
+        payload = {
+            "complete": True,
+            "created": created,
+            "fingerprint": fingerprint,
+            "parent": str(
+                item.get("product_id") or legacy_item.get("product") or "S1_ROI"
+            ),
+            "swath": str(item.get("swath") or legacy_item.get("swath") or "IW1"),
+            "polarization": str(
+                item.get("polarization") or legacy_item.get("pol") or "VV"
+            ),
+            "bursts": _annotation_burst_coverage(safe_dir),
+        }
+        _atomic_write_json(coverage_path, payload)
+    _strip_in_safe_scratch(safe_dir)
 
 
 def _safe_canvas_intact(safe_dir: Path) -> bool:
@@ -1430,55 +1257,16 @@ def _canvas_dem_id(
 ) -> str:
     """Return the DEM identity folded into the canvas fingerprint.
 
-    ``dem:file:<path>:<sha256>`` when the multi-polygon ``run_geo2rdr``
-    branch is active and the DEM is backed by a real file;
-    ``dem:grid:<sha256>`` when a caller-supplied sampler has no readable
-    path (the hash covers the sampled height grid actually fed to
-    ``run_geo2rdr``); ``dem:none`` when no DEM participates.
+    :func:`_plan_cdse_windows` runs ``geo2rdr`` against the DEM for every
+    ROI-granularity plan, so the identity is ``dem:file:<path>:<size>:<mtime>``
+    under exactly that condition and ``dem:none`` otherwise.  A ``stat`` is
+    enough to notice a replaced DEM without reading the raster.
     """
-    active = (
-        isinstance(roi, Polygons)
-        and granularity == "roi"
-        and len(roi.to_desired().geodataframe) > 1
-    )
-    if not active or dem is None:
+    if roi is None or granularity != "roi" or dem is None:
         return "dem:none"
-    path = getattr(dem, "path", None)
-    if path is not None:
-        candidate = Path(path)
-        if candidate.is_file():
-            digest = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            resolved = candidate.expanduser().resolve(strict=False)
-            return f"dem:file:{resolved}:{digest.hexdigest()}"
-    heights = _polygon_dem_samples(roi, dem)
-    digest = hashlib.sha256(heights.tobytes()).hexdigest()
-    return f"dem:grid:{digest}"
-
-
-def _polygon_dem_samples(polygons: Polygons, dem: RasterDEM) -> np.ndarray:
-    """Return the DEM height samples ``_polygon_envelopes`` feeds geo2rdr.
-
-    The concatenated per-polygon grids mirror the sampling in
-    :func:`_polygon_envelopes` (same adaptive ``n``, same meshgrid,
-    NaN-to-zero) so the fingerprint covers the exact heights the planner
-    consumed, not just a DEM file identity.
-    """
-    gdf = polygons.to_desired().geodataframe.to_crs(4326)
-    parts: list[np.ndarray] = []
-    for geom in gdf.geometry:
-        minx, miny, maxx, maxy = geom.bounds
-        n = _geo2rdr_grid_size(maxx - minx, maxy - miny)
-        xs = np.linspace(minx, maxx, n)
-        ys = np.linspace(miny, maxy, n)
-        lons, lats = np.meshgrid(xs, ys)
-        heights = np.asarray(dem.sample(lats.ravel(), lons.ravel()), dtype=np.float64)
-        parts.append(np.where(np.isnan(heights), 0.0, heights))
-    if not parts:
-        return np.zeros(0, dtype=np.float64)
-    return np.concatenate(parts)
+    path = Path(dem.path).expanduser().resolve(strict=False)
+    stat = path.stat()
+    return f"dem:file:{path}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 def _canvas_fingerprint(
@@ -1513,26 +1301,45 @@ def _canvas_fingerprint(
     return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
-def _fetch_dem_for_polygons(
-    roi: Polygons,
+def _fetch_dem_for_roi(
+    roi: BoundingBox | Points | Polygons,
     work_dir: str | Path,
 ) -> RasterDEM:
-    """Fetch a Copernicus DEM mosaic covering all desired polygons.
+    """Fetch a Copernicus DEM mosaic covering the whole ROI.
 
-    Downloads GLO-30 tiles for the union bounding box and writes a merged
-    GeoTIFF under ``work_dir/dem/``.  The result is persisted so a later
-    ``prepare`` pass can reuse it without re-downloading.
+    Downloads GLO-30 tiles for the ROI union bounding box and writes a
+    merged GeoTIFF under ``work_dir/dem/``.  The result is persisted so a
+    later ``prepare`` pass can reuse it without re-downloading.  Bounds are
+    inflated by a small margin so biquintic DEM sampling along the ROI
+    edge has the kernel support it needs — required by the shared
+    ``run_geo2rdr`` envelope path every ROI kind uses.
     """
     from faninsar.processing.geometry.dem_manager import DEMManager
 
-    gdf = roi.to_desired().geodataframe.to_crs(4326)
-    bounds = gdf.total_bounds
+    minx, miny, maxx, maxy = inversion_envelope(roi)
+    # ~2 km margin keeps the 6x6 biquintic kernel fully inside the raster
+    # for every ROI-edge sample.
+    margin_deg = 2.0 / 111.0
+    bounds = (
+        minx - margin_deg,
+        miny - margin_deg,
+        maxx + margin_deg,
+        maxy + margin_deg,
+    )
     out_dir = Path(work_dir) / "dem"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "rgv_stack.tif"
     mgr = DEMManager(cache_dir=Path(work_dir) / "dem-cache")
-    mgr.fetch_dem(bounds=tuple(bounds), output_path=out_path)
+    mgr.fetch_dem(bounds=bounds, output_path=out_path)
     return RasterDEM(path=out_path)
+
+
+def _fetch_dem_for_polygons(
+    roi: Polygons,
+    work_dir: str | Path,
+) -> RasterDEM:
+    """Backward-compatible alias for :func:`_fetch_dem_for_roi`."""
+    return _fetch_dem_for_roi(roi, work_dir)
 
 
 def _fetch_annotation_xml(
@@ -1627,18 +1434,78 @@ def _bind_cdse_item(item: Any) -> list[dict[str, Any]]:
         )
         polarization = str(properties.get("polarization") or fallback_pol).upper()
         swath = str(properties.get("swath") or _swath_from_pair_suffix(suffix))
+        product_id = str(getattr(item, "item_id", "S1_ROI"))
         bindings.append(
             {
-                "product_id": str(getattr(item, "item_id", "S1_ROI")),
+                "product_id": product_id,
                 "annotation_url": annotation_url,
                 "measurement_url": measurement_url,
                 "measurement_size": int(size or 0),
                 "annotation_size": int(annotation_size or 0),
                 "polarization": polarization,
                 "swath": swath,
+                "mission_id": _mission_letter(product_id),
+                "relative_orbit": _item_relative_orbit(item, metadata),
+                "orbit_direction": _item_orbit_direction(item, metadata),
+                "ipf_version": _item_ipf_version(item, metadata),
             }
         )
     return bindings
+
+
+def _mission_letter(product_id: str) -> str:
+    """Return the mission letter (``"A"``, ``"B"``, ``"C"``, or ``"D"``)."""
+    name = product_id.upper()
+    for letter in ("A", "B", "C", "D"):
+        if name.startswith(f"S1{letter}"):
+            return letter
+    return ""
+
+
+def _item_ipf_version(item: Any, metadata: Mapping[str, Any]) -> str | None:
+    """Return the Sentinel-1 IPF version recorded on a catalog item, if any."""
+    for source in (metadata, getattr(item, "raw_metadata", {}) or {}):
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("ipf_version")
+        if value:
+            return str(value)
+        software = source.get("processing:software")
+        if isinstance(software, Mapping) and software.get("Sentinel-1 IPF"):
+            return str(software["Sentinel-1 IPF"])
+    return None
+
+
+def _item_relative_orbit(item: Any, metadata: Mapping[str, Any]) -> int | None:
+    """Return ``sat:relative_orbit`` from item fields or raw metadata."""
+    direct = getattr(item, "relative_orbit", None)
+    if isinstance(direct, int):
+        return direct
+    for source in (metadata, getattr(item, "raw_metadata", {}) or {}):
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("relative_orbit") or source.get("sat:relative_orbit")
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _item_orbit_direction(item: Any, metadata: Mapping[str, Any]) -> str:
+    """Return ``"ASCENDING"``/``"DESCENDING"`` from item fields or metadata."""
+    direct = getattr(item, "orbit_direction", None)
+    if isinstance(direct, str) and direct:
+        return direct.upper()
+    for source in (metadata, getattr(item, "raw_metadata", {}) or {}):
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("orbit_direction") or source.get("sat:orbit_state")
+        if isinstance(value, str) and value:
+            return value.upper()
+    return ""
 
 
 def _asset_pair_suffix(key: str, role: str) -> str:
@@ -1853,6 +1720,35 @@ def _full_intersecting_burst_lines(
     return start * lpb, (stop + 1) * lpb
 
 
+@dataclass(frozen=True, slots=True)
+class _WindowPlan:
+    """Payload-free placement of one connected ROI row segment.
+
+    ``line0`` and ``col0`` are burst-local; ``parent_line0`` and
+    ``parent_line1`` address physical TIFF rows, not azimuth-time rows.
+    ``line_valid``, when present, has one entry per parent burst line and
+    uses inclusive last columns, as does :class:`BurstFetchedWindow`.
+    """
+
+    burst_index: int
+    line0: int
+    col0: int
+    n_lines: int
+    n_samples: int
+    lines_per_burst: int
+    line_valid: tuple[tuple[int, int], ...] | None = None
+
+    @property
+    def parent_line0(self) -> int:
+        """First physical parent TIFF row, inclusive."""
+        return self.burst_index * self.lines_per_burst + self.line0
+
+    @property
+    def parent_line1(self) -> int:
+        """Last physical parent TIFF row, exclusive."""
+        return self.parent_line0 + self.n_lines
+
+
 class _RoiFetchContext:
     """Per-measurement fetch context shared by ROI and overlap planning.
 
@@ -1867,14 +1763,16 @@ class _RoiFetchContext:
       batch issued through the context) feeds the probe-based narrow-ROI
       rule in :func:`_fetch_measurement_bodies`;
     - when ``span_cache`` is set, measurement spans persist durable
-      progress under ``.span-cache/<fingerprint>/`` so an interrupted item
-      resumes unfinished spans instead of restarting them (PROPOSAL-0070).
+      progress under ``tmp/s1-transfer/<canvas>/<fingerprint>/`` so an
+      interrupted item resumes unfinished spans instead of restarting
+      them.  Completing the canvas deletes that scratch.
     """
 
     def __init__(self, span_cache: _SpanCache | None = None) -> None:
         self.strip_tables: dict[
             tuple[str, int, int], tuple[list[int], list[int], int]
         ] = {}
+        self.layouts: dict[str, tiff.TiffLayout] = {}
         self.bodies: dict[tuple[str, int, int], bytes] = {}
         self.probed_bytes = 0
         self.probed_seconds = 0.0
@@ -1897,33 +1795,81 @@ class _RoiFetchContext:
             self.probed_bytes += bytes_fetched
 
 
-def _polygon_envelopes(
-    polygons: Polygons,
+def _burst_azimuth_origin_lines(swath: S1Swath) -> np.ndarray:
+    """Return each burst's azimuth-line origin measured from ``bursts[0]``.
+
+    Sentinel-1 TOPS bursts overlap in azimuth, so the real per-burst line
+    offset is ``(azimuth_time[k] - azimuth_time[0]) / ati`` — smaller than
+    ``k * lines_per_burst``.  This is the same convention
+    :func:`~faninsar.missions.s1.coregister._unit_placement` and
+    :func:`~faninsar.missions.s1.overlap._adjacent_window` use; it is *not*
+    the physical TIFF row slot ``index * lines_per_burst``.
+    """
+    ati = float(swath.azimuth_time_interval_s)
+    t0 = swath.bursts[0].azimuth_time
+    return np.asarray(
+        [
+            round((burst.azimuth_time - t0).total_seconds() / ati)
+            for burst in swath.bursts
+        ],
+        dtype=np.float64,
+    )
+
+
+def _azimuth_to_physical_lines(
+    swath: S1Swath,
+    azimuth_index: np.ndarray,
+    origins: np.ndarray,
+) -> np.ndarray:
+    """Convert geo2rdr azimuth indices into physical TIFF row indices.
+
+    ``azimuth_index`` counts rows linearly from ``bursts[0].azimuth_time``
+    (the ``run_geo2rdr`` model convention).  The parent TIFF stores each
+    burst contiguously at ``index * lines_per_burst``, so the physical row of
+    a solution inside burst ``k`` is ``k * lpb + (az - origins[k])``.  In the
+    azimuth overlap between adjacent bursts one ``az`` can map to two
+    physical rows; *all* mapped rows are returned (flattened) so the caller
+    can take the overall min/max and the enclosing envelope covers every
+    burst copy the polygon intersects.  Rows outside every burst are
+    returned as NaN and should be filtered by the caller.
+    """
+    lpb = int(swath.lines_per_burst)
+    n_bursts = len(swath.bursts)
+    az = np.asarray(azimuth_index, dtype=np.float64).reshape(-1, 1)
+    local = az - origins.reshape(1, n_bursts)
+    in_burst = (local >= 0.0) & (local < float(lpb))
+    slot = np.arange(n_bursts, dtype=np.float64).reshape(1, n_bursts) * lpb
+    physical = np.where(in_burst, slot + local, np.nan)
+    return physical.ravel()
+
+
+def _geoms_to_envelopes(
+    geometries: Sequence[Any],
     swath: S1Swath,
     dem: RasterDEM,
 ) -> list[tuple[int, int, int, int]]:
-    """Invert each desired polygon to a per-polygon (line0, line1, col0, col1).
+    """Invert WGS84 geometries to per-geometry ``(line0, line1, col0, col1)``.
 
-    Each polygon's WGS84 bounding box is sampled on an adaptive N x N grid
+    Each geometry's bounding box is sampled on an adaptive N x N grid
     (N from :func:`_geo2rdr_grid_size`, 4x4 to 10x10 log-interpolated by
     polygon size).  DEM heights are sampled at the grid points and
-    ``run_geo2rdr`` solves for (line, pixel) per point.  The polygon's
+    ``run_geo2rdr`` solves for (line, pixel) per point.  The geometry's
     envelope is the bounding box of converged solutions.
+
+    This is the single geo→radar inversion path every ROI kind funnels
+    through; the geolocation-grid approximation is not used for ROI
+    envelopes because it ignores terrain.
 
     Returns
     -------
     list of tuple of int
-        One ``(line0, line1, col0, col1)`` per desired polygon, clamped to
-        the swath extent.  Polygons with no converged geo2rdr points are
+        One ``(line0, line1, col0, col1)`` per geometry, clamped to the
+        swath extent.  Geometries with no converged geo2rdr points are
         skipped.
 
     """
     from faninsar.missions.s1.processing import _radar_model
     from faninsar.processing.geometry.prepare_production import run_geo2rdr
-
-    gdf = polygons.to_desired().geodataframe.to_crs(4326)
-    if gdf.empty:
-        return []
 
     burst = swath.bursts[0]
     model = _radar_model(
@@ -1935,8 +1881,14 @@ def _polygon_envelopes(
     )
     total_lines = int(swath.lines)
     total_samples = int(swath.samples_per_burst)
+    # Geo2rdr azimuth_index counts azimuth lines from bursts[0].azimuth_time,
+    # but downstream planners bucket and fetch by physical TIFF row
+    # (``index * lines_per_burst``).  Convert each converged solution to its
+    # physical row so the returned envelope is in the same coordinate the
+    # range fetcher and canvas writer use.
+    origins = _burst_azimuth_origin_lines(swath)
     envelopes: list[tuple[int, int, int, int]] = []
-    for geom in gdf.geometry:
+    for geom in geometries:
         minx, miny, maxx, maxy = geom.bounds
         n = _geo2rdr_grid_size(maxx - minx, maxy - miny)
         xs = np.linspace(minx, maxx, n)
@@ -1949,18 +1901,77 @@ def _polygon_envelopes(
         result = run_geo2rdr(model, lats, lons, heights, device="cpu")
         az = np.asarray(result.azimuth_index).ravel()
         rg = np.asarray(result.range_index).ravel()
-        conv = np.asarray(result.converged).ravel().astype(bool)
+        conv = (
+            np.asarray(result.converged).ravel().astype(bool)
+            & (az >= 0)
+            & (az < total_lines)
+            & (rg >= 0)
+            & (rg < total_samples)
+        )
         if not conv.any():
             continue
-        az_ok = az[conv]
+        lines = _azimuth_to_physical_lines(swath, az[conv], origins)
+        lines = lines[np.isfinite(lines)]
+        if lines.size == 0:
+            continue
         rg_ok = rg[conv]
-        line0 = max(0, math.floor(az_ok.min()))
-        line1 = min(total_lines, math.ceil(az_ok.max()) + 1)
+        line0 = max(0, math.floor(lines.min()))
+        line1 = min(total_lines, math.ceil(lines.max()) + 1)
         col0 = max(0, math.floor(rg_ok.min()))
         col1 = min(total_samples, math.ceil(rg_ok.max()) + 1)
         if line1 > line0 and col1 > col0:
             envelopes.append((line0, line1, col0, col1))
     return envelopes
+
+
+def _polygon_envelopes(
+    polygons: Polygons,
+    swath: S1Swath,
+    dem: RasterDEM,
+) -> list[tuple[int, int, int, int]]:
+    """Invert each desired polygon via the shared geo2rdr envelope path."""
+    gdf = polygons.to_desired().geodataframe.to_crs(4326)
+    if gdf.empty:
+        return []
+    return _geoms_to_envelopes(list(gdf.geometry), swath, dem)
+
+
+def _roi_envelopes(
+    roi: BoundingBox | Points | Polygons,
+    swath: S1Swath,
+    dem: RasterDEM,
+) -> list[tuple[int, int, int, int]]:
+    """Invert any spatial ROI to envelopes through ``run_geo2rdr``.
+
+    ``BoundingBox`` becomes one box geometry, ``Points`` becomes one small
+    buffered box per point, and ``Polygons`` keeps one geometry per desired
+    polygon — every kind then shares the single geo2rdr inversion in
+    :func:`_geoms_to_envelopes`, so terrain-aware radar geometry is used for
+    all ROI shapes instead of the geolocation-grid approximation.
+    """
+    from shapely.geometry import box as _box
+
+    normalized = normalize_roi_wgs84(roi)
+    geoms: list[Any] = []
+    if isinstance(normalized, Polygons):
+        gdf = normalized.to_desired().geodataframe.to_crs(4326)
+        geoms = list(gdf.geometry)
+    elif isinstance(normalized, Points):
+        for x, y in normalized.values:
+            west, south, east, north = _point_buffer_bounds(float(x), float(y))
+            geoms.append(_box(west, south, east, north))
+    else:
+        geoms.append(
+            _box(
+                float(normalized.left),
+                float(normalized.bottom),
+                float(normalized.right),
+                float(normalized.top),
+            )
+        )
+    if not geoms:
+        return []
+    return _geoms_to_envelopes(geoms, swath, dem)
 
 
 def _geo2rdr_grid_size(bbox_w_deg: float, bbox_h_deg: float) -> int:
@@ -2018,104 +2029,197 @@ def _windows_for_polygons(
     file_size: int,
     fetch_context: _RoiFetchContext | None = None,
 ) -> list[BurstFetchedWindow]:
-    """Build per-burst windows for multiple polygon envelopes.
+    """Fetch disjoint polygon row requirements and assemble per-burst windows."""
+    return _fetch_planned_windows(
+        _plan_windows_for_polygons(swath, envelopes),
+        url=url,
+        file_size=file_size,
+        samples_per_row=int(swath.samples_per_burst),
+        fetch_context=fetch_context,
+    )
 
-    Line segments from all envelopes are unioned into disjoint ranges,
-    each fetched once via the range planner.  Small polygons whose column
-    width falls below the narrow-ROI rule use exact-column spans; larger
-    ones fetch whole rows.  Envelopes on the same burst whose column
-    ranges overlap are merged into one window so samples do not
-    overwrite each other.
-    """
+
+def _plan_windows_for_polygons(
+    swath: S1Swath,
+    envelopes: Sequence[tuple[int, int, int, int]],
+) -> list[_WindowPlan]:
+    """Keep disjoint ROI rows separate while unioning overlapping requirements."""
     if not envelopes:
         return []
     lpb = int(swath.lines_per_burst)
     samples_per_burst = int(swath.samples_per_burst)
-
-    # Drop envelopes that intersect no burst before any fetch.
-    burst_line_ranges = [
-        (int(burst.index) * lpb, (int(burst.index) + 1) * lpb) for burst in swath.bursts
-    ]
-    envelopes = [
-        env
-        for env in envelopes
-        if any(env[0] < b1 and env[1] > b0 for b0, b1 in burst_line_ranges)
-    ]
-    if not envelopes:
-        reject_product("no polygon envelope intersects any Sentinel-1 burst")
-
-    # 1. Group envelopes by burst index; each burst's union envelope
-    #    decides whether its rows fetch whole or exact-column spans.
-    burst_groups: dict[int, list[tuple[int, int, int, int]]] = {}
-    for env in envelopes:
-        for burst in swath.bursts:
-            burst_line0 = int(burst.index) * lpb
-            burst_line1 = burst_line0 + lpb
-            if env[0] < burst_line1 and env[1] > burst_line0:
-                burst_groups.setdefault(int(burst.index), []).append(env)
-
-    all_bodies: dict[str, bytes] = {}
-    for burst_envs in burst_groups.values():
-        line0 = min(env[0] for env in burst_envs)
-        line1 = max(env[1] for env in burst_envs)
-        col0 = min(env[2] for env in burst_envs)
-        col1 = max(env[3] for env in burst_envs)
-        col0 = max(0, col0)
-        col1 = min(samples_per_burst, max(col0 + 1, col1))
-        bodies = _fetch_measurement_bodies(
-            url,
-            file_size=file_size,
-            line0=line0,
-            line1=line1,
-            col0=col0,
-            col1=col1,
-            samples=samples_per_burst,
-            fetch_context=fetch_context,
-        )
-        all_bodies.update(bodies)
-
-    # 3. Merge envelopes on the same burst whose column ranges overlap,
-    #    then slice each merged window's columns from the fetched rows.
-    windows: list[BurstFetchedWindow] = []
+    plans: list[_WindowPlan] = []
     for burst in swath.bursts:
-        burst_line0 = burst.index * lpb
+        burst_index = int(burst.index)
+        burst_line0 = burst_index * lpb
         burst_line1 = burst_line0 + lpb
         burst_envs = [
-            env for env in envelopes if env[0] < burst_line1 and env[1] > burst_line0
+            (max(line0, burst_line0), min(line1, burst_line1), col0, col1)
+            for line0, line1, col0, col1 in envelopes
+            if line0 < burst_line1 and line1 > burst_line0
         ]
-        if not burst_envs:
-            continue
-        # All envelopes on this burst merge into one window covering the
-        # union rectangle (write_roi_safe_canvas allows one window per
-        # burst index).
-        merged = _merge_burst_windows(burst_envs)
-        for line0, line1, env_col0, env_col1 in merged:
-            col0 = max(0, env_col0)
-            col1 = min(samples_per_burst, max(col0 + 1, env_col1))
-            inter0 = max(line0, burst_line0)
-            inter1 = min(line1, burst_line1)
-            row0 = inter0 - burst_line0
-            n_lines = inter1 - inter0
-            n_cols = col1 - col0
-            samples = _assemble_window_samples(
-                all_bodies,
-                parent_line0=inter0,
-                n_lines=n_lines,
-                col0=col0,
-                n_cols=n_cols,
+        for line0, line1 in _merge_line_segments(
+            [(env[0], env[1]) for env in burst_envs]
+        ):
+            segment_envs = [
+                env for env in burst_envs if env[0] < line1 and env[1] > line0
+            ]
+            col0 = max(0, min(env[2] for env in segment_envs))
+            col1 = min(
+                samples_per_burst, max(col0 + 1, *(env[3] for env in segment_envs))
+            )
+            line_valid = _line_valid_for_burst(
+                segment_envs,
+                burst_line0=burst_line0,
+                lines_per_burst=lpb,
                 samples_per_burst=samples_per_burst,
             )
-            windows.append(
-                BurstFetchedWindow(
-                    burst_index=int(burst.index),
-                    row0=row0,
+            plans.append(
+                _WindowPlan(
+                    burst_index=burst_index,
+                    line0=line0 - burst_line0,
                     col0=col0,
-                    samples=samples,
+                    n_lines=line1 - line0,
+                    n_samples=col1 - col0,
+                    lines_per_burst=lpb,
+                    line_valid=line_valid,
                 )
             )
-    if not windows:
+    if not plans:
         reject_product("no polygon envelope intersects any Sentinel-1 burst")
+    return plans
+
+
+def _fetch_planned_windows(
+    plans: Sequence[_WindowPlan],
+    *,
+    url: str,
+    file_size: int,
+    samples_per_row: int,
+    fetch_context: _RoiFetchContext | None,
+) -> list[BurstFetchedWindow]:
+    """Compatibility fetch facade over payload-free spatial plans.
+
+    Probe one source once, retain physical strip gaps, and leave contiguous
+    row requirements unsplit.  Column cropping happens only in assembly.
+    """
+    if not plans:
+        return []
+    offsets, counts, rows_per_strip = _strip_tables_for(
+        url,
+        file_size=file_size,
+        samples=samples_per_row,
+        fetch_context=fetch_context,
+    )
+    spans: list[RangeSpan] = []
+    for line0, line1 in _merge_line_segments(
+        [(plan.parent_line0, plan.parent_line1) for plan in plans]
+    ):
+        spans.extend(
+            plan_measurement_spans(
+                url=url,
+                strip_offsets=offsets,
+                strip_byte_counts=counts,
+                rows_per_strip=rows_per_strip,
+                samples=samples_per_row,
+                bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
+                line0=line0,
+                line1=line1,
+                col0=0,
+                col1=samples_per_row,
+                max_span_bytes=None,
+            )
+        )
+    bodies = _fetch_deduped(spans, fetch_context)
+    return _assemble_planned_windows(plans, bodies, samples_per_row=samples_per_row)
+
+
+def _assemble_planned_windows(
+    plans: Sequence[_WindowPlan],
+    bodies: Mapping[str, bytes],
+    *,
+    samples_per_row: int,
+) -> list[BurstFetchedWindow]:
+    """Assemble supplied segments into one masked window per burst.
+
+    A caller may pass just one ready burst's plans.  Row gaps are zero-filled
+    rather than decoded from unrelated transfer bodies; their XML mask stays
+    invalid.  Payload labels remain local to this measurement source.
+    """
+    by_burst: dict[int, list[_WindowPlan]] = {}
+    for plan in plans:
+        by_burst.setdefault(plan.burst_index, []).append(plan)
+    windows: list[BurstFetchedWindow] = []
+    for burst_index, burst_plans in by_burst.items():
+        line0 = min(plan.line0 for plan in burst_plans)
+        line1 = max(plan.line0 + plan.n_lines for plan in burst_plans)
+        col0 = min(plan.col0 for plan in burst_plans)
+        col1 = max(plan.col0 + plan.n_samples for plan in burst_plans)
+        samples = np.zeros((line1 - line0, col1 - col0), dtype=np.complex64)
+        valid = [[-1, -1] for _ in range(burst_plans[0].lines_per_burst)]
+        for plan in burst_plans:
+            segment = _assemble_window_samples(
+                bodies,
+                parent_line0=plan.parent_line0,
+                n_lines=plan.n_lines,
+                col0=plan.col0,
+                n_cols=plan.n_samples,
+                samples_per_burst=samples_per_row,
+            )
+            r0, c0 = plan.line0 - line0, plan.col0 - col0
+            samples[r0 : r0 + plan.n_lines, c0 : c0 + plan.n_samples] = segment
+            for row in range(plan.line0, plan.line0 + plan.n_lines):
+                first, last = (
+                    plan.line_valid[row]
+                    if plan.line_valid is not None
+                    else (plan.col0, plan.col0 + plan.n_samples - 1)
+                )
+                if first < 0:
+                    continue
+                if valid[row][0] < 0:
+                    valid[row] = [first, last]
+                else:
+                    valid[row][0] = min(valid[row][0], first)
+                    valid[row][1] = max(valid[row][1], last)
+        windows.append(
+            BurstFetchedWindow(
+                burst_index=burst_index,
+                row0=line0,
+                col0=col0,
+                samples=samples,
+                line_valid=tuple((first, last) for first, last in valid),
+            )
+        )
     return windows
+
+
+def _line_valid_for_burst(
+    envelopes: Sequence[tuple[int, int, int, int]],
+    *,
+    burst_line0: int,
+    lines_per_burst: int,
+    samples_per_burst: int,
+) -> tuple[tuple[int, int], ...]:
+    """Return per-burst-line ``(first, last)`` valid columns of the envelopes.
+
+    Each envelope is an absolute-frame ``(line0, line1, col0, col1)``
+    rectangle.  For every burst-local line the covering envelopes' column
+    ranges are unioned into a single span; lines no envelope covers keep
+    ``(-1, -1)`` so the canvas records them as unfetched.
+    """
+    valid: list[list[int]] = [[-1, -1] for _ in range(lines_per_burst)]
+    for line0, line1, col0, col1 in envelopes:
+        r0 = max(0, int(line0) - burst_line0)
+        r1 = min(lines_per_burst, int(line1) - burst_line0)
+        c0 = max(0, int(col0))
+        c1 = min(samples_per_burst, int(col1))
+        for row in range(r0, r1):
+            if valid[row][0] < 0:
+                valid[row] = [c0, c1 - 1]
+            else:
+                valid[row][0] = min(valid[row][0], c0)
+                valid[row][1] = max(valid[row][1], c1 - 1)
+    return tuple((pair[0], pair[1]) for pair in valid)
 
 
 def _merge_burst_windows(
@@ -2148,51 +2252,48 @@ def _windows_for_lines(
     file_size: int,
     fetch_context: _RoiFetchContext | None = None,
 ) -> list[BurstFetchedWindow]:
-    """Build per-burst fetched windows, filling samples from range fetches."""
+    """Plan, fetch, and assemble a physical row envelope for legacy callers."""
+    return _fetch_planned_windows(
+        _plan_windows_for_lines(swath, line0=line0, line1=line1, col0=col0, col1=col1),
+        url=url,
+        file_size=file_size,
+        samples_per_row=int(swath.samples_per_burst),
+        fetch_context=fetch_context,
+    )
+
+
+def _plan_windows_for_lines(
+    swath: S1Swath,
+    *,
+    line0: int,
+    line1: int,
+    col0: int,
+    col1: int,
+) -> list[_WindowPlan]:
+    """Intersect a physical row envelope with parent burst slots, without I/O."""
     lpb = int(swath.lines_per_burst)
     samples_per_burst = int(swath.samples_per_burst)
     col0 = max(0, col0)
     col1 = min(samples_per_burst, max(col0 + 1, col1))
-    bodies = _fetch_measurement_bodies(
-        url,
-        file_size=file_size,
-        line0=line0,
-        line1=line1,
-        col0=col0,
-        col1=col1,
-        samples=samples_per_burst,
-        fetch_context=fetch_context,
-    )
-    windows: list[BurstFetchedWindow] = []
+    plans: list[_WindowPlan] = []
     for burst in swath.bursts:
-        burst_line0 = burst.index * lpb
-        burst_line1 = burst_line0 + lpb
+        burst_line0 = int(burst.index) * lpb
         inter0 = max(line0, burst_line0)
-        inter1 = min(line1, burst_line1)
-        if inter1 <= inter0:
-            continue
-        row0 = inter0 - burst_line0
-        n_lines = inter1 - inter0
-        n_cols = col1 - col0
-        samples = _assemble_window_samples(
-            bodies,
-            parent_line0=inter0,
-            n_lines=n_lines,
-            col0=col0,
-            n_cols=n_cols,
-            samples_per_burst=samples_per_burst,
-        )
-        windows.append(
-            BurstFetchedWindow(
-                burst_index=int(burst.index),
-                row0=row0,
-                col0=col0,
-                samples=samples,
+        inter1 = min(line1, burst_line0 + lpb)
+        if inter1 > inter0:
+            plans.append(
+                _WindowPlan(
+                    burst_index=int(burst.index),
+                    line0=inter0 - burst_line0,
+                    col0=col0,
+                    n_lines=inter1 - inter0,
+                    n_samples=col1 - col0,
+                    lines_per_burst=lpb,
+                )
             )
-        )
-    if not windows:
+    if not plans:
         reject_product("ROI does not intersect any Sentinel-1 burst")
-    return windows
+    return plans
 
 
 def _fetch_measurement_bodies(
@@ -2205,6 +2306,7 @@ def _fetch_measurement_bodies(
     col1: int,
     samples: int,
     fetch_context: _RoiFetchContext | None = None,
+    max_span_bytes: int | None = MAX_SPAN_BYTES,
 ) -> dict[str, bytes]:
     """Fetch IFD probes then bounded measurement spans for one ROI window.
 
@@ -2213,7 +2315,8 @@ def _fetch_measurement_bodies(
     them, measurement spans identical to an earlier request are not
     re-requested, and the probe fetch feeds the context bandwidth used
     by the narrow-ROI rule.  Without a context every call probes and
-    fetches independently, exactly as before.
+    fetches independently, exactly as before.  ``max_span_bytes=None``
+    keeps each merged contiguous row group as one span.
     """
     if not url:
         reject_product("CDSE measurement fetch requires a non-empty object URL")
@@ -2226,6 +2329,7 @@ def _fetch_measurement_bodies(
         col1=col1,
         samples=samples,
         fetch_context=fetch_context,
+        max_span_bytes=max_span_bytes,
     )
     return _fetch_deduped(spans, fetch_context)
 
@@ -2263,6 +2367,31 @@ def _strip_tables_for(
         return probed
 
 
+# Tests replace ``_strip_tables_for``; the live ROI path compares against this
+# original so TIFF probes stay on the shared asyncio session.
+_strip_tables_for_impl = _strip_tables_for
+
+
+def _ifd_followup_spans(
+    url: str,
+    header: bytes,
+    *,
+    file_size: int,
+) -> tuple[RangeSpan, ...]:
+    """Return IFD/strip-table probes that follow a TIFF header body."""
+    ifd_offset, _endian, _bigtiff = _parse_tiff_header(header)
+    if file_size > ifd_offset:
+        ifd_length = min(file_size - ifd_offset, _MAX_IFD_PROBE_BYTES)
+    else:
+        ifd_length = _IFD_PROBE_BYTES
+    probes = plan_ifd_probe_spans(
+        url,
+        ifd_offset=ifd_offset,
+        ifd_length=max(ifd_length, _IFD_PROBE_BYTES),
+    )
+    return tuple(span for span in probes if span.label != "tiff-header")
+
+
 def _probe_strip_tables(
     url: str,
     *,
@@ -2276,17 +2405,9 @@ def _probe_strip_tables(
     """
     header_probe = (RangeSpan(url, 0, HEADER_PROBE_BYTES - 1, "tiff-header"),)
     header_bodies = _fetch_cdse_ranges(header_probe)
-    ifd_offset, _endian, _bigtiff = _parse_tiff_header(header_bodies["tiff-header"])
-    if file_size > ifd_offset:
-        ifd_length = min(file_size - ifd_offset, _MAX_IFD_PROBE_BYTES)
-    else:
-        ifd_length = _IFD_PROBE_BYTES
-    probes = plan_ifd_probe_spans(
-        url,
-        ifd_offset=ifd_offset,
-        ifd_length=max(ifd_length, _IFD_PROBE_BYTES),
+    remaining = _ifd_followup_spans(
+        url, header_bodies["tiff-header"], file_size=file_size
     )
-    remaining = tuple(span for span in probes if span.label != "tiff-header")
     probe_bodies = dict(header_bodies)
     if remaining:
         probe_bodies.update(_fetch_cdse_ranges(remaining))
@@ -2296,32 +2417,66 @@ def _probe_strip_tables(
     return _strip_tables_from_probes(probe_bodies, samples=samples), fetched
 
 
+async def _probe_strip_tables_async(
+    url: str,
+    *,
+    file_size: int,
+    samples: int,
+    fetcher: Any,
+) -> tuple[tuple[list[int], list[int], int], int]:
+    """Async variant of :func:`_probe_strip_tables` on an open fetcher.
+
+    Parameters
+    ----------
+    url : str
+        Measurement object URL.
+    file_size : int
+        Declared measurement size, used to bound the IFD probe.
+    samples : int
+        Samples per row, forwarded to strip-table decode.
+    fetcher : RangeFetcher
+        Open session shared with annotation and measurement transfers.
+
+    Returns
+    -------
+    tables : tuple of (list of int, list of int, int)
+        ``(offsets, counts, rows_per_strip)``.
+    bytes_fetched : int
+        Header plus IFD bytes charged to the bandwidth meter.
+
+    """
+    header_probe = (RangeSpan(url, 0, HEADER_PROBE_BYTES - 1, "tiff-header"),)
+    header_bodies = await fetch_ranges_async(header_probe, fetcher=fetcher)
+    remaining = _ifd_followup_spans(
+        url, header_bodies["tiff-header"], file_size=file_size
+    )
+    probe_bodies = dict(header_bodies)
+    if remaining:
+        probe_bodies.update(await fetch_ranges_async(remaining, fetcher=fetcher))
+    fetched = sum(span.end - span.start + 1 for span in header_probe) + sum(
+        span.end - span.start + 1 for span in remaining
+    )
+    return _strip_tables_from_probes(probe_bodies, samples=samples), fetched
+
+
 def _use_exact_columns(
-    fetch_context: _RoiFetchContext | None,
+    _fetch_context: _RoiFetchContext | None,
     *,
     n_cols: int,
     samples: int,
 ) -> bool:
-    """Probe-based narrow-ROI rule for exact-column per-row span planning.
+    """Return whether the ROI uses per-row exact-column spans.
 
-    Exact-column spans trade many small requests for bytes not fetched,
-    which only pays off on a slow link with a narrow ROI.  The rule
-    engages when both hold:
-
-    - the bandwidth observed through ``fetch_context`` is below
-      :data:`NARROW_ROI_BANDWIDTH_BPS` (1.3 MiB/s), and
-    - the ROI column width is below
-      :data:`NARROW_ROI_MAX_WIDTH_FRACTION` (30%) of the row.
-
-    Without a context (or before its first probe completes) the rule
-    stays off and whole-row planning is preserved.
+    Disabled by policy: row-window fetches always download the merged
+    contiguous row block as whole-row ranges and slice the polygon's
+    columns after download, rather than issuing one ``[col0, col1)`` span
+    per row.  Per-row spans cost one request per row and historically
+    starved on CDSE; the merged block is a single range per burst group.
+    ``n_cols``/``samples``/``_fetch_context`` are accepted so callers keep
+    one signature if the heuristic is ever re-enabled.
     """
-    if fetch_context is None:
-        return False
-    bandwidth = fetch_context.bandwidth_bps
-    if bandwidth is None or bandwidth >= NARROW_ROI_BANDWIDTH_BPS:
-        return False
-    return n_cols < NARROW_ROI_MAX_WIDTH_FRACTION * samples
+    del n_cols, samples
+    return False
 
 
 def _fetch_deduped(
@@ -2393,340 +2548,133 @@ def _fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     return run_sync(fetch_cdse_ranges(span_tuple))
 
 
-def _scrub_url(url: str) -> str:
-    """Strip query/fragment so persisted span records stay OData-canonical."""
-    parts = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+class _LazySpanFetcher:
+    """Provider fetcher proxy that opens the session on first byte transfer.
+
+    A rerun whose executed plan matches a durable canvas performs zero
+    network calls; deferring session construction (and its token grant for
+    CDSE) keeps that rerun genuinely offline.  Callers keep using the
+    ``async with`` shape and the ``fetch``/``fetch_into`` surface.
+    """
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._cm: Any = None
+        self._fetcher: Any = None
+
+    async def _ensure(self) -> Any:
+        if self._fetcher is None:
+            self._cm = self._factory()
+            self._fetcher = await self._cm.__aenter__()
+        return self._fetcher
+
+    async def fetch(self, spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+        return await (await self._ensure()).fetch(spans)
+
+    async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+        return await (await self._ensure()).fetch_into(span, sink, **kwargs)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> Any:
+        if self._cm is not None:
+            return await self._cm.__aexit__(*exc_info)
+        return None
 
 
 def _span_fetcher_cm(spans: Sequence[RangeSpan]) -> Any:
-    """Return an async context manager yielding an open span fetcher.
-
-    CDSE OData spans use ``cdse_range_fetcher`` (token + 401-refresh
-    inside); until the remote seam lands, an inline
-    ``RangeFetcher(token=..., refresh=...)`` keeps the same credential
-    contract.  Fixture/test URLs take a plain ``RangeFetcher``.
-    """
+    """Use provider-owned auth and refresh; fixture URLs remain anonymous."""
     span_tuple = tuple(spans)
-    if _cdse_range_host(span_tuple[0].url):
-        if _cdse_range_fetcher is not None:
-            return _cdse_range_fetcher(span_tuple)
-        from faninsar.remote.providers.cdse import (
-            refresh_cdse_token,
-            request_cdse_token,
-        )
-
-        @asynccontextmanager
-        async def _inline_fetcher() -> AsyncIterator[RangeFetcher]:
-            token = request_cdse_token()
-            async with RangeFetcher(
-                token=token,
-                refresh=refresh_cdse_token,
-            ) as fetcher:
-                yield fetcher
-
-        return _inline_fetcher()
-    return RangeFetcher()
+    if any(_cdse_range_host(span.url) for span in span_tuple):
+        return _LazySpanFetcher(lambda: _cdse_range_fetcher(span_tuple))
+    return _LazySpanFetcher(RangeFetcher)
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Write JSON through a tmp sibling + rename so readers never see halves."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
-
-
-class _SpanCache:
-    """Durable per-item span cache under ``<item SAFE>/.span-cache/<F>/``.
-
-    ``manifest.json`` records ``{fingerprint, spans: [{key, url, start,
-    end, label, state, part_size, sha1}]}``; ``key`` is
-    ``sha1(url|start|end)`` of the scrubbed URL so manifest ``url`` fields
-    never carry signed query parameters.  Each span body streams into an
-    append-only ``<key>.part`` via ``RangeFetcher.fetch_into``, which
-    already resumes from the sink's file size — a crash mid-span leaves a
-    partial ``.part`` the next run resumes from ``start + received``.
-
-    A ``state="complete"`` record is honored only when
-    ``part_size == actual .part size == end-start+1``; any drift refetches
-    the span from byte 0.  The optional ``sha1`` is verified on read-back
-    so a same-size corrupted ``.part`` is never mistaken for a clean span.
-    """
-
-    def __init__(self, root: Path, fingerprint: str) -> None:
-        """Open the cache rooted at ``root / fingerprint``.
-
-        Parameters
-        ----------
-        root : pathlib.Path
-            ``<item SAFE>/.span-cache`` directory.
-        fingerprint : str
-            Planner fingerprint ``F`` naming this plan's subdirectory.
-
-        """
-        self.root = Path(root)
-        self.fingerprint = fingerprint
-        self.dir = self.root / fingerprint
-        self._records: dict[str, dict[str, Any]] = {}
-        self._gc_done = False
-        self._load_manifest()
-
-    @staticmethod
-    def span_key(span: RangeSpan) -> str:
-        """Return ``sha1(url|start|end)`` of the query-scrubbed span URL."""
-        material = f"{_scrub_url(span.url)}|{span.start}|{span.end}"
-        return hashlib.sha1(material.encode("utf-8")).hexdigest()
-
-    def _load_manifest(self) -> None:
-        """Load span records, tolerating a missing or torn manifest."""
-        manifest_path = self.dir / "manifest.json"
-        try:
-            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        if not isinstance(raw, dict) or raw.get("fingerprint") != self.fingerprint:
-            return
-        spans = raw.get("spans")
-        if not isinstance(spans, list):
-            return
-        for record in spans:
-            if isinstance(record, dict) and isinstance(record.get("key"), str):
-                self._records[record["key"]] = dict(record)
-
-    def _save_manifest(self) -> None:
-        """Atomically persist the current span records."""
-        payload = {
-            "fingerprint": self.fingerprint,
-            "spans": list(self._records.values()),
-        }
-        _atomic_write_json(self.dir / "manifest.json", payload)
-
-    def _part_path(self, key: str) -> Path:
-        """Return the ``.part`` path for one span key."""
-        return self.dir / f"{key}.part"
-
-    def _record_for(self, span: RangeSpan) -> dict[str, Any]:
-        """Return the reconciled record for ``span``, honoring resume rules."""
-        key = self.span_key(span)
-        expected = span.end - span.start + 1
-        part = self._part_path(key)
-        part_size = part.stat().st_size if part.exists() else 0
-        record = self._records.get(key)
-        if record is not None:
-            if record.get("state") == "complete":
-                honored = record.get(
-                    "part_size"
-                ) == part_size == expected and self._sha1_ok(record, part)
-                if honored:
-                    return record
-                # Drift or corruption: a recorded-complete span whose bytes
-                # no longer verify is refetched from byte 0.
-                part.unlink(missing_ok=True)
-                part_size = 0
-                record = None
-            else:
-                # Pending record: the .part file size is the progress record.
-                if part_size > expected:
-                    part.unlink(missing_ok=True)
-                    part_size = 0
-                record["part_size"] = part_size
-                record["state"] = "pending"
-                return record
-        if part_size > expected:
-            part.unlink(missing_ok=True)
-            part_size = 0
-        record = {
-            "key": key,
-            "url": _scrub_url(span.url),
-            "start": span.start,
-            "end": span.end,
-            "label": span.label,
-            "state": "pending",
-            "part_size": part_size,
-        }
-        self._records[key] = record
-        return record
-
-    def _sha1_ok(self, record: Mapping[str, Any], part: Path) -> bool:
-        """Verify a recorded sha1 against the current ``.part`` bytes."""
-        recorded = record.get("sha1")
-        if not isinstance(recorded, str) or not recorded:
-            return True
-        try:
-            digest = hashlib.sha1(part.read_bytes()).hexdigest()
-        except OSError:
-            return False
-        return digest == recorded
-
-    def _mark_complete(self, record: dict[str, Any], part: Path) -> None:
-        """Record one span complete after ``fetch_into`` returned."""
-        record["part_size"] = part.stat().st_size
-        record["sha1"] = hashlib.sha1(part.read_bytes()).hexdigest()
-        record["state"] = "complete"
-        self._save_manifest()
-
-    async def _fetch_pending(self, pending: Sequence[RangeSpan]) -> None:
-        """Fetch pending spans sequentially inside one shared fetcher."""
-        async with _span_fetcher_cm(pending) as fetcher:
-            for span in pending:
-                record = self._records[self.span_key(span)]
-                part = self._part_path(record["key"])
-                await fetcher.fetch_into(span, part)
-                self._mark_complete(record, part)
-
-    def _read_part(self, span: RangeSpan, record: Mapping[str, Any]) -> bytes:
-        """Read back one completed span's ``.part`` bytes."""
-        del span
-        part = self._part_path(record["key"])
-        try:
-            return part.read_bytes()
-        except OSError:
-            return reject_product(f"span cache part file unreadable: {part}")
-
-    def _gc_orphans_once(self, planned: Sequence[RangeSpan]) -> None:
-        """Remove orphan ``<F'>`` dirs, keeping plan-overlapping partials.
-
-        A pending partial whose span overlaps the current plan's
-        ``(url, start, end)`` set still carries usable bytes and is kept;
-        every other orphan tree is removed so bandwidth-regime flips and
-        planner-version bumps cannot grow the disk unboundedly.
-        """
-        if self._gc_done or not self.root.is_dir():
-            self._gc_done = True
-            return
-        planned_keys = {self.span_key(span) for span in planned}
-        planned_ranges = [(_scrub_url(s.url), s.start, s.end) for s in planned]
-        for child in self.root.iterdir():
-            if not child.is_dir() or child.name == self.fingerprint:
-                continue
-            if self._orphan_overlaps(child, planned_keys, planned_ranges):
-                logger.info(
-                    "keeping orphan span cache %s: pending partial overlaps "
-                    "the current plan",
-                    child,
-                )
-                continue
-            logger.info("removing orphan span cache %s", child)
-            shutil.rmtree(child, ignore_errors=True)
-        self._gc_done = True
-
-    @staticmethod
-    def _orphan_overlaps(
-        orphan: Path,
-        planned_keys: set[str],
-        planned_ranges: Sequence[tuple[str, int, int]],
-    ) -> bool:
-        """Return True when ``orphan`` holds a pending partial in the plan."""
-        try:
-            raw = json.loads((orphan / "manifest.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = None
-        if isinstance(raw, dict) and isinstance(raw.get("spans"), list):
-            for record in raw["spans"]:
-                if not isinstance(record, dict) or record.get("state") == "complete":
-                    continue
-                if record.get("key") in planned_keys:
-                    return True
-                url = str(record.get("url", ""))
-                try:
-                    start = int(record.get("start", -1))
-                    end = int(record.get("end", -2))
-                except (TypeError, ValueError):
-                    continue
-                for p_url, p_start, p_end in planned_ranges:
-                    if url == p_url and start <= p_end and end >= p_start:
-                        return True
-        # Manifest missing/torn: a .part whose filename key is in the plan
-        # still carries resumable bytes.
-        return any(part.stem in planned_keys for part in orphan.glob("*.part"))
+class _SpanCache(SpanCache):
+    """Synchronous S1 compatibility facade; recovery remains remote-owned."""
 
     def fetch(self, spans: Sequence[RangeSpan]) -> dict[str, bytes]:
-        """Return ``{label: bytes}`` for every span, resuming partials.
+        listed = tuple(spans)
+        self._gc_orphans_once(listed)
 
-        Pending spans fetch sequentially through
-        ``RangeFetcher.fetch_into`` on one shared async loop (the AIMD
-        window still parallelizes a span's own chunk stream); completed
-        records read back from their ``.part`` files.
-        """
-        span_tuple = tuple(spans)
-        if not span_tuple:
-            return {}
-        self._gc_orphans_once(span_tuple)
-        records = [self._record_for(span) for span in span_tuple]
-        pending = [
-            span
-            for span, record in zip(span_tuple, records, strict=True)
-            if record["state"] != "complete"
-        ]
-        if pending:
-            run_sync(self._fetch_pending(pending))
-        bodies: dict[str, bytes] = {}
-        for span, record in zip(span_tuple, records, strict=True):
-            payload = self._read_part(span, record)
-            if not self._sha1_ok(record, self._part_path(record["key"])):
-                # Same-size corruption slipped past the honor check: refetch
-                # the span from byte 0 and verify once more.
-                part = self._part_path(record["key"])
-                part.unlink(missing_ok=True)
-                record["state"] = "pending"
-                record["part_size"] = 0
-                record.pop("sha1", None)
-                run_sync(self._fetch_pending((span,)))
-                payload = self._read_part(span, record)
-            bodies[span.label] = payload
-        return bodies
+        async def stage() -> None:
+            async with _span_fetcher_cm(listed) as fetcher:
+                await asyncio.gather(*(self.stage(span, fetcher) for span in listed))
 
-    def finalize(self) -> None:
-        """Delete ``.part`` payloads; the kept manifest is the audit record."""
-        for part in self.dir.glob("*.part"):
-            part.unlink(missing_ok=True)
+        run_sync(stage())
+        return {
+            span.label: self._read_part(span, self._record_for(span)) for span in listed
+        }
 
 
 def _strip_tables_from_probes(
-    bodies: Mapping[str, bytes],
-    *,
-    samples: int,
+    bodies: Mapping[str, bytes], *, samples: int
 ) -> tuple[list[int], list[int], int]:
-    """Parse strip tables from IFD probe bodies for an uncompressed strip TIFF."""
-    del samples
-    header = _probe_body(bodies, "tiff-header")
-    ifd_offset, endian, bigtiff = _parse_tiff_header(header)
-    regions = _probe_regions(bodies)
-    ifd_body = _ifd_bytes_from_regions(regions, ifd_offset)
-    tags = _parse_ifd_tags(
-        ifd_body,
-        endian=endian,
-        bigtiff=bigtiff,
-        regions=regions,
-        ifd_file_offset=ifd_offset,
+    """Wrap :func:`faninsar.io.tiff._strip_tables_from_probes` with product errors."""
+    try:
+        return tiff._strip_tables_from_probes(bodies, samples=samples)
+    except ValueError as error:
+        return reject_product(str(error))
+
+
+def _validate_strip_tables(
+    offsets: Sequence[int],
+    counts: Sequence[int],
+    *,
+    rows_per_strip: int,
+    row_stride: int,
+) -> int:
+    """Wrap :func:`faninsar.io.tiff._validate_strip_tables` with product errors."""
+    try:
+        return tiff._validate_strip_tables(
+            offsets, counts, rows_per_strip=rows_per_strip, row_stride=row_stride
+        )
+    except ValueError as error:
+        return reject_product(str(error))
+
+
+def _bytes_to_complex_span(
+    raw: bytes,
+    *,
+    n_span_lines: int,
+    samples_per_burst: int,
+    col0: int,
+    n_cols: int,
+) -> np.ndarray:
+    """Decode one whole-row complex-int16 span with product-level errors."""
+    try:
+        return tiff.decode_complex_int16(
+            raw, rows=n_span_lines, samples=samples_per_burst, col0=col0, n_cols=n_cols
+        )
+    except ValueError as error:
+        return reject_product(str(error))
+
+
+def _bytes_to_complex_column(raw: bytes, *, n_cols: int, label: str) -> np.ndarray:
+    """Decode one single-row column span with product-level errors."""
+    try:
+        return tiff.decode_complex_int16(raw, rows=1, samples=n_cols)[0]
+    except ValueError as error:
+        return reject_product(f"column span {label}: {error}")
+
+
+_parse_tiff_header = tiff._parse_tiff_header
+
+
+def _span_cache_for_canvas(
+    work_dir: str | Path,
+    safe_dir: Path,
+    fingerprint: str,
+) -> _SpanCache:
+    """Return the transfer-scratch cache for one CDSE canvas."""
+    from faninsar.stack.layout import s1_transfer_root
+
+    return _SpanCache(
+        s1_transfer_root(work_dir, safe_dir.name),
+        fingerprint,
+        label=safe_dir.name,
     )
-    if any(tag in tags for tag in _TILE_TAGS):
-        reject_product(
-            "tiled measurement TIFF cannot be planned for range fetch; "
-            "row-aligned spans require stripped organization"
-        )
-    compression = _first_int_tag(tags, _TAG_COMPRESSION, endian=endian, default=1)
-    if compression != 1:
-        reject_product(
-            "compressed measurement TIFF cannot be planned for range fetch; "
-            "strip rows have no fixed byte stride"
-        )
-    rows_per_strip = _first_int_tag(tags, _TAG_ROWS_PER_STRIP, endian=endian)
-    if rows_per_strip is None or rows_per_strip <= 0:
-        reject_product("measurement TIFF IFD is missing a positive RowsPerStrip")
-    offsets = _int_tag_values(tags, _TAG_STRIP_OFFSETS, endian=endian)
-    counts = _int_tag_values(tags, _TAG_STRIP_BYTE_COUNTS, endian=endian)
-    if not offsets or not counts:
-        reject_product(
-            "measurement TIFF IFD is missing StripOffsets or StripByteCounts"
-        )
-    if len(offsets) != len(counts):
-        reject_product(
-            "StripOffsets length "
-            f"{len(offsets)} != StripByteCounts length {len(counts)}"
-        )
-    return offsets, counts, rows_per_strip
 
 
 def _assemble_window_samples(
@@ -2778,10 +2726,16 @@ def _assemble_window_samples(
         span_col1 = int(col_match.group(3))
         if not parent_line0 <= span_line < parent_line1:
             continue
+        # ``span_line`` is the absolute physical row; rows in different burst
+        # slots cannot share an absolute line index, so a sibling window's
+        # span is already filtered by the ``parent_line0 <= line < parent_line1``
+        # check above.  A col-span on a row this window owns whose columns do
+        # not match the request is a fetch bug, not a sibling span — fail
+        # closed rather than silently skipping.
         if span_col0 != col0 or span_col1 - span_col0 != n_cols:
             reject_product(
                 f"column span {label} does not match the requested "
-                f"columns [{col0}, {col0 + n_cols})"
+                f"columns {col0}..{col0 + n_cols}"
             )
         canvas[span_line - parent_line0] = _bytes_to_complex_column(
             payload,
@@ -2789,22 +2743,6 @@ def _assemble_window_samples(
             label=label,
         )
     return canvas
-
-
-def _bytes_to_complex_column(
-    raw: bytes,
-    *,
-    n_cols: int,
-    label: str,
-) -> np.ndarray:
-    """Decode one exact-column span payload into ``n_cols`` complex64."""
-    expected = n_cols * _BYTES_PER_COMPLEX_INT16
-    if len(raw) != expected:
-        reject_product(f"column span {label} is {len(raw)} bytes, expected {expected}")
-    pairs = np.frombuffer(raw, dtype="<i2").reshape(n_cols, 2)
-    real = pairs[:, 0].astype(np.float32)
-    imag = pairs[:, 1].astype(np.float32)
-    return (real + 1j * imag).astype(np.complex64)
 
 
 def _fetch_overlap_rectangles(
@@ -2925,6 +2863,7 @@ def _plan_measurement_spans(
     col1: int,
     samples: int,
     fetch_context: _RoiFetchContext | None,
+    max_span_bytes: int | None = MAX_SPAN_BYTES,
 ) -> tuple[RangeSpan, ...]:
     """Plan bounded measurement spans for one parent-line rectangle.
 
@@ -2932,6 +2871,8 @@ def _plan_measurement_spans(
     :func:`_fetch_measurement_bodies` so overlap rectangles reuse cached
     tables and the narrow-ROI bandwidth regime; only the ``RangeSpan``
     planning is returned — callers own the fetch and assembly.
+    ``max_span_bytes=None`` emits each merged contiguous row group as one
+    span (whole-burst block fetches).
     """
     if not url:
         reject_product("CDSE measurement fetch requires a non-empty object URL")
@@ -2957,6 +2898,7 @@ def _plan_measurement_spans(
             n_cols=col1 - col0,
             samples=samples,
         ),
+        max_span_bytes=max_span_bytes,
     )
 
 
@@ -3032,217 +2974,822 @@ def _window_covers_rectangle(
     )
 
 
-def _probe_body(bodies: Mapping[str, bytes], label: str) -> bytes:
-    """Return one named probe body or fail closed."""
-    payload = bodies.get(label)
-    if payload is None:
-        reject_product(f"IFD probe body {label!r} is missing")
-    return payload
+# ---------------------------------------------------------------------------
+# Stage-3 provider-decoupled track materialization
+# ---------------------------------------------------------------------------
 
 
-def _ifd_bytes_from_regions(
-    regions: Sequence[tuple[int, bytes]],
-    ifd_offset: int,
-) -> bytes:
-    """Return the IFD starting at the header pointer inside a covering probe."""
-    for start, payload in regions:
-        relative = ifd_offset - start
-        if relative >= 0 and relative < len(payload):
-            return payload[relative:]
-    return reject_product(
-        f"IFD at file offset {ifd_offset} is not covered by any probe body"
+def _seconds_of_day(value: datetime) -> float:
+    """Return seconds since UTC midnight of one aware datetime."""
+    return (
+        value.hour * 3600.0
+        + value.minute * 60.0
+        + value.second
+        + value.microsecond / 1e6
     )
 
 
-def _parse_tiff_header(header: bytes) -> tuple[int, str, bool]:
-    """Return ``(ifd_offset, endian, bigtiff)`` from a TIFF header probe."""
-    if len(header) < 8:
-        reject_product("TIFF header probe is shorter than 8 bytes")
-    endian_code = header[:2]
-    if endian_code == b"II":
-        endian = "<"
-    elif endian_code == b"MM":
-        endian = ">"
-    else:
-        reject_product(f"unrecognized TIFF byte order {endian_code!r}")
-    magic = struct.unpack_from(f"{endian}H", header, 2)[0]
-    if magic == 42:
-        ifd_offset = int(struct.unpack_from(f"{endian}I", header, 4)[0])
-        return ifd_offset, endian, False
-    if magic == 43:
-        if len(header) < HEADER_PROBE_BYTES:
-            reject_product("BigTIFF header probe is shorter than 16 bytes")
-        offset_size, reserved = struct.unpack_from(f"{endian}HH", header, 4)
-        if offset_size != 8 or reserved != 0:
-            reject_product("BigTIFF header has an unexpected offset size")
-        ifd_offset = int(struct.unpack_from(f"{endian}Q", header, 8)[0])
-        return ifd_offset, endian, True
-    return reject_product(f"unrecognized TIFF magic number {magic}")
+def _burst_sensing_axis_seconds(swath: S1Swath) -> np.ndarray:
+    """Return each burst's ``sensing_time`` as seconds-of-day.
+
+    Catalog ``sensingStart`` hints are wall-clock datetimes, so matching
+    them against parent bursts uses the sensing-time axis (wrapped daily),
+    not ``azimuth_anx_time_s`` — ANX seconds is the cross-mission *pairing*
+    coordinate between two swaths, not a wall-clock match key.
+    """
+    return np.asarray(
+        [_seconds_of_day(burst.sensing_time) for burst in swath.bursts],
+        dtype=np.float64,
+    )
 
 
-def _probe_regions(bodies: Mapping[str, bytes]) -> list[tuple[int, bytes]]:
-    """Map probe labels to ``(file_offset, payload)`` regions."""
-    regions: list[tuple[int, bytes]] = []
-    for label, payload in bodies.items():
-        if label == "tiff-header":
-            start = 0
-        elif label.startswith("ifd-"):
-            start = int(label[4:])
-        elif label.startswith("strip-tables-"):
-            start = int(label[len("strip-tables-") :])
-        else:
+def _burst_window_seconds(swath: S1Swath) -> float:
+    """Return one burst's azimuth extent in seconds (linesPerBurst * ATI)."""
+    return float(swath.lines_per_burst) * float(swath.azimuth_time_interval_s)
+
+
+def _resolve_burst_indices(
+    swath: S1Swath,
+    *,
+    absolute_burst_ids: Sequence[int] | None,
+    catalog_sensing_times: Sequence[datetime] | None = None,
+) -> tuple[int, ...]:
+    """Map requested burst identities to parent ``burst_index`` values.
+
+    CDSE SAFE annotation XML carries no ``absoluteBurstID`` (stage-1
+    finding), so an ``absolute_burst_ids`` selection is resolved through
+    the sensing-time axis: each requested id's catalog ``sensing_time``
+    hint is matched to the parent burst nearest on the swath's time axis
+    within half a burst window — the same tolerance
+    :func:`_common_burst_pairs` uses for cross-mission pairing.  When no
+    ``catalog_sensing_times`` hints are given the ids select bursts by
+    order (``absolute_burst_ids[i]`` picks the ``i``-th nearest burst to
+    that id's relative position), which only holds when ids arrive in
+    ascending azimuth order — callers should prefer the hint form.
+
+    Parameters
+    ----------
+    swath : S1Swath
+        Parsed parent sub-swath.
+    absolute_burst_ids : sequence of int, optional
+        Catalog absolute burst ids to keep.  ``None`` selects every burst.
+    catalog_sensing_times : sequence of datetime, optional
+        Catalog ``sensingStart`` hints aligned with
+        ``absolute_burst_ids``; required for position-correct matching
+        when ids are given.
+
+    Returns
+    -------
+    tuple of int
+        Sorted unique parent burst indices to fetch.
+
+    Raises
+    ------
+    Sentinel1ProductError
+        If a requested burst cannot be matched within half a burst
+        window.
+
+    """
+    n = len(swath.bursts)
+    if absolute_burst_ids is None:
+        return tuple(int(burst.index) for burst in swath.bursts)
+    if not absolute_burst_ids:
+        reject_product("absolute_burst_ids selects no bursts")
+    axis = _burst_sensing_axis_seconds(swath)
+    tolerance = 0.5 * _burst_window_seconds(swath)
+    resolved: set[int] = set()
+    for position, _burst_id in enumerate(absolute_burst_ids):
+        if catalog_sensing_times is not None and position < len(catalog_sensing_times):
+            hint = _seconds_of_day(catalog_sensing_times[position])
+            gaps = np.abs(axis - hint)
+            # Wrap the daily cycle when the axis is a time-of-day axis.
+            gaps = np.minimum(gaps, 86400.0 - gaps)
+            best = int(np.argmin(gaps))
+            if gaps[best] > tolerance:
+                reject_product(
+                    f"no parent burst matches catalog burst "
+                    f"{_burst_id} within half a burst window "
+                    f"(best gap {gaps[best]:.3f}s > {tolerance:.3f}s)"
+                )
+            resolved.add(best)
             continue
-        regions.append((start, payload))
-    return regions
-
-
-def _bytes_at(
-    regions: Sequence[tuple[int, bytes]], offset: int, nbytes: int
-) -> bytes | None:
-    """Return ``nbytes`` at a file offset, or None if no probe covers it."""
-    for start, payload in regions:
-        relative = offset - start
-        if relative >= 0 and relative + nbytes <= len(payload):
-            return payload[relative : relative + nbytes]
-    return None
-
-
-def _parse_ifd_tags(
-    ifd_body: bytes,
-    *,
-    endian: str,
-    bigtiff: bool,
-    regions: Sequence[tuple[int, bytes]],
-    ifd_file_offset: int,
-) -> dict[int, tuple[int, bytes]]:
-    """Parse classic or BigTIFF IFD entries from a probe body."""
-    count_fmt = "Q" if bigtiff else "H"
-    count_size = 8 if bigtiff else 2
-    entry_size = 20 if bigtiff else 12
-    offset_size = 8 if bigtiff else 4
-    if len(ifd_body) < count_size:
-        reject_product("IFD probe is shorter than the directory count")
-    n_entries = int(struct.unpack_from(f"{endian}{count_fmt}", ifd_body, 0)[0])
-    if n_entries <= 0 or n_entries > _MAX_IFD_ENTRIES:
-        reject_product(f"IFD entry count {n_entries} is not usable")
-    needed = count_size + n_entries * entry_size
-    if len(ifd_body) < needed:
-        reject_product(
-            f"IFD probe is {len(ifd_body)} bytes, need {needed} for {n_entries} entries"
-        )
-    tags: dict[int, tuple[int, bytes]] = {}
-    for index in range(n_entries):
-        start = count_size + index * entry_size
-        if bigtiff:
-            tag, typ, count = struct.unpack_from(f"{endian}HHQ", ifd_body, start)
-            value_offset = start + 12
+        # Positional fallback: pick the burst whose ordinal slot matches
+        # the id's rank in the request — only valid for contiguous
+        # ascending-id selections.
+        if len(absolute_burst_ids) == 1:
+            rank = 0
         else:
-            tag, typ, count = struct.unpack_from(f"{endian}HHI", ifd_body, start)
-            value_offset = start + 8
-        payload = _ifd_value_bytes(
-            ifd_body,
-            typ=int(typ),
-            count=int(count),
-            value_offset=value_offset,
-            endian=endian,
-            offset_size=offset_size,
-            regions=regions,
-            ifd_file_offset=ifd_file_offset,
+            rank = round(position * (n - 1) / (len(absolute_burst_ids) - 1))
+        resolved.add(int(swath.bursts[min(rank, n - 1)].index))
+        logger.warning(
+            "absolute_burst_id %s resolved positionally to burst index %d; "
+            "pass catalog_sensing_times for an exact sensing_time match",
+            _burst_id,
+            min(rank, n - 1),
         )
-        tags[int(tag)] = (int(typ), payload)
-    return tags
+    return tuple(sorted(resolved))
 
 
-def _ifd_value_bytes(
-    ifd_body: bytes,
+def _fetch_burst_block(
+    item: Mapping[str, Any],
+    swath: S1Swath,
+    burst_index: int,
     *,
-    typ: int,
-    count: int,
-    value_offset: int,
-    endian: str,
-    offset_size: int,
-    regions: Sequence[tuple[int, bytes]],
-    ifd_file_offset: int,
-) -> bytes:
-    """Return the value bytes of one IFD entry, following file offsets."""
-    unit = _TIFF_TYPE_SIZE.get(typ)
-    if unit is None:
-        reject_product(f"unsupported TIFF field type {typ}")
-    nbytes = unit * count
-    inline = ifd_body[value_offset : value_offset + offset_size]
-    if nbytes <= offset_size:
-        return inline[:nbytes]
-    offset_fmt = "Q" if offset_size == 8 else "I"
-    if len(inline) < offset_size:
-        reject_product("IFD value offset is truncated")
-    pointer = int(struct.unpack_from(f"{endian}{offset_fmt}", inline, 0)[0])
-    payload = _bytes_at(regions, pointer, nbytes)
-    if payload is not None:
-        return payload
-    relative = pointer - ifd_file_offset
-    if relative >= 0 and relative + nbytes <= len(ifd_body):
-        return ifd_body[relative : relative + nbytes]
-    return reject_product(
-        "IFD extra values at file offset "
-        f"{pointer} ({nbytes} bytes) are not in any probe"
+    fetch_context: _RoiFetchContext | None,
+) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+    """Fetch one whole burst's rows and derive its valid-column mask.
+
+    Rows ``burst_index * lines_per_burst`` through ``+lines_per_burst``
+    are range-fetched via :func:`_fetch_measurement_bodies` (reusing the
+    shared strip tables and span cache through ``fetch_context``) and
+    assembled into a full ``(lines_per_burst, samples_per_burst)``
+    complex64 block.  The returned ``line_valid`` keeps only columns the
+    annotation's own ``firstValidSample``/``lastValidSample`` declares
+    valid, so the path-SAFE mask mirrors the parent burst rather than the
+    fetched rectangle.
+    """
+    lpb = int(swath.lines_per_burst)
+    spb = int(swath.samples_per_burst)
+    line0 = int(burst_index) * lpb
+    bodies = _fetch_measurement_bodies(
+        str(item.get("measurement_url", "")),
+        file_size=int(item.get("measurement_size") or 0),
+        line0=line0,
+        line1=line0 + lpb,
+        col0=0,
+        col1=spb,
+        samples=spb,
+        fetch_context=fetch_context,
+    )
+    samples = _assemble_window_samples(
+        bodies,
+        parent_line0=line0,
+        n_lines=lpb,
+        col0=0,
+        n_cols=spb,
+        samples_per_burst=spb,
+    )
+    burst = swath.bursts[int(burst_index)]
+    first = tuple(int(v) for v in burst.first_valid_sample)
+    last = tuple(int(v) for v in burst.last_valid_sample)
+    if len(first) == lpb and len(last) == lpb:
+        line_valid = tuple(
+            (first_i, last_i) for first_i, last_i in zip(first, last, strict=True)
+        )
+    else:
+        line_valid = tuple((0, spb - 1) for _ in range(lpb))
+    return samples, line_valid
+
+
+def _binding_track_key(item: Mapping[str, Any]) -> str | None:
+    """Return the track key from one CDSE binding's orbit-group fields."""
+    return track_group_key(
+        str(item.get("mission_id") or ""),
+        item.get("relative_orbit"),
+        str(item.get("orbit_direction") or ""),
     )
 
 
-def _int_tag_values(
-    tags: Mapping[int, tuple[int, bytes]],
-    tag: int,
+def materialize_cdse_burst_safes(
+    roi: BoundingBox | Points | Polygons | None = None,
+    datetime_range: tuple[datetime, datetime] | None = None,
     *,
-    endian: str,
-) -> list[int]:
-    """Decode an integer TIFF tag into a list of ints."""
-    entry = tags.get(tag)
-    if entry is None:
-        return []
-    typ, payload = entry
-    fmt = _TIFF_INT_FORMAT.get(typ)
-    if fmt is None:
-        reject_product(f"TIFF tag {tag} has non-integer type {typ}")
-    unit = struct.calcsize(fmt)
-    if len(payload) % unit != 0:
-        reject_product(f"TIFF tag {tag} payload is not a whole number of integers")
-    count = len(payload) // unit
-    values = struct.unpack(f"{endian}{count}{fmt}", payload)
-    return [int(value) for value in values]
+    polarizations: Sequence[str] | Literal["all"] = ("VV",),
+    work_dir: str | Path,
+    absolute_burst_ids: Sequence[int] | None = None,
+    catalog_sensing_times: Sequence[datetime] | None = None,
+    items: Sequence[dict[str, Any]] | None = None,
+    orbit_group: str | None = None,
+    **kwargs: Any,
+) -> list[Path]:
+    """Materialize same-track burst path-SAFEs from CDSE range fetches.
 
+    The CDSE counterpart of the ASF burst path: instead of ROI-clipped
+    canvases, each measurement's selected bursts are fetched as whole
+    burst rows and assembled into a
+    ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` path-SAFE readable by
+    :func:`open_safe_product` — the identical
+    structure the ASF burst-extractor path produces, so the provider does
+    not leak upward.
 
-def _first_int_tag(
-    tags: Mapping[int, tuple[int, bytes]],
-    tag: int,
-    *,
-    endian: str,
-    default: int | None = None,
-) -> int | None:
-    """Return the first integer of a tag, or ``default`` when absent."""
-    values = _int_tag_values(tags, tag, endian=endian)
-    if not values:
-        return default
-    return values[0]
+    Parameters
+    ----------
+    roi : BoundingBox, Points, or Polygons, optional
+        Spatial search bound.  Only needed to discover items and to
+        restrict the burst selection to bursts intersecting it; when
+        ``absolute_burst_ids`` is given the id selection already defines
+        the bursts and ``roi`` may be omitted (discovery still uses it
+        when ``items`` is not given).
+    datetime_range : tuple, optional
+        Inclusive acquisition window forwarded to discovery.
+    polarizations : sequence of str or ``"all"``, optional
+        Channels retained as measurement bindings.
+    work_dir : path-like
+        Stack work directory; path-SAFEs land under
+        ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` (or
+        ``inputs/<YYYYMMDD>/<parentBox>`` when no track identity
+        resolves).
+    absolute_burst_ids : sequence of int, optional
+        Catalog absolute burst ids to keep per measurement.  ``None``
+        keeps every burst intersecting ``roi`` (or every burst when
+        ``roi`` is also ``None``).
+    catalog_sensing_times : sequence of datetime, optional
+        Catalog ``sensingStart`` hints aligned with
+        ``absolute_burst_ids``; enables exact sensing_time matching.
+    items : sequence of mapping, optional
+        Pre-bound measurement dicts (``_bind_cdse_item`` output);
+        discovery is skipped when given.
+    orbit_group : {"auto", "require"} or str, optional
+        ``None`` (default) keeps every matched track so each product lands
+        under its own ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>``
+        directory; pass an
+        explicit selector (or ``"auto"``/``"require"``) to narrow to one
+        track.  Same selection contract as
+        :func:`materialize_cdse_roi_safes`.
+    **kwargs : Any
+        Forwarded to :func:`discover_cdse_slc_items` when ``items`` is
+        not given.
 
+    Returns
+    -------
+    list of pathlib.Path
+        Generated path-SAFE directory roots.
 
-def _bytes_to_complex_span(
-    raw: bytes,
-    *,
-    n_span_lines: int,
-    samples_per_burst: int,
-    col0: int,
-    n_cols: int,
-) -> np.ndarray:
-    """Reinterpret a row-labeled span as complex64, slicing fetched columns."""
-    if n_span_lines <= 0 or n_cols <= 0:
-        reject_product("row span assembly requires a positive rectangle")
-    expected_full = n_span_lines * samples_per_burst * _BYTES_PER_COMPLEX_INT16
-    if len(raw) != expected_full:
-        reject_product(
-            f"row span is {len(raw)} bytes, expected {expected_full} whole-row bytes"
+    """
+    from faninsar.missions.s1.io.path_safe import PathBurstPayload, write_path_safe
+
+    roi = normalize_roi_wgs84(roi) if roi is not None else None
+    if items is None:
+        if roi is None:
+            message = (
+                "CDSE burst materialization needs roi for discovery; "
+                "pass roi=... or pre-bound items=..."
+            )
+            reject(message, ValueError, logger=logger)
+        items = discover_cdse_slc_items(
+            roi,
+            datetime_range=datetime_range,
+            polarizations=polarizations,
+            **kwargs,
         )
-    pairs = np.frombuffer(raw, dtype="<i2").reshape(n_span_lines, samples_per_burst, 2)[
-        :, col0 : col0 + n_cols
-    ]
-    real = pairs[..., 0].astype(np.float32)
-    imag = pairs[..., 1].astype(np.float32)
-    return (real + 1j * imag).astype(np.complex64)
+    else:
+        requested = (
+            None if polarizations == "all" else {str(p).upper() for p in polarizations}
+        )
+        items = [
+            binding
+            for binding in items
+            if requested is None or binding.get("polarization") in requested
+        ]
+    if not items:
+        message = "Sentinel-1 CDSE search returned no products"
+        reject(message, ValueError, logger=logger)
+    items = _select_orbit_group(items, orbit_group)
+    if not items:
+        message = (
+            "Sentinel-1 CDSE search returned no products in the selected "
+            f"orbit group {orbit_group!r}"
+        )
+        reject(message, ValueError, logger=logger)
+
+    def _out_dir_for(item: Mapping[str, Any]) -> tuple[Path, str | None]:
+        key = _binding_track_key(item)
+        if key is None:
+            out_dir = Path(work_dir) / "inputs"
+        else:
+            out_dir = track_acquisitions_dir(work_dir, key)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir, key
+
+    paths: list[Path] = []
+    for item in items:
+        out_dir, track_key = _out_dir_for(item)
+        product_id = str(item.get("product_id", "S1_ROI"))
+        fetch_context = _RoiFetchContext()
+        xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
+        if roi is not None and not _roi_overlaps_geolocation(xml_text, roi):
+            logger.warning(
+                "Skipping CDSE measurement %s %s %s: "
+                "ROI is outside the geolocation envelope",
+                item.get("product_id", "?"),
+                item.get("swath", "?"),
+                item.get("polarization", "?"),
+            )
+            continue
+        swath = parse_annotation_xml(
+            xml_text,
+            annotation_path=str(item.get("annotation_url", "cdse://annotation.xml")),
+            measurement_path=str(
+                item.get("measurement_url", "cdse://measurement.tiff")
+            ),
+        )
+        indices = _resolve_burst_indices(
+            swath,
+            absolute_burst_ids=absolute_burst_ids,
+            catalog_sensing_times=catalog_sensing_times,
+        )
+        if roi is not None:
+            # Drop resolved bursts outside the ROI's line envelope so an
+            # explicit id selection can still be bounded spatially.
+            l0, l1, _c0, _c1 = invert_geolocation_grid(xml_text, roi)
+            lpb = int(swath.lines_per_burst)
+            indices = tuple(
+                index
+                for index in indices
+                if (index * lpb) < l1 and ((index + 1) * lpb) > l0
+            )
+        if not indices:
+            logger.warning(
+                "Skipping CDSE measurement %s: no resolved burst intersects the ROI",
+                product_id,
+            )
+            continue
+        payloads: list[PathBurstPayload] = []
+        for index in indices:
+            block, line_valid = _fetch_burst_block(
+                item,
+                swath,
+                index,
+                fetch_context=fetch_context,
+            )
+            payloads.append(
+                PathBurstPayload(
+                    burst_index=int(index),
+                    samples=block,
+                    line_valid=line_valid,
+                    absolute_burst_id=swath.bursts[int(index)].absolute_burst_id,
+                )
+            )
+        result = write_path_safe(
+            swath,
+            payloads,
+            track_key or "000?",
+            out_dir,
+            annotation_xml=xml_text,
+            product_id=None,
+            ipf_version=item.get("ipf_version"),
+        )
+        paths.append(result.safe_root)
+    if not paths:
+        message = "Sentinel-1 CDSE search produced no burst SAFEs"
+        reject(message, ValueError, logger=logger)
+    return paths
+
+
+def _asf_item_science(item: Any) -> dict[str, Any]:
+    """Return the stage-1 ASF science properties of one catalog item."""
+    props = getattr(item.acquisition, "properties", {}) or {}
+    raw = getattr(item, "raw_metadata", {}) or {}
+    nested = raw.get("properties") if isinstance(raw, Mapping) else {}
+    return {
+        "absoluteBurstID": (
+            props.get("absoluteBurstID") or props.get("BURST_ID_ABSOLUTE")
+        ),
+        "relativeBurstID": props.get("relativeBurstID")
+        or props.get("BURST_ID_RELATIVE"),
+        "relativeOrbit": props.get("relativeOrbit") or props.get("PATH_NUMBER"),
+        "orbitDirection": props.get("orbitDirection")
+        or props.get("ASCENDING_DESCENDING"),
+        "mission": props.get("mission") or props.get("MISSION_NAME"),
+        "sensingStart": props.get("sensingStart") or props.get("SENSING_START"),
+        "nested": nested if isinstance(nested, Mapping) else {},
+    }
+
+
+def _asf_item_track_key(item: Any) -> str | None:
+    """Return the track key from one ASF catalog item's science fields."""
+    science = _asf_item_science(item)
+    return track_group_key(
+        str(science.get("mission") or ""),
+        science.get("relativeOrbit"),
+        str(science.get("orbitDirection") or ""),
+    )
+
+
+def _asf_sensing_time(item: Any) -> datetime | None:
+    """Return the catalog ``sensingStart`` of one ASF burst item."""
+    science = _asf_item_science(item)
+    value = science.get("sensingStart")
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def asf_burst_selectors(
+    items: Sequence[Any],
+) -> tuple[list[int], list[datetime]]:
+    """Map ASF burst items to CDSE ``absolute_burst_ids``/``sensing`` hints.
+
+    ``from_search`` searches on ASF but may download on CDSE.  The two
+    catalogs share the ``absoluteBurstID`` namespace and the sensing-time
+    axis, so an ASF item's ``absoluteBurstID`` + ``sensingStart`` is the
+    selector that re-finds the same bursts inside a CDSE-discovered parent
+    frame (``_resolve_burst_indices``).
+
+    Returns
+    -------
+    tuple of (list of int, list of datetime)
+        Aligned ``absolute_burst_ids`` and ``catalog_sensing_times`` for
+        :func:`materialize_s1_acquisitions`.  Items lacking either field
+        are skipped.
+
+    """
+    ids: list[int] = []
+    times: list[datetime] = []
+    for item in items:
+        science = _asf_item_science(item)
+        absolute = science.get("absoluteBurstID")
+        sensing = _asf_sensing_time(item)
+        if absolute is None or sensing is None:
+            continue
+        ids.append(int(absolute))
+        times.append(sensing)
+    return ids, times
+
+
+def asf_frame_selectors(
+    items: Sequence[Any],
+) -> tuple[tuple[datetime, datetime] | None, set[str]]:
+    """Map ASF frame-granule items to a CDSE rediscovery window + tracks.
+
+    ASF burst-level searches return whole-frame SLC granules (the burst
+    extractor splits them downstream), so there is no ``absoluteBurstID``
+    to match — the bridge to CDSE is the sensing-time window plus the
+    track identity (mission + relativeOrbit + orbitDirection).  Returns
+    the ``datetime_range`` that bounds every item's sensing window and the
+    set of track keys those items belong to, so a CDSE re-discovery can be
+    narrowed to the same frames instead of the whole ROI/time envelope.
+
+    Returns
+    -------
+    tuple of (datetime_range or None, set of str)
+        ``(min(start), max(end))`` across items and the resolved
+        ``track_key`` set (e.g. ``{"88A", "117A"}``).
+
+    """
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    tracks: set[str] = set()
+    for item in items:
+        acquisition = getattr(item, "acquisition", None)
+        start = getattr(acquisition, "start", None)
+        end = getattr(acquisition, "end", None)
+        if isinstance(start, datetime):
+            starts.append(start if start.tzinfo else start.replace(tzinfo=UTC))
+        if isinstance(end, datetime):
+            ends.append(end if end.tzinfo else end.replace(tzinfo=UTC))
+        key = _asf_item_track_key(item)
+        if key is not None:
+            tracks.add(key)
+    window = (min(starts), max(ends)) if starts and ends else None
+    return window, tracks
+
+
+def materialize_asf_burst_safes(
+    items: Sequence[Any],
+    *,
+    work_dir: str | Path,
+    download: Any | None = None,
+    polarizations: Sequence[str] | Literal["all"] = ("VV",),
+    on_exclusion: Any | None = None,
+) -> list[Path]:
+    """Download ASF burst products and reassemble them into path-SAFEs.
+
+    Each ASF ``SLC-BURST`` catalog item is a one-burst SAFE zip.  The
+    items are downloaded into the track-aware staging root (already
+    ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` via
+    :func:`~faninsar.missions.s1.search.local_destination`), opened, and
+    each same-track group's bursts are reassembled into a single
+    path-SAFE directory — the same on-disk structure the CDSE burst path
+    emits, so ``provider`` never surfaces above this layer.
+
+    Parameters
+    ----------
+    items : sequence of CatalogItem
+        ASF burst catalog items (``dataset=SLC-BURST``).  Their
+        ``acquisition.properties`` carry the stage-1 pass-through fields
+        ``absoluteBurstID``/``relativeOrbit``/``orbitDirection``/
+        ``mission``/``sensingStart``.
+    work_dir : path-like
+        Stack work directory; downloads and path-SAFEs land under
+        ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` when the track
+        resolves.
+    download : callable, optional
+        ``(asset, destination) -> Path`` transfer hook; defaults to
+        :func:`faninsar.remote.download`.  Tests inject a fake.
+    polarizations : sequence of str or ``"all"``, optional
+        Channels retained when opening downloaded products.
+    on_exclusion : callable, optional
+        ``(item, destination)`` hook invoked when one item's download
+        fails provider checksum verification (``RemoteIntegrityError``
+        reason ``checksum_mismatch``); the item is skipped and other
+        downloads continue.  Other download errors stay fail-closed.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Generated path-SAFE directory roots, one per same-track group.
+
+    """
+    from faninsar.missions.s1.io.export import _read_annotation_source
+    from faninsar.missions.s1.io.path_safe import PathBurstPayload, write_path_safe
+    from faninsar.missions.s1.io.read import read_full_burst
+    from faninsar.missions.s1.safe import open_safe_product
+    from faninsar.missions.s1.search import (
+        complete_safe_asset,
+        local_destination,
+    )
+
+    if not items:
+        message = "Sentinel-1 ASF search returned no burst products"
+        reject(message, ValueError, logger=logger)
+    if download is None:
+        from faninsar import remote
+
+        download = remote.download
+
+    requested = (
+        None if polarizations == "all" else {str(p).upper() for p in polarizations}
+    )
+    root = Path(work_dir)
+
+    # Download every burst zip into the track-aware staging root.  A
+    # download whose bytes fail provider checksum verification is skipped
+    # (reported through ``on_exclusion``) while other items continue;
+    # every other download failure stays fail-closed.
+    from faninsar import remote as _remote
+
+    staged: list[tuple[Any, Path]] = []
+    for item in items:
+        asset = complete_safe_asset(item)
+        destination = local_destination(root, item, asset)
+        try:
+            staged.append((item, download(asset, destination)))
+        except _remote.RemoteIntegrityError as integrity_error:
+            if integrity_error.reason != "checksum_mismatch":
+                raise
+            logger.warning(
+                "Sentinel-1 input failed download verification and was "
+                "excluded: %s; delete the recorded file and re-download it "
+                "before processing.",
+                destination,
+            )
+            if on_exclusion is not None:
+                on_exclusion(item, destination)
+    if not staged:
+        message = (
+            "every Sentinel-1 input failed download verification; delete "
+            "the recorded files and re-download them before preparing"
+        )
+        reject(message, ValueError, logger=logger)
+
+    # Group by (track key, sensing date, swath, polarization) so one
+    # path-SAFE gathers one date's bursts of one measurement.
+    groups: dict[tuple[str, str, str, str], list[tuple[Any, Path]]] = {}
+    for item, path in staged:
+        science = _asf_item_science(item)
+        track_key = _asf_item_track_key(item) or "000?"
+        sensing = _asf_sensing_time(item)
+        date_key = sensing.strftime("%Y%m%d") if sensing else "undated"
+        swath_name = str(
+            science.get("nested", {}).get("swath")
+            or getattr(item.acquisition, "beam_mode", None)
+            or "IW"
+        )
+        polarization = str(
+            science.get("nested", {}).get("polarization")
+            or getattr(item.acquisition, "polarization", None)
+            or "VV"
+        ).upper()
+        if requested is not None and polarization not in requested:
+            continue
+        groups.setdefault((track_key, date_key, swath_name, polarization), []).append(
+            (item, path)
+        )
+
+    paths: list[Path] = []
+    for (track_key, _date, _swath_name, _pol), members in sorted(groups.items()):
+        out_dir = (
+            track_acquisitions_dir(root, track_key)
+            if track_key != "000?"
+            else root / "inputs"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Each member is an independent one-burst product; every payload
+        # carries its own annotation so write_path_safe sees the group as
+        # N documents ordered by sensing_time.
+        parent_swath = None
+        ipf_versions: set[str | None] = set()
+        payloads: list[PathBurstPayload] = []
+        for item, path in members:
+            product = open_safe_product(
+                path,
+                polarizations=(None if requested is None else tuple(sorted(requested))),
+            )
+            if not product.swaths:
+                continue
+            swath = product.swaths[0]
+            ipf_versions.add(product.ipf_version)
+            if parent_swath is None:
+                parent_swath = swath
+            science = _asf_item_science(item)
+            burst = swath.bursts[0]
+            array = read_full_burst(
+                swath,
+                burst_index=int(burst.index),
+                full_range=True,
+            ).samples
+            absolute = science.get("absoluteBurstID")
+            payloads.append(
+                PathBurstPayload(
+                    burst_index=int(burst.index),
+                    samples=array,
+                    line_valid=None,
+                    absolute_burst_id=(int(absolute) if absolute is not None else None),
+                    annotation_xml=_read_annotation_source(swath),
+                )
+            )
+        if parent_swath is None or not payloads:
+            continue
+        if len(ipf_versions) > 1:
+            reject_product(
+                "same-date ASF bursts come from different IPF versions: "
+                f"{sorted(str(v) for v in ipf_versions)}"
+            )
+        result = write_path_safe(
+            parent_swath,
+            payloads,
+            track_key,
+            out_dir,
+            ipf_version=next(iter(ipf_versions)),
+        )
+        paths.append(result.safe_root)
+    if not paths:
+        message = "Sentinel-1 ASF downloads produced no burst SAFEs"
+        reject(message, ValueError, logger=logger)
+    return paths
+
+
+def _search_asf_burst_items(
+    roi: BoundingBox | Points | Polygons,
+    *,
+    datetime_range: tuple[datetime, datetime] | None,
+    polarizations: Sequence[str] | Literal["all"],
+    **kwargs: Any,
+) -> list[Any]:
+    """Search ASF ``SLC-BURST`` catalog items for the burst path.
+
+    Delegates to :meth:`S1Stack.search` so the mission-owned query
+    composition (dataset/processingLevel/polarization filters, canonical
+    ordering) is reused rather than duplicated here.
+    """
+    from faninsar.missions.s1.stack import S1Stack
+
+    return list(
+        S1Stack.search(
+            roi,
+            polarizations=polarizations,
+            datetime_range=datetime_range,
+            **kwargs,
+        )
+    )
+
+
+def materialize_s1_acquisitions(
+    roi: BoundingBox | Points | Polygons,
+    datetime_range: tuple[datetime, datetime] | None = None,
+    *,
+    provider: Literal["cdse", "asf"] | None = None,
+    granularity: str = "burst",
+    polarizations: Sequence[str] | Literal["all"] = ("VV",),
+    work_dir: str | Path,
+    absolute_burst_ids: Sequence[int] | None = None,
+    items: Sequence[Any] | None = None,
+    orbit_group: str | None = None,
+    **kwargs: Any,
+) -> list[Path]:
+    """Unified provider-decoupled acquisition materialization entry.
+
+    Dispatches to the CDSE range-fetch path (default) or the ASF
+    burst-extractor path; both emit
+    ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` path-SAFE directories
+    readable by :func:`open_safe_product`, so the chosen provider never
+    surfaces above this seam.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Points, or Polygons
+        Spatial search/selection bound.
+    datetime_range : tuple, optional
+        Inclusive acquisition window.
+    provider : {"cdse", "asf"} or None, optional
+        ``None`` (default) lets :func:`resolve_roi_acquisition` infer the
+        provider from ``granularity`` (``"roi"``/``"burst"`` → ``"cdse"``).
+        ``"cdse"`` range-fetches windows out of CDSE full products;
+        ``"asf"`` downloads ASF burst-extractor zips and reassembles them
+        into the same path-SAFE structure.  An explicit provider must be
+        compatible with ``granularity`` (``"roi"`` is CDSE-only;
+        ``"burst"`` works on both).
+    granularity : {"roi", "burst"}, optional
+        ``"burst"`` (default) materializes whole-burst path-SAFEs;
+        ``"roi"`` keeps the legacy CDSE ROI-canvas behaviour
+        (``materialize_cdse_roi_safes``).  ``"scene"`` is rejected — this
+        entry only emits path-SAFE acquisitions; whole-frame scenes are
+        downloaded externally and enter through ``from_safes``.
+    polarizations : sequence of str or ``"all"``, optional
+        Channels retained.
+    work_dir : path-like
+        Stack work directory; output lands under
+        ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>``.
+    absolute_burst_ids : sequence of int, optional
+        Catalog absolute burst ids to keep (matched through
+        ``sensing_time`` on CDSE).  ``None`` keeps every burst
+        intersecting ``roi``.  CDSE burst path only.
+    items : sequence, optional
+        Pre-selected catalog items (CDSE bindings or ASF CatalogItems);
+        skips internal search when given.
+    orbit_group : {"auto", "require"} or str, optional
+        Orbit-group selection policy (CDSE path).  ``None`` (default) keeps
+        every matched track so each lands under its own
+        ``tracks/<trackKey>/acquisitions/<YYYYMMDD>/<parentBox>`` directory — the
+        multi-track behaviour.  ``"auto"``/``"require"``/an explicit selector
+        narrow to a
+        single track.  ROI downloads across selected tracks share one
+        transfer pool while retaining per-track canvas destinations.
+    **kwargs : Any
+        Routed extras.  ``dem`` and ``coreg_mode`` reach the CDSE roi
+        canvas path (geo2rdr inversion / NESD ``listed_indices``);
+        ``download`` and ``on_exclusion`` reach the ASF burst path
+        (transfer hook / checksum-skip exclusion recorder); the rest are
+        forwarded to CDSE item discovery.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Generated SAFE directory roots.
+
+    Raises
+    ------
+    ValueError
+        If the provider/granularity pair is incompatible or discovery
+        returns nothing.
+
+    """
+    resolved_granularity, resolved_provider = resolve_roi_acquisition(
+        granularity,
+        provider,
+    )
+    if resolved_granularity == "scene":
+        # This entry only emits path-SAFE acquisitions (burst rows or the
+        # CDSE roi canvas); whole-frame scene downloads belong to the
+        # caller-driven ``from_safes`` path, not this provider seam.
+        message = (
+            "materialize_s1_acquisitions does not emit whole-frame scenes; "
+            'use granularity="burst"/"roi" or download scenes externally '
+            "and start from from_safes"
+        )
+        reject(message, ValueError, logger=logger)
+    catalog_sensing_times = kwargs.pop("catalog_sensing_times", None)
+    if resolved_provider != "asf":
+        kwargs.pop("on_exclusion", None)
+    if resolved_provider == "asf":
+        if items is None:
+            items = _search_asf_burst_items(
+                roi,
+                datetime_range=datetime_range,
+                polarizations=polarizations,
+                **kwargs,
+            )
+        return materialize_asf_burst_safes(
+            list(items),
+            work_dir=work_dir,
+            download=kwargs.pop("download", None),
+            polarizations=polarizations,
+            on_exclusion=kwargs.pop("on_exclusion", None),
+        )
+    if resolved_granularity == "burst":
+        return materialize_cdse_burst_safes(
+            roi,
+            datetime_range=datetime_range,
+            polarizations=polarizations,
+            work_dir=work_dir,
+            absolute_burst_ids=absolute_burst_ids,
+            catalog_sensing_times=catalog_sensing_times,
+            items=items,
+            orbit_group=orbit_group,
+            **kwargs,
+        )
+    return materialize_cdse_roi_safes(
+        roi,
+        datetime_range=datetime_range,
+        polarizations=polarizations,
+        work_dir=work_dir,
+        granularity=resolved_granularity,
+        items=items,
+        orbit_group=orbit_group,
+        **kwargs,
+    )

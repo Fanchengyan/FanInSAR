@@ -11,7 +11,7 @@ from faninsar.logging import setup_logger
 from faninsar.missions.protocols import DopplerCentroidPolynomial
 
 from .errors import reject_product
-from .types import S1Burst, S1Swath
+from .types import ElevationAngleRecord, S1Burst, S1Swath
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -115,6 +115,44 @@ def _parse_burst_footprints(
     return footprints
 
 
+def _parse_elevation_angle_records(
+    root: ET.Element,
+) -> tuple[ElevationAngleRecord, ...]:
+    """Return annotation ``antennaPattern`` elevation-angle records, if present."""
+    container = next(
+        (child for child in root if _local(child.tag) == "antennaPattern"), None
+    )
+    if container is None:
+        return ()
+    pattern_list = next(
+        (child for child in container if _local(child.tag) == "antennaPatternList"),
+        None,
+    )
+    if pattern_list is None:
+        return ()
+    records: list[ElevationAngleRecord] = []
+    for element in pattern_list:
+        if _local(element.tag) != "antennaPattern":
+            continue
+        azimuth = _optional_text(element, "azimuthTime")
+        taus = _optional_text(element, "slantRangeTime")
+        angles = _optional_text(element, "elevationAngle")
+        if azimuth is None or taus is None or angles is None:
+            continue
+        tau_values = _floats(taus)
+        angle_values = _floats(angles)
+        if len(tau_values) != len(angle_values) or len(tau_values) < 2:
+            continue
+        records.append(
+            ElevationAngleRecord(
+                azimuth_time=_parse_time(azimuth),
+                slant_range_time_s=tau_values,
+                elevation_angle_deg=angle_values,
+            )
+        )
+    return tuple(records)
+
+
 def parse_annotation_xml(
     xml_text: str,
     *,
@@ -154,6 +192,7 @@ def parse_annotation_xml(
     footprints = _parse_burst_footprints(root, lines_per_burst)
     bursts: list[S1Burst] = []
     burst_list = _child(swath_timing, "burstList")
+    saw_absolute_burst_id = False
     for index, burst_el in enumerate(
         child for child in burst_list if _local(child.tag) == "burst"
     ):
@@ -163,6 +202,19 @@ def parse_annotation_xml(
             reject_product(
                 f"burst {index} valid-sample length mismatch in {annotation_path}"
             )
+        # Standard ESA annotation XML carries no absolute-burst id; some
+        # reprocessed/derived products emit ``absoluteBurstID`` or
+        # ``burstIdAbsolute`` and we adopt it when present.
+        absolute_id_text = _optional_text(burst_el, "absoluteBurstID") or (
+            _optional_text(burst_el, "burstIdAbsolute")
+        )
+        absolute_burst_id: int | None = None
+        if absolute_id_text is not None:
+            try:
+                absolute_burst_id = int(absolute_id_text)
+                saw_absolute_burst_id = True
+            except ValueError:
+                absolute_burst_id = None
         bursts.append(
             S1Burst(
                 index=index,
@@ -180,10 +232,19 @@ def parse_annotation_xml(
                     else None
                 ),
                 measurement_path=measurement_path,
+                absolute_burst_id=absolute_burst_id,
             )
         )
     if not bursts:
         reject_product(f"no bursts found in {annotation_path}")
+    if not saw_absolute_burst_id:
+        # ``sensingTime`` plus ``azimuthAnxTime`` remain the cross-mission
+        # matching keys when no annotation-level absolute id exists.
+        logger.debug(
+            "annotation %s exposes no absoluteBurstID; using sensing_time and "
+            "azimuth_anx_time_s as burst matching keys",
+            annotation_path,
+        )
 
     vectors: list[OrbitStateVector] = []
     orbit_list = _child(general, "orbitList")
@@ -233,7 +294,17 @@ def parse_annotation_xml(
         for fm_el in (item for item in child if _local(item.tag) == "azimuthFmRate"):
             poly = _optional_text(fm_el, "azimuthFmRatePolynomial")
             if poly is None:
-                # some products nest coefficients differently
+                # IPF < 2.40 stores coefficients as separate c0, c1, ... elements
+                coeffs = sorted(
+                    (
+                        item
+                        for item in fm_el
+                        if _local(item.tag)[0] == "c" and _local(item.tag)[1:].isdigit()
+                    ),
+                    key=lambda item: int(_local(item.tag)[1:]),
+                )
+                poly = " ".join(item.text.strip() for item in coeffs) or None
+            if poly is None:
                 continue
             fm_rates.append(
                 (
@@ -250,6 +321,7 @@ def parse_annotation_xml(
     # sub-millimetre path error and therefore a radian-scale flattening phase
     # error.  ISCE2 derives the spacing from the sampling rate for this reason.
     range_pixel_spacing_m = SPEED_OF_LIGHT_M_S / (2.0 * range_sampling_rate_hz)
+    ascending_node = _optional_text(image_info, "ascendingNodeTime")
 
     return S1Swath(
         swath=swath_name,  # type: ignore[arg-type]
@@ -278,6 +350,10 @@ def parse_annotation_xml(
         azimuth_fm_rate=tuple(fm_rates),
         azimuth_steering_rate_rad_s=float(_text(product_info, "azimuthSteeringRate"))
         * (3.141592653589793 / 180.0),
+        ascending_node_time=(
+            _parse_time(ascending_node) if ascending_node is not None else None
+        ),
+        elevation_angle_records=_parse_elevation_angle_records(root),
     )
 
 

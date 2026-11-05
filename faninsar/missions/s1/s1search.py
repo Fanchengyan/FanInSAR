@@ -20,13 +20,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
+from faninsar.remote.errors import RemoteQueryError, _fail
 
 if TYPE_CHECKING:
     from faninsar.data.query import BoundingBox, Points, Polygons
-    from faninsar.remote.records import CatalogItem
+    from faninsar.missions.s1.search import S1PolarizationRequest
+    from faninsar.remote.records import CatalogItem, RemoteResourceBudget
 
 logger = setup_logger(__name__)
 
@@ -76,9 +78,16 @@ def _raw(item: CatalogItem) -> Mapping[str, Any]:
 
 def _platform(item: CatalogItem) -> str:
     """Return the short satellite id ``S1A``/``B``/``C``/``D``, or ``""``."""
+    props = getattr(item.acquisition, "properties", {}) or {}
+    nested = _raw(item).get("properties")
+    nested_map = nested if isinstance(nested, Mapping) else {}
     for source in (
         getattr(item.acquisition, "platform", None),
+        props.get("mission"),
+        props.get("platform"),
         _raw(item).get("platform"),
+        nested_map.get("mission"),
+        nested_map.get("platform"),
         _item_id(item)[:3],
     ):
         text = str(source or "").upper().replace("-", "")
@@ -95,6 +104,14 @@ def _start(item: CatalogItem) -> datetime | None:
     if start is None:
         start = _raw(item).get("start")
     return _utc(start)
+
+
+def _end(item: CatalogItem) -> datetime | None:
+    """Return the acquisition stop time across adapter layouts."""
+    end = getattr(item.acquisition, "end", None)
+    if end is None:
+        end = _raw(item).get("end")
+    return _utc(end)
 
 
 def _date_key(item: CatalogItem) -> str:
@@ -135,7 +152,9 @@ class S1Search:
     Attributes
     ----------
     items : tuple of CatalogItem
-        Selected acquisitions in provider-return order.
+        Selected acquisitions.  :func:`search_acquisitions` returns them in
+        canonical order (acquisition start, item ID, asset hrefs); filters
+        and set algebra preserve the left operand's order.
     catalog : str or None
         Registered catalog name that produced the items (``sentinel1-cdse``,
         ``sentinel1-asf``); used by ``from_search`` to pick the provider path.
@@ -154,7 +173,7 @@ class S1Search:
 
     # -- sequence protocol ------------------------------------------------
     def __iter__(self) -> Any:
-        """Iterate the selected acquisitions in provider order."""
+        """Iterate the selected acquisitions in stored order."""
         return iter(self.items)
 
     def __len__(self) -> int:
@@ -285,53 +304,274 @@ class S1Search:
         return ax
 
 
-def search_acquisitions(
-    spatial: BoundingBox | Points | Polygons,
+def _apply_named(
+    merged: dict[str, Any],
+    key: str,
+    value: Any,
     *,
-    catalog: str = "sentinel1-cdse",
-    collections: Sequence[str] | None = None,
-    datetime_range: tuple[datetime, datetime] | None = None,
-    flight_direction: str | None = None,
-    filters: Mapping[str, Any] | None = None,
-    auth_profile: str | None = None,
-    limit: int = 100,
-    budget: Any | None = None,
-) -> S1Search:
-    """Search a registered catalog and return a composable ``S1Search``.
+    name: str,
+) -> None:
+    """Set one ASF filter from a named parameter, overriding its alias."""
+    if key in merged and merged[key] != value:
+        logger.warning(
+            "named %s=%r overrides advanced filter %s=%r",
+            name,
+            value,
+            key,
+            merged[key],
+        )
+    merged[key] = value
 
-    This is the provider-neutral first pass: the spatial + coarse
-    ``datetime_range`` bounds go to the server (cheap traversal), while exact
-    dates / satellites / orbit direction are applied client-side on the
-    returned set.  ``catalog`` selects the provider — ``sentinel1-cdse`` for
-    CDSE range downloads, ``sentinel1-asf`` for ASF burst/scene products.
+
+def _compose_query(
+    *,
+    missions: tuple[str, ...] | None,
+    polarizations: tuple[str, ...] | Literal["all"],
+    flight_direction: str | None,
+    track: int | Sequence[int] | None,
+    burst_id: int | Sequence[int] | None,
+    filters: Mapping[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Compose ASF burst filters with one precedence order.
+
+    Precedence is profile defaults, then validated advanced aliases from
+    ``filters``, then named values.  A named value (including the documented
+    ``polarizations`` default) is authoritative; a named ``None`` for any
+    other optional field leaves the advanced alias effective.  The orbit
+    direction occupies exactly one slot: the dedicated ``flight_direction``
+    argument of :func:`faninsar.remote.search`.
+
+    Returns
+    -------
+    tuple of (dict, str or None)
+        Provider filters and the single effective orbit direction.
+
+    """
+    from faninsar.missions.s1.search import mission_platform_filter, product_filters
+
+    # Profile defaults: the ASF burst dataset/processing level only.
+    merged = product_filters("burst", "all")
+    merged.update(filters)
+
+    alias_direction = merged.pop("flightDirection", None)
+    direction = flight_direction
+    if direction is None:
+        direction = alias_direction
+    elif alias_direction is not None and alias_direction != direction:
+        logger.warning(
+            "named flight_direction=%r overrides advanced filter flightDirection=%r",
+            direction,
+            alias_direction,
+        )
+
+    if missions is not None:
+        _apply_named(
+            merged, "platform", mission_platform_filter(missions), name="missions"
+        )
+    if track is not None:
+        _apply_named(merged, "relativeOrbit", track, name="track")
+    if burst_id is not None:
+        _apply_named(merged, "absoluteBurstID", burst_id, name="burst_id")
+
+    if polarizations != "all" and len(polarizations) == 1:
+        # ASF burst queries accept one polarization per request.
+        _apply_named(merged, "polarization", polarizations[0], name="polarizations")
+    elif "polarization" in merged:
+        # A multi-channel or 'all' request cannot coexist with a
+        # single-channel server filter; channels are selected client-side.
+        logger.warning(
+            "polarizations=%r removes conflicting advanced filter polarization=%r",
+            polarizations,
+            merged.pop("polarization"),
+        )
+    return merged, direction
+
+
+def search_acquisitions(
+    roi: BoundingBox | Points | Polygons,
+    *,
+    missions: str | Sequence[str] | None = None,
+    polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
+    collections: Sequence[str] | None = None,
+    datetime_range: tuple[Any, Any] | None = None,
+    flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
+    track: int | Sequence[int] | None = None,
+    burst_id: int | Sequence[int] | None = None,
+    auth_profile: str | None = "earthdata-asf",
+    limit: int = 10_000,
+    budget: RemoteResourceBudget | None = None,
+    **filters: Any,
+) -> S1Search:
+    """Search Sentinel-1 ASF burst records and return a composable ``S1Search``.
+
+    This is the single Sentinel-1 search implementation; ``S1Stack.search``
+    is the same function.  The spatial bound, coarse ``datetime_range`` and
+    the composed ASF filters go to the server.  Results are then finished
+    locally in one canonical order (acquisition start, item ID, sorted asset
+    hrefs), multi-channel polarization requests are filtered on catalog
+    metadata, and the result is truncated to ``limit``.  The download
+    provider is chosen later in :meth:`S1Stack.from_search`; this search
+    only selects the bursts.
+
+    Filter precedence is: Sentinel-1 burst profile defaults
+    (``dataset="SLC-BURST"``, ``processingLevel="BURST"``), then advanced
+    ``**filters`` aliases, then named parameters.  A named value, including
+    the documented ``polarizations`` default, is authoritative; a named
+    ``None`` leaves the matching advanced alias effective.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Points, or Polygons
+        Search geometry using exact FanInSAR spatial semantics — catalog
+        items are kept only when their footprint intersects it.
+    missions : str or sequence of str, optional
+        Sentinel-1 satellite letters to keep — ``"A"``, ``("A", "C", "D")``,
+        ``"ACD"``, or the ``"S1A"``/``"Sentinel-1B"`` spellings (normalized
+        to letters).  ``None`` (default) keeps every satellite ASF indexes.
+        Translated to the ASF ``platform`` filter.
+    polarizations : sequence of str or str, default ``("VV",)``
+        Channels to keep — ``("VV",)``, ``"VV"``, ``"VV+VH"``, or ``"all"``.
+        Every channel must be requested explicitly with ``"all"``.  A single
+        channel becomes the provider-side ``polarization`` filter; a
+        multi-channel or ``"all"`` request removes any ``polarization``
+        alias and multi-channel results are filtered client-side.
+    collections : sequence of str, optional
+        ASF collections to restrict the query; ``None`` keeps the registered
+        default.
+    datetime_range : tuple of (datetime | str), optional
+        Inclusive ``(start, end)`` acquisition window.  Each bound accepts a
+        ``datetime`` or a ``"YYYY-MM-DD"`` / ``"YYYYMMDD"`` / ``"YYYY/MM/DD"``
+        string.  ``None`` searches the full archive.
+    flight_direction : {"ASCENDING", "DESCENDING"}, optional
+        Orbit direction filter; ``None`` accepts both unless a
+        ``flightDirection`` alias is given.
+    track : int or sequence of int, optional
+        Relative-orbit (track) number(s) to keep — ``117`` or ``[117, 88]``.
+        Translated to the ASF ``relativeOrbit`` filter.
+    burst_id : int or sequence of int, optional
+        ``absoluteBurstID`` value(s) to keep — ``3001`` or ``[3001, 3002]``.
+        Translated to the ASF ``absoluteBurstID`` filter.
+    auth_profile : str, default ``"earthdata-asf"``
+        ASF authentication profile.
+    limit : int, default ``10000``
+        Maximum number of items returned.  The provider stops collecting
+        candidates at this bound (it also sizes the default budget's
+        ``max_items``); canonical ordering and polarization filtering run
+        on those candidates before the final local truncation to ``limit``.
+    budget : RemoteResourceBudget, optional
+        Advanced resource limits; ``limit`` already sizes ``max_items``.
+    **filters : Any
+        Advanced ASF query aliases for fields with no dedicated parameter,
+        validated by the ASF adapter.  Accepted keys:
+
+        - ``beamMode``         : "IW"/"EW"/"WV"/"S1".."S6"
+        - ``lookDirection``    : "LEFT"/"RIGHT"
+        - ``absoluteOrbit``    : absolute orbit number(s)
+        - ``relativeBurstID``  : relative burst id within the track
+        - ``fullBurstID``      : full burst id string
+        - ``groupID`` / ``granule_list`` / ``product_list`` / ``instrument``
+        - ``processingLevel`` / ``dataset`` : override the burst defaults
+        - ``platform`` / ``flightDirection`` / ``relativeOrbit`` /
+          ``absoluteBurstID`` / ``polarization`` : aliases of the dedicated
+          parameters above, which win when given
+
+    Returns
+    -------
+    S1Search
+        Composable search result in canonical acquisition order
+        (``.items``, ``.platforms()``, ``.dates()``, ``.between()``, set
+        algebra); feeds :meth:`S1Stack.from_search` directly.
+
+    Raises
+    ------
+    ValueError
+        If ``polarizations`` is ``None``, a mission/polarization/datetime
+        value is not supported, or a multi-channel burst item lacks
+        unambiguous polarization metadata.
+    RemoteQueryError
+        If ``limit``, ``datetime_range``, ``flight_direction``, or a filter
+        fails remote query validation.
+    RemoteAccessError
+        If the ASF catalog or ``auth_profile`` is not registered.
+
+    Examples
+    --------
+    >>> from faninsar.missions.s1 import S1Stack
+    >>> search = S1Stack.search(  # doctest: +SKIP
+    ...     roi,
+    ...     datetime_range=("2026-01-01", "2026-03-01"),
+    ...     polarizations=("VV",),
+    ...     track=88,
+    ... )
+    >>> stack = S1Stack.from_search(search, roi=roi, work_dir="study")  # doctest: +SKIP
+
     """
     from faninsar import remote
+    from faninsar.missions.s1.search import (
+        canonical_items,
+        ensure_asf_catalog,
+        filter_burst_polarizations,
+        normalize_missions,
+        normalize_polarizations,
+    )
 
-    if catalog == "sentinel1-cdse":
-        from faninsar.remote.providers.cdse import ensure_cdse_catalog
+    if polarizations is None:
+        message = (
+            "polarizations=None is not accepted; use the default ('VV',) or "
+            "request every channel explicitly with polarizations='all'"
+        )
+        reject(message, ValueError, logger=logger)
+    selected_polarizations = normalize_polarizations(polarizations)
+    normalized_missions = normalize_missions(missions)
 
-        ensure_cdse_catalog()
-    if budget is None and limit > 100:
+    catalog = "sentinel1-asf"
+    ensure_asf_catalog(catalog, product_type="burst")
+    merged, direction = _compose_query(
+        missions=normalized_missions,
+        polarizations=selected_polarizations,
+        flight_direction=flight_direction,
+        track=track,
+        burst_id=burst_id,
+        filters=filters,
+    )
+
+    # datetime_range accepts datetimes or date strings.
+    parsed_range: tuple[datetime, datetime] | None = None
+    if datetime_range is not None:
+        lo, hi = datetime_range
+        parsed_range = (_parse_date(lo), _parse_date(hi))
+
+    if limit <= 0:
+        _fail(RemoteQueryError, "invalid_limit")
+    if budget is None:
         budget = remote.RemoteResourceBudget(max_items=limit)
     items = remote.search(
-        spatial,
+        roi,
         catalog=catalog,
         collections=collections,
-        datetime_range=datetime_range,
-        flight_direction=flight_direction,
-        filters=filters,
+        datetime_range=parsed_range,
+        flight_direction=direction,
+        filters=merged,
         auth_profile=auth_profile,
         limit=limit,
         budget=budget,
     )
+    # Canonical local finishing precedes the final local truncation.
+    ordered = canonical_items(items)
+    if selected_polarizations != "all":
+        ordered = filter_burst_polarizations(ordered, selected_polarizations)
     return S1Search(
-        tuple(items),
+        tuple(ordered[:limit]),
         catalog=catalog,
-        spatial=spatial,
+        spatial=roi,
         query={
-            "datetime_range": datetime_range,
-            "flight_direction": flight_direction,
-            "filters": dict(filters or {}),
+            "missions": normalized_missions,
+            "polarizations": selected_polarizations,
+            "datetime_range": parsed_range,
+            "flight_direction": direction,
+            "track": track,
+            "burst_id": burst_id,
+            "filters": dict(filters),
             "collections": tuple(collections) if collections is not None else None,
         },
     )

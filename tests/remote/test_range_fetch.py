@@ -348,8 +348,26 @@ def test_range_fetcher_assembles_out_of_order_spans_by_label() -> None:
     assert assembled == {"slow": b"ABCD", "fast": b"EFGH"}
 
 
-def test_aimd_window_ignores_401_and_halves_on_429() -> None:
-    """401 is auth expiry, not congestion; 429 halves the shared AIMD window."""
+def _aimd_206(payload: bytes, request: web.Request) -> web.StreamResponse:
+    start_s, end_s = request.headers["Range"].removeprefix("bytes=").split("-")
+    start, end = int(start_s), int(end_s)
+    body = payload[start : end + 1]
+    return web.Response(
+        status=206,
+        body=body,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/10",
+            "Content-Encoding": "identity",
+        },
+    )
+
+
+def test_aimd_window_ignores_401_and_halves_on_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """401 is auth expiry, not congestion; 429 halves, then a success probes up."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
     payload = b"ABCDEFGHIJ"
     rate_hits = {"n": 0}
 
@@ -362,17 +380,7 @@ def test_aimd_window_ignores_401_and_halves_on_429() -> None:
                 rate_hits["n"] += 1
                 if rate_hits["n"] == 1:
                     return web.Response(status=429)
-            start_s, end_s = request.headers["Range"].removeprefix("bytes=").split("-")
-            start, end = int(start_s), int(end_s)
-            body = payload[start : end + 1]
-            return web.Response(
-                status=206,
-                body=body,
-                headers={
-                    "Content-Range": f"bytes {start}-{end}/10",
-                    "Content-Encoding": "identity",
-                },
-            )
+            return _aimd_206(payload, request)
 
         async def refresh() -> str:
             return "fresh"
@@ -406,7 +414,351 @@ def test_aimd_window_ignores_401_and_halves_on_429() -> None:
     seed, after_auth, after_rate = asyncio.run(_run())
     assert seed == (20, 20)
     assert after_auth == (20, 20)
-    assert after_rate == (10, 10)
+    # 20 triggered → 15 (3/4); the retry succeeded at 15 → probe toward 20 is 17.
+    assert after_rate == (17, 17)
+
+
+def test_aimd_window_sits_just_below_the_last_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a 429, successes binary-search up and then sit at hi-1."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> list[int]:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            if hits["n"] == 1:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            windows: list[int] = []
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                for i in range(6):
+                    body = await fetcher.fetch(
+                        (RangeSpan(url=url, start=2, end=5, label=f"s{i}"),)
+                    )
+                    assert body == {f"s{i}": b"CDEF"}
+                    windows.append(fetcher.window)
+            return windows
+        finally:
+            await server.close()
+
+    # 429 at 20 → 15, success probes 17, 18, 19, then sit at 19 (hi=20).
+    assert asyncio.run(_run()) == [17, 18, 19, 19, 19, 19]
+
+
+def test_aimd_probe_429_searches_midpoint_not_half(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 on a probe cuts to (lo+hi)/2, not another multiplicative half."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> tuple[int, int]:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            # First fetch: 429 then 206 (20→15, success probes 17).
+            # Second fetch: 429 at the probe, then 206 (walk back to 15,
+            # success probes (15+17)//2 = 16).
+            if hits["n"] in {1, 3}:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                await fetcher.fetch((RangeSpan(url=url, start=2, end=5, label="a"),))
+                after_first = fetcher.window
+                await fetcher.fetch((RangeSpan(url=url, start=6, end=9, label="b"),))
+                return after_first, fetcher.window
+        finally:
+            await server.close()
+
+    assert asyncio.run(_run()) == (17, 16)
+
+
+def test_concurrent_429s_cut_the_window_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight 429s at the same sending window share one decrease."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+    n = 8
+
+    async def _run() -> int:
+        wave = asyncio.Barrier(n)
+        first = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            async with asyncio.Lock():
+                # Count this arrival before the barrier so every first-wave
+                # GET 429s together at window=20.
+                first["n"] += 1
+                idx = first["n"]
+            if idx <= n:
+                await wave.wait()
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            url = str(server.make_url("/obj"))
+            async with RangeFetcher() as fetcher:
+                results = await asyncio.gather(
+                    *[
+                        fetcher.fetch(
+                            (RangeSpan(url=url, start=2, end=5, label=f"s{i}"),)
+                        )
+                        for i in range(n)
+                    ]
+                )
+                assert all(row == {f"s{i}": b"CDEF"} for i, row in enumerate(results))
+                return fetcher.window
+        finally:
+            await server.close()
+
+    # One shared 3/4 20→15, then one shared probe to 17 — not eight cuts to 1.
+    assert asyncio.run(_run()) == 17
+
+
+def test_repeated_429s_on_one_span_do_not_collapse_past_the_first_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retries of the same 429 wave do not keep halving 20→10→5→2→1."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> tuple[int, int]:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            if hits["n"] <= 4:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                body = await fetcher.fetch(
+                    (RangeSpan(url=url, start=2, end=5, label="a"),)
+                )
+                assert body == {"a": b"CDEF"}
+                return hits["n"], fetcher.window
+        finally:
+            await server.close()
+
+    hits, window = asyncio.run(_run())
+    assert hits == 5
+    # First 429 cuts 20→15; the next three retries do not cut again;
+    # the 206 at 15 probes toward 20.
+    assert window == 17
+
+
+def test_inflight_success_at_the_old_window_does_not_reopen_the_429_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 206 already in flight at 20 must not let leftover 429s keep cutting."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> int:
+        slow_hits = {"n": 0}
+        first_429 = asyncio.Event()
+        holder: dict[str, object] = {}
+
+        async def slow(request: web.Request) -> web.StreamResponse:
+            slow_hits["n"] += 1
+            if slow_hits["n"] == 1:
+                first_429.set()
+            if slow_hits["n"] <= 4:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        async def fast(request: web.Request) -> web.StreamResponse:
+            await first_429.wait()
+            fetcher = holder["fetcher"]
+            while fetcher.window == 20:  # type: ignore[attr-defined]
+                await asyncio.sleep(0)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/slow", slow)
+        app.router.add_get("/fast", fast)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            async with RangeFetcher() as fetcher:
+                holder["fetcher"] = fetcher
+                slow_url = str(server.make_url("/slow"))
+                fast_url = str(server.make_url("/fast"))
+                slow_body, fast_body = await asyncio.gather(
+                    fetcher.fetch(
+                        (RangeSpan(url=slow_url, start=2, end=5, label="slow"),)
+                    ),
+                    fetcher.fetch(
+                        (RangeSpan(url=fast_url, start=6, end=9, label="fast"),)
+                    ),
+                )
+                assert slow_body == {"slow": b"CDEF"}
+                assert fast_body == {"fast": b"GHIJ"}
+                return fetcher.window
+        finally:
+            await server.close()
+
+    # Fast 206 was sent at 20; it is not evidence that the reduced window is
+    # safe, so Slow's leftover 429s must not keep cutting 15→10→7→1.
+    assert asyncio.run(_run()) == 17
+
+
+def test_aimd_hold_blocks_probe_while_429s_are_still_arriving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long hold keeps leftover 429s from looking like a failed probe."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 60)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> int:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            if hits["n"] == 1:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                await fetcher.fetch((RangeSpan(url=url, start=2, end=5, label="a"),))
+                return fetcher.window
+        finally:
+            await server.close()
+
+    # 20→15, then the 206 must sit at 15 until the hold elapses.
+    assert asyncio.run(_run()) == 15
+
+
+def test_429_on_a_sitting_ceiling_walks_back_the_climb_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later 429 at 19 walks back 18, not another 3/4 or half."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 0)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> list[int]:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            if hits["n"] in {1, 8}:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            windows: list[int] = []
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                for i in range(8):
+                    body = await fetcher.fetch(
+                        (RangeSpan(url=url, start=2, end=5, label=f"s{i}"),)
+                    )
+                    assert body == {f"s{i}": b"CDEF"}
+                    windows.append(fetcher.window)
+            return windows
+        finally:
+            await server.close()
+
+    # Climb 15→17→18→19, sit, then 429 at 19 walks back to 18.
+    assert asyncio.run(_run()) == [17, 18, 19, 19, 19, 19, 18, 18]
+
+
+def test_second_virgin_429_halves_the_original_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no climb path, 20→15, and a 429 at 15 goes to 10 (half of 20)."""
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._RATE_LIMIT_BACKOFF_S", 0)
+    monkeypatch.setattr("faninsar.remote.fetch.ranges._AIMD_HOLD_S", 60)
+    payload = b"ABCDEFGHIJ"
+
+    async def _run() -> tuple[int, int]:
+        hits = {"n": 0}
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            hits["n"] += 1
+            if hits["n"] in {1, 3}:
+                return web.Response(status=429)
+            return _aimd_206(payload, request)
+
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+            async with RangeFetcher() as fetcher:
+                url = str(server.make_url("/obj"))
+                await fetcher.fetch((RangeSpan(url=url, start=2, end=5, label="a"),))
+                after_first = fetcher.window
+                fetcher._hold_until = 0.0
+                await fetcher.fetch((RangeSpan(url=url, start=6, end=9, label="b"),))
+                return after_first, fetcher.window
+        finally:
+            await server.close()
+
+    assert asyncio.run(_run()) == (15, 10)
 
 
 def test_range_fetcher_has_no_chunk_bytes() -> None:
@@ -571,28 +923,40 @@ def test_https_proxy_url_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
 class _FakeStreamContent:
     """Chunk source shaped like ``response.content`` for the fake response."""
 
-    def __init__(self, body: bytes, *, fail_after: int | None = None) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        fail_after: int | None = None,
+        drop_exc: BaseException | None = None,
+    ) -> None:
         self._body = body
         self._fail_after = fail_after
+        self._drop_exc = drop_exc
         self._drop_message = "simulated mid-stream drop"
 
-    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
+    def _drop(self) -> None:
         import aiohttp
 
+        if self._drop_exc is not None:
+            raise self._drop_exc
+        raise aiohttp.ClientPayloadError(self._drop_message)
+
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
         delivered = 0
         for offset in range(0, len(self._body), n):
             chunk = self._body[offset : offset + n]
             if self._fail_after is not None:
                 remaining = self._fail_after - delivered
                 if remaining <= 0:
-                    raise aiohttp.ClientPayloadError(self._drop_message)
+                    self._drop()
                 if len(chunk) > remaining:
                     yield chunk[:remaining]
-                    raise aiohttp.ClientPayloadError(self._drop_message)
+                    self._drop()
             delivered += len(chunk)
             yield chunk
         if self._fail_after is not None and delivered <= self._fail_after:
-            raise aiohttp.ClientPayloadError(self._drop_message)
+            self._drop()
 
 
 class _FakeRangeResponse:
@@ -643,6 +1007,7 @@ class _RangedFakeResponse:
         *,
         fail_after: int | None = None,
         content_range: str | None = None,
+        drop_exc: BaseException | None = None,
     ) -> None:
         self.status = 206
         body = payload[request_start : request_end + 1]
@@ -650,7 +1015,9 @@ class _RangedFakeResponse:
             "Content-Range": content_range
             or f"bytes {request_start}-{request_end}/{len(payload)}"
         }
-        self.content = _FakeStreamContent(body, fail_after=fail_after)
+        self.content = _FakeStreamContent(
+            body, fail_after=fail_after, drop_exc=drop_exc
+        )
 
     async def __aenter__(self) -> Self:
         return self
@@ -669,11 +1036,13 @@ class _RangedSession:
         drop_at_call: int | None = None,
         fail_after: int | None = None,
         content_range: str | None = None,
+        drop_exc: BaseException | None = None,
     ) -> None:
         self._payload = payload
         self._drop_at_call = drop_at_call
         self._fail_after = fail_after
         self._content_range = content_range
+        self._drop_exc = drop_exc
         self.calls = 0
         self.requests: list[str] = []
 
@@ -696,6 +1065,7 @@ class _RangedSession:
             int(end_s),
             fail_after=fail_after,
             content_range=self._content_range,
+            drop_exc=self._drop_exc,
         )
 
 
@@ -771,6 +1141,48 @@ def test_stream_span_resumes_suffix_after_mid_stream_payload_drop(
     assert bytes(body) == payload[2:10]
     assert session.requests == ["2-9", "4-9"]
     assert session.calls == 2
+
+
+def test_stream_span_resumes_suffix_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-stream TimeoutError is the same class of drop as a payload cut."""
+    from faninsar.remote.fetch import RangeSpan
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    monkeypatch.setattr(ranges_module, "_CONNECT_BACKOFF_S", 0)
+    payload = b"ABCDEFGHIJ"
+    session = _RangedSession(
+        payload, drop_at_call=1, fail_after=2, drop_exc=TimeoutError()
+    )
+    span = RangeSpan(
+        url="https://zipper.example.invalid/obj", start=2, end=9, label="a"
+    )
+    body = bytearray()
+
+    async def _run() -> None:
+        await ranges_module._stream_span(session, span, body.extend, lambda: len(body))
+
+    asyncio.run(_run())
+    assert bytes(body) == payload[2:10]
+    assert session.requests == ["2-9", "4-9"]
+    assert session.calls == 2
+
+
+def test_range_fetcher_session_has_no_total_timeout() -> None:
+    """A live range GET is bounded by idle sockets and suffix retries, not 300s."""
+    from faninsar.remote.fetch import RangeFetcher
+    from faninsar.remote.fetch import ranges as ranges_module
+
+    async def _run() -> tuple[float | None, float | None, float | None]:
+        async with RangeFetcher() as fetcher:
+            timeout = fetcher._session.timeout
+            return timeout.total, timeout.sock_connect, timeout.sock_read
+
+    total, sock_connect, sock_read = asyncio.run(_run())
+    assert total is None
+    assert sock_connect == ranges_module._SOCK_CONNECT_S
+    assert sock_read == ranges_module._SOCK_READ_S
 
 
 def test_stream_span_persistent_payload_drops_raise_after_bounded_retries(
@@ -991,3 +1403,272 @@ def test_range_fetcher_fetch_into_requires_a_tellable_writable_sink() -> None:
 
     with pytest.raises(TypeError):
         asyncio.run(_run())
+
+
+def test_fetch_into_flushes_small_network_chunks_to_part(tmp_path: Path) -> None:
+    """A 4 KiB network prefix is visible on disk before the span ends."""
+    from aiohttp import web
+
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    payload = b"A" * 8192
+    first = 4096
+    part = tmp_path / "span.part"
+    proceed = asyncio.Event()
+    first_sent = asyncio.Event()
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(
+            status=206,
+            headers={
+                "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                "Content-Encoding": "identity",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        await response.prepare(request)
+        await response.write(payload[:first])
+        first_sent.set()
+        await proceed.wait()
+        await response.write(payload[first:])
+        await response.write_eof()
+        return response
+
+    async def _run() -> int:
+        app = web.Application()
+        app.router.add_get("/obj", handler)
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        try:
+            url = str(server.make_url("/obj"))
+            span = RangeSpan(url=url, start=0, end=len(payload) - 1, label="a")
+            async with RangeFetcher() as fetcher:
+                task = asyncio.create_task(fetcher.fetch_into(span, part))
+                await asyncio.wait_for(first_sent.wait(), timeout=5)
+                size = 0
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 2
+                while loop.time() < deadline:
+                    if part.exists():
+                        size = part.stat().st_size
+                        if size >= first:
+                            break
+                    await asyncio.sleep(0.02)
+                proceed.set()
+                await task
+                return size
+        finally:
+            proceed.set()
+            await server.close()
+
+    size_mid = asyncio.run(_run())
+    assert size_mid >= first
+    assert part.read_bytes() == payload
+
+
+# ---------------------------------------------------------------------------
+# Resume revision pinning (PROPOSAL-0071): ETag recorded at byte 0, If-Range
+# on resume, a changed object surfaces as ``revision_changed``.
+# ---------------------------------------------------------------------------
+
+
+async def _serve_versioned(
+    versions: dict[str, bytes],
+    current: list[str],
+    seen: list[dict[str, str]],
+) -> TestServer:
+    """Serve ``versions[current[0]]`` with RFC 9110 ``If-Range`` semantics."""
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        seen.append(dict(request.headers))
+        tag = current[0]
+        body = versions[tag]
+        etag = f'"{tag}"'
+        if_range = request.headers.get("If-Range")
+        if if_range is not None and if_range != etag:
+            return web.Response(status=200, body=body, headers={"ETag": etag})
+        first, last = request.headers["Range"].removeprefix("bytes=").split("-")
+        start, end = int(first), int(last)
+        return web.Response(
+            status=206,
+            body=body[start : end + 1],
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(body)}",
+                "ETag": etag,
+            },
+        )
+
+    app = web.Application()
+    app.router.add_get("/obj", handler)
+    server = TestServer(app, host="127.0.0.1")
+    await server.start_server()
+    return server
+
+
+def test_fetch_into_reports_the_etag_of_a_span_started_at_byte_zero(
+    tmp_path: Path,
+) -> None:
+    """A fresh span reports its strong ETag and sends no If-Range."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+    learned: list[str] = []
+    part = tmp_path / "span.part"
+
+    async def _run() -> None:
+        server = await _serve_versioned({"v1": b"ABCDEFGHIJ"}, ["v1"], seen)
+        try:
+            span = RangeSpan(str(server.make_url("/obj")), 2, 9, "a")
+            async with RangeFetcher() as fetcher:
+                await fetcher.fetch_into(span, part, on_etag=learned.append)
+        finally:
+            await server.close()
+
+    asyncio.run(_run())
+    assert learned == ['"v1"']
+    assert "If-Range" not in seen[0]
+    assert part.read_bytes() == b"CDEFGHIJ"
+
+
+def test_fetch_into_sends_if_range_when_resuming_a_pinned_prefix(
+    tmp_path: Path,
+) -> None:
+    """A recorded ETag rides the resume as If-Range; 206 appends the suffix."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+    part = tmp_path / "span.part"
+    part.write_bytes(b"CD")
+
+    async def _run() -> None:
+        server = await _serve_versioned({"v1": b"ABCDEFGHIJ"}, ["v1"], seen)
+        try:
+            span = RangeSpan(str(server.make_url("/obj")), 2, 9, "a")
+            async with RangeFetcher() as fetcher:
+                await fetcher.fetch_into(span, part, etag='"v1"')
+        finally:
+            await server.close()
+
+    asyncio.run(_run())
+    assert [(h["Range"], h.get("If-Range")) for h in seen] == [("bytes=4-9", '"v1"')]
+    assert part.read_bytes() == b"CDEFGHIJ"
+
+
+def test_fetch_into_rejects_a_changed_revision_without_appending(
+    tmp_path: Path,
+) -> None:
+    """A 200 answer to If-Range raises revision_changed; the prefix is untouched."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+    part = tmp_path / "span.part"
+    part.write_bytes(b"CD")
+
+    async def _run() -> None:
+        server = await _serve_versioned({"v2": b"abcdefghij"}, ["v2"], seen)
+        try:
+            span = RangeSpan(str(server.make_url("/obj")), 2, 9, "a")
+            async with RangeFetcher() as fetcher:
+                await fetcher.fetch_into(span, part, etag='"v1"')
+        finally:
+            await server.close()
+
+    with pytest.raises(RemoteIntegrityError) as raised:
+        asyncio.run(_run())
+    assert raised.value.reason == "revision_changed"
+    assert len(seen) == 1
+    assert part.read_bytes() == b"CD"
+
+
+def test_fetch_into_without_a_recorded_etag_resumes_unvalidated(
+    tmp_path: Path,
+) -> None:
+    """No recorded ETag keeps today's contract: no If-Range on resume."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+    learned: list[str] = []
+    part = tmp_path / "span.part"
+    part.write_bytes(b"CD")
+
+    async def _run() -> None:
+        server = await _serve_versioned({"v1": b"ABCDEFGHIJ"}, ["v1"], seen)
+        try:
+            span = RangeSpan(str(server.make_url("/obj")), 2, 9, "a")
+            async with RangeFetcher() as fetcher:
+                await fetcher.fetch_into(span, part, on_etag=learned.append)
+        finally:
+            await server.close()
+
+    asyncio.run(_run())
+    assert [(h["Range"], h.get("If-Range")) for h in seen] == [("bytes=4-9", None)]
+    # A resumed (non-zero) start never records a validator for the prefix.
+    assert learned == []
+    assert part.read_bytes() == b"CDEFGHIJ"
+
+
+def test_fetch_into_rejects_changed_etag_even_on_exact_206(tmp_path: Path) -> None:
+    """A server ignoring If-Range cannot append a new revision's suffix."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+
+    class ChangedSession(_RangedSession):
+        def get(self, url: str, **kwargs: object) -> _RangedFakeResponse:
+            seen.append(dict(kwargs["headers"]))
+            response = super().get(url, **kwargs)
+            response.headers["ETag"] = '"v2"'
+            return response
+
+    part = tmp_path / "span.part"
+    part.write_bytes(b"AB")
+    fetcher = RangeFetcher()
+    fetcher._session = ChangedSession(b"abcdefghij")
+    with pytest.raises(RemoteIntegrityError, match="revision"):
+        asyncio.run(fetcher.fetch_into(RangeSpan("https://example.test/o", 0, 9, "x"), part, etag='"v1"'))
+    assert seen[0]["If-Range"] == '"v1"'
+    assert part.read_bytes() == b"AB"
+
+
+def test_fetch_into_does_not_send_saved_weak_validator(tmp_path: Path) -> None:
+    """A weak validator loaded from old progress is never sent as If-Range."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    seen: list[dict[str, str]] = []
+
+    class WeakSession(_RangedSession):
+        def get(self, url: str, **kwargs: object) -> _RangedFakeResponse:
+            seen.append(dict(kwargs["headers"]))
+            return super().get(url, **kwargs)
+
+    part = tmp_path / "span.part"
+    part.write_bytes(b"AB")
+    fetcher = RangeFetcher()
+    fetcher._session = WeakSession(b"ABCDEFGHIJ")
+    asyncio.run(fetcher.fetch_into(RangeSpan("https://example.test/o", 0, 9, "x"), part, etag='W/"v1"'))
+    assert "If-Range" not in seen[0]
+    assert part.read_bytes() == b"ABCDEFGHIJ"
+
+
+def test_fetch_into_ignores_weak_etags() -> None:
+    """Weak validators cannot pin byte ranges (RFC 9110 If-Range)."""
+    from faninsar.remote.fetch import RangeFetcher, RangeSpan
+
+    class _WeakSession(_RangedSession):
+        def get(self, url: str, **kwargs: object) -> _RangedFakeResponse:
+            response = super().get(url, **kwargs)
+            response.headers["ETag"] = 'W/"v1"'
+            return response
+
+    import io
+
+    fetcher = RangeFetcher()
+    fetcher._session = _WeakSession(b"ABCDEFGHIJ")
+    learned: list[str] = []
+    span = RangeSpan("https://zipper.example.invalid/obj", 0, 9, "a")
+
+    async def _run() -> int:
+        return await fetcher.fetch_into(span, io.BytesIO(), on_etag=learned.append)
+
+    assert asyncio.run(_run()) == 10
+    assert learned == []

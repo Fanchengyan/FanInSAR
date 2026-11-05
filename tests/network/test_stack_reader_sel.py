@@ -250,6 +250,69 @@ def test_sel_rejects_invalid_args(tmp_path: Path) -> None:
         collection.sel(looks=(10, 4, 2))  # type: ignore[arg-type]
 
 
+def test_sel_polygon_requires_multi_polygon_roi(tmp_path: Path) -> None:
+    """sel(polygon=) is only valid when the effective ROI has > 1 polygon."""
+    stack = _planned_stack(tmp_path)
+    collection = StackInterferogramCollection(stack)
+
+    # No ROI configured: roi_polygon_count == 0.
+    assert stack.roi_polygon_count == 0
+    with pytest.raises(ValueError, match="multi-polygon ROI"):
+        collection.sel(polygon=0)
+
+
+def test_sel_polygon_reads_the_polygon_subtree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sel(polygon=i) reads the ``ifg/ml_AxR/<pair>/p<i>`` subtree."""
+    from faninsar.io.storage.ifg_store import write_ifg_artifact
+
+    stack = _planned_stack(tmp_path)
+    monkeypatch.setattr(
+        type(stack), "roi_polygon_count", property(lambda _self: 2)
+    )
+    phase_p0 = np.full((3, 4), 0.2, dtype=np.float32)
+    phase_p1 = np.full((3, 4), 0.9, dtype=np.float32)
+    for index, phase in ((0, phase_p0), (1, phase_p1)):
+        for pair_id in PLANNED:
+            root = (
+                stack.config.work_dir
+                / "ifg"
+                / "ml_1x1"
+                / pair_id
+                / f"p{index}"
+            )
+            write_ifg_artifact(
+                root,
+                pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
+                looks=(1, 1),
+                filter_name="none",
+                filter_parameters={},
+                source_manifest_digests={
+                    "primary": "a" * 64,
+                    "secondary": "b" * 64,
+                },
+                complex_ifg=np.exp(1j * phase).astype(np.complex64),
+                coherence=np.full(phase.shape, 0.75, dtype=np.float32),
+                replace_existing=True,
+            )
+
+    collection = StackInterferogramCollection(stack)
+    view_p0 = collection.sel(polygon=0)
+    view_p1 = collection.sel(polygon=1)
+    assert isinstance(view_p0, StackInterferogramCollection)
+    np.testing.assert_allclose(
+        view_p0.open(TARGET, "complex").values,
+        np.exp(1j * phase_p0).astype(np.complex64),
+    )
+    np.testing.assert_allclose(
+        view_p1.open(TARGET, "complex").values,
+        np.exp(1j * phase_p1).astype(np.complex64),
+    )
+    with pytest.raises(ValueError, match=r"\[0, 2\)"):
+        collection.sel(polygon=2)
+
+
 def test_sel_looks_on_incomplete_view_fails_closed(tmp_path: Path) -> None:
     """sel(looks=) on a partially committed multilook fails closed."""
     stack = _planned_stack(tmp_path)

@@ -15,10 +15,7 @@ from faninsar.processing.runtime.resources import ResourceBudget
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
-    from faninsar.missions.s1.processing import (
-        BurstSelection,
-        CoregistrationGrid,
-    )
+    from faninsar.missions.protocols import BurstSelection, CoregistrationGrid
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim

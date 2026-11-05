@@ -1,14 +1,17 @@
-"""PROPOSAL-0070: CDSE canvas manifest (S4) and span cache (S3) tests.
+"""PROPOSAL-0070: CDSE canvas coverage and span-cache tests.
 
-A completed item records ``.canvas_manifest.json`` with a planner
-fingerprint; a restart skips intact items and refetches only unfinished
-byte spans through ``.span-cache/<fingerprint>/`` part files.
+A completed item records ``coverage.json`` with a planner fingerprint;
+a restart skips intact items.  Unfinished byte spans resume from
+``tmp/s1-transfer/<canvas>/<fingerprint>/`` part files, which are
+deleted when the canvas completes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
+import threading
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -18,6 +21,7 @@ import pytest
 from faninsar.data.query import BoundingBox
 from faninsar.missions.s1 import acquisition as acquisition_mod
 from faninsar.remote.fetch import RangeSpan
+from faninsar.stack.layout import s1_transfer_root, staged_acquisition_path
 
 ROI = BoundingBox(100.0, 44.0, 100.4, 44.4, crs="EPSG:4326")
 
@@ -38,6 +42,12 @@ ANNOTATION_URL_B = ANNOTATION_URL.replace("S1A_TEST", "S1B_TEST").replace(
 )
 MEASUREMENT_URL_B = MEASUREMENT_URL.replace("S1A_TEST", "S1B_TEST").replace(
     "measurement.tiff", "measurement-b.tiff"
+)
+ANNOTATION_URL_C = ANNOTATION_URL.replace("S1A_TEST", "S1C_TEST").replace(
+    "annotation.xml", "annotation-c.xml"
+)
+MEASUREMENT_URL_C = MEASUREMENT_URL.replace("S1A_TEST", "S1C_TEST").replace(
+    "measurement.tiff", "measurement-c.tiff"
 )
 
 
@@ -243,8 +253,17 @@ class _FakeRangeFetcher:
     async def __aexit__(self, *args: object) -> None:
         del args
 
-    async def fetch_into(self, span: RangeSpan, sink: Any) -> int:
+    async def fetch(self, spans: Any) -> dict[str, bytes]:
+        """Return in-memory bodies so XML/IFD probes can reuse this session."""
+        return {
+            span.label: type(self).blob[span.start : span.end + 1] for span in spans
+        }
+
+    async def fetch_into(
+        self, span: RangeSpan, sink: Any, *, on_bytes: Any = None
+    ) -> int:
         """Append ``body[received:]`` like the real resume contract."""
+        del on_bytes
         path = Path(sink)
         received = path.stat().st_size if path.exists() else 0
         type(self).requests.append(
@@ -266,6 +285,7 @@ class _FakeRangeFetcher:
 @pytest.fixture
 def mission_env(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> dict[str, Any]:
     """Patch the fetch seams for materialize-level tests.
 
@@ -297,6 +317,30 @@ def mission_env(
         return bodies
 
     monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch_ranges_async)
+
+    # The roi branch now inverts every ROI through terrain-aware geo2rdr,
+    # which needs a real DEM and a geophysically valid swath.  These tests
+    # exercise the span-cache/manifest byte accounting on a synthetic
+    # annotation, so the inversion is stubbed to the geolocation-grid
+    # envelope the synthetic XML actually supports; ``_windows_for_polygons``
+    # (the code under test) still plans the real byte ranges.
+    def fake_roi_envelopes(roi, swath, dem):
+        del swath, dem
+        return [acquisition_mod.invert_geolocation_grid(xml_text, roi)]
+
+    monkeypatch.setattr(acquisition_mod, "_roi_envelopes", fake_roi_envelopes)
+    # ``materialize_cdse_roi_safes`` auto-fetches a DEM for the roi branch;
+    # the stubbed inversion ignores its heights, but the canvas fingerprint
+    # stats its file, so return a real local RasterDEM without any fetch.
+    from faninsar.processing.geometry.dem import RasterDEM
+
+    dem_path = tmp_path_factory.mktemp("dem") / "dem.tif"
+    dem_path.write_bytes(b"stub-dem")
+    monkeypatch.setattr(
+        acquisition_mod,
+        "_fetch_dem_for_roi",
+        lambda *_args, **_kwargs: RasterDEM(path=dem_path),
+    )
     return {
         "xml_text": xml_text,
         "blob": blob,
@@ -319,15 +363,601 @@ def _materialize_items(
     )
 
 
+def _transfer_root(work_dir: Path, safe: Path) -> Path:
+    """Return the per-canvas transfer scratch root."""
+    return s1_transfer_root(work_dir, safe.name)
+
+
+def _transfer_parts(work_dir: Path, safe: Path) -> list[Path]:
+    """Return in-flight ``.part`` files for one canvas."""
+    return list(_transfer_root(work_dir, safe).glob("*/*.part"))
+
+
+def _progress_file(work_dir: Path, safe: Path) -> Path | None:
+    """Return the first in-flight progress.json, if any."""
+    matches = list(_transfer_root(work_dir, safe).glob("*/progress.json"))
+    return matches[0] if matches else None
+
+
+def _coverage(safe: Path) -> dict[str, Any]:
+    """Load the published canvas coverage record."""
+    return json.loads((safe / "coverage.json").read_text(encoding="utf-8"))
+
+
+def test_global_roi_pool_overlaps_tracks_and_keeps_owner_bytes(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different tracks share one loop/session without colliding row labels."""
+    import rasterio
+
+    xml_text = mission_env["xml_text"]
+    blobs = {
+        MEASUREMENT_URL: mission_env["blob"],
+        MEASUREMENT_URL_B: _measurement_blob(_parent_raster() + 1000),
+    }
+    items = [
+        dict(
+            _binding(
+                product,
+                annotation,
+                measurement,
+                measurement_size=len(blobs[measurement]),
+                annotation_size=len(xml_text),
+            ),
+            mission_id="S1A",
+            relative_orbit=orbit,
+            orbit_direction="ASCENDING",
+        )
+        for product, annotation, measurement, orbit in (
+            ("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL, 88),
+            ("S1B_TEST", ANNOTATION_URL_B, MEASUREMENT_URL_B, 117),
+        )
+    ]
+    metadata_calls: list[str] = []
+    transfers: list[tuple[str, str, int, int]] = []
+    opened: list[object] = []
+
+    async def metadata(spans: Any, **kwargs: Any) -> dict[str, bytes]:
+        del kwargs
+        result = {}
+        for span in spans:
+            metadata_calls.append(span.url)
+            body = (
+                xml_text.encode()
+                if span.url in (ANNOTATION_URL, ANNOTATION_URL_B)
+                else blobs[span.url]
+            )
+            result[span.label] = body[span.start : span.end + 1]
+        return result
+
+    class ConcurrentFetcher:
+        async def __aenter__(self) -> Self:
+            opened.append(self)
+            self.arrived: set[str] = set()
+            self.both = asyncio.Event()
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            del args
+
+        async def fetch(self, spans: Any) -> dict[str, bytes]:
+            return await metadata(spans)
+
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            del kwargs
+            assert span.url in metadata_calls
+            self.arrived.add(span.url)
+            if len(self.arrived) == 2:
+                self.both.set()
+            await asyncio.wait_for(self.both.wait(), timeout=0.5)
+            transfers.append(
+                (
+                    span.url,
+                    span.label,
+                    id(asyncio.get_running_loop()),
+                    threading.get_ident(),
+                )
+            )
+            path = Path(sink)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blobs[span.url][span.start : span.end + 1])
+            return span.end - span.start + 1
+
+    monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", metadata)
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", ConcurrentFetcher)
+    paths = acquisition_mod.materialize_s1_acquisitions(
+        ROI,
+        provider="cdse",
+        granularity="roi",
+        work_dir=tmp_path,
+        items=items,
+        orbit_group=None,
+    )
+    assert len(opened) == 1
+    assert {url for url, *_ in transfers} == set(blobs)
+    assert len({loop for _, _, loop, _ in transfers}) == 1
+    assert len({thread for _, _, _, thread in transfers}) == 1
+    assert {path.parents[3].name for path in paths} == {"88A", "117A"}
+    for path, expected_offset in zip(paths, (0, 1000), strict=True):
+        with rasterio.open(next((path / "measurement").glob("*.tiff"))) as dataset:
+            fetched = dataset.read(1)
+        assert fetched.real.max() >= 40 + expected_offset
+        assert fetched.real.max() < 60 + expected_offset
+    transfers.clear()
+    metadata_calls.clear()
+    opened.clear()
+    assert (
+        acquisition_mod.materialize_s1_acquisitions(
+            ROI,
+            provider="cdse",
+            granularity="roi",
+            work_dir=tmp_path,
+            items=items,
+            orbit_group=None,
+        )
+        == paths
+    )
+    assert not transfers and not metadata_calls and not opened
+
+
+def test_first_xml_starts_measurement_before_later_xml_finishes(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One finished annotation is planned and queued without waiting for the rest."""
+    xml_text = mission_env["xml_text"]
+    blobs = {
+        MEASUREMENT_URL: mission_env["blob"],
+        MEASUREMENT_URL_B: _measurement_blob(_parent_raster() + 1000),
+    }
+    items = [
+        dict(
+            _binding(
+                product,
+                annotation,
+                measurement,
+                measurement_size=len(blobs[measurement]),
+                annotation_size=len(xml_text),
+            ),
+            mission_id="S1A",
+            relative_orbit=orbit,
+            orbit_direction="ASCENDING",
+        )
+        for product, annotation, measurement, orbit in (
+            ("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL, 88),
+            ("S1B_TEST", ANNOTATION_URL_B, MEASUREMENT_URL_B, 117),
+        )
+    ]
+    order: list[str] = []
+    state: dict[str, asyncio.Event] = {}
+
+    async def metadata(spans: Any, **kwargs: Any) -> dict[str, bytes]:
+        del kwargs
+        result: dict[str, bytes] = {}
+        for span in spans:
+            if span.url == ANNOTATION_URL_B:
+                order.append("xml-b-wait")
+                gate = state.setdefault("a_meas", asyncio.Event())
+                await asyncio.wait_for(gate.wait(), timeout=5)
+                order.append("xml-b-done")
+                result[span.label] = xml_text.encode()[span.start : span.end + 1]
+            elif span.url == ANNOTATION_URL:
+                order.append("xml-a-done")
+                result[span.label] = xml_text.encode()[span.start : span.end + 1]
+            else:
+                result[span.label] = blobs[span.url][span.start : span.end + 1]
+        return result
+
+    class StreamingFetcher:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def fetch(self, spans: Any) -> dict[str, bytes]:
+            return await metadata(spans)
+
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            del kwargs
+            state.setdefault("a_meas", asyncio.Event()).set()
+            order.append(f"meas:{span.url}")
+            path = Path(sink)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blobs[span.url][span.start : span.end + 1])
+            return span.end - span.start + 1
+
+    monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", metadata)
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", StreamingFetcher)
+    paths = acquisition_mod.materialize_s1_acquisitions(
+        ROI,
+        provider="cdse",
+        granularity="roi",
+        work_dir=tmp_path,
+        items=items,
+        orbit_group=None,
+    )
+    assert len(paths) == 2
+    xml_b_done = order.index("xml-b-done")
+    assert order.index("xml-a-done") < xml_b_done
+    assert any(entry.startswith("meas:") for entry in order[:xml_b_done])
+
+
+def test_xml_and_measurement_share_pool_one_to_one(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """XML and measurement share one slot pool and grow 1:1 when both wait.
+
+    A two-slot pool with three owners must start a measurement before the
+    last XML (so remaining annotations do not drain first) and must still
+    fetch that last XML while the measurement occupies a slot (so bulk
+    transfer does not starve planning).
+    """
+    from faninsar.missions.s1 import roi_transfer as roi_transfer_mod
+
+    xml_text = mission_env["xml_text"]
+    blobs = {
+        MEASUREMENT_URL: mission_env["blob"],
+        MEASUREMENT_URL_B: mission_env["blob"],
+        MEASUREMENT_URL_C: mission_env["blob"],
+    }
+    items = [
+        dict(
+            _binding(
+                product,
+                annotation,
+                measurement,
+                measurement_size=len(blobs[measurement]),
+                annotation_size=len(xml_text),
+            ),
+            mission_id="S1A",
+            relative_orbit=orbit,
+            orbit_direction="ASCENDING",
+        )
+        for product, annotation, measurement, orbit in (
+            ("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL, 88),
+            ("S1B_TEST", ANNOTATION_URL_B, MEASUREMENT_URL_B, 117),
+            ("S1C_TEST", ANNOTATION_URL_C, MEASUREMENT_URL_C, 66),
+        )
+    ]
+    order: list[str] = []
+    first_meas = asyncio.Event()
+    xml_c_started = asyncio.Event()
+
+    async def metadata(spans: Any, **kwargs: Any) -> dict[str, bytes]:
+        del kwargs
+        result: dict[str, bytes] = {}
+        for span in spans:
+            if span.url == ANNOTATION_URL_B:
+                order.append("xml-b")
+                await asyncio.wait_for(first_meas.wait(), timeout=5)
+                result[span.label] = xml_text.encode()[span.start : span.end + 1]
+            elif span.url == ANNOTATION_URL_C:
+                order.append("xml-c")
+                xml_c_started.set()
+                result[span.label] = xml_text.encode()[span.start : span.end + 1]
+            elif span.url == ANNOTATION_URL:
+                order.append("xml-a")
+                result[span.label] = xml_text.encode()[span.start : span.end + 1]
+            else:
+                result[span.label] = blobs[span.url][span.start : span.end + 1]
+        return result
+
+    class FairFetcher:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def fetch(self, spans: Any) -> dict[str, bytes]:
+            return await metadata(spans)
+
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            del kwargs
+            order.append("meas-start")
+            first_meas.set()
+            await asyncio.wait_for(xml_c_started.wait(), timeout=5)
+            order.append("meas-end")
+            path = Path(sink)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blobs[span.url][span.start : span.end + 1])
+            return span.end - span.start + 1
+
+    monkeypatch.setattr(roi_transfer_mod, "_MAX_TRANSFER_TASKS", 2)
+    monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", metadata)
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", FairFetcher)
+    paths = acquisition_mod.materialize_s1_acquisitions(
+        ROI,
+        provider="cdse",
+        granularity="roi",
+        work_dir=tmp_path,
+        items=items,
+        orbit_group=None,
+    )
+    assert len(paths) == 3
+    assert order.index("meas-start") < order.index("xml-c")
+    assert order.index("xml-c") < order.index("meas-end")
+
+
+@pytest.mark.parametrize("corrupt", (False, True), ids=("resume", "corrupt-burst"))
+def test_ready_burst_is_written_and_released_before_sibling_finishes(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt: bool,
+) -> None:
+    """A durable burst checkpoint replaces raw bytes before whole-SAFE completion."""
+    import rasterio
+    from rasterio.windows import Window
+
+    item = _binding(
+        "S1A_TEST",
+        ANNOTATION_URL,
+        MEASUREMENT_URL,
+        measurement_size=len(mission_env["blob"]),
+        annotation_size=len(mission_env["xml_text"]),
+    )
+    safe = staged_acquisition_path(tmp_path / "inputs", "S1A_TEST-IW1-VV.SAFE")
+    observed: list[dict[str, Any]] = []
+    fail = True
+
+    class SlowSibling(_FakeRangeFetcher):
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            if span.start >= 16 + 50 * SAMPLES_PER_BURST * 4 and fail:
+
+                async def wait_for_burst() -> None:
+                    while True:
+                        progress = _progress_file(tmp_path, safe)
+                        if progress is None:
+                            await asyncio.sleep(0.001)
+                            continue
+                        try:
+                            checkpoint = json.loads(progress.read_text())
+                        except (OSError, ValueError):
+                            await asyncio.sleep(0.001)
+                            continue
+                        if "4" in checkpoint.get("bursts", {}):
+                            observed.append(checkpoint)
+                            return
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_burst(), timeout=2)
+                assert not (safe / "coverage.json").exists()
+                assert not _transfer_parts(tmp_path, safe)
+                raise RuntimeError("unfinished sibling")
+            return await super().fetch_into(span, sink, **kwargs)
+
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", SlowSibling)
+    with pytest.raises(RuntimeError, match="unfinished sibling"):
+        _materialize_items(tmp_path, [item])
+    assert observed
+    fail = False
+    if corrupt:
+        measurement = next((safe / "measurement").glob("*.tiff"))
+        with rasterio.open(measurement, "r+") as dataset:
+            dataset.write(
+                np.array([[999 + 0j]], dtype=np.complex64), 1, window=Window(0, 0, 1, 1)
+            )
+    SlowSibling.requests.clear()
+    assert _materialize_items(tmp_path, [item]) == [safe]
+    assert SlowSibling.requests
+    starts = [request[1] for request in SlowSibling.requests]
+    boundary = 16 + 50 * SAMPLES_PER_BURST * 4
+    if corrupt:
+        assert any(start < boundary for start in starts)
+    else:
+        assert all(start >= boundary for start in starts)
+    assert _progress_file(tmp_path, safe) is None
+    assert not _transfer_parts(tmp_path, safe)
+    assert _coverage(safe)["complete"]
+
+
+def test_pool_stops_sibling_writers_before_closing_session(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed download drains every sibling before its session exits."""
+    items = [
+        _binding(
+            product,
+            annotation,
+            measurement,
+            measurement_size=len(mission_env["blob"]),
+            annotation_size=len(mission_env["xml_text"]),
+        )
+        for product, annotation, measurement in (
+            ("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL),
+            ("S1B_TEST", ANNOTATION_URL_B, MEASUREMENT_URL_B),
+        )
+    ]
+    events: list[str] = []
+
+    class FailingFetcher:
+        async def __aenter__(self) -> Self:
+            self.sibling_started = asyncio.Event()
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            del args
+            assert events and all(event == "sibling-stopped" for event in events)
+            events.append("session-closed")
+
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            del sink, kwargs
+            if span.url == MEASUREMENT_URL:
+                await self.sibling_started.wait()
+                raise RuntimeError("download failed")
+            self.sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("sibling-stopped")
+            return 0
+
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", FailingFetcher)
+    with pytest.raises(RuntimeError, match="download failed"):
+        _materialize_items(tmp_path, items)
+    assert events[-1] == "session-closed"
+    assert events[:-1] and all(event == "sibling-stopped" for event in events[:-1])
+    assert not list(tmp_path.rglob("coverage.json"))
+
+
+def test_roi_and_nesd_share_spatial_row_union_without_duplicate_requests(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlapping ROI/NESD rows fetch once, retaining both physical burst copies."""
+    from faninsar.missions.s1.overlap import BurstOverlapWindow
+
+    monkeypatch.setattr(
+        acquisition_mod,
+        "_roi_envelopes",
+        lambda *args: [(43, 48, 20, 60), (46, 49, 30, 70)],
+    )
+    overlap = BurstOverlapWindow(
+        swath="IW1",
+        top_index=4,
+        bottom_index=5,
+        top_row0=7,
+        bottom_row0=0,
+        col0=0,
+        n_lines=3,
+        n_samples=100,
+    )
+    monkeypatch.setattr(
+        acquisition_mod,
+        "overlap_windows_for_canvas",
+        lambda *args, **kwargs: (overlap,),
+    )
+    item = _binding(
+        "S1A_TEST",
+        ANNOTATION_URL,
+        MEASUREMENT_URL,
+        measurement_size=len(mission_env["blob"]),
+        annotation_size=len(mission_env["xml_text"]),
+    )
+    _materialize_items(tmp_path, [item], coreg_mode="nesd")
+    requested = [
+        (start, end, label)
+        for _, start, end, _, label in mission_env["fetcher"].requests
+    ]
+    stride = SAMPLES_PER_BURST * 4
+    assert requested == [
+        (16 + 43 * stride, 16 + 50 * stride - 1, "row-43-50"),
+        (16 + 50 * stride, 16 + 53 * stride - 1, "row-50-53"),
+    ]
+
+
+def test_canvas_sync_failure_keeps_raw_spans_and_publishes_no_checkpoint(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disk I/O failure cannot authorize deleting the only durable raw bytes."""
+    import errno
+    from faninsar.missions.s1.io import canvas as canvas_mod
+
+    real_fsync = canvas_mod.os.fsync
+    original_sync = canvas_mod._sync_canvas_file
+    syncing_canvas = False
+
+    def fail_sync(descriptor: int) -> None:
+        if syncing_canvas:
+            raise OSError(errno.EIO, "simulated disk I/O error")
+        real_fsync(descriptor)
+
+    def canvas_sync(path: Path) -> None:
+        nonlocal syncing_canvas
+        syncing_canvas = True
+        try:
+            original_sync(path)
+        finally:
+            syncing_canvas = False
+
+    monkeypatch.setattr(canvas_mod.os, "fsync", fail_sync)
+    monkeypatch.setattr(canvas_mod, "_sync_canvas_file", canvas_sync)
+    item = _binding(
+        "S1A_TEST",
+        ANNOTATION_URL,
+        MEASUREMENT_URL,
+        measurement_size=len(mission_env["blob"]),
+        annotation_size=len(mission_env["xml_text"]),
+    )
+    with pytest.raises(OSError, match="disk I/O"):
+        _materialize_items(tmp_path, [item])
+    safe = staged_acquisition_path(tmp_path / "inputs", "S1A_TEST-IW1-VV.SAFE")
+    assert _transfer_parts(tmp_path, safe)
+    assert not (safe / "coverage.json").exists()
+    assert not (safe / ".span-cache").exists()
+    assert _progress_file(tmp_path, safe) is None
+
+
+def test_executed_window_change_invalidates_canvas_with_same_dem_stat(
+    tmp_path: Path, mission_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume identity follows executed placement/validity, including DEM effects."""
+    item = _binding("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL,
+                    measurement_size=len(mission_env["blob"]),
+                    annotation_size=len(mission_env["xml_text"]))
+    envelopes = [(43, 48, 20, 60)]
+    planned = []
+
+    def plan(*args):
+        planned.append(tuple(envelopes))
+        return envelopes
+
+    monkeypatch.setattr(acquisition_mod, "_roi_envelopes", plan)
+    safe = _materialize_items(tmp_path, [item])[0]
+    original = _coverage(safe)["fingerprint"]
+    mission_env["fetcher"].requests.clear()
+    assert _materialize_items(tmp_path, [item]) == [safe]
+    assert not mission_env["fetcher"].requests
+    assert len(planned) == 2  # each attempt plans once, including the payload skip
+    envelopes[:] = [(44, 48, 21, 60)]
+    _materialize_items(tmp_path, [item])
+    assert mission_env["fetcher"].requests
+    assert _coverage(safe)["fingerprint"] != original
+    assert len(planned) == 3
+
+
+def test_dem_stat_change_with_identical_executed_plan_reuses_canvas(
+    tmp_path: Path, mission_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """File metadata is not the scientific identity of the sampled plan."""
+    from faninsar.processing.geometry.dem import RasterDEM
+
+    dem_path = tmp_path / "dem.tif"
+    dem_path.write_bytes(b"a")
+    dem = RasterDEM(path=dem_path)
+    item = _binding("S1A_TEST", ANNOTATION_URL, MEASUREMENT_URL,
+                    measurement_size=len(mission_env["blob"]),
+                    annotation_size=len(mission_env["xml_text"]))
+    safe = _materialize_items(tmp_path, [item], dem=dem)[0]
+    fingerprint = _coverage(safe)["fingerprint"]
+    mission_env["fetcher"].requests.clear()
+    dem_path.write_bytes(b"a changed file whose executed plan is identical")
+    assert _materialize_items(tmp_path, [item], dem=dem) == [safe]
+    assert not mission_env["fetcher"].requests
+    assert _coverage(safe)["fingerprint"] == fingerprint
+
+
 class TestSpanCacheFetchInto:
-    """S3: per-span .part files + manifest under .span-cache/<F>/."""
+    """S3: per-span .part files under tmp/s1-transfer/<canvas>/<F>/."""
 
     def test_completed_span_cache_deletes_parts_keeps_manifest(
         self,
         tmp_path: Path,
         mission_env: dict[str, Any],
     ) -> None:
-        """After the item completes, .part files are gone; manifest stays."""
+        """After the item completes, transfer scratch is gone; coverage stays."""
         item = _binding(
             "S1A_TEST",
             ANNOTATION_URL,
@@ -337,20 +967,26 @@ class TestSpanCacheFetchInto:
         )
         paths = _materialize_items(tmp_path, [item])
         safe_root = paths[0]
-        cache_root = safe_root / ".span-cache"
-        assert cache_root.is_dir()
-        manifests = list(cache_root.glob("*/manifest.json"))
-        assert len(manifests) == 1
-        manifest = json.loads(manifests[0].read_text())
-        assert manifest["fingerprint"]
-        assert manifest["spans"]
-        for record in manifest["spans"]:
-            assert record["state"] == "complete"
-            assert record["part_size"] == record["end"] - record["start"] + 1
-            assert record["sha1"]
-            assert "?" not in record["url"]  # OData $value hrefs carry no query
-        # Post-completion the .part payloads are deleted; manifest.json stays.
-        assert not list(cache_root.glob("*/*.part"))
+        coverage = _coverage(safe_root)
+        assert coverage["complete"] is True
+        assert coverage["fingerprint"]
+        assert coverage["parent"] == "S1A_TEST"
+        assert coverage["swath"] == "IW1"
+        assert coverage["polarization"] == "VV"
+        assert coverage["bursts"]
+        assert all("index" in burst for burst in coverage["bursts"])
+        assert not (safe_root / ".span-cache").exists()
+        assert not (safe_root / ".canvas_manifest.json").exists()
+        # Raw transfer bytes are fully reclaimed; only the small durable
+        # plan-metadata caches (original annotation, TIFF strip tables)
+        # may remain to support a zero-network rerun.
+        scratch = _transfer_root(tmp_path, safe_root)
+        if scratch.exists():
+            assert {path.name for path in scratch.iterdir()} <= {
+                "annotations",
+                "layouts",
+            }
+        assert not _transfer_parts(tmp_path, safe_root)
 
     def test_abort_mid_span_resumes_from_received_prefix(
         self,
@@ -369,24 +1005,30 @@ class TestSpanCacheFetchInto:
         fetcher.abort_after_bytes = 7
         with pytest.raises(RuntimeError, match="abort"):
             _materialize_items(tmp_path, [item])
+        # Concurrent fetches may issue sibling requests before the abort
+        # cancels them; what matters is the partial .part is kept and the
+        # aborted span recorded its 7 received bytes.
         first_requests = list(fetcher.requests)
-        assert len(first_requests) == 1
-        _url, start, end, _received, _label = first_requests[0]
-        safe_root = tmp_path / "inputs" / "S1A_TEST-IW1-VV.SAFE"
-        part_files = list((safe_root / ".span-cache").glob("*/*.part"))
-        assert len(part_files) == 1
-        assert part_files[0].stat().st_size == 7
+        aborted = [r for r in first_requests if r[3] == 0 and r[4].startswith("row-")]
+        assert aborted
+        _url, start, end, _received, _label = aborted[0]
+        safe_root = staged_acquisition_path(tmp_path / "inputs", "S1A_TEST-IW1-VV.SAFE")
+        part_files = _transfer_parts(tmp_path, safe_root)
+        assert part_files
+        assert any(p.stat().st_size == 7 for p in part_files)
 
         fetcher.requests.clear()
         fetcher.abort_after_bytes = None
         paths = _materialize_items(tmp_path, [item])
         assert paths[0] == safe_root
-        resumed = [r for r in fetcher.requests if r[4].startswith(("row-", "col-"))]
+        resumed = [
+            r
+            for r in fetcher.requests
+            if r[4] == _label and (r[1], r[2]) == (start, end)
+        ]
+        # The aborted span resumed at start+received (received=7).
         assert resumed
-        # The aborted span resumed at start+received; other spans started at 0.
-        resumed_first = [r for r in resumed if (r[1], r[2]) == (start, end)]
-        assert resumed_first
-        assert resumed_first[0][3] == 7
+        assert resumed[0][3] == 7
 
     def test_complete_record_with_size_drift_refetches_from_zero(
         self,
@@ -543,14 +1185,14 @@ class TestSpanCacheFetchInto:
 
 
 class TestCanvasManifest:
-    """S4: item-level .canvas_manifest.json skip + fingerprint coverage."""
+    """S4: item-level coverage.json skip + fingerprint coverage."""
 
     def test_second_run_skips_completed_item(
         self,
         tmp_path: Path,
         mission_env: dict[str, Any],
     ) -> None:
-        """A complete manifest + intact SAFE skips all fetches on rerun."""
+        """A complete coverage record + intact SAFE skips all fetches on rerun."""
         item = _binding(
             "S1A_TEST",
             ANNOTATION_URL,
@@ -560,17 +1202,61 @@ class TestCanvasManifest:
         )
         paths = _materialize_items(tmp_path, [item])
         safe_root = paths[0]
-        manifest_path = safe_root / ".canvas_manifest.json"
-        assert manifest_path.is_file()
-        manifest = json.loads(manifest_path.read_text())
-        assert manifest["complete"] is True
-        assert manifest["fingerprint"]
-        assert manifest["item"]["product"] == "S1A_TEST"
+        coverage = _coverage(safe_root)
+        assert coverage["complete"] is True
+        assert coverage["fingerprint"]
+        assert coverage["parent"] == "S1A_TEST"
         fetcher = mission_env["fetcher"]
         fetcher.requests.clear()
         rerun = _materialize_items(tmp_path, [item])
         assert rerun == paths
         assert fetcher.requests == []  # no span fetches at all
+
+    def test_legacy_hidden_manifest_is_promoted_on_skip(
+        self,
+        tmp_path: Path,
+        mission_env: dict[str, Any],
+    ) -> None:
+        """A complete ``.canvas_manifest.json`` is rewritten as ``coverage.json``."""
+        item = _binding(
+            "S1A_TEST",
+            ANNOTATION_URL,
+            MEASUREMENT_URL,
+            measurement_size=len(mission_env["blob"]),
+            annotation_size=len(mission_env["xml_text"]),
+        )
+        paths = _materialize_items(tmp_path, [item])
+        safe_root = paths[0]
+        coverage = _coverage(safe_root)
+        (safe_root / "coverage.json").unlink()
+        (safe_root / ".canvas_manifest.json").write_text(
+            json.dumps(
+                {
+                    "complete": True,
+                    "created": coverage["created"],
+                    "fingerprint": coverage["fingerprint"],
+                    "item": {
+                        "n_bursts": len(coverage["bursts"]),
+                        "pol": "VV",
+                        "product": "S1A_TEST",
+                        "swath": "IW1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (safe_root / ".span-cache" / "old").mkdir(parents=True)
+        fetcher = mission_env["fetcher"]
+        fetcher.requests.clear()
+        rerun = _materialize_items(tmp_path, [item])
+        assert rerun == paths
+        assert fetcher.requests == []
+        promoted = _coverage(safe_root)
+        assert promoted["complete"] is True
+        assert promoted["parent"] == "S1A_TEST"
+        assert promoted["bursts"]
+        assert not (safe_root / ".canvas_manifest.json").exists()
+        assert not (safe_root / ".span-cache").exists()
 
     def test_two_item_stack_refetches_only_deleted_manifest_item(
         self,
@@ -598,7 +1284,7 @@ class TestCanvasManifest:
         ]
         paths = _materialize_items(tmp_path, items)
         assert len(paths) == 2
-        (paths[0] / ".canvas_manifest.json").unlink()
+        (paths[0] / "coverage.json").unlink()
         fetcher = mission_env["fetcher"]
         fetcher.requests.clear()
         rerun = _materialize_items(tmp_path, items)
@@ -691,6 +1377,33 @@ class TestCanvasManifest:
         monkeypatch.undo()
         assert changed_version != fingerprint1
 
+    def test_dem_identity_follows_planner_dem_use(self, tmp_path: Path) -> None:
+        """Every ROI-granularity plan consumes the DEM, so F must see it."""
+        from faninsar.processing.geometry.dem import RasterDEM
+
+        dem_a_path = tmp_path / "dem_a.tif"
+        dem_b_path = tmp_path / "dem_b.tif"
+        dem_a_path.write_bytes(b"heights-a")
+        dem_b_path.write_bytes(b"heights-bb")
+        dem_a = RasterDEM(path=dem_a_path)
+        dem_b = RasterDEM(path=dem_b_path)
+
+        id_a = acquisition_mod._canvas_dem_id(ROI, granularity="roi", dem=dem_a)
+        id_b = acquisition_mod._canvas_dem_id(ROI, granularity="roi", dem=dem_b)
+        assert id_a != "dem:none"
+        assert id_a != id_b
+        assert (
+            acquisition_mod._canvas_dem_id(
+                ROI, granularity="roi", dem=RasterDEM(path=dem_a_path)
+            )
+            == id_a
+        )
+        # Burst granularity plans from the geolocation grid without a DEM.
+        assert (
+            acquisition_mod._canvas_dem_id(ROI, granularity="burst", dem=dem_a)
+            == "dem:none"
+        )
+
     def test_changed_measurement_size_forces_rematerialization(
         self,
         tmp_path: Path,
@@ -720,7 +1433,7 @@ class TestSpanCacheOrphanGCIntegration:
         tmp_path: Path,
         mission_env: dict[str, Any],
     ) -> None:
-        """End-to-end: orphan dir seeded under the item SAFE is GC'd on rerun."""
+        """End-to-end: orphan dir seeded under transfer scratch is GC'd on rerun."""
         item = _binding(
             "S1A_TEST",
             ANNOTATION_URL,
@@ -730,38 +1443,56 @@ class TestSpanCacheOrphanGCIntegration:
         )
         paths = _materialize_items(tmp_path, [item])
         safe_root = paths[0]
-        cache_root = safe_root / ".span-cache"
-        # Adopt one real planned span from the finished manifest.
-        current_manifest = json.loads(
-            next(cache_root.glob("*/manifest.json")).read_text()
+        (safe_root / "coverage.json").unlink()
+        cache_root = _transfer_root(tmp_path, safe_root)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        blob_end = len(mission_env["blob"]) - 1
+        overlap_key = acquisition_mod._SpanCache.span_key(
+            RangeSpan(MEASUREMENT_URL, 0, blob_end, "overlap")
         )
-        adopted = dict(current_manifest["spans"][0])
-        adopted_key = adopted["key"]
-
         overlap_orphan = cache_root / "orphan-overlap"
         stale_orphan = cache_root / "orphan-stale"
         for orphan in (overlap_orphan, stale_orphan):
             orphan.mkdir()
-        (overlap_orphan / f"{adopted_key}.part").write_bytes(b"\x00" * 32)
-        adopted["state"] = "pending"
-        adopted["part_size"] = 32
+        (overlap_orphan / f"{overlap_key}.part").write_bytes(b"\x00" * 32)
         (overlap_orphan / "manifest.json").write_text(
-            json.dumps({"fingerprint": "orphan-overlap", "spans": [adopted]})
+            json.dumps(
+                {
+                    "fingerprint": "orphan-overlap",
+                    "spans": [
+                        {
+                            "key": overlap_key,
+                            "url": MEASUREMENT_URL,
+                            "start": 0,
+                            "end": blob_end,
+                            "label": "overlap",
+                            "state": "pending",
+                            "part_size": 32,
+                        }
+                    ],
+                }
+            )
         )
-        stale = dict(current_manifest["spans"][0])
-        stale["key"] = "stalekey"
-        stale["url"] = MEASUREMENT_URL
-        stale["start"] = 999_000_000
-        stale["end"] = 999_000_999
-        stale["state"] = "pending"
-        stale["part_size"] = 10
         (stale_orphan / "stalekey.part").write_bytes(b"\x00" * 10)
         (stale_orphan / "manifest.json").write_text(
-            json.dumps({"fingerprint": "orphan-stale", "spans": [stale]})
+            json.dumps(
+                {
+                    "fingerprint": "orphan-stale",
+                    "spans": [
+                        {
+                            "key": "stalekey",
+                            "url": MEASUREMENT_URL,
+                            "start": 999_000_000,
+                            "end": 999_000_999,
+                            "label": "stale",
+                            "state": "pending",
+                            "part_size": 10,
+                        }
+                    ],
+                }
+            )
         )
 
-        # Force re-materialization so the item's span cache runs GC.
-        (safe_root / ".canvas_manifest.json").unlink()
         _materialize_items(tmp_path, [item])
         assert overlap_orphan.is_dir()
         assert not stale_orphan.exists()

@@ -53,8 +53,9 @@ def _read_annotation_source(swath: S1Swath) -> str:
     """
     ap = str(swath.annotation_path)
     if ap.startswith("/vsizip/"):
-        # /vsizip//<zip>/<member>
-        body = ap[len("/vsizip/") :].lstrip("/")
+        # /vsizip/<zip-path>/<member>; the zip path keeps its own leading
+        # slash, so only the member portion is normalized.
+        body = ap[len("/vsizip/") :]
         sep = body.find(".zip/")
         if sep == -1:
             reject_product(f"unparseable vsizip annotation path: {ap}")
