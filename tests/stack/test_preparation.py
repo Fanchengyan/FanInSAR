@@ -201,3 +201,194 @@ def test_pending_request_and_attempt_records_never_persist_secrets(tmp_path):
     assert "private-token" not in text
     assert "user:secret" not in text
     assert "token=secret" not in text
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_offline_source_dem_cache_miss_never_reaches_transport(tmp_path, monkeypatch, strict):
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec
+    source = tmp_path / "source"
+    source.write_bytes(b"local")
+    grid = GridSpec("EPSG:4326", Affine(0.001, 0, 10, 0, -0.001, 50), height=2, width=2)
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_source("glo30", cache_dir=tmp_path / "empty")), request={"source": source})
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append(True)
+        pytest.fail("offline preparation reached DEM network fetch_plan")
+    monkeypatch.setattr("faninsar.processing.geometry.dem_transport.fetch_plan", forbidden)
+    if strict:
+        with pytest.raises(DataPreparationError) as raised:
+            stack.prepare_data(offline=True, on_error="raise")
+        assert raised.value.report.outcome == "failed"
+    else:
+        assert stack.prepare_data(offline=True).outcome == "failed"
+    assert calls == []
+    assert not stack.data_ready
+
+
+def test_offline_source_dem_reuses_real_cached_tiles(tmp_path, monkeypatch):
+    import numpy as np
+    import rasterio
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec
+    from faninsar.processing.geometry.dem_sources import get_dem_source
+    from faninsar.processing.geometry.providers.p0030_adapter import _bounds
+    grid = GridSpec("EPSG:4326", Affine(0.001, 0, 10.5, 0, -0.001, 50.5), height=2, width=2)
+    cache = tmp_path / "cache"
+    entry = get_dem_source("glo30")
+    for tile in entry.plan(_bounds(grid)).tiles:
+        path = cache / tile.cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(path, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=Affine(0.01, 0, 10, 0, -0.01, 51)) as dataset:
+            dataset.write(np.full((128, 128), 42, dtype="float32"), 1)
+        with path.open("ab") as padded:
+            padded.write(b"\0" * max(0, tile.min_bytes - path.stat().st_size))
+    source = tmp_path / "source"
+    source.write_bytes(b"local")
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline cache hit attempted transport")
+    monkeypatch.setattr("faninsar.processing.geometry.dem_transport.fetch_plan", forbidden)
+    monkeypatch.setattr("faninsar.processing.geometry.providers.p0030_adapter._head_status", forbidden)
+    # Local normalized datum fixture keeps this test about real source-cache lookup.
+    monkeypatch.setattr("faninsar.processing.geometry.datum.convert_heights", lambda values, *args, **kwargs: values)
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_source("glo30", cache_dir=cache)), request={"source": source})
+    assert stack.prepare_data(offline=True).outcome == "complete"
+    assert stack.data_ready
+
+
+def test_strict_retry_preserves_dem_product_and_identity_bytes(tmp_path):
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec
+    from faninsar.stack.preparation import writer_guard
+    sources = {target: tmp_path / target for target in ("20200101", "20200113")}
+    sources["20200101"].write_bytes(b"ready")
+    grid = GridSpec("EPSG:4326", Affine(0.001, 0, 10, 0, -0.001, 50), height=2, width=2)
+    stack = SubsetMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_constant(7)), request={"sources": sources})
+    stack.prepare_data()
+    artifact = stack.config.work_dir / "dem.tif"
+    stack.config.dem.to_raster(grid).save(artifact)
+    product = stack.config.work_dir / "coreg" / "product.bin"
+    product.parent.mkdir()
+    product.write_bytes(b"committed scientific payload")
+    identity = stack.config.work_dir / "stack.json"
+    before = {path: path.read_bytes() for path in (artifact, product, identity)}
+    with pytest.raises(DataPreparationError):
+        stack.prepare_data(on_error="raise", offline=True)
+    assert all(path.read_bytes() == payload for path, payload in before.items())
+    assert stack.data_ready
+    assert stack.config.grid == grid
+
+
+def test_cancellation_joins_real_writer_before_workspace_release(tmp_path):
+    import threading
+    from faninsar.stack.preparation import writer_guard
+    cleanup_started, release_writer = threading.Event(), threading.Event()
+    root = tmp_path / "work"
+    artifact = tmp_path / "qualified.bin"
+    artifact.write_bytes(b"prior durable artifact")
+    class CancelMission(Stack):
+        def _prepare_inputs(self, context):
+            def writer():
+                cleanup_started.set()
+                release_writer.wait(5)
+                (root / "writer-finished").write_bytes(b"durable checkpoint")
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                raise KeyboardInterrupt()
+            finally:
+                thread.join()
+    stack = CancelMission.configure(config=StackConfig(work_dir=root), request={"source": artifact})
+    caught = []
+    def prepare():
+        try:
+            stack.prepare_data()
+        except KeyboardInterrupt:
+            caught.append(True)
+    task = threading.Thread(target=prepare)
+    task.start()
+    try:
+        assert cleanup_started.wait(5)
+        with pytest.raises(RuntimeError, match="another preparation writer"):
+            with writer_guard(root):
+                pytest.fail("lock released before actual writer joined")
+    finally:
+        release_writer.set()
+        task.join(5)
+    assert not task.is_alive()
+    assert caught == [True]
+    assert artifact.read_bytes() == b"prior durable artifact"
+    assert (root / "writer-finished").is_file()
+    assert not (root / "stack.json").exists()
+    with writer_guard(root):
+        pass
+
+
+def test_recovered_member_retains_grid_and_committed_dem_artifact(tmp_path):
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec
+    sources = {target: tmp_path / target for target in ("20200101", "20200113")}
+    sources["20200101"].write_bytes(b"ready")
+    grid = GridSpec("EPSG:4326", Affine(0.001, 0, 10, 0, -0.001, 50), height=2, width=2)
+    stack = SubsetMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_constant(7)), request={"sources": sources})
+    assert stack.prepare_data().outcome == "partial"
+    dem = stack.config.work_dir / "dem.tif"
+    stack.config.dem.to_raster(grid).save(dem)
+    before = dem.read_bytes()
+    sources["20200113"].write_bytes(b"repaired")
+    assert stack.prepare_data(offline=True).outcome == "complete"
+    assert stack.config.grid == grid
+    assert stack.reference == "20200101"
+    assert dem.read_bytes() == before
+
+
+def test_offline_geoid_miss_cannot_use_live_transport(tmp_path, monkeypatch):
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec
+    from faninsar.processing.geometry import fetch as geoid_fetch
+    from dataclasses import replace
+    source = tmp_path / "source"
+    source.write_bytes(b"local")
+    monkeypatch.setenv("FANINSAR_GEOID_CACHE", str(tmp_path / "geoid-empty"))
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline datum conversion attempted geoid acquisition")
+    monkeypatch.setattr(geoid_fetch, "_requests_transport", forbidden)
+    grid = GridSpec("EPSG:4326", Affine(0.001, 0, 10, 0, -0.001, 50), height=2, width=2)
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_constant(7, vertical_datum="egm2008")), request={"source": source})
+    # A source raster requiring datum conversion exercises the geoid boundary directly.
+    raster_path = tmp_path / "orthometric.tif"
+    stack._request_config.dem.to_raster(GridSpec("EPSG:4326", Affine(0.001, 0, 9.99, 0, -0.001, 50.01), height=30, width=30), vertical_datum="egm2008").save(raster_path)
+    stack._request_config.dem = DEM.from_raster(raster_path, vertical_datum="egm2008")
+    assert stack.prepare_data(offline=True).outcome == "failed"
+
+
+def test_expanded_recovered_coverage_cannot_overwrite_prior_dem(tmp_path, monkeypatch):
+    import numpy as np
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
+    from faninsar.stack.preparation import PreparedInputs
+    first, recovered = tmp_path / "first", tmp_path / "recovered"
+    first.write_bytes(b"ready")
+    public_grid = GridSpec("EPSG:4326", Affine(0.01, 0, 10, 0, -0.01, 40.1), height=10, width=10)
+    class CoverageMission(Stack):
+        def _prepare_inputs(self, context):
+            sources = {"20200101": (first,)}
+            failures = (PreparationFailure("20200113", "source", "missing", FileNotFoundError()),)
+            footprint = (9.9, 39.9, 10.2, 40.2)
+            if recovered.exists():
+                sources["20200113"] = (recovered,)
+                failures = ()
+                footprint = (9.5, 39.5, 10.5, 40.5)
+            from faninsar.stack.search import MissionPreparedInputs
+            return PreparedInputs(sources=sources, requested=("20200101", "20200113"), failures=failures, mission=MissionPreparedInputs(selected_footprints=(footprint,)))
+    monkeypatch.setattr(SourceDEM, "to_raster", lambda self, grid, **kwargs: RasterDEM(array=np.full(grid.shape, 12, dtype="float32"), grid=grid, vertical_datum="ellipsoidal"))
+    stack = CoverageMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=public_grid, dem=DEM.from_source("glo30", cache_dir=tmp_path / "cache")), request={"source": first})
+    assert stack.prepare_data().outcome == "partial"
+    paths = tuple(path for path in stack.config.work_dir.iterdir() if path.name in {"dem.tif", "dem_wgs84.tif", "dem.json", "stack.json"})
+    before = {path: path.read_bytes() for path in paths}
+    recovered.write_bytes(b"recovered")
+    with pytest.raises(DataPreparationError):
+        stack.prepare_data(on_error="raise")
+    assert all(path.read_bytes() == payload for path, payload in before.items())
+    assert stack.catalog.dates == ("20200101",)
+    assert stack.config.grid == public_grid

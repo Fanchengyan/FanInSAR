@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 from faninsar.logging import reject, setup_logger
 
@@ -23,7 +25,31 @@ from .cache import (
 logger = setup_logger(__name__)
 
 
-class GeoidResourceError(RuntimeError):
+_OFFLINE_RESOURCES: ContextVar[bool] = ContextVar(
+    "geometry_offline_resources", default=False
+)
+
+
+class OfflineResourceError(OSError, RuntimeError):
+    """A required geometry resource is absent from the local offline cache."""
+
+
+def resources_offline() -> bool:
+    """Return the scoped execution policy without modifying process environment."""
+    return _OFFLINE_RESOURCES.get()
+
+
+@contextmanager
+def offline_resources(offline: bool) -> Iterator[None]:
+    """Constrain geometry resource acquisition, preserving nested offline scopes."""
+    token = _OFFLINE_RESOURCES.set(offline or resources_offline())
+    try:
+        yield
+    finally:
+        _OFFLINE_RESOURCES.reset(token)
+
+
+class GeoidResourceError(OSError, RuntimeError):
     """Raised when a geoid resource is unavailable or invalid."""
 
 
@@ -168,7 +194,7 @@ class Fetch:
             )
             return target
         except ArtifactValidationError as cache_error:
-            if _offline():
+            if _offline() or resources_offline():
                 message = f"required geoid {model} is not valid in offline cache"
                 reject(message, GeoidResourceError, cause=cache_error)
         return self._download(resource, target)

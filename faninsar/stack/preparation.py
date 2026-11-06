@@ -269,6 +269,18 @@ def restore_request(root: Path, runtime: Mapping[str, Any]) -> Stack:
 def prepare_stack_data(
     stack: Stack, *, on_error: str, offline: bool, budget: RemoteResourceBudget | None
 ) -> PreparationReport:
+    """Prepare under one geometry-resource policy, including mission DEM demands."""
+    from faninsar.processing.geometry.fetch import offline_resources
+
+    with offline_resources(offline):
+        return _prepare_stack_data(
+            stack, on_error=on_error, offline=offline, budget=budget
+        )
+
+
+def _prepare_stack_data(
+    stack: Stack, *, on_error: str, offline: bool, budget: RemoteResourceBudget | None
+) -> PreparationReport:
     """Prepare a candidate and atomically install only a qualified ready set."""
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pair import Pairs
@@ -340,7 +352,16 @@ def prepare_stack_data(
         requested = inputs.requested or tuple(
             dict.fromkeys((*sources, *(f.target for f in failures)))
         )
+        if failures and on_error == "raise":
+            report = PreparationReport(
+                tuple(requested), tuple(sorted(sources)), tuple(failures)
+            )
+            atomic_json(root / "inputs" / "attempt.json", report_document(report))
+            error = DataPreparationError(report)
+            logger.error("%s", error)
+            raise error from failures[0].cause
         candidate = copy.copy(stack)
+        candidate._preparation_preserve_artifacts = stack.data_ready
         candidate.config = replace(
             stack._request_config, extra=thaw(freeze(stack._request_config.extra))
         )

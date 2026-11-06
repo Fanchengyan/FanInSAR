@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import reject, setup_logger
+from faninsar.processing.geometry.fetch import OfflineResourceError, resources_offline
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry import GridSpec, RasterDEM
@@ -116,6 +117,9 @@ def _execute_plan(
                 hits.append(target)
             else:
                 missing.append(unit)
+        if missing and resources_offline():
+            message = "required DEM tiles are unavailable in offline cache"
+            reject(message, OfflineResourceError)
         if missing:
             hits.extend(
                 fetch_plan(
@@ -136,6 +140,25 @@ def _execute_plan(
                 resolved.append(path)
         return resolved
 
+    if resources_offline():
+        if isinstance(plan, Artifact) and plan.cache_path is not None:
+            target = cache_dir / plan.cache_path
+            validate_cache_target(cache_dir, target)
+            if target.is_file() and target.stat().st_size >= plan.min_total_bytes:
+                if plan.expand != "zip":
+                    return [target]
+                from faninsar.processing.geometry.dem_transport import (
+                    extract_zip_members,
+                )
+
+                return extract_zip_members(
+                    target,
+                    target.with_suffix(target.suffix + ".zip-staging"),
+                    members=plan.members,
+                    member_pattern=plan.member_pattern,
+                )
+        message = "required DEM artifact is unavailable in offline cache"
+        reject(message, OfflineResourceError)
     executed = fetch_plan(plan, cache_dir, max_fetch_bytes=max_fetch_bytes)
     if isinstance(plan, Artifact) and plan.expand == "zip" and plan.cache_path:
         staging = (
@@ -168,6 +191,9 @@ def _execute_remote_granules(
     if not isinstance(plan, (DeferredGranulePlan, DeferredStacPlan)):
         message = "expected a deferred remote plan"
         raise TypeError(message)
+    if resources_offline():
+        message = "offline DEM discovery requires a previously materialized local DEM"
+        reject(message, OfflineResourceError)
     discover = getattr(entry, "discover", None)
     if not callable(discover):
         message = f"DEM source {entry.name!r} cannot resolve deferred granules"
@@ -414,6 +440,18 @@ def _materialize_auto(
     fallback = get_dem_source("glo90")
     primary_plan = primary.plan(bounds)
     fallback_plan = fallback.plan(bounds)
+    if resources_offline():
+        paths = _execute_plan(primary_plan, cache_dir, budget=budget)
+        return RasterDEM(
+            array=_sample_paths(paths, primary, grid),
+            grid=grid,
+            vertical_datum=primary.vertical_datum,
+            provenance={
+                "provider": primary.provider,
+                "product": "auto",
+                "resampling": "direct-source-target",
+            },
+        )
     statuses = {tile.url: _head_status(tile.url) for tile in primary_plan.tiles}
     primary_tiles = []
     fallback_tiles = []

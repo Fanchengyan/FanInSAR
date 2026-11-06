@@ -622,6 +622,14 @@ def materialize_source(
         max(lon_a, lon_b),
         max(lat_a, lat_b),
     )
+    from faninsar.processing.geometry.fetch import (
+        OfflineResourceError,
+        resources_offline,
+    )
+
+    if resources_offline():
+        message = "offline STAC DEM requires a previously materialized local DEM"
+        reject(message, OfflineResourceError)
     resources = source.discover(
         source.plan(bounds), client=client, signer=signer, budget=budget
     )

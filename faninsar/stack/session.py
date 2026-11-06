@@ -2083,6 +2083,14 @@ class Stack(NetworkContract, ABC):
             except (OSError, ValueError):
                 existing = {}
             if existing.get("identity") != raster.identity:
+                if getattr(self, "_preparation_preserve_artifacts", False):
+                    from faninsar.stack.preparation import InputUnavailableError
+
+                    message = (
+                        "candidate DEM conflicts with a durable artifact; "
+                        "retain prior data"
+                    )
+                    reject(message, InputUnavailableError, logger=logger)
                 path.unlink()
         if not path.is_file():
             raster.save(path)
@@ -2115,6 +2123,14 @@ class Stack(NetworkContract, ABC):
                 existing = {}
             if existing.get("wgs84_identity") == wgs84.identity and path.is_file():
                 return
+            if getattr(self, "_preparation_preserve_artifacts", False):
+                from faninsar.stack.preparation import InputUnavailableError
+
+                message = (
+                    "recovered coverage needs a new geographic DEM; "
+                    "prior artifact retained"
+                )
+                reject(message, InputUnavailableError, logger=logger)
             path.unlink()
         wgs84.save(path)
 
