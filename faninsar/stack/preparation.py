@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -430,6 +431,33 @@ def _prepare_stack_data(
                 candidate.config.extra["selected_footprints"] = (
                     inputs.mission.selected_footprints
                 )
+            if stack.data_ready:
+                from faninsar.stack.identity import encode_value
+
+                scope_identity = {
+                    "request": document,
+                    "sources": {
+                        key: [
+                            {
+                                "path": str(path),
+                                "size": path.stat().st_size,
+                                "mtime_ns": path.stat().st_mtime_ns,
+                            }
+                            for path in paths
+                        ]
+                        for key, paths in sorted(sources.items())
+                    },
+                    "footprints": encode_value(inputs.mission.selected_footprints),
+                    "grid": encode_value(candidate.config.grid),
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(scope_identity, sort_keys=True).encode()
+                ).hexdigest()
+                candidate.config.extra["preparation_dem_scope"] = (
+                    f"inputs/dem/{fingerprint}"
+                )
+                candidate._preparation_preserve_artifacts = False
+                candidate._dem_wgs84 = None
             candidate._validate_mission_prepared(inputs.mission)
             try:
                 if (
@@ -481,9 +509,10 @@ def _prepare_stack_data(
             candidate.preparation_report = report
             candidate.config.extra["preparation_report"] = report_document(report)
             candidate._track_metadata()
+            _sync_dem_artifacts(candidate)
             save_stack_identity(candidate)
             stack.__dict__.update(candidate.__dict__)
-        else:
+        elif not stack.data_ready:
             stack.preparation_report = report
         return report
 
@@ -528,3 +557,23 @@ def _prepare_mask_dependencies(stack: Stack, *, offline: bool) -> None:
             except MaskProviderUnavailableError as error:
                 message = "water mask prerequisites are unavailable"
                 raise InputUnavailableError(message) from error
+
+
+def _sync_dem_artifacts(stack: Stack) -> None:
+    """Make candidate raster files durable before publishing their identity."""
+    paths = (
+        stack._stack_dem_raster_path(),
+        stack._stack_wgs84_raster_path(),
+        stack._stack_dem_sidecar_path(),
+    )
+    for path in paths:
+        if path.is_file():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+    directory = stack._dem_artifact_root()
+    if directory.is_dir():
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

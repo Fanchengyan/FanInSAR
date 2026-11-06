@@ -98,6 +98,7 @@ SAVED_EXTRA_KEYS = frozenset(
         "height_m",
         "track_metadata",
         "preparation_report",
+        "preparation_dem_scope",
         "nisar_provider",
         "source_lineage",
         "source_admission",

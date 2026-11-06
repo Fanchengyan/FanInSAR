@@ -2022,6 +2022,20 @@ class Stack(NetworkContract, ABC):
         """Return whether the Stack has an ROI or selected footprints."""
         return self.config.roi is not None or self._selected_footprint_roi() is not None
 
+    def _dem_artifact_root(self) -> Path:
+        """Resolve an immutable prepared artifact scope within the workspace."""
+        scope = self.config.extra.get("preparation_dem_scope")
+        if scope is None:
+            return self.config.work_dir
+        path = Path(str(scope))
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or path.parts[:2] != ("inputs", "dem")
+        ):
+            reject_invalid_state("invalid prepared DEM artifact scope")
+        return self.config.work_dir / path
+
     def _stack_dem_raster_path(self) -> Path:
         """Return the durable raster path owned by this Stack.
 
@@ -2030,19 +2044,19 @@ class Stack(NetworkContract, ABC):
         """
         from faninsar.stack.layout import dem_raster_path
 
-        return dem_raster_path(self.config.work_dir)
+        return dem_raster_path(self._dem_artifact_root())
 
     def _stack_dem_sidecar_path(self) -> Path:
         """Return the sidecar that records source and raster identity."""
         from faninsar.stack.layout import dem_sidecar_path
 
-        return dem_sidecar_path(self.config.work_dir)
+        return dem_sidecar_path(self._dem_artifact_root())
 
     def _stack_wgs84_raster_path(self) -> Path:
         """Return the geographic DEM used by rdr2geo."""
         from faninsar.stack.layout import dem_wgs84_path
 
-        return dem_wgs84_path(self.config.work_dir)
+        return dem_wgs84_path(self._dem_artifact_root())
 
     def _geometry_dem(self) -> RasterDEM | object | None:
         """Return the DEM passed to radar geometry.
@@ -3768,7 +3782,7 @@ class Stack(NetworkContract, ABC):
                 {
                     key: value
                     for key, value in config.extra.items()
-                    if key != "preparation_report"
+                    if key not in {"preparation_report", "preparation_dem_scope"}
                 }
             ),
         }
