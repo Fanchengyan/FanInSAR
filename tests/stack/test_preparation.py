@@ -577,3 +577,42 @@ def test_original_qualification_survives_three_retries_and_reopen(tmp_path, monk
     damaged.write_bytes(b"qualified original bytes")
     assert stack.prepare_data(offline=True).complete
     assert stack.catalog.dates == ("20200101", "20200113")
+
+
+def test_actual_verified_large_redownload_restores_original_request(tmp_path, monkeypatch):
+    import hashlib
+    from shapely.geometry import Polygon
+    from faninsar import remote
+    from faninsar.data.query import Points
+    from faninsar.remote.catalog import _register_fixture
+    from faninsar.missions import base as registry
+    payload = b"V" * (1024 * 1024 + 1)
+    name = "p73-receipt-fixture"
+    _register_fixture([{"id": "item", "collection": "slc", "geometry": Polygon(((-1,-1),(1,-1),(1,1),(-1,1))), "assets": {"data": {"href": "https://fixture.invalid/data", "data": payload, "size": len(payload), "checksum": "sha256:" + hashlib.sha256(payload).hexdigest()}}}], name=name)
+    asset = remote.search(Points([(0,0)], crs=4326), catalog=name)[0].assets["data"]
+    first, second = tmp_path / "first", tmp_path / "second"
+    remote.download(asset, first)
+    second.write_bytes(b"qualified")
+    class ReceiptMission(Stack):
+        def _prepare_inputs(self, context):
+            return PreparedInputs(sources={"20200101": (first,), "20200113": (second,)}, requested=("20200101", "20200113"))
+    monkeypatch.setitem(registry._MISSION_STACKS, "ReceiptMission", (__name__, "_receipt_mission"))
+    monkeypatch.setattr(__import__(__name__, fromlist=["x"]), "_receipt_mission", ReceiptMission, raising=False)
+    stack = ReceiptMission.configure(config=StackConfig(work_dir=tmp_path / "work"), request={"sources": (first, second)})
+    assert stack.prepare_data(offline=True).complete
+    first.write_bytes(b"corrupt")
+    assert stack.prepare_data(offline=True).outcome == "partial"
+    stack = Stack.open(stack.config.work_dir)
+    first.unlink()
+    remote.download(asset, first)
+    # Tampering after a genuine receipt cannot authorize the changed bytes.
+    first.write_bytes(b"X" * len(payload))
+    assert stack.prepare_data(offline=True).outcome == "partial"
+    first.unlink()
+    from dataclasses import replace
+    remote.download(replace(asset, version="different-representation"), first)
+    assert stack.prepare_data(offline=True).outcome == "partial"
+    first.unlink()
+    remote.download(asset, first)
+    assert stack.prepare_data(offline=True).complete
+    assert stack.data_ready

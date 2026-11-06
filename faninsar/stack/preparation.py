@@ -703,6 +703,9 @@ def local_input_records(stack: Stack) -> dict[str, Any]:
     for path, entry in records.items():
         entry["content"] = _bounded_content(Path(path))
         entry["active"] = True
+        from faninsar.remote.fetch.complete import qualified_download_receipt
+
+        entry["receipt"] = qualified_download_receipt(Path(path))
     return records
 
 
@@ -737,6 +740,10 @@ def unavailable_local_inputs(
             matches = _path_signature(Path(recorded)) == entry["stat"]
             if not matches and entry.get("content") is not None:
                 matches = _bounded_content(Path(recorded)) == entry["content"]
+            if not matches and entry.get("receipt") is not None:
+                from faninsar.remote.fetch.complete import qualified_download_receipt
+
+                matches = qualified_download_receipt(Path(recorded)) == entry["receipt"]
         except OSError:
             matches = False
         if not matches:

@@ -1288,6 +1288,8 @@ def _publish_manifest(
     digest: str,
     size: int,
     verification: Mapping[str, object],
+    *,
+    destination: Path | None = None,
 ) -> None:
     """Atomically publish one per-destination transfer manifest.
 
@@ -1310,6 +1312,15 @@ def _publish_manifest(
                     "sha256": digest,
                     "size": size,
                     "verification": dict(verification),
+                    "local_stat": None
+                    if destination is None
+                    else {
+                        "path": str(destination.resolve()),
+                        "size": destination.stat().st_size,
+                        "mtime_ns": destination.stat().st_mtime_ns,
+                        "ctime_ns": destination.stat().st_ctime_ns,
+                        "inode": destination.stat().st_ino,
+                    },
                 },
                 stream,
                 separators=(",", ":"),
@@ -1521,7 +1532,9 @@ def download(
             staging.replace(destination)
             if temporary is not None:
                 temporary = None
-            _publish_manifest(manifest, identity, digest, size, verification)
+            _publish_manifest(
+                manifest, identity, digest, size, verification, destination=destination
+            )
             if resume:
                 part.unlink(missing_ok=True)
                 part_state_path.unlink(missing_ok=True)
@@ -1565,3 +1578,39 @@ def read_verification(path: str | Path) -> dict[str, object] | None:
 
 
 __all__ = ["_RedirectHandler", "_stream_download", "download", "read_verification"]
+
+
+def qualified_download_receipt(path: Path) -> dict[str, object] | None:
+    """Read a provider-verified receipt bound to the current local file metadata.
+
+    This is local cache evidence, not authentication of arbitrary caller JSON.
+    Consumers must additionally anchor representation identity to prior evidence.
+    """
+    try:
+        stat = path.stat()
+        current = {
+            "path": str(path.resolve()),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "inode": stat.st_ino,
+        }
+        manifests = sorted(path.parent.glob(f"{path.name}.faninsar.remote.*.json"))
+        for manifest_path in manifests:
+            record = json.loads(manifest_path.read_text())
+            verification = record.get("verification", {})
+            if (
+                record.get("local_stat") == current
+                and verification.get("status") == "verified"
+                and verification.get("size") == stat.st_size
+                and record.get("size") == stat.st_size
+                and isinstance(record.get("identity"), str)
+                and isinstance(record.get("sha256"), str)
+            ):
+                return {
+                    key: record[key]
+                    for key in ("identity", "sha256", "size", "verification")
+                }
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
