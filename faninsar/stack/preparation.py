@@ -312,13 +312,7 @@ def _prepare_stack_data(
             )
         ):
             return stack.preparation_report
-        unavailable = unavailable_local_inputs(stack)
-        observed_unavailable = {}
-        for path in unavailable:
-            try:
-                observed_unavailable[path] = _path_signature(Path(path))
-            except OSError:
-                observed_unavailable[path] = None
+        unavailable = unavailable_local_inputs(stack, include_history=True)
         atomic_json(request_path, document)
         context = PreparationContext(
             stack.request,
@@ -373,10 +367,7 @@ def _prepare_stack_data(
             for target, path in bindings.items():
                 prior = unavailable.get(str(path))
                 if not Path(path).is_file() or (
-                    prior is not None
-                    and prior["kind"] in {"orbit", "aux"}
-                    and observed_unavailable.get(str(path))
-                    == _path_signature(Path(path))
+                    prior is not None and prior["kind"] in {"orbit", "aux"}
                 ):
                     sources.pop(target, None)
                     failures.append(
@@ -568,9 +559,15 @@ def _prepare_stack_data(
             candidate.config.extra["preparation_report"] = report_document(report)
             candidate._track_metadata()
             _sync_dem_artifacts(candidate)
-            candidate.config.extra["preparation_local_inputs"] = local_input_records(
-                candidate
-            )
+            current_records = local_input_records(candidate)
+            historical = {
+                path: {**entry, "active": False}
+                for path, entry in stack.config.extra.get(
+                    "preparation_local_inputs", {}
+                ).items()
+            }
+            historical.update(current_records)
+            candidate.config.extra["preparation_local_inputs"] = historical
             save_stack_identity(candidate)
             stack.__dict__.update(candidate.__dict__)
         elif not stack.data_ready:
@@ -703,16 +700,43 @@ def local_input_records(stack: Stack) -> dict[str, Any]:
                 "target": "shared",
                 "stat": _path_signature(path),
             }
+    for path, entry in records.items():
+        entry["content"] = _bounded_content(Path(path))
+        entry["active"] = True
     return records
 
 
-def unavailable_local_inputs(stack: Stack) -> dict[str, Any]:
+def _bounded_content(path: Path) -> str | None:
+    """Qualify small repairable artifacts without hashing bulk payloads."""
+    paths = (
+        sorted(member for member in path.rglob("*") if member.is_file())
+        if path.is_dir()
+        else [path]
+    )
+    if sum(member.stat().st_size for member in paths) > 1024 * 1024:
+        return None
+    digest = hashlib.sha256()
+    for member in paths:
+        digest.update(
+            str(member.relative_to(path) if path.is_dir() else "file").encode()
+        )
+        digest.update(member.read_bytes())
+    return digest.hexdigest()
+
+
+def unavailable_local_inputs(
+    stack: Stack, *, include_history: bool = False
+) -> dict[str, Any]:
     """Stat-qualify the installed snapshot without acquisition or payload hashes."""
     records = stack.config.extra.get("preparation_local_inputs", {})
     unavailable = {}
     for recorded, entry in records.items():
+        if not include_history and not entry.get("active", True):
+            continue
         try:
             matches = _path_signature(Path(recorded)) == entry["stat"]
+            if not matches and entry.get("content") is not None:
+                matches = _bounded_content(Path(recorded)) == entry["content"]
         except OSError:
             matches = False
         if not matches:

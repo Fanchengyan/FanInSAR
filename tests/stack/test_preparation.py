@@ -537,3 +537,43 @@ def test_damaged_shared_artifact_keeps_product_only_open_local(tmp_path, monkeyp
     assert "20200101" in opened.scenes
     assert opened.prepare_data(offline=True).complete
     assert opened.data_ready
+
+
+@pytest.mark.parametrize("role", ["source", "aux", "directory"])
+def test_original_qualification_survives_three_retries_and_reopen(tmp_path, monkeypatch, role):
+    from faninsar.stack.search import MissionPreparedInputs
+    from faninsar.missions import base as registry
+    first, second, auxiliary = tmp_path / "first", tmp_path / "second", tmp_path / "aux"
+    if role == "directory":
+        first.mkdir()
+        damaged = first / "member"
+    else:
+        damaged = auxiliary if role == "aux" else first
+    for path in (second, auxiliary):
+        path.write_bytes(b"qualified original bytes")
+    if role != "directory":
+        first.write_bytes(b"qualified original bytes")
+    damaged.write_bytes(b"qualified original bytes")
+    class HistoryMission(Stack):
+        def _prepare_inputs(self, context):
+            return PreparedInputs(sources={"20200101": (first,), "20200113": (second,)}, requested=("20200101", "20200113"), mission=MissionPreparedInputs(aux_cal_paths_by_acquisition={"20200101": auxiliary} if role == "aux" else {}))
+    monkeypatch.setitem(registry._MISSION_STACKS, "HistoryMission", (__name__, "_history_mission"))
+    monkeypatch.setattr(__import__(__name__, fromlist=["x"]), "_history_mission", HistoryMission, raising=False)
+    stack = HistoryMission.configure(config=StackConfig(work_dir=tmp_path / "work"), request={"source": first})
+    assert stack.prepare_data().complete
+    damaged.write_bytes(b"x")
+    for attempt in range(3):
+        report = stack.prepare_data(offline=True)
+        assert report.outcome == "partial"
+        assert report.ready == ("20200113",)
+        stack = Stack.open(stack.config.work_dir)
+        assert stack.data_ready
+        with pytest.raises(DataPreparationError):
+            stack.prepare_data(offline=True, on_error="raise")
+    damaged.write_bytes(b"different damaged bits")
+    assert stack.prepare_data(offline=True).outcome == "partial"
+    damaged.unlink()
+    assert stack.prepare_data(offline=True).outcome == "partial"
+    damaged.write_bytes(b"qualified original bytes")
+    assert stack.prepare_data(offline=True).complete
+    assert stack.catalog.dates == ("20200101", "20200113")
