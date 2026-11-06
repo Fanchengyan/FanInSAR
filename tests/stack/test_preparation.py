@@ -429,3 +429,111 @@ def test_expanded_recovered_coverage_uses_new_dem_preserving_prior_bytes(tmp_pat
     assert opened.catalog.dates == (*initial, "20200113")
     assert opened._stack_wgs84_raster_path() == stack._stack_wgs84_raster_path()
     assert opened._dem_wgs84.grid == stack._dem_wgs84.grid
+
+
+@pytest.mark.parametrize("damage", ["delete", "truncate"])
+def test_complete_reuse_repairs_deleted_required_dem(tmp_path, monkeypatch, damage):
+    import numpy as np
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
+    source = tmp_path / "source"
+    source.write_bytes(b"qualified")
+    grid = GridSpec("EPSG:4326", Affine(.001, 0, 10, 0, -.001, 50), height=2, width=2)
+    calls = []
+    def materialize(self, grid, **kwargs):
+        calls.append(True)
+        return RasterDEM(array=np.full(grid.shape, 7, dtype="float32"), grid=grid, vertical_datum="ellipsoidal")
+    monkeypatch.setattr(SourceDEM, "to_raster", materialize)
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_source("glo30", cache_dir=tmp_path / "cache")), request={"source": source})
+    assert stack.prepare_data(offline=True).complete
+    for _ in range(2):
+        if damage == "delete":
+            stack._stack_dem_raster_path().unlink()
+        else:
+            stack._stack_dem_raster_path().write_bytes(b"corrupt")
+        assert not stack.data_ready
+        count = len(calls)
+        assert stack.prepare_data(offline=True).complete
+        assert len(calls) > count
+        assert stack._stack_dem_raster_path().is_file()
+        assert stack.data_ready
+
+
+def test_changed_source_cannot_reuse_complete_report(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"qualified")
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work"), request={"source": source})
+    stack.prepare_data()
+    source.write_bytes(b"truncated")
+    assert not stack.data_ready
+    source.write_bytes(b"x")
+    assert stack.prepare_data(offline=True).outcome == "failed"
+    assert not stack.data_ready
+
+
+@pytest.mark.parametrize("kind", ["orbit", "aux"])
+@pytest.mark.parametrize("damage", ["delete", "truncate"])
+def test_auxiliary_damage_invalidates_ready_and_only_dependent_target(tmp_path, kind, damage):
+    from faninsar.stack.search import MissionPreparedInputs
+    paths = {target: tmp_path / target for target in ("20200101", "20200113")}
+    aux = tmp_path / "required-auxiliary"
+    for path in (*paths.values(), aux):
+        path.write_bytes(b"qualified")
+    class BoundMission(Stack):
+        def _prepare_inputs(self, context):
+            bindings = {"orbit_paths_by_acquisition" if kind == "orbit" else "aux_cal_paths_by_acquisition": {"20200101": aux}}
+            return PreparedInputs(sources={key: (path,) for key, path in paths.items()}, requested=tuple(paths), mission=MissionPreparedInputs(**bindings))
+    stack = BoundMission.configure(config=StackConfig(work_dir=tmp_path / "work"), request={"sources": paths})
+    assert stack.prepare_data().complete
+    if damage == "delete":
+        aux.unlink()
+    else:
+        aux.write_bytes(b"x")
+    assert not stack.data_ready
+    report = stack.prepare_data(offline=True)
+    assert report.outcome == "partial"
+    assert report.ready == ("20200113",)
+    assert report.failed[0].target == "20200101"
+    assert stack.data_ready
+
+
+def test_missing_dem_cache_cannot_fall_back_to_stale_in_memory_raster(tmp_path, monkeypatch):
+    import numpy as np
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
+    source = tmp_path / "source"
+    source.write_bytes(b"qualified")
+    grid = GridSpec("EPSG:4326", Affine(.001, 0, 10, 0, -.001, 50), height=2, width=2)
+    original = SourceDEM.to_raster
+    monkeypatch.setattr(SourceDEM, "to_raster", lambda self, grid, **kwargs: RasterDEM(array=np.full(grid.shape, 7, dtype="float32"), grid=grid, vertical_datum="ellipsoidal"))
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_source("glo30", cache_dir=tmp_path / "empty-cache")), request={"source": source})
+    stack.prepare_data(offline=True)
+    stack._stack_dem_raster_path().write_bytes(b"corrupted")
+    assert not stack.data_ready
+    monkeypatch.setattr(SourceDEM, "to_raster", original)
+    monkeypatch.setattr("faninsar.processing.geometry.dem_transport.fetch_plan", lambda *args, **kwargs: pytest.fail("offline repair attempted network"))
+    for _ in range(2):
+        assert stack.prepare_data(offline=True).outcome == "failed"
+        assert not stack.data_ready
+
+
+def test_damaged_shared_artifact_keeps_product_only_open_local(tmp_path, monkeypatch):
+    import numpy as np
+    from affine import Affine
+    from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
+    from faninsar.missions import base as registry
+    monkeypatch.setitem(registry._MISSION_STACKS, "LocalMission", (__name__, "LocalMission"))
+    source = tmp_path / "source"
+    source.write_bytes(b"qualified")
+    grid = GridSpec("EPSG:4326", Affine(.001, 0, 10, 0, -.001, 50), height=2, width=2)
+    monkeypatch.setattr(SourceDEM, "to_raster", lambda self, grid, **kwargs: RasterDEM(array=np.full(grid.shape, 7, dtype="float32"), grid=grid, vertical_datum="ellipsoidal"))
+    stack = LocalMission.configure(config=StackConfig(work_dir=tmp_path / "work", grid=grid, dem=DEM.from_source("glo30", cache_dir=tmp_path / "cache")), request={"source": source})
+    stack.prepare_data(offline=True)
+    from tests.support.scene_stores import write_test_scene
+    write_test_scene(stack.config.work_dir, date_id="20200101", reference_id="20200101", payload=np.ones((2,2), dtype="complex64"))
+    stack._stack_dem_raster_path().write_bytes(b"broken")
+    opened = Stack.open(stack.config.work_dir)
+    assert not opened.data_ready
+    assert "20200101" in opened.scenes
+    assert opened.prepare_data(offline=True).complete
+    assert opened.data_ready

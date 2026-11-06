@@ -1105,7 +1105,13 @@ class Stack(NetworkContract, ABC):
     @property
     def data_ready(self) -> bool:
         """Whether a nonempty qualified ready set is installed."""
-        return self._prepared and self._inputs_state is not None
+        from faninsar.stack.preparation import unavailable_local_inputs
+
+        return (
+            self._prepared
+            and self._inputs_state is not None
+            and not unavailable_local_inputs(self)
+        )
 
     @abstractmethod
     def _prepare_inputs(self, context: PreparationContext) -> PreparedInputs:
@@ -2356,6 +2362,17 @@ class Stack(NetworkContract, ABC):
     def _restore_local_inputs(self) -> None:
         """Restore persisted local DEMs without preparing missing inputs."""
         self._capture_dem_source()
+        from faninsar.stack.preparation import unavailable_local_inputs
+
+        if any(
+            entry["kind"] == "dem" for entry in unavailable_local_inputs(self).values()
+        ):
+            self._dem_wgs84 = None
+            logger.warning(
+                "Prepared DEM artifacts are unavailable; "
+                "product inspection remains local"
+            )
+            return
         raster = self._load_persisted_raster_dem()
         if raster is not None:
             self.config.dem = raster
@@ -3782,7 +3799,12 @@ class Stack(NetworkContract, ABC):
                 {
                     key: value
                     for key, value in config.extra.items()
-                    if key not in {"preparation_report", "preparation_dem_scope"}
+                    if key
+                    not in {
+                        "preparation_report",
+                        "preparation_dem_scope",
+                        "preparation_local_inputs",
+                    }
                 }
             ),
         }

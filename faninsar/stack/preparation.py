@@ -312,6 +312,13 @@ def _prepare_stack_data(
             )
         ):
             return stack.preparation_report
+        unavailable = unavailable_local_inputs(stack)
+        observed_unavailable = {}
+        for path in unavailable:
+            try:
+                observed_unavailable[path] = _path_signature(Path(path))
+            except OSError:
+                observed_unavailable[path] = None
         atomic_json(request_path, document)
         context = PreparationContext(
             stack.request,
@@ -338,8 +345,17 @@ def _prepare_stack_data(
             reject(message, TypeError, logger=logger)
         failures = list(inputs.failures)
         sources = {}
+        changed_sources = {
+            entry["target"]
+            for path, entry in unavailable.items()
+            if entry["kind"] == "source" and Path(path).exists()
+        }
         for target, paths in inputs.sources.items():
-            if paths and all(path.exists() for path in paths):
+            if (
+                target not in changed_sources
+                and paths
+                and all(path.exists() for path in paths)
+            ):
                 sources[target] = paths
             else:
                 failures.append(
@@ -350,6 +366,27 @@ def _prepare_stack_data(
                         FileNotFoundError(target),
                     )
                 )
+        for bindings in (
+            inputs.mission.orbit_paths_by_acquisition,
+            inputs.mission.aux_cal_paths_by_acquisition,
+        ):
+            for target, path in bindings.items():
+                prior = unavailable.get(str(path))
+                if not Path(path).is_file() or (
+                    prior is not None
+                    and prior["kind"] in {"orbit", "aux"}
+                    and observed_unavailable.get(str(path))
+                    == _path_signature(Path(path))
+                ):
+                    sources.pop(target, None)
+                    failures.append(
+                        PreparationFailure(
+                            target,
+                            "mission_inputs",
+                            "unqualified_auxiliary",
+                            FileNotFoundError(str(path)),
+                        )
+                    )
         requested = inputs.requested or tuple(
             dict.fromkeys((*sources, *(f.target for f in failures)))
         )
@@ -363,27 +400,43 @@ def _prepare_stack_data(
             raise error from failures[0].cause
         candidate = copy.copy(stack)
         candidate._preparation_preserve_artifacts = stack.data_ready
+        if any(entry["kind"] == "dem" for entry in unavailable.values()):
+            candidate._dem_wgs84 = None
         candidate.config = replace(
             stack._request_config, extra=thaw(freeze(stack._request_config.extra))
         )
         candidate.config.extra.update(thaw(inputs.extra))
         if stack._inputs_state is not None:
             candidate.config.grid = stack.config.grid
-            candidate.config.dem = stack.config.dem
+            if not any(entry["kind"] == "dem" for entry in unavailable.values()):
+                candidate.config.dem = stack.config.dem
         candidate.__dict__.update(inputs.runtime)
         candidate.scene_provider = (
             inputs.scene_provider
             or stack.scene_provider
             or stack._default_scene_provider()
         )
-        candidate._mission_prepared = inputs.mission
+        mission = replace(
+            inputs.mission,
+            orbit_paths_by_acquisition={
+                key: value
+                for key, value in inputs.mission.orbit_paths_by_acquisition.items()
+                if key in sources
+            },
+            aux_cal_paths_by_acquisition={
+                key: value
+                for key, value in inputs.mission.aux_cal_paths_by_acquisition.items()
+                if key in sources
+            },
+        )
+        candidate._mission_prepared = mission
         if inputs.mission.orbit_paths_by_acquisition:
             candidate.config.extra["orbit_paths"] = dict(
-                inputs.mission.orbit_paths_by_acquisition
+                mission.orbit_paths_by_acquisition
             )
         if inputs.mission.aux_cal_paths_by_acquisition:
             candidate.config.extra["aux_cal_paths"] = dict(
-                inputs.mission.aux_cal_paths_by_acquisition
+                mission.aux_cal_paths_by_acquisition
             )
         prerequisites = []
         if sources:
@@ -431,7 +484,7 @@ def _prepare_stack_data(
                 candidate.config.extra["selected_footprints"] = (
                     inputs.mission.selected_footprints
                 )
-            if stack.data_ready:
+            if stack._prepared and stack._inputs_state is not None:
                 from faninsar.stack.identity import encode_value
 
                 scope_identity = {
@@ -449,6 +502,11 @@ def _prepare_stack_data(
                     },
                     "footprints": encode_value(inputs.mission.selected_footprints),
                     "grid": encode_value(candidate.config.grid),
+                    "repair_of": {
+                        path: entry.get("stat")
+                        for path, entry in unavailable.items()
+                        if entry["kind"] == "dem"
+                    },
                 }
                 fingerprint = hashlib.sha256(
                     json.dumps(scope_identity, sort_keys=True).encode()
@@ -458,7 +516,7 @@ def _prepare_stack_data(
                 )
                 candidate._preparation_preserve_artifacts = False
                 candidate._dem_wgs84 = None
-            candidate._validate_mission_prepared(inputs.mission)
+            candidate._validate_mission_prepared(mission)
             try:
                 if (
                     candidate.config.grid != "utm_ups"
@@ -510,6 +568,9 @@ def _prepare_stack_data(
             candidate.config.extra["preparation_report"] = report_document(report)
             candidate._track_metadata()
             _sync_dem_artifacts(candidate)
+            candidate.config.extra["preparation_local_inputs"] = local_input_records(
+                candidate
+            )
             save_stack_identity(candidate)
             stack.__dict__.update(candidate.__dict__)
         elif not stack.data_ready:
@@ -577,3 +638,88 @@ def _sync_dem_artifacts(stack: Stack) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+def _path_signature(path: Path) -> dict[str, Any]:
+    """Record local metadata without reading large scientific payloads."""
+    stat = path.stat()
+    record = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    if path.is_dir():
+        record["members"] = {
+            str(member.relative_to(path)): {
+                "size": item.st_size,
+                "mtime_ns": item.st_mtime_ns,
+            }
+            for member in sorted(path.rglob("*"))
+            if member.is_file()
+            for item in (member.stat(),)
+        }
+    return record
+
+
+def local_input_records(stack: Stack) -> dict[str, Any]:
+    """Capture all installed local input and shared artifact dependencies."""
+    records = {}
+    for target, paths in stack.catalog.paths.items():
+        for path in paths:
+            records[str(path)] = {
+                "kind": "source",
+                "target": target,
+                "stat": _path_signature(path),
+            }
+    for kind, key in (("orbit", "orbit_paths"), ("aux", "aux_cal_paths")):
+        for target, raw_path in stack.config.extra.get(key, {}).items():
+            path = Path(raw_path)
+            records[str(path)] = {
+                "kind": kind,
+                "target": target,
+                "stat": _path_signature(path),
+            }
+    for path in (
+        stack._stack_dem_raster_path(),
+        stack._stack_wgs84_raster_path(),
+        stack._stack_dem_sidecar_path(),
+    ):
+        if path.is_file():
+            records[str(path)] = {
+                "kind": "dem",
+                "target": "shared",
+                "stat": _path_signature(path),
+            }
+    dem_path = getattr(stack.config.dem, "path", None)
+    if dem_path is not None:
+        path = Path(dem_path)
+        records[str(path)] = {
+            "kind": "dem",
+            "target": "shared",
+            "stat": _path_signature(path),
+        }
+    for definition in stack.config.mask_plan.masks.values():
+        path = getattr(definition, "path", None)
+        if path is not None:
+            path = Path(path)
+            records[str(path)] = {
+                "kind": "mask",
+                "target": "shared",
+                "stat": _path_signature(path),
+            }
+    return records
+
+
+def unavailable_local_inputs(stack: Stack) -> dict[str, Any]:
+    """Stat-qualify the installed snapshot without acquisition or payload hashes."""
+    records = stack.config.extra.get("preparation_local_inputs", {})
+    unavailable = {}
+    for recorded, entry in records.items():
+        try:
+            matches = _path_signature(Path(recorded)) == entry["stat"]
+        except OSError:
+            matches = False
+        if not matches:
+            unavailable[recorded] = entry
+    if not records and stack._inputs_state is not None:
+        for target, paths in stack.catalog.paths.items():
+            for path in paths:
+                if not path.exists():
+                    unavailable[str(path)] = {"kind": "source", "target": target}
+    return unavailable

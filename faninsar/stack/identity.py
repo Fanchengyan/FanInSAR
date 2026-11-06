@@ -99,6 +99,7 @@ SAVED_EXTRA_KEYS = frozenset(
         "track_metadata",
         "preparation_report",
         "preparation_dem_scope",
+        "preparation_local_inputs",
         "nisar_provider",
         "source_lineage",
         "source_admission",
