@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -53,7 +55,7 @@ def test_prepare_promotes_source_dem_and_reopen_reloads(
     monkeypatch.setattr(Stack, "materialize_dem", _fake_materialize)
 
     work = tmp_path / "work"
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
@@ -63,20 +65,20 @@ def test_prepare_promotes_source_dem_and_reopen_reloads(
     assert isinstance(stack.config.dem, SourceDEM)
     assert stack.dem is None
 
-    stack.prepare()
+    stack.prepare_data()
     assert isinstance(stack.dem, RasterDEM)
     assert (work / "dem.tif").is_file()
     assert (work / "dem.json").is_file()
     assert stack.dem.path == work / "dem.tif"
 
-    reopened = Stack._from_safes(
+    reopened = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
         grid=grid,
         dem_cache_dir=cache,
     )
-    reopened.prepare()
+    reopened.prepare_data()
     assert isinstance(reopened.dem, RasterDEM)
     assert reopened.dem.grid == grid
 
@@ -116,14 +118,14 @@ def test_prepare_writes_native_wgs84_from_source(
     monkeypatch.setattr(SourceDEM, "to_raster", _fake_to_raster)
 
     work = tmp_path / "work"
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
         grid=utm,
         dem_cache_dir=cache,
     )
-    stack.prepare()
+    stack.prepare_data()
 
     assert str(stack.dem.crs) == "EPSG:32633"
     assert (work / "dem.tif").is_file()
@@ -136,14 +138,14 @@ def test_prepare_writes_native_wgs84_from_source(
     assert "EPSG:4326" in grids
     n_materialize = len(grids)
 
-    reopened = Stack._from_safes(
+    reopened = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
         grid=utm,
         dem_cache_dir=cache,
     )
-    reopened.prepare()
+    reopened.prepare_data()
     assert str(reopened.dem.crs) == "EPSG:32633"
     assert reopened._dem_wgs84 is not None
     assert str(reopened._dem_wgs84.crs) == "EPSG:4326"
@@ -186,7 +188,7 @@ def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
     monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
 
     work = tmp_path / "work-frame"
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
@@ -194,7 +196,7 @@ def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
         dem_cache_dir=cache,
     )
     stack.config.extra["selected_footprints"] = (frame,)
-    stack.prepare()
+    stack.prepare_data()
 
     public = stack.dem
     assert isinstance(public, RasterDEM)
@@ -242,7 +244,7 @@ def test_geographic_roi_grid_builds_larger_processing_dem(
     monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
 
     work = tmp_path / "work-geo-frame"
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
@@ -250,7 +252,7 @@ def test_geographic_roi_grid_builds_larger_processing_dem(
         dem_cache_dir=cache,
     )
     stack.config.extra["selected_footprints"] = (frame,)
-    stack.prepare()
+    stack.prepare_data()
 
     public = stack.dem
     assert isinstance(public, RasterDEM)
@@ -265,14 +267,14 @@ def test_geographic_roi_grid_builds_larger_processing_dem(
     assert wgs84.grid != roi_grid
     n_materialize = len(grids)
 
-    reopened = Stack._from_safes(
+    reopened = LocalStack.from_paths(
         _dummy_safes(tmp_path),
         work_dir=work,
         dem=source,
         grid=roi_grid,
         dem_cache_dir=cache,
     )
-    reopened.prepare()
+    reopened.prepare_data()
     restored = reopened._dem_wgs84
     assert restored is not None
     west, south, east, north = restored.grid.bounds

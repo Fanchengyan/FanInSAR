@@ -9,6 +9,8 @@ other download failure keeps the fail-closed construction boundary.
 
 from __future__ import annotations
 
+from tests.missions.s1.test_stack_search import _materialize_selected
+
 import json
 import logging
 import zipfile
@@ -238,7 +240,7 @@ def test_checksum_mismatch_skips_acquisition_and_continues(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with caplog.at_level(logging.WARNING, logger="faninsar.missions.s1.acquisition"):
-        S1Stack.from_search(
+        _materialize_selected(
             _asf_search([failed, good]), work_dir=tmp_path, provider="asf"
         )
 
@@ -289,7 +291,7 @@ def test_other_integrity_errors_still_fail_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(remote.RemoteIntegrityError) as integrity_error:
-        S1Stack.from_search(
+        _materialize_selected(
             _asf_search([first, second]), work_dir=tmp_path, provider="asf"
         )
     assert integrity_error.value.reason == "content_length_mismatch"
@@ -316,7 +318,7 @@ def test_network_transfer_failure_still_fails_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(OSError, match="connection reset"):
-        S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
+        _materialize_selected(_asf_search([item]), work_dir=tmp_path, provider="asf")
 
 
 def test_all_acquisitions_failed_verification_raises_without_stack(
@@ -340,7 +342,7 @@ def test_all_acquisitions_failed_verification_raises_without_stack(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(ValueError, match="download verification"):
-        S1Stack.from_search(_asf_search([only]), work_dir=tmp_path, provider="asf")
+        _materialize_selected(_asf_search([only]), work_dir=tmp_path, provider="asf")
 
 
 def test_burst_path_skips_verification_failure(
@@ -366,7 +368,7 @@ def test_burst_path_skips_verification_failure(
         return _FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_search(_asf_search([failed, good]), work_dir=tmp_path, provider="asf")
+    _materialize_selected(_asf_search([failed, good]), work_dir=tmp_path, provider="asf")
 
     # Only the surviving burst was reassembled into a path-SAFE.
     assert len(captured) == 1

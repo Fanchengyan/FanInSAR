@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -63,12 +65,13 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date}T000000.SAFE"
         path.mkdir()
         safe_paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         safe_paths,
         work_dir=tmp_path / "out",
         pairs=Pairs.from_names(["20240101_20240113"]),
         multilook=(1, 1),
-    ).prepare_scenes()
+    )
+    stack.prepare_data()
     phase = np.full((2, 3), 0.2, dtype=np.float32)
     write_ifg_artifact(
         stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113",

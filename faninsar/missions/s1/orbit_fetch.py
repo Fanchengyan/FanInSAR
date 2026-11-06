@@ -232,7 +232,9 @@ def _raise_download_error(date_id: str, error: BaseException) -> None:
         host = S1_ORBITS_ORIGIN.removeprefix("https://")
         status = int(getattr(error, "status", 0) or 0)
     message = f"orbit download failed for {date_id} from {host} (HTTP {status})"
-    reject(message, RuntimeError, cause=error, logger=logger)
+    from faninsar.stack.preparation import InputUnavailableError
+
+    reject(message, InputUnavailableError, cause=error, logger=logger)
 
 
 def _adapter() -> S1OrbitsAdapter:

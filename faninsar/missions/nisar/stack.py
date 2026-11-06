@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
-from faninsar.core.acquisition import Acquisition
 from faninsar.logging import reject
 from faninsar.missions.nisar import NisarSensor, normalize_channel
 from faninsar.missions.nisar.provider import (
@@ -16,10 +16,16 @@ from faninsar.missions.nisar.provider import (
 )
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import StackConfig
+from faninsar.stack.preparation import (
+    PreparationContext,
+    PreparationFailure,
+    PreparedInputs,
+    thaw,
+)
 from faninsar.stack.provider import (
     StackSceneProvider,
 )
-from faninsar.stack.session import Stack, _pairs_from_factory
+from faninsar.stack.session import Stack
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -100,6 +106,131 @@ class NISARStack(Stack):
         misreg_max_days: int = 36,
         **config_kwargs: Any,
     ) -> Self:
+        """Configure local RSLC sources; defer reader admission to prepare_data.
+
+        Parameters
+        ----------
+        paths : sequence of path-like
+            Unique local RSLC source descriptions. No reader is opened here.
+        work_dir : path-like
+            Workspace for explicitly prepared inputs and scientific products.
+        frequency, polarization : str, optional
+            Requested channel, normalized without opening products.
+        reference : date-like, optional
+            Explicit processing reference, retained even if unavailable.
+        pairs, misreg_pairs : Pairs, optional
+            Explicit processing networks.
+        pair_max_interval, pair_max_days, misreg_max_interval, misreg_max_days : int
+            Default network policies, evaluated over ready membership.
+        **config_kwargs : Any
+            Stack science and runtime configuration.
+
+        Returns
+        -------
+        NISARStack
+            Configured Stack, requiring explicit preparation.
+
+        """
+        sources = tuple(Path(path).absolute() for path in paths)
+        if not sources or len(set(sources)) != len(sources):
+            reject("NISARStack RSLC paths must be nonempty and unique", ValueError)
+        channel = (
+            normalize_channel(frequency, field="frequency"),
+            normalize_channel(polarization, field="polarization"),
+        )
+        extra = dict(config_kwargs.pop("extra", {}) or {})
+        admission = config_kwargs.pop(
+            "nisar_admission", config_kwargs.pop("admission", None)
+        )
+        if admission is not None:
+            extra["nisar_admission"] = admission
+        from faninsar.stack.preparation import topology_request
+
+        stack = cls.configure(
+            config=StackConfig(
+                work_dir=Path(work_dir), swaths=(), extra=extra, **config_kwargs
+            ),
+            request={
+                "kind": "rslc",
+                "paths": sources,
+                "frequency": channel[0],
+                "polarization": channel[1],
+                "topology": topology_request(
+                    reference,
+                    pairs,
+                    misreg_pairs,
+                    pair_max_interval,
+                    pair_max_days,
+                    misreg_max_interval,
+                    misreg_max_days,
+                ),
+            },
+        )
+        stack._nisar_channel = channel
+        return stack
+
+    def _prepare_inputs(self, context: PreparationContext) -> PreparedInputs:
+        from dataclasses import fields
+
+        kwargs = {
+            item.name: getattr(self._request_config, item.name)
+            for item in fields(self._request_config)
+            if item.name not in {"work_dir", "swaths", "extra"}
+        }
+        inputs = type(self)._admit_rslc(
+            context.request["paths"],
+            work_dir=self.config.work_dir,
+            frequency=context.request["frequency"],
+            polarization=context.request["polarization"],
+            extra=thaw(self._request_config.extra),
+            **kwargs,
+        )
+        from faninsar.missions.nisar.preparation import decode_product, restore_provider
+        from faninsar.stack.preparation import PreparedStackData
+        from faninsar.stack.session import _pairs_from_factory
+
+        if inputs.sources:
+            dates = tuple(sorted(inputs.sources))
+            reference = context.request["topology"].get("reference") or (
+                self.reference
+                if self._inputs_state is not None and self.reference in dates
+                else dates[0]
+            )
+            candidate = copy.copy(self)
+            candidate.config = replace(
+                self._request_config,
+                extra={**self._request_config.extra, **thaw(inputs.extra)},
+            )
+            candidate._inputs_state = PreparedStackData(
+                SceneCatalog(inputs.sources),
+                _pairs_from_factory(dates),
+                _pairs_from_factory(dates),
+                reference,
+            )
+            restore_provider(candidate)
+            runtime = dict(inputs.runtime)
+            runtime["_nisar_products"] = {
+                key: decode_product(value)
+                for key, value in thaw(inputs.extra)["nisar_provider"][
+                    "products"
+                ].items()
+            }
+            return replace(
+                inputs, scene_provider=candidate.scene_provider, runtime=runtime
+            )
+        return inputs
+
+    @classmethod
+    def _admit_rslc(
+        cls,
+        paths: Sequence[str | Path],
+        *,
+        work_dir: str | Path,
+        frequency: str = "B",
+        polarization: str = "HH",
+        reference: object | None = None,
+        **config_kwargs: Any,
+    ) -> Self:
         """Construct a mission-neutral Stack from admitted NISAR RSLCs.
 
         Parameters
@@ -146,8 +277,8 @@ class NISARStack(Stack):
             polarization,
             field="polarization",
         )
-        if len(source_paths) < 2:
-            message = "NISARStack requires at least two RSLC paths"
+        if not source_paths:
+            message = "NISARStack requires at least one RSLC path"
             reject(message, ValueError)
         if len(set(source_paths)) != len(source_paths):
             message = "NISARStack RSLC paths must be unique"
@@ -166,90 +297,90 @@ class NISARStack(Stack):
         results: dict[str, SLCReadResult] = {}
         lineage: dict[str, str] = {}
         admission_lineage: dict[str, dict[str, object]] = {}
+        failures = []
         for path in source_paths:
-            if configured_admission is None:
-                handle = sensor.open_product(str(path))
-            else:
-                handle = sensor.open_product(
-                    str(path),
-                    admission=configured_admission,
+            try:
+                if configured_admission is None:
+                    handle = sensor.open_product(str(path))
+                else:
+                    handle = sensor.open_product(
+                        str(path),
+                        admission=configured_admission,
+                    )
+                result = sensor.to_slc_product(
+                    handle,
+                    frequency=admitted_frequency,
+                    polarization=admitted_polarization,
+                    source_path=path,
                 )
-            result = sensor.to_slc_product(
-                handle,
-                frequency=admitted_frequency,
-                polarization=admitted_polarization,
-                source_path=path,
-            )
-            native_frequency = normalize_channel(
-                result.mission_native.get("frequency"),
-                field="frequency",
-            )
-            native_polarization = normalize_channel(
-                result.mission_native.get("polarization"),
-                field="polarization",
-            )
-            if (native_frequency, native_polarization) != (
-                admitted_frequency,
-                admitted_polarization,
-            ):
-                message = (
-                    "NISAR reader admitted a channel different from the requested "
-                    f"{admitted_frequency}/{admitted_polarization}: "
-                    f"{native_frequency}/{native_polarization}"
+                native_frequency = normalize_channel(
+                    result.mission_native.get("frequency"),
+                    field="frequency",
                 )
-                reject(message, ValueError)
-            if result.source_path != str(path):
-                message = (
-                    "NISAR reader source lineage does not match the admitted RSLC "
-                    f"path {path}: {result.source_path}"
+                native_polarization = normalize_channel(
+                    result.mission_native.get("polarization"),
+                    field="polarization",
                 )
-                reject(message, ValueError)
-            acquisition_id = _acquisition_id(result, path)
-            if acquisition_id in results:
-                message = (
-                    "NISARStack requires one RSLC per acquisition; duplicate "
-                    f"date {acquisition_id} appears in {path} and "
-                    f"{lineage[acquisition_id]}"
+                if (native_frequency, native_polarization) != (
+                    admitted_frequency,
+                    admitted_polarization,
+                ):
+                    message = (
+                        "NISAR reader admitted a channel different from the requested "
+                        f"{admitted_frequency}/{admitted_polarization}: "
+                        f"{native_frequency}/{native_polarization}"
+                    )
+                    reject(message, ValueError)
+                if result.source_path != str(path):
+                    message = (
+                        "NISAR reader source lineage does not match the admitted RSLC "
+                        f"path {path}: {result.source_path}"
+                    )
+                    reject(message, ValueError)
+                acquisition_id = _acquisition_id(result, path)
+                if acquisition_id in results:
+                    message = (
+                        "NISARStack requires one RSLC per acquisition; duplicate "
+                        f"date {acquisition_id} appears in {path} and "
+                        f"{lineage[acquisition_id]}"
+                    )
+                    reject(message, ValueError)
+                # Keep the normalized product's acquisition identity aligned with
+                # the Stack catalog, while preserving every other reader field.
+                result = replace(
+                    result,
+                    product=replace(result.product, acquisition_id=acquisition_id),
                 )
-                reject(message, ValueError)
-            # Keep the normalized product's acquisition identity aligned with
-            # the Stack catalog, while preserving every other reader field.
-            result = replace(
-                result,
-                product=replace(result.product, acquisition_id=acquisition_id),
+                handles[path] = handle
+                results[acquisition_id] = result
+                lineage[acquisition_id] = str(path)
+                metadata = sensor.admission_metadata(handle)
+                if metadata is None:
+                    native = result.mission_native
+                    if native.get("source_id") and native.get("source_digest"):
+                        metadata = {
+                            "source_id": native["source_id"],
+                            "source_digest": native["source_digest"],
+                            "source_size_bytes": native.get("source_size_bytes", 0),
+                            "policy": native.get("admission_policy"),
+                        }
+                if metadata is not None:
+                    admission_lineage[acquisition_id] = metadata
+            except OSError as error:
+                failures.append(
+                    PreparationFailure(str(path), "reader", type(error).__name__, error)
+                )
+
+        if not results:
+            return PreparedInputs(
+                sources={},
+                requested=tuple(str(p) for p in source_paths),
+                failures=tuple(failures),
             )
-            handles[path] = handle
-            results[acquisition_id] = result
-            lineage[acquisition_id] = str(path)
-            metadata = sensor.admission_metadata(handle)
-            if metadata is None:
-                native = result.mission_native
-                if native.get("source_id") and native.get("source_digest"):
-                    metadata = {
-                        "source_id": native["source_id"],
-                        "source_digest": native["source_digest"],
-                        "source_size_bytes": native.get("source_size_bytes", 0),
-                        "policy": native.get("admission_policy"),
-                    }
-            if metadata is not None:
-                admission_lineage[acquisition_id] = metadata
 
         dates = tuple(sorted(results))
-        catalog = SceneCatalog(
-            paths={date_id: Path(lineage[date_id]) for date_id in dates}
-        )
         reference_id = (
             dates[0] if reference is None else _reference_id(reference, dates)
-        )
-        ifg_pairs = pairs or _pairs_from_factory(
-            dates,
-            max_interval=pair_max_interval,
-            max_days=pair_max_days,
-        )
-        network_pairs = misreg_pairs or _pairs_from_factory(
-            dates,
-            max_interval=misreg_max_interval,
-            max_days=misreg_max_days,
         )
         extra.update(
             {
@@ -267,6 +398,10 @@ class NISARStack(Stack):
             extra=extra,
             **config_kwargs,
         )
+        if config.dem is None and extra.get("height_m", extra.get("height")) is None:
+            from faninsar.processing.errors import reject_invalid_state
+
+            reject_invalid_state("NISAR preparation requires an explicit DEM or height")
         configured_window = extra.get("nisar_window", extra.get("rslc_window"))
         configured_tile_shape = extra.get("nisar_tile_shape")
         provider_callback = make_nisar_scene_provider(
@@ -285,33 +420,47 @@ class NISARStack(Stack):
             admission_lineage=admission_lineage,
             flatten_stage=config.flatten_stage,
         )
-        stack = cls(
-            catalog=catalog,
-            config=config,
-            pairs=ifg_pairs,
-            misreg_pairs=network_pairs,
-            reference=reference_id,
-            acquisitions=Acquisition(list(dates)),
+        from faninsar.missions.nisar.preparation import encode_product
+
+        extra["nisar_provider"] = {
+            "version": 1,
+            "channel": (admitted_frequency, admitted_polarization),
+            "products": {
+                key: encode_product(item.product) for key, item in results.items()
+            },
+        }
+        return PreparedInputs(
+            sources={date_id: (Path(lineage[date_id]),) for date_id in dates},
+            requested=tuple(str(path) for path in source_paths),
+            failures=tuple(failures),
+            extra=extra,
             scene_provider=StackSceneProvider(
-                name="NISAR RSLC",
-                produce_pair=provider_callback,
+                name="NISAR RSLC", produce_pair=provider_callback
             ),
+            runtime={
+                "_nisar_sensor": sensor,
+                "_nisar_handles": handles,
+                "_nisar_results": results,
+                "_nisar_lineage": lineage,
+                "_nisar_admission": admission_lineage,
+                "_nisar_channel": (admitted_frequency, admitted_polarization),
+            },
         )
-        stack._nisar_sensor = sensor
-        stack._nisar_handles = handles
-        stack._nisar_results = results
-        stack._nisar_lineage = lineage
-        stack._nisar_admission = admission_lineage
-        stack._nisar_channel = (
-            admitted_frequency,
-            admitted_polarization,
-        )
-        return stack
+
+    def _restore_local_inputs(self) -> None:
+        super()._restore_local_inputs()
+        from faninsar.missions.nisar.preparation import restore_provider
+
+        restore_provider(self)
 
     @property
     def channel(self) -> tuple[str, str]:
         """Return the selected ``(frequency, polarization)`` channel."""
-        return self._nisar_channel
+        return getattr(
+            self,
+            "_nisar_channel",
+            (self.request["frequency"], self.request["polarization"]),
+        )
 
     @property
     def source_lineage(self) -> Mapping[str, str]:
@@ -326,6 +475,8 @@ class NISARStack(Stack):
     @property
     def products(self) -> Mapping[str, SLCProduct]:
         """Return normalized lazy SLC products keyed by acquisition date."""
+        if hasattr(self, "_nisar_products"):
+            return dict(self._nisar_products)
         return {date_id: item.product for date_id, item in self._nisar_results.items()}
 
     @property

@@ -26,6 +26,7 @@ from faninsar.stack.masks import (
     StackMasks,
     StackMaskView,
 )
+from faninsar.stack.preparation import DataPreparationError, PreparationReport
 from faninsar.stack.provider import (
     SceneProductionCallback,
     SourceHandle,
@@ -48,6 +49,7 @@ __all__ = [
     "STAGES",
     "CombinedMaskView",
     "CoregMode",
+    "DataPreparationError",
     "FlattenStage",
     "GpuMemoryReclaim",
     "InterferogramArtifact",
@@ -56,6 +58,7 @@ __all__ = [
     "MaskPlan",
     "MissionPreparedInputs",
     "MissionSearchProfile",
+    "PreparationReport",
     "SceneCatalog",
     "SceneProductionCallback",
     "SelectionRequest",

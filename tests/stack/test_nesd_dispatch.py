@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 import json
 from pathlib import Path
 
@@ -27,14 +29,14 @@ def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         coreg_mode=coreg_mode,  # type: ignore[arg-type]
         pair_max_interval=2,
         pair_max_days=60,
     )
-    stack = stack.prepare_scenes()
+    stack.prepare_data()
     # Dummy SAFE directories have no annotation products.
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     return stack

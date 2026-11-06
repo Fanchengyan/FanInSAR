@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from faninsar.missions.s1.processing import BurstSelection
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
     from faninsar.stack.config import CoregMode
+    from faninsar.stack.preparation import PreparationContext, PreparedInputs
 
 logger = setup_logger(__name__)
 
@@ -266,7 +267,7 @@ class S1Stack(Stack):
             or ``s1?-aux-cal.xml``) or date bindings.  Only IPF 002.36
             products use them, for the elevation antenna phase correction
             applied on load; uncovered dates are downloaded from SAR-MPC
-            during :meth:`prepare`.
+            during :meth:`prepare_data`.
         coreg_mode : {"geometry", "nesd"}, optional
             Stack coregistration mode. Defaults to ``"geometry"``.
             Tests that exercise NESD pass ``coreg_mode="nesd"``.
@@ -313,11 +314,12 @@ class S1Stack(Stack):
         stack.scene_provider = cls._default_scene_provider()
         stack.config.extra.update(extra)
         stack.config.extra.setdefault("polarizations", selected_polarizations)
-        _configure_s1_bindings(
-            stack,
-            orbit_paths=orbit_paths,
-            aux_cal_paths=aux_cal_paths,
-        )
+        from faninsar.stack.preparation import freeze, thaw
+
+        request = thaw(stack.request)
+        request.update({"orbit_paths": orbit_paths, "aux_cal_paths": aux_cal_paths})
+        stack.request = freeze(request)
+        stack._request_config.extra = dict(stack.config.extra)
         return stack  # type: ignore[return-value]
 
     @classmethod
@@ -329,7 +331,7 @@ class S1Stack(Stack):
         roi: Points | BoundingBox | Polygons | None = None,
         provider: Literal["cdse", "asf"] = "cdse",
         granularity: Literal["roi", "burst"] = "roi",
-        polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
+        polarizations: S1PolarizationRequest | Sequence[str] | str | None = None,
         coreg_mode: CoregMode = "geometry",
         orbit_group: str | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
@@ -354,7 +356,7 @@ class S1Stack(Stack):
           forced to ``"burst"``.
 
         ``roi`` is optional.  When given it bounds processing — CDSE crops to
-        byte ranges on download; ASF downloads whole products but ``prepare``/
+        byte ranges on download; ASF downloads whole products but ``prepare_data``/
         ``coregister`` still crop to the ROI.  When omitted the full
         frame/burst extent is used.
 
@@ -404,7 +406,7 @@ class S1Stack(Stack):
         Returns
         -------
         S1Stack
-            Prepared Stack over the selected acquisitions.
+            Configured Stack over the selected acquisition request.
 
         """
         from faninsar.missions.s1.s1search import S1Search
@@ -419,7 +421,11 @@ class S1Stack(Stack):
         if not search.items:
             message = "from_search received an empty S1Search; nothing to download"
             reject(message, ValueError, logger=logger)
-        selected_polarizations = normalize_polarizations(polarizations)
+        selected_polarizations = normalize_polarizations(
+            search.query.get("polarizations", ("VV",))
+            if polarizations is None
+            else polarizations
+        )
         effective_roi = roi if roi is not None else search.spatial
         if effective_roi is not None:
             effective_roi = normalize_roi_wgs84(effective_roi)
@@ -437,34 +443,31 @@ class S1Stack(Stack):
             # granularity to select.
             granularity = "burst"
 
-        extra_preview = dict(kwargs.get("extra", {}) or {})
-        orbit_prefetch = None
-        if orbit_paths is None and bool(extra_preview.get("orbit_auto_fetch", True)):
-            from faninsar.missions.s1.orbit_fetch import start_orbit_prefetch
-            from faninsar.stack.layout import workspace_orbits_dir
+        from faninsar.missions.s1.preparation import serialize_search
+        from faninsar.stack.preparation import freeze, thaw
 
-            orbit_prefetch = start_orbit_prefetch(
-                search.items,
-                workspace_orbits_dir(work_dir),
-            )
-
-        try:
-            return cls._materialize_from_search(
-                search,
-                work_dir=work_dir,
-                provider=provider,
-                granularity=granularity,
-                polarizations=selected_polarizations,
-                coreg_mode=coreg_mode,
-                orbit_group=orbit_group,
-                orbit_paths=orbit_paths,
-                aux_cal_paths=aux_cal_paths,
-                effective_roi=effective_roi,
-                kwargs=kwargs,
-            )
-        finally:
-            if orbit_prefetch is not None:
-                orbit_prefetch.join()
+        stack = cls.from_safes(
+            (),
+            work_dir=work_dir,
+            roi=effective_roi,
+            polarizations=selected_polarizations,
+            coreg_mode=coreg_mode,
+            orbit_paths=orbit_paths,
+            aux_cal_paths=aux_cal_paths,
+            **kwargs,
+        )
+        request = thaw(stack.request)
+        request.update(
+            {
+                "kind": "search",
+                "search": serialize_search(search),
+                "provider": provider,
+                "granularity": granularity,
+                "orbit_group": orbit_group,
+            }
+        )
+        stack.request = freeze(request)
+        return stack
 
     @classmethod
     def _materialize_from_search(
@@ -588,19 +591,13 @@ class S1Stack(Stack):
             if effective_roi is not None:
                 kwargs.setdefault("roi", effective_roi)
             kwargs["extra"] = extra
-            stack = cls.from_safes(
+            return cls.from_safes(
                 local_paths,
                 work_dir=work_dir,
                 polarizations=selected_polarizations,
                 coreg_mode=coreg_mode,
                 **kwargs,
             )
-            prepare = getattr(stack, "prepare", None)
-            if callable(prepare):
-                prepare()
-            else:
-                stack.prepare_scenes()
-            return stack
 
         # ASF burst-extractor path: whole-burst products reassembled into
         # the same tracks/<key>/acquisitions path-SAFE layout the CDSE
@@ -639,19 +636,13 @@ class S1Stack(Stack):
             kwargs["aux_cal_paths"] = aux_cal_paths
         kwargs.setdefault("roi", spatial_arg)
         kwargs["extra"] = extra
-        stack = cls.from_safes(
+        return cls.from_safes(
             local_paths,
             work_dir=work_dir,
             polarizations=selected_polarizations,
             coreg_mode=coreg_mode,
             **kwargs,
         )
-        prepare = getattr(stack, "prepare", None)
-        if callable(prepare):
-            prepare()
-        else:
-            stack.prepare_scenes()
-        return stack
 
     @classmethod
     def _from_cdse_roi(
@@ -704,18 +695,12 @@ class S1Stack(Stack):
             kwargs["aux_cal_paths"] = aux_cal_paths
         kwargs.setdefault("roi", roi)
         kwargs["extra"] = extra
-        stack = cls.from_safes(
+        return cls.from_safes(
             local_paths,
             work_dir=root,
             polarizations=selected_polarizations,
             **kwargs,
         )
-        prepare = getattr(stack, "prepare", None)
-        if callable(prepare):
-            prepare()
-        else:
-            stack.prepare_scenes()
-        return stack
 
     @classmethod
     def _from_asf_complete(
@@ -966,32 +951,24 @@ class S1Stack(Stack):
             filters["aux_cal_paths"] = aux_cal_paths
         filters.setdefault("roi", roi)
         filters["extra"] = extra
-        stack = cls.from_safes(
+        return cls.from_safes(
             local_paths,
             work_dir=root,
             polarizations=selected_polarizations,
             **filters,
         )
-        prepare = getattr(stack, "prepare", None)
-        if callable(prepare):
-            prepare()
-        else:
-            stack.prepare_scenes()
-        return stack
 
     @classmethod
     def _default_scene_provider(cls) -> Any:
         """Return the Sentinel-1 SAFE production provider."""
         return StackSceneProvider(name="Sentinel-1 SAFE")
 
-    def prepare(self, *, refresh: bool = False) -> Self:
-        """Prepare shared inputs, re-enabling orbit/AUX_CAL auto-fetch on refresh."""
-        if refresh:
-            self.config.extra["orbit_auto_fetch"] = True
-            self.config.extra["aux_cal_auto_fetch"] = True
-        return super().prepare()
+    def _prepare_inputs(self, context: PreparationContext) -> PreparedInputs:
+        from faninsar.missions.s1.preparation import prepare_s1_inputs
 
-    def _ensure_precise_orbits(self) -> None:
+        return prepare_s1_inputs(self, context)
+
+    def _bind_precise_orbits(self) -> None:
         """Download covering EOFs from s1-orbits before coregistration."""
         from faninsar.missions.s1.orbit_fetch import ensure_covering_orbit_paths
         from faninsar.missions.s1.safe import open_safe_product
@@ -1042,6 +1019,7 @@ class S1Stack(Stack):
             cache_dir=cache_dir,
             existing=existing_paths,
             auto_fetch=auto_fetch,
+            budget=getattr(self, "_preparation_budget", None),
         )
         if selected:
             self.config.extra["orbit_paths"] = selected
@@ -1063,9 +1041,10 @@ class S1Stack(Stack):
             cache_dir=aux_cal_dir(self.config.work_dir),
             existing=existing if isinstance(existing, Mapping) else None,
             auto_fetch=bool(self.config.extra.get("aux_cal_auto_fetch", True)),
+            budget=getattr(self, "_preparation_budget", None),
         )
 
-    def _prepare_mission(self) -> MissionPreparedInputs:
+    def _local_mission_inputs(self) -> MissionPreparedInputs:
         """Return SAFE-derived S1 footprints and local mission bindings."""
         from faninsar.missions.s1.safe import open_safe_product
 

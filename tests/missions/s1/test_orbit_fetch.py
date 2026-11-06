@@ -500,7 +500,7 @@ def test_from_safes_prepare_does_not_fetch_orbits(
         lambda *_args, **_kwargs: _fake_product(),
     )
     stack = S1Stack.from_safes([_dummy_safe(tmp_path)], work_dir=tmp_path / "work")
-    stack._prepare_mission()
+    assert not stack.data_ready
     assert opener.requests == []
     assert not stack.config.extra.get("orbit_paths")
 
@@ -518,7 +518,12 @@ def test_precise_orbit_stage_downloads_and_binds(
         lambda *_args, **_kwargs: _fake_product(),
     )
     stack = S1Stack.from_safes([_dummy_safe(tmp_path)], work_dir=tmp_path / "work")
-    stack._ensure_precise_orbits()
+    from faninsar.stack.catalog import SceneCatalog
+    from faninsar.stack.preparation import PreparedStackData
+    from faninsar.stack.session import _pairs_from_factory
+    catalog = SceneCatalog.from_paths(stack.request["paths"])
+    stack._inputs_state = PreparedStackData(catalog, _pairs_from_factory(catalog.dates), _pairs_from_factory(catalog.dates), catalog.dates[0])
+    stack._bind_precise_orbits()
     bound = stack.config.extra["orbit_paths"]
     assert "20240101" in bound
     assert Path(bound["20240101"]).name.startswith("S1A_OPER_AUX_POEORB_")
@@ -537,6 +542,11 @@ def test_coregister_scenes_invokes_precise_orbit_hook(
         lambda *_args, **_kwargs: _fake_product(),
     )
     stack = S1Stack.from_safes([_dummy_safe(tmp_path)], work_dir=tmp_path / "work")
+    from faninsar.stack.catalog import SceneCatalog
+    from faninsar.stack.preparation import PreparedStackData
+    from faninsar.stack.session import _pairs_from_factory
+    catalog = SceneCatalog.from_paths(stack.request["paths"])
+    stack._inputs_state = PreparedStackData(catalog, _pairs_from_factory(catalog.dates), _pairs_from_factory(catalog.dates), catalog.dates[0])
     called: list[str] = []
     monkeypatch.setattr(
         stack,
@@ -566,7 +576,12 @@ def test_open_manifest_reuse_does_not_auto_fetch(
     )
     stack = S1Stack.from_safes([_dummy_safe(tmp_path)], work_dir=tmp_path / "work")
     stack.config.extra["orbit_auto_fetch"] = False
-    stack._ensure_precise_orbits()
+    from faninsar.stack.catalog import SceneCatalog
+    from faninsar.stack.preparation import PreparedStackData
+    from faninsar.stack.session import _pairs_from_factory
+    catalog = SceneCatalog.from_paths(stack.request["paths"])
+    stack._inputs_state = PreparedStackData(catalog, _pairs_from_factory(catalog.dates), _pairs_from_factory(catalog.dates), catalog.dates[0])
+    stack._bind_precise_orbits()
     assert not stack.config.extra.get("orbit_paths")
     assert opener.requests == []
 
@@ -689,7 +704,9 @@ def test_from_search_prefetches_orbits_beside_slc_download(
         events.append(("slc_start", time.monotonic()))
         time.sleep(0.2)
         events.append(("slc_end", time.monotonic()))
-        return [tmp_path / "scene.SAFE"]
+        scene = tmp_path / "20240101.SAFE"
+        scene.mkdir()
+        return [scene]
 
     monkeypatch.setattr(
         "faninsar.missions.s1.orbit_fetch.prefetch_covering_orbits",
@@ -698,13 +715,6 @@ def test_from_search_prefetches_orbits_beside_slc_download(
     monkeypatch.setattr(
         "faninsar.missions.s1.stack.materialize_s1_acquisitions",
         fake_materialize,
-    )
-    monkeypatch.setattr(
-        S1Stack,
-        "from_safes",
-        classmethod(
-            lambda _cls, _paths, **_kw: type("S", (), {"prepare": lambda self: None})()
-        ),
     )
     search = S1Search(
         items=(
@@ -719,7 +729,14 @@ def test_from_search_prefetches_orbits_beside_slc_download(
         spatial=BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326"),
         query={},
     )
-    S1Stack.from_search(search, work_dir=tmp_path, provider="asf")
+    from faninsar.processing.geometry import ConstantDEM
+    from faninsar.stack.preparation import PreparationContext
+    from faninsar.stack.search import MissionPreparedInputs
+    monkeypatch.setattr(S1Stack, "_bind_precise_orbits", lambda self: None)
+    monkeypatch.setattr(S1Stack, "_local_mission_inputs", lambda self: MissionPreparedInputs())
+    stack = S1Stack.from_search(search, work_dir=tmp_path, provider="asf", dem=ConstantDEM(0))
+    assert events == []
+    stack.prepare_data()
     stamps = dict(events)
     assert stamps["orbit_start"] < stamps["slc_end"]
     assert stamps["slc_start"] < stamps["orbit_end"]
@@ -745,7 +762,12 @@ def test_track_open_reuses_workspace_orbit_cache(
         [_dummy_safe(tmp_path)],
         work_dir=tmp_path / "work" / "tracks" / "88A",
     )
-    stack._ensure_precise_orbits()
+    from faninsar.stack.catalog import SceneCatalog
+    from faninsar.stack.preparation import PreparedStackData
+    from faninsar.stack.session import _pairs_from_factory
+    catalog = SceneCatalog.from_paths(stack.request["paths"])
+    stack._inputs_state = PreparedStackData(catalog, _pairs_from_factory(catalog.dates), _pairs_from_factory(catalog.dates), catalog.dates[0])
+    stack._bind_precise_orbits()
     bound = Path(stack.config.extra["orbit_paths"]["20240101"])
     assert bound == cached
     object_gets = [

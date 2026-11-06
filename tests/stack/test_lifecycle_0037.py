@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
+from tests.support.local_stack import LocalStack
 
 from faninsar.missions.s1 import S1Stack
 from faninsar.stack import (
@@ -32,7 +33,7 @@ def test_s1_stack_installs_provider_and_groups_source_segments(tmp_path: Path) -
     second = _safe(tmp_path, "20240101", "_frame-b")
     later = _safe(tmp_path, "20240113")
 
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         [first, second, later],
         work_dir=tmp_path / "work",
     )
@@ -45,7 +46,7 @@ def test_s1_stack_installs_provider_and_groups_source_segments(tmp_path: Path) -
 def test_base_stack_provider_boundary_fails_closed(tmp_path: Path) -> None:
     """A mission-neutral Stack cannot guess a production engine."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         source,
         work_dir=tmp_path / "work",
     )
@@ -63,7 +64,7 @@ def test_s1_pair_engine_is_not_a_production_entry(
 ) -> None:
     """S1 Stack does not install a one-shot pair-production callback."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         source,
         work_dir=tmp_path / "work",
     )
@@ -76,7 +77,7 @@ def test_stack_provider_receives_opaque_handles_without_path_leak(
 ) -> None:
     """Provider callbacks receive handles whose repr and string are opaque."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
-    stack = Stack._from_safes(
+    stack = LocalStack.from_paths(
         source,
         work_dir=tmp_path / "work",
     )
@@ -111,7 +112,7 @@ def test_stack_reference_is_the_only_public_common_acquisition_name(
 ) -> None:
     """Stack constructors expose Reference and reject the removed spelling."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         source,
         work_dir=tmp_path / "work",
         reference="20240113",

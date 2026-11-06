@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from tests.support.local_stack import LocalStack
 
 from faninsar import Pairs
 from faninsar.missions.s1 import S1Stack
@@ -39,7 +40,7 @@ def _stack(
         path = tmp_path / name / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir(parents=True)
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / name / "work",
         pairs=Pairs.from_names(
@@ -48,6 +49,8 @@ def _stack(
         multilook=(1, 1),
         coreg_mode="geometry",
     )
+    stack._request_config.extra["orbit_paths"] = _orbit_fixtures(stack)
+    stack.config.extra["orbit_paths"] = dict(stack._request_config.extra["orbit_paths"])
     data = np.ones((2, 2), dtype=np.complex64)
     for date_id in dates:
         properties: dict[str, object] = {}
@@ -68,6 +71,7 @@ def _stack(
             properties=properties,
         )
     from faninsar.stack.search import MissionPreparedInputs
+    from faninsar.stack.preparation import PreparedInputs
 
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     # Track resolution would write ``track_metadata`` into ``extra`` during
@@ -77,13 +81,13 @@ def _stack(
     stack._prepare_reference_scene = (  # type: ignore[method-assign]
         lambda *, overwrite, polygon=None: None
     )
-    stack._prepare_mission = (  # type: ignore[method-assign]
-        lambda: MissionPreparedInputs(
+    stack._prepare_inputs = (  # type: ignore[method-assign]
+        lambda context: PreparedInputs(sources=stack.catalog.paths, mission=MissionPreparedInputs(
             orbit_paths_by_acquisition={
                 date_id: path for date_id, path in _orbit_fixtures(stack).items()
             }
         )
-    )
+    ))
     return stack
 
 
@@ -106,7 +110,7 @@ def test_missing_stack_json_still_rejects_on_open(tmp_path: Path) -> None:
 def test_rescan_reports_recovered_dropped_and_defaulted(tmp_path: Path) -> None:
     """rescan audits a drifted stack.json without writing."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     work = stack.config.work_dir
 
     _drift_schema(work)
@@ -137,7 +141,7 @@ def test_rescan_reports_recovered_dropped_and_defaulted(tmp_path: Path) -> None:
 def test_open_is_tolerant_and_attaches_repair_report(tmp_path: Path) -> None:
     """A drifted stack.json still opens a degraded-but-usable Stack."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     stack.coregister_scenes()
     work = stack.config.work_dir
     _drift_schema(work)
@@ -160,7 +164,7 @@ def test_open_is_tolerant_and_attaches_repair_report(tmp_path: Path) -> None:
 def test_repair_rewrites_identity_and_recovers_stack(tmp_path: Path) -> None:
     """repair rewrites stack.json at v1 and returns a working Stack."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     stack.coregister_scenes()
     stack.form_interferograms()
     work = stack.config.work_dir
@@ -184,7 +188,7 @@ def test_repair_rewrites_identity_and_recovers_stack(tmp_path: Path) -> None:
 def test_repair_infers_pairs_and_reference_from_products(tmp_path: Path) -> None:
     """Committed ifg/ml_* products reconstruct the planned network."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     stack.coregister_scenes()
     stack.form_interferograms()
     stack.unwrap(SpatialIRLS())
@@ -209,7 +213,7 @@ def test_repair_infers_pairs_and_reference_from_products(tmp_path: Path) -> None
 def test_repair_reports_inputs_changed_without_blocking(tmp_path: Path) -> None:
     """A size-changed input is reported in the RepairReport but never blocks."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     work = stack.config.work_dir
 
     # Corrupt a recorded SAFE size so _check_input fails.

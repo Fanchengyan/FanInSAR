@@ -55,6 +55,7 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -416,8 +417,9 @@ def run_sync(coro: Awaitable[Any]) -> Any:
         finally:
             loop.close()
 
+    copied_context = copy_context()
     thread = threading.Thread(
-        target=_runner,
+        target=lambda: copied_context.run(_runner),
         name="faninsar-s1-range-fetch",
         daemon=True,
     )
@@ -2548,6 +2550,11 @@ def _fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     return run_sync(fetch_cdse_ranges(span_tuple))
 
 
+_preparation_remote_policy: ContextVar[tuple[Any, Any]] = ContextVar(
+    "s1_preparation_remote_policy", default=(None, None)
+)
+
+
 class _LazySpanFetcher:
     """Provider fetcher proxy that opens the session on first byte transfer.
 
@@ -2586,9 +2593,15 @@ class _LazySpanFetcher:
 def _span_fetcher_cm(spans: Sequence[RangeSpan]) -> Any:
     """Use provider-owned auth and refresh; fixture URLs remain anonymous."""
     span_tuple = tuple(spans)
+    policy_budget, policy_ledger = _preparation_remote_policy.get()
+    policy = (
+        {}
+        if policy_budget is None and policy_ledger is None
+        else {"budget": policy_budget, "ledger": policy_ledger}
+    )
     if any(_cdse_range_host(span.url) for span in span_tuple):
-        return _LazySpanFetcher(lambda: _cdse_range_fetcher(span_tuple))
-    return _LazySpanFetcher(RangeFetcher)
+        return _LazySpanFetcher(lambda: _cdse_range_fetcher(span_tuple, **policy))
+    return _LazySpanFetcher(lambda: RangeFetcher(**policy))
 
 
 class _SpanCache(SpanCache):
@@ -3510,7 +3523,14 @@ def materialize_asf_burst_safes(
     if download is None:
         from faninsar import remote
 
-        download = remote.download
+        policy_budget, policy_ledger = _preparation_remote_policy.get()
+        download = (
+            remote.download
+            if policy_budget is None and policy_ledger is None
+            else lambda asset, destination: remote.download(
+                asset, destination, budget=policy_budget, ledger=policy_ledger
+            )
+        )
 
     requested = (
         None if polarizations == "all" else {str(p).upper() for p in polarizations}

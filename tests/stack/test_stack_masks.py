@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -68,14 +70,17 @@ def _stack(tmp_path: Path, *, mask_plan: MaskPlan | None = None) -> Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         multilook=(1, 1),
         geo_grid=_geo_grid(),
-        mask_plan=mask_plan,
+        mask_plan=MaskPlan(),
     )
-    return stack.prepare_scenes()
+    stack.prepare_data()
+    # These mask facade tests inject runtime masks after input preparation.
+    stack.config.mask_plan = mask_plan or MaskPlan()
+    return stack
 
 
 def test_masks_facade_mapping_and_attribute_access(tmp_path: Path) -> None:

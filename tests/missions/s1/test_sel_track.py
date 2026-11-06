@@ -10,6 +10,8 @@ and the cross-track pairing constraint in :meth:`S1Stack._coregister_one_scene`.
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -435,7 +437,7 @@ def test_scenes_sel_track(tmp_path: Path) -> None:
 def test_coregister_rejects_cross_track_secondary(tmp_path: Path) -> None:
     """_coregister_one_scene fails closed across two tracks."""
     stack = _tracked_stack(tmp_path)
-    stack = stack.prepare_scenes()
+    stack._prepared = True
     with pytest.raises(Exception, match="different tracks"):
         stack._coregister_one_scene(
             "20240125",
@@ -451,7 +453,7 @@ def test_reference_scene_polygon_wrong_track_skipped(
 ) -> None:
     """_prepare_reference_scene on an off-track polygon reports no units."""
     stack = _tracked_stack(tmp_path)
-    stack = stack.prepare_scenes()
+    stack._prepared = True
     monkeypatch.setattr(
         type(stack), "polygon_tracks", property(lambda _s: {0: "88A", 1: "12D"})
     )

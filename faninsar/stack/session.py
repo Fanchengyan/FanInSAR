@@ -15,8 +15,10 @@ import gc
 import hashlib
 import json
 import os
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from copy import deepcopy
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -71,13 +73,20 @@ from faninsar.processing.interferometry.phase_filter import (
 from faninsar.processing.unwrapping.errors import UnwrapFailedError
 from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.processing.unwrapping.snaphu_backend import Snaphu
-from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     CoregMode,
     FlattenStage,
     StackConfig,
 )
 from faninsar.stack.mask_plan import MaskPlan, StageName
+from faninsar.stack.preparation import (
+    PreparationContext,
+    PreparationReport,
+    PreparedInputs,
+    PreparedStackData,
+    freeze,
+    prepare_stack_data,
+)
 from faninsar.stack.provider import SourceHandle
 from faninsar.stack.search import (
     MissionPreparedInputs,
@@ -109,6 +118,7 @@ if TYPE_CHECKING:
     from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
+    from faninsar.stack.catalog import SceneCatalog
     from faninsar.stack.masks import StackMasks
     from faninsar.stack.misreg import MisregRecord
     from faninsar.stack.provider import StackSceneProvider
@@ -654,8 +664,10 @@ def _pairs_from_factory(
     max_days: int = 72,
 ) -> Pairs:
     """Build short-baseline pairs from date ids."""
-    from faninsar.core.pair import PairsFactory
+    from faninsar.core.pair import Pairs, PairsFactory
 
+    if len(dates) < 2:
+        return Pairs.from_names([])
     factory = PairsFactory(list(dates))
     return factory.from_interval(max_interval=max_interval, max_days=max_days)
 
@@ -936,8 +948,8 @@ def _commit_geocoded_product(
     )
 
 
-@dataclass
-class Stack(NetworkContract):
+@dataclass(init=False)
+class Stack(NetworkContract, ABC):
     """Multi-scene InSAR session with Reference-relative coregistration.
 
     Parameters
@@ -973,12 +985,9 @@ class Stack(NetworkContract):
         default=None, init=False, repr=False
     )
 
-    catalog: SceneCatalog
     config: StackConfig
-    pairs: Pairs
-    misreg_pairs: Pairs
-    reference: str
-    acquisitions: Acquisition | None = None
+    _inputs_state: PreparedStackData | None = field(default=None, repr=False)
+    preparation_report: PreparationReport | None = field(default=None, repr=False)
     dask_client: Any | None = field(default=None, repr=False)
     scene_provider: StackSceneProvider | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
@@ -1011,6 +1020,124 @@ class Stack(NetworkContract):
     _dem_source: SourceDEM | None = field(default=None, repr=False)
     _dem_wgs84: RasterDEM | None = field(default=None, repr=False)
     repair_report: Any | None = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        *,
+        config: StackConfig,
+        catalog: SceneCatalog | None = None,
+        pairs: Pairs | None = None,
+        misreg_pairs: Pairs | None = None,
+        reference: str | None = None,
+        acquisitions: Acquisition | None = None,
+        **runtime: Any,
+    ) -> None:
+        """Initialize configured state, optionally with locally restored inputs."""
+        for item in fields(self):
+            if item.default_factory is not MISSING:
+                setattr(self, item.name, item.default_factory())
+            elif item.default is not MISSING:
+                setattr(self, item.name, deepcopy(item.default))
+        self.config = config
+        self._request_config = replace(config, extra=dict(config.extra))
+        self.request = freeze({})
+        if catalog is not None:
+            dates = catalog.dates
+            self._inputs_state = PreparedStackData(
+                catalog,
+                pairs
+                if pairs is not None
+                else _pairs_from_factory(dates, max_interval=3, max_days=72),
+                misreg_pairs
+                if misreg_pairs is not None
+                else _pairs_from_factory(dates, max_interval=2, max_days=36),
+                reference or dates[0],
+                acquisitions,
+            )
+        for name, value in runtime.items():
+            if name not in {item.name for item in fields(self)}:
+                message = f"unknown Stack runtime field {name}"
+                reject(message, TypeError, logger=logger)
+            setattr(self, name, value)
+        self.__post_init__()
+
+    @classmethod
+    def configure(cls, *, config: StackConfig, request: Mapping[str, Any]) -> Self:
+        """Capture a source request without reading or publishing inputs."""
+        stack = cls(config=config)
+        stack.request = freeze(request)
+        return stack
+
+    def _resolved_inputs(self) -> PreparedStackData:
+        if self._inputs_state is None:
+            reject_invalid_state("Stack inputs are not prepared; call prepare_data()")
+        return self._inputs_state
+
+    @property
+    def catalog(self) -> SceneCatalog:
+        """Return the installed local acquisition catalog."""
+        return self._resolved_inputs().catalog
+
+    @property
+    def pairs(self) -> Pairs:
+        """Return the resolved interferogram network."""
+        return self._resolved_inputs().pairs
+
+    @pairs.setter
+    def pairs(self, value: Pairs) -> None:
+        self._inputs_state = replace(self._resolved_inputs(), pairs=value)
+
+    @property
+    def misreg_pairs(self) -> Pairs:
+        """Return the resolved misregistration network."""
+        return self._resolved_inputs().misreg_pairs
+
+    @property
+    def reference(self) -> str:
+        """Return the configured explicit or resolved default reference."""
+        return self._resolved_inputs().reference
+
+    @property
+    def acquisitions(self) -> Acquisition | None:
+        """Return the installed acquisition index."""
+        return self._resolved_inputs().acquisitions
+
+    @property
+    def data_ready(self) -> bool:
+        """Whether a nonempty qualified ready set is installed."""
+        return self._prepared and self._inputs_state is not None
+
+    @abstractmethod
+    def _prepare_inputs(self, context: PreparationContext) -> PreparedInputs:
+        """Qualify mission inputs and return results for common finalization."""
+
+    def prepare_data(
+        self,
+        *,
+        on_error: Literal["warn", "raise"] = "warn",
+        offline: bool = False,
+        budget: RemoteResourceBudget | None = None,
+    ) -> PreparationReport:
+        """Explicitly prepare inputs, retaining independent ready targets.
+
+        Parameters
+        ----------
+        on_error : {"warn", "raise"}, default="warn"
+            Report expected target failures or raise with the partial report.
+        offline : bool, default=False
+            Require local dependencies without remote acquisition.
+        budget : RemoteResourceBudget, optional
+            Remote execution policy, independent of catalog item selection.
+
+        Returns
+        -------
+        PreparationReport
+            Original requested, ready and failed target membership.
+
+        """
+        return prepare_stack_data(
+            self, on_error=on_error, offline=offline, budget=budget
+        )
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -2224,7 +2351,7 @@ class Stack(NetworkContract):
         flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
         filters: Mapping[str, object] | None = None,
         auth_profile: str | None = None,
-        limit: int = 100,
+        limit: int | None = None,
         budget: RemoteResourceBudget | None = None,
     ) -> list[CatalogItem]:
         """Search a mission catalog through the provider-neutral remote API.
@@ -2241,7 +2368,7 @@ class Stack(NetworkContract):
             Advanced provider filters accepted by the mission profile.
         auth_profile : str, optional
             Registered authentication and delivery profile.
-        limit : int, default=100
+        limit : int, optional
             Candidate limit after complete catalog traversal and mission
             normalization.
         budget : RemoteResourceBudget, optional
@@ -2280,25 +2407,13 @@ class Stack(NetworkContract):
         )
         return profile.select(normalized, request)
 
-    def _prepare_mission(self) -> MissionPreparedInputs:
-        """Return mission-owned local inputs for shared preparation.
-
-        Local-only stacks have no additional orbit or AUX_CAL inputs. A
-        mission adapter may override this hook after constructing a valid
-        local Stack; the result is validated before shared state is published.
-        """
-        selected = self.config.extra.get("selected_footprints", ())
-        if isinstance(selected, (str, bytes)):
-            selected = (selected,)
-        return MissionPreparedInputs(selected_footprints=tuple(selected))
-
     def _validate_mission_prepared(
         self,
         prepared: MissionPreparedInputs,
     ) -> MissionPreparedInputs:
         """Validate one immutable mission preparation result."""
         if not isinstance(prepared, MissionPreparedInputs):
-            message = "_prepare_mission must return MissionPreparedInputs"
+            message = "_prepare_inputs mission value must be MissionPreparedInputs"
             reject(message, TypeError, logger=logger)
         paths = (
             *prepared.orbit_paths_by_acquisition.values(),
@@ -2309,44 +2424,6 @@ class Stack(NetworkContract):
                 message = f"mission preparation path is not a file: {path}"
                 reject(message, FileNotFoundError, logger=logger)
         return prepared
-
-    def prepare(self) -> Self:
-        """Prepare shared Stack inputs and save the Stack identity.
-
-        Mission preparation resolves local orbit and AUX_CAL bindings
-        (downloading missing files is allowed here, never on reopen), the
-        output grid is resolved and recorded, and the DEM recipe is
-        materialized onto it. The identity is then saved as ``stack.json``;
-        reopen goes through :meth:`Stack.open`, which never touches the
-        network.
-        """
-        self._prepared = False
-        self._mission_prepared = None
-        try:
-            prepared = self._validate_mission_prepared(self._prepare_mission())
-            self._mission_prepared = prepared
-            if prepared.selected_footprints:
-                self.config.extra["selected_footprints"] = prepared.selected_footprints
-
-            self.prepare_scenes()
-
-            if (
-                self.config.grid != "utm_ups"
-                or self.config.roi is not None
-                or prepared.selected_footprints
-            ):
-                # Persist the resolved grid as the science value so a reopened
-                # Stack resolves the same geometry without the footprints.
-                self.config.grid = self.resolve_grid()
-            self._ensure_raster_dem()
-            from faninsar.stack.identity import save_stack_identity
-
-            save_stack_identity(self)
-        except Exception:
-            self._prepared = False
-            self._mission_prepared = None
-            raise
-        return self
 
     @classmethod
     def open(cls, work_dir: str | Path, **runtime: Any) -> Stack:
@@ -2391,6 +2468,13 @@ class Stack(NetworkContract):
         )
 
         root = Path(work_dir)
+        if (
+            not (root / "stack.json").exists()
+            and (root / "inputs" / "request.json").is_file()
+        ):
+            from faninsar.stack.preparation import restore_request
+
+            return restore_request(root, runtime)
         runtime_fields = UNSAVED_FIELDS - {"extra"}
         unknown = set(runtime) - runtime_fields - {"scene_provider"}
         if unknown:
@@ -2419,15 +2503,25 @@ class Stack(NetworkContract):
         mission = str(document["mission"])
         stack_cls = cls if mission == cls.__name__ else _mission_class(mission)
 
+        missing_inputs = False
+
+        def local_input(entry: Any) -> Path:
+            nonlocal missing_inputs
+            try:
+                return _check_input(entry)
+            except InvalidProcessingStateError:
+                missing_inputs = True
+                return Path(str(entry["path"]))
+
         sources: dict[str, list[Path]] = {}
         for date, entries in document["inputs"]["sources"].items():
-            sources[date] = [_check_input(entry) for entry in entries]
+            sources[date] = [local_input(entry) for entry in entries]
         orbits = {
-            date: _check_input(entry)
+            date: local_input(entry)
             for date, entry in document["inputs"].get("orbits", {}).items()
         }
         aux_cal = {
-            date: _check_input(entry)
+            date: local_input(entry)
             for date, entry in document["inputs"].get("aux_cal", {}).items()
         }
 
@@ -2464,9 +2558,7 @@ class Stack(NetworkContract):
         from faninsar import Pairs
 
         stack = stack_cls(
-            catalog=SceneCatalog.from_paths(
-                [path for date in sorted(sources) for path in sources[date]]
-            ),
+            catalog=SceneCatalog(sources),
             config=config,
             pairs=Pairs.from_names(document["pairs"]),
             misreg_pairs=Pairs.from_names(document["misreg_pairs"]),
@@ -2476,7 +2568,22 @@ class Stack(NetworkContract):
             runtime.get("scene_provider") or stack_cls._default_scene_provider()
         )
         stack._restore_local_inputs()
-        stack._prepared = True
+        stack._prepared = not missing_inputs
+        if (root / "inputs" / "request.json").is_file():
+            from faninsar.stack.preparation import PreparationFailure, restore_request
+
+            configured = restore_request(root, runtime)
+            stack.request = configured.request
+            stack._request_config = configured._request_config
+            report = config.extra.get("preparation_report")
+            if isinstance(report, dict):
+                stack.preparation_report = PreparationReport(
+                    tuple(report["requested"]),
+                    tuple(report["ready"]),
+                    tuple(PreparationFailure(**item) for item in report["failed"]),
+                    tuple(report.get("reused", ())),
+                    tuple(report.get("prerequisites", ())),
+                )
         stack._refresh_network()
         return stack
 
@@ -2561,26 +2668,6 @@ class Stack(NetworkContract):
         resource_budget: ResourceBudget | None = None,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
-        catalog = SceneCatalog.from_paths(list(paths))
-        dates = list(catalog.dates)
-        reference_id = dates[0] if reference is None else _date_to_yyyymmdd(reference)
-        if reference_id not in catalog.paths:
-            reject_invalid_state(f"reference {reference_id} not in catalog")
-        ifg_pairs = pairs or _pairs_from_factory(
-            dates,
-            max_interval=pair_max_interval,
-            max_days=pair_max_days,
-        )
-        m_pairs = misreg_pairs or _pairs_from_factory(
-            dates,
-            max_interval=misreg_max_interval,
-            max_days=misreg_max_days,
-        )
-        from faninsar.core.acquisition import Acquisition
-
-        acq = Acquisition(
-            sorted({_date_to_yyyymmdd(d) for d in dates}),
-        )
         config = StackConfig(
             work_dir=Path(work_dir),
             coreg_mode=coreg_mode,
@@ -2607,57 +2694,44 @@ class Stack(NetworkContract):
             gpu_memory_reclaim=gpu_memory_reclaim,
             resource_budget=resource_budget,
         )
-        return cls(
-            catalog=catalog,
+        from faninsar.stack.preparation import topology_request
+
+        stack = cls.configure(
             config=config,
-            pairs=ifg_pairs,
-            misreg_pairs=m_pairs,
-            reference=_date_to_yyyymmdd(reference_id),
-            acquisitions=acq,
-            dask_client=dask_client,
+            request={
+                "kind": "safes",
+                "paths": tuple(Path(path).absolute() for path in paths),
+                "topology": topology_request(
+                    reference,
+                    pairs,
+                    misreg_pairs,
+                    pair_max_interval,
+                    pair_max_days,
+                    misreg_max_interval,
+                    misreg_max_days,
+                ),
+            },
         )
+        stack.dask_client = dask_client
+        return stack
 
     @classmethod
     def _default_scene_provider(cls) -> Any:
         """Return the mission's default scene provider, if it defines one."""
         return None
 
-    @_reclaim_after_stage
-    def prepare_scenes(self) -> Self:
-        """Create work directories and validate the Reference acquisition."""
-        self.config.work_dir.mkdir(parents=True, exist_ok=True)
-        # Product roots appear as their first product is committed.
-        if self.reference not in self.catalog.paths:
-            reject_invalid_state(f"reference {self.reference} missing from catalog")
-        # Resolve the mission's track map once up front so the recorded
-        # ``track_metadata`` is settled before any resume identity digest
-        # is computed — resolving lazily mid-stage would mutate ``extra``
-        # and stale every scene committed under the earlier config.
-        self._track_metadata()
-        self._prepared = True
-        logger.info(
-            "Stack prepared reference=%s n_scenes=%s n_pairs=%s "
-            "n_misreg_pairs=%s mode=%s",
-            self.reference,
-            len(self.catalog),
-            len(self.pairs),
-            len(self.misreg_pairs),
-            self.config.coreg_mode,
-        )
-        return self
-
     def _ensure_prepared(self) -> None:
-        if not self._prepared:
-            self.prepare_scenes()
+        if not self.data_ready:
+            reject_invalid_state("Stack inputs are not prepared; call prepare_data()")
+        if self.reference not in self.catalog.paths:
+            reject_invalid_state(
+                f"explicit reference {self.reference} is unavailable; "
+                "repair inputs or select available processing dependencies"
+            )
 
     def _ensure_precise_orbits(self) -> None:
-        """Bind covering precise orbits before geometry stages.
-
-        The base Stack has no orbit network dependency. Mission adapters may
-        override this hook so the first precise-orbit stage can download
-        covering files after local SAFE inputs already exist.
-        """
-        return
+        """Require input readiness; preparation owns mission auxiliaries."""
+        self._ensure_prepared()
 
     def _effective_roi_with_mask(self) -> _EffectiveRoi:
         """Resolve the explicit ROI mask stage once per Stack run."""
@@ -3674,7 +3748,13 @@ class Stack(NetworkContract):
             "dem": _dem_sampler_identity(config.dem),
             "geo_grid": encode_value(config.geo_grid),
             "mask_plan": encode_value(config.mask_plan),
-            "extra": encode_value(config.extra),
+            "extra": encode_value(
+                {
+                    key: value
+                    for key, value in config.extra.items()
+                    if key != "preparation_report"
+                }
+            ),
         }
 
     def _misreg_dir(self) -> Path:
@@ -4257,7 +4337,7 @@ class Stack(NetworkContract):
 
         """
         coherence_window = validate_coherence_window(coherence_window)
-        self._ensure_prepared()
+        self._resolved_inputs()
 
         from faninsar.processing.runtime.resources import (
             ResourceAdmissionLedger,
@@ -5552,7 +5632,7 @@ def _mission_class(mission: str) -> type[Stack]:
 
     """
     if mission == "Stack":
-        return Stack
+        return _RecoveredStack
     from faninsar.missions.base import get_mission_stack
 
     try:
@@ -5563,3 +5643,13 @@ def _mission_class(mission: str) -> type[Stack]:
             "this work directory with the FanInSAR version that created it"
         )
         return reject(message, InvalidProcessingStateError, logger=logger)
+
+
+class _RecoveredStack(Stack):
+    """Local inspection of legacy base identities, without a source adapter."""
+
+    def _prepare_inputs(self, _context: PreparationContext) -> PreparedInputs:
+        reject_invalid_state(
+            "legacy Stack identity has no mission source recipe; "
+            "reconstruct through a concrete mission"
+        )

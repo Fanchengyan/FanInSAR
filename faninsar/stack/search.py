@@ -32,14 +32,14 @@ class SelectionRequest:
 
     """
 
-    limit: int = 100
+    limit: int | None = None
     datetime_range: tuple[datetime, datetime] | None = None
     flight_direction: str | None = None
     filters: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         """Protect nested filter state from mutation."""
-        if self.limit <= 0:
+        if self.limit is not None and self.limit <= 0:
             message = "selection limit must be positive"
             raise ValueError(message)
         if self.flight_direction not in (None, "ASCENDING", "DESCENDING"):

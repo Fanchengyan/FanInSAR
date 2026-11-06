@@ -9,6 +9,8 @@ persistence semantics (PROPOSAL-0033).
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -99,7 +101,7 @@ def stack(tmp_path: Path) -> Stack:
         safe.mkdir()
         paths.append(safe)
     model = _toy_geometry()
-    instance = Stack(
+    instance = LocalStack(
         catalog=SceneCatalog.from_paths(paths),
         config=StackConfig(
             work_dir=tmp_path / "work",
@@ -777,7 +779,7 @@ def test_layer_rejects_a_different_stack_reference(
 
     _write_ifg(stack)
     layer = stack.interferograms["20240101_20240113"].wrapped_phase
-    other = Stack(
+    other = LocalStack(
         catalog=stack.catalog,
         config=StackConfig(
             work_dir=tmp_path / "other",
@@ -902,7 +904,7 @@ def test_geocode_on_a_fresh_stack_reads_the_persisted_reference(
     Regression: ``geocode`` used to require the in-memory projection context
     of a coregistration run in the same process.
     """
-    fresh = Stack(
+    fresh = LocalStack(
         catalog=stack.catalog,
         config=stack.config,
         pairs=stack.pairs,
@@ -1167,7 +1169,7 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
         safe.mkdir()
         paths.append(safe)
     model = _toy_geometry()
-    stack = Stack(
+    stack = LocalStack(
         catalog=SceneCatalog.from_paths(paths),
         config=StackConfig(
             work_dir=work,

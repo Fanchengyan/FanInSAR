@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from pathlib import Path
 
 import numpy as np
@@ -64,14 +66,15 @@ def _stack_with_scene_units(tmp_path: Path) -> Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         pairs=Pairs.from_names(
             ["20240101_20240113", "20240113_20240125", "20240101_20240125"]
         ),
         multilook=(1, 1),
-    ).prepare_scenes()
+    )
+    stack.prepare_data()
     reference = stack.reference
     for date_id in DATES:
         write_test_scene(

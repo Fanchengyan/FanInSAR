@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from tests.support.local_stack import LocalStack
 
 from faninsar import Pairs
 from faninsar.missions.s1 import S1Stack
@@ -34,7 +35,7 @@ def _stack(
         path = tmp_path / name / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir(parents=True)
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / name / "work",
         pairs=Pairs.from_names(
@@ -43,6 +44,8 @@ def _stack(
         multilook=(1, 1),
         coreg_mode="geometry",
     )
+    stack._request_config.extra["orbit_paths"] = _orbit_fixtures(stack)
+    stack.config.extra["orbit_paths"] = dict(stack._request_config.extra["orbit_paths"])
     data = np.ones((2, 2), dtype=np.complex64)
     for date_id in dates:
         # The committed identity matches a geometry-mode resume so
@@ -67,6 +70,7 @@ def _stack(
     # The fixture SAFEs are empty directories; mission preparation is
     # replaced so prepare() exercises only the shared identity flow.
     from faninsar.stack.search import MissionPreparedInputs
+    from faninsar.stack.preparation import PreparedInputs
 
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     # Track resolution would write ``track_metadata`` into ``extra`` during
@@ -78,13 +82,13 @@ def _stack(
     stack._prepare_reference_scene = (  # type: ignore[method-assign]
         lambda *, overwrite, polygon=None: None
     )
-    stack._prepare_mission = (  # type: ignore[method-assign]
-        lambda: MissionPreparedInputs(
+    stack._prepare_inputs = (  # type: ignore[method-assign]
+        lambda context: PreparedInputs(sources=stack.catalog.paths, mission=MissionPreparedInputs(
             orbit_paths_by_acquisition={
                 date_id: path for date_id, path in _orbit_fixtures(stack).items()
             }
         )
-    )
+    ))
     return stack
 
 
@@ -105,19 +109,19 @@ def test_prepare_saves_identity_and_open_restores_the_stack(
 ) -> None:
     """A fresh-process reopen restores identity and discovers scene products."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     document = json.loads(
         (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
     )
     assert document["schema"] == "faninsar.stack.v1"
-    assert document["mission"] == "S1Stack"
+    assert document["mission"] == "LocalStack"
     assert document["reference"] == "20240101"
     assert document["pairs"] == ["20240101_20240113"]
     assert "work_dir" not in document["science"]
 
     reopened = Stack.open(stack.config.work_dir, device="cpu")
 
-    assert type(reopened) is S1Stack
+    assert type(reopened) is LocalStack
     assert reopened.reference == "20240101"
     assert reopened.config.multilook == (1, 1)
     assert reopened.config.coreg_mode == "geometry"
@@ -130,7 +134,7 @@ def test_prepare_saves_identity_and_open_restores_the_stack(
 def test_reopen_after_stages_reuses_committed_work(tmp_path: Path) -> None:
     """A reopened Stack resumes: committed scenes, IFGs, and unwraps are kept."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     stack.coregister_scenes()
     stack.form_interferograms()
     stack.unwrap(SpatialIRLS())
@@ -154,7 +158,7 @@ def test_reopen_after_stages_reuses_committed_work(tmp_path: Path) -> None:
 def test_reopen_rejects_unknown_runtime_option(tmp_path: Path) -> None:
     """Science options cannot be changed through ``Stack.open``."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     with pytest.raises(TypeError, match="runtime values only"):
         Stack.open(stack.config.work_dir, multilook=(2, 2))
 
@@ -176,21 +180,25 @@ def test_reopen_rejects_changed_or_missing_input(tmp_path: Path) -> None:
     import shutil
 
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     work = stack.config.work_dir
     safe = next(iter((tmp_path / "out").glob("*.SAFE")))
     shutil.rmtree(safe)
-    with pytest.raises(InvalidProcessingStateError, match="missing"):
-        Stack.open(work)
+    reopened = Stack.open(work)
+    assert not reopened.data_ready
+    assert set(reopened.scenes) == {"20240101", "20240113"}
     safe.write_bytes(b"x")
-    with pytest.raises(InvalidProcessingStateError, match="changed on disk"):
-        Stack.open(work)
+    changed = Stack.open(work)
+    assert not changed.data_ready
+    assert set(changed.scenes) == {"20240101", "20240113"}
+    with pytest.raises(InvalidProcessingStateError, match="call prepare_data"):
+        changed.coregister_scenes()
 
 
 def test_status_reports_missing_and_stale_products(tmp_path: Path) -> None:
     """status() compares the planned network with committed products."""
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     status = stack.status()
     assert status["scenes"]["missing"] == []
     assert status["interferograms"]["missing"] == ["20240101_20240113"]
@@ -227,7 +235,7 @@ def test_verify_detects_a_damaged_payload(tmp_path: Path) -> None:
     import zarr
 
     stack = _stack(tmp_path)
-    stack.prepare()
+    stack.prepare_data()
     assert stack.verify() == []
     stack.coregister_scenes()
     assert stack.verify() == []
@@ -246,7 +254,7 @@ def test_form_interferograms_pairs_outside_the_plan_extend_it(
     from faninsar.processing.unwrapping.irls import SpatialIRLS
 
     stack = _stack(tmp_path, dates=("20240101", "20240113", "20240125"), name="extend")
-    stack.prepare()
+    stack.prepare_data()
     document = json.loads(
         (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
     )
@@ -280,7 +288,7 @@ def test_form_interferograms_subset_forms_only_the_requested_pairs(
     from faninsar.processing.unwrapping.irls import SpatialIRLS
 
     stack = _stack(tmp_path, dates=("20240101", "20240113", "20240125"), name="subset")
-    stack.prepare()
+    stack.prepare_data()
     stack.form_interferograms(pairs=Pairs.from_names(["20240101_20240113"]))
 
     committed = sorted(
@@ -299,7 +307,7 @@ def test_finished_work_directory_holds_only_products(tmp_path: Path) -> None:
     from faninsar.processing.unwrapping.irls import SpatialIRLS
 
     stack = _stack(tmp_path, name="walk")
-    stack.prepare()
+    stack.prepare_data()
     stack.coregister_scenes()
     stack.form_interferograms()
     stack.unwrap(SpatialIRLS())
@@ -353,7 +361,9 @@ def test_science_configuration_round_trips(tmp_path: Path) -> None:
     )
     stack.config.dem = DEM.from_constant(12.0)
     stack.config.extra["polarizations"] = ("VV", "VH")
-    stack.prepare()
+    from dataclasses import replace
+    stack._request_config = replace(stack.config, extra=dict(stack.config.extra))
+    stack.prepare_data()
     work = stack.config.work_dir
 
     reopened = Stack.open(work)
@@ -419,6 +429,7 @@ def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> 
         path.write_bytes(b"orbit")
         orbits[date_id] = path
     stack.config.extra["orbit_paths"] = dict(orbits)
+    stack._prepare_inputs = lambda context: __import__("faninsar.stack.preparation", fromlist=["PreparedInputs"]).PreparedInputs(sources=stack.catalog.paths, mission=__import__("faninsar.stack.search", fromlist=["MissionPreparedInputs"]).MissionPreparedInputs(orbit_paths_by_acquisition=orbits))
     # Mark the first orbit as verified at download time (the P0055 record).
     verified_orbit = orbits[stack.catalog.dates[0]]
     manifest = verified_orbit.with_name(
@@ -437,7 +448,7 @@ def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> 
             }
         )
     )
-    stack.prepare()
+    stack.prepare_data()
     document = json.loads(
         (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
     )
@@ -464,7 +475,8 @@ def test_aux_cal_bindings_round_trip_through_stack_json(tmp_path: Path) -> None:
     aux.write_bytes(b"<auxiliaryCalibration/>")
     bound = dict.fromkeys(stack.catalog.dates, aux)
     stack.config.extra["aux_cal_paths"] = dict(bound)
-    stack.prepare()
+    stack._request_config.extra["aux_cal_paths"] = dict(bound)
+    stack.prepare_data()
     document = json.loads(
         (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
     )

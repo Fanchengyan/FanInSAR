@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from tests.support.local_stack import LocalStack
 
 from faninsar.io.storage.ifg_store import (
     InterferogramArtifactStore,
@@ -48,7 +49,7 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         coreg_mode="nesd",
@@ -57,7 +58,7 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
         ),
         multilook=(1, 1),
     )
-    stack = stack.prepare_scenes()
+    stack.prepare_data()
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     return stack
 
@@ -102,7 +103,7 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
         p = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         p.mkdir()
         paths.append(p)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         coreg_mode="geometry",
@@ -111,7 +112,7 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     )
     assert stack.reference == "20160101"
     assert len(stack.catalog) == 3
-    stack.prepare_scenes()
+    stack.prepare_data()
     assert stack.reference == "20160101"
     # geometry mode skips measure/invert
     stack.measure_misreg()
@@ -141,7 +142,7 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         # Identity includes coreg_mode; this is not testing NESD physics.
@@ -429,7 +430,7 @@ def test_stack_formation_validates_coherence_before_scene_io(tmp_path: Path) -> 
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
     )
@@ -454,7 +455,7 @@ def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
         height=20,
         resolution_m=(40.0, 40.0),
     )
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         coregistration_grid="geo",
@@ -475,14 +476,14 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         coreg_mode="nesd",
         pair_max_interval=2,
         pair_max_days=60,
     )
-    stack.prepare_scenes()
+    stack.prepare_data()
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
 
     def fake_measure(*_args: object, **_kwargs: object) -> MisregArc:
@@ -514,11 +515,11 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
         path.mkdir()
         safe_paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         safe_paths,
         work_dir=tmp_path / "out",
     )
-    stack.prepare_scenes()
+    stack.prepare_data()
 
     reference = np.ones((2, 2), dtype=np.complex64)
     secondary = np.full((2, 2), 1.0 + 2.0j, dtype=np.complex64)
@@ -571,12 +572,12 @@ def test_stack_applies_multilook_before_publishing_ifg(
         return original_form(*args, **kwargs)
 
     monkeypatch.setattr(session_module, "form_merged_scene_interferogram", wrapped_form)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         safe_paths,
         work_dir=tmp_path / "out",
         dask_client=client,
     )
-    stack.prepare_scenes()
+    stack.prepare_data()
 
     reference = (
         np.arange(64 * 64, dtype=np.float32).reshape(64, 64) + 1.0 + 1.0j
@@ -1021,11 +1022,12 @@ def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         multilook=(1, 1),
-    ).prepare_scenes()
+    )
+    stack.prepare_data()
     data = np.ones((2, 2), dtype=np.complex64)
     for date_id in dates:
         write_test_scene(
@@ -1252,7 +1254,7 @@ def test_stack_config_gpu_memory_reclaim_defaults_to_adaptive(tmp_path: Path) ->
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
     )
@@ -1354,7 +1356,7 @@ def test_stack_dask_persist_stage_reclaim_uses_client_run(
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         gpu_memory_reclaim="eager",

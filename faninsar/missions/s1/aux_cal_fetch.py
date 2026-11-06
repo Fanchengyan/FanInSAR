@@ -24,6 +24,7 @@ from faninsar.remote.providers.sar_mpc import (
     sar_mpc_download_url,
 )
 from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
+from faninsar.stack.preparation import InputUnavailableError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -153,7 +154,7 @@ def ensure_aux_cal_paths(
             "IPF 002.36 acquisitions need AUX_CAL files and automatic download "
             f"is disabled; uncovered dates: {sorted(missing)}"
         )
-        reject(message, ValueError, logger=logger)
+        reject(message, InputUnavailableError, logger=logger)
 
     from faninsar import remote
 
@@ -174,11 +175,11 @@ def ensure_aux_cal_paths(
             )
         except (SarMpcHttpError, RemoteAccessError) as error:
             message = f"AUX_CAL listing failed for {date_id} from sar-mpc.eu"
-            reject(message, RuntimeError, cause=error, logger=logger)
+            reject(message, InputUnavailableError, cause=error, logger=logger)
         record = _best_record(records, mission_id=mission, sensing=sensing)
         if record is None:
             message = f"SAR-MPC has no active {mission} AUX_CAL covering {date_id}"
-            reject(message, RuntimeError, logger=logger)
+            reject(message, InputUnavailableError, logger=logger)
         name = str(record["product_name"])
         if name not in downloaded:
             archive_path = cache / f"{name}.SAFE.zip"
@@ -186,7 +187,7 @@ def ensure_aux_cal_paths(
                 remote.download(_asset(record), archive_path, budget=budget)
             except (SarMpcHttpError, RemoteAccessError) as error:
                 message = f"AUX_CAL download failed for {date_id}: {name}"
-                reject(message, RuntimeError, cause=error, logger=logger)
+                reject(message, InputUnavailableError, cause=error, logger=logger)
             downloaded[name] = _extract(archive_path, cache, name)
             logger.info("Downloaded AUX_CAL %s for %s", name, date_id)
         pins.update(

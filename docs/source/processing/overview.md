@@ -22,12 +22,24 @@ stack = S1Stack.from_safes(
 )
 
 # Each stage is explicit and resumable.
-stack.prepare_scenes()
+report = stack.prepare_data()
 stack.coregister_scenes()
 stack.form_interferograms(multilook=(2, 8))
 stack.unwrap()
 result = stack.network.invert()
 ```
+
+All mission constructors (`S1Stack.from_safes`, `S1Stack.from_search`, and
+`NISARStack.from_rslc`) configure requests only. Call `prepare_data()` explicitly
+before raw-input scientific stages; those stages never download or auto-prepare.
+`prepare_data()` returns requested, ready and failed membership with an outcome
+of `complete`, `partial`, or `failed`. The default `on_error="warn"` keeps
+independent qualified targets usable. Use `on_error="raise"` for strict
+completeness; `DataPreparationError.report` retains the partial report and the
+previous committed state remains installed. `offline=True` requires local inputs.
+A complete matching request is a local no-op; a partial request retries missing
+inputs. `Stack.open(work_dir)` is local and read-only, including request-only
+recovery and product inspection after original raw sources disappear.
 
 `Stack.unwrap()` uses SNAPHU by default. The Torch-native `SpatialIRLS`
 backend remains available as an explicit developer/experimental strategy:

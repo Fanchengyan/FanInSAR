@@ -419,7 +419,7 @@ def repair(
         runtime.get("scene_provider") or stack_cls._default_scene_provider()
     )
     save_stack_identity(stack)
-    stack.prepare_scenes()
+    stack._prepared = False
     stack._capture_dem_source()
     stack._ensure_raster_dem()
     stack._prepared = True

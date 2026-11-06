@@ -97,6 +97,16 @@ SAVED_EXTRA_KEYS = frozenset(
         "height",
         "height_m",
         "track_metadata",
+        "preparation_report",
+        "nisar_provider",
+        "source_lineage",
+        "source_admission",
+        "nisar_admission",
+        "admission_policy",
+        "mission",
+        "product",
+        "frequency",
+        "polarization",
     }
 )
 
@@ -450,7 +460,9 @@ def _science_and_extra(
         for key in sorted(config.extra)
         if key in SAVED_EXTRA_KEYS
     }
-    return science, extra
+    from faninsar.remote.records import _sanitize
+
+    return _sanitize(science), _sanitize(extra)
 
 
 def _orbit_inputs(config: Any) -> dict[str, object]:

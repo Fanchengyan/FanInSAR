@@ -262,7 +262,7 @@ def test_fetch_uses_cache_then_sar_mpc(tmp_path: Path, monkeypatch: Any) -> None
     )
     assert again == bound
     assert calls == []
-    with pytest.raises(ValueError, match="automatic download is disabled"):
+    with pytest.raises(OSError, match="automatic download is disabled"):
         aux_cal_fetch.ensure_aux_cal_paths(
             acquisitions=acquisitions, cache_dir=tmp_path / "empty", auto_fetch=False
         )

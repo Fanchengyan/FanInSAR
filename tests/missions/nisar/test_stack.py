@@ -28,6 +28,7 @@ from faninsar.missions.protocols import (
     ValidSampleMask,
 )
 from faninsar.missions.nisar import NISARStack
+from faninsar.processing.geometry import ConstantDEM
 
 
 def _result(path: Path, date_id: str) -> SLCReadResult:
@@ -105,12 +106,17 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
     stack = NISARStack.from_rslc(
         paths,
         work_dir=tmp_path / "work",
+        dem=ConstantDEM(0.0),
         nisar_admission={
             "trusted_roots": [tmp_path],
             "max_size_bytes": 1024,
         },
     )
 
+    assert calls == []
+    for path in paths:
+        path.write_bytes(b"fixture")
+    stack.prepare_data()
     assert stack.reference == "20240101"
     assert stack.catalog.dates == ("20240101", "20240113", "20240125")
     assert len(stack.pairs) == 3
@@ -153,9 +159,14 @@ def test_nisar_stack_passes_explicit_admission_metadata_to_reader(
     stack = NISARStack.from_rslc(
         paths,
         work_dir=tmp_path / "work",
+        dem=ConstantDEM(0.0),
         extra={"nisar_admission": policy},
     )
 
+    assert admissions == []
+    for path in paths:
+        path.write_bytes(b"fixture")
+    stack.prepare_data()
     assert admissions == [policy, policy]
     assert set(stack.config.extra["source_admission"]) == {"20240101", "20240113"}
 
@@ -182,11 +193,12 @@ def test_nisar_stack_rejects_duplicate_acquisitions(
         NISARStack.from_rslc(
             paths,
             work_dir=tmp_path / "work",
+        dem=ConstantDEM(0.0),
             nisar_admission={
                 "trusted_roots": [tmp_path],
                 "max_size_bytes": 1024,
             },
-        )
+        ).prepare_data()
 
 
 @pytest.mark.parametrize(
@@ -241,11 +253,12 @@ def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
         NISARStack.from_rslc(
             paths,
             work_dir=tmp_path / "work",
+        dem=ConstantDEM(0.0),
             nisar_admission={
                 "trusted_roots": [tmp_path],
                 "max_size_bytes": 1024,
             },
-        )
+        ).prepare_data()
 
 
 def test_nisar_stack_fails_closed_before_shared_s1_processing(
@@ -290,10 +303,10 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     )
 
     with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
-        stack.measure_misreg()
-    with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
+        stack.prepare_data()
+    with pytest.raises(InvalidProcessingStateError, match="call prepare_data"):
         stack.coregister_scenes()
-    with pytest.raises(InvalidProcessingStateError, match="scene product missing"):
+    with pytest.raises(InvalidProcessingStateError, match="call prepare_data"):
         stack.form_interferograms()
 
 
@@ -327,11 +340,6 @@ def test_nisar_scene_provider_requires_geometry_for_full_scene(
         },
     )
 
-    assert stack.scene_provider is not None
+    assert stack.scene_provider is None
     with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
-        stack.scene_provider(
-            paths[0],
-            paths[1],
-            output_dir=tmp_path / "pair",
-            options={},
-        )
+        stack.prepare_data()

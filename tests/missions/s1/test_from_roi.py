@@ -9,6 +9,8 @@ burst/scene products.  ``from_roi`` is deleted.
 
 from __future__ import annotations
 
+from tests.missions.s1.test_stack_search import _materialize_selected
+
 import ast
 import inspect
 import struct
@@ -463,7 +465,7 @@ def test_from_search_signature_matches_proposal() -> None:
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["roi"].default is None
     assert parameters["provider"].default == "cdse"
-    assert parameters["polarizations"].default == ("VV",)
+    assert parameters["polarizations"].default is None  # inherit selected channels
     assert parameters["granularity"].default == "roi"
     assert parameters["coreg_mode"].default == "geometry"
     # work_dir is required (no default) so it stays next to ``search``.
@@ -618,7 +620,7 @@ class TestCdseRoiCanvasOrder:
         )
         monkeypatch.setattr(S1Stack, "from_safes", classmethod(fake_from_safes))
 
-        result = _from_search(
+        result = _materialize_selected(
             _cdse_search(),
             work_dir=tmp_path,
             granularity="roi",
@@ -626,15 +628,14 @@ class TestCdseRoiCanvasOrder:
             extra={"orbit_auto_fetch": False},
         )
         assert isinstance(result, FakeStack)
-        assert prepared == [True]
+        assert prepared == []
         assert captured_paths
         assert all(Path(path).name.endswith(".SAFE") for path in captured_paths[0])
         write_at = order.index("write_canvas")
         safes_at = order.index("from_safes")
-        prepare_at = order.index("prepare")
         # Overlap rectangles stream into write_burst itself, so all canvas
         # work finishes before from_safes consumes the SAFE.
-        assert write_at < order.index("finish_canvas") < safes_at < prepare_at
+        assert write_at < order.index("finish_canvas") < safes_at
         assert sorted(written_overlap_roles) == [(4, "top"), (5, "bottom")]
         assert "fetch_ranges" in order
 

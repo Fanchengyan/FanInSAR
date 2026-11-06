@@ -300,7 +300,8 @@ def source_phase_binding(
             reject_product(
                 f"{product.product_id} was processed by IPF {product.ipf_version} and "
                 "needs the AUX_CAL elevation antenna phase correction, but no "
-                "AUX_CAL file is bound; run Stack.prepare() to download it or pass "
+                "AUX_CAL file is bound; run Stack.prepare_data() "
+                "to download it or pass "
                 "aux_cal_paths="
             )
         path = normalize_aux_cal_path(aux_cal_path)
@@ -459,7 +460,7 @@ def correct_eap_phase(
         reject_product(
             f"{product.product_id} was processed by IPF {product.ipf_version} and "
             "needs the AUX_CAL elevation antenna phase correction, but no "
-            "AUX_CAL file is bound; run Stack.prepare() to download it or pass "
+            "AUX_CAL file is bound; run Stack.prepare_data() to download it or pass "
             "aux_cal_paths="
         )
     pattern = read_elevation_antenna_pattern(

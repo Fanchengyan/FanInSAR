@@ -473,10 +473,10 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    result = S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
+    result = _materialize_selected(_asf_search([item]), work_dir=tmp_path, provider="asf")
     assert isinstance(result, FakeStack)
     assert downloaded == [staged_acquisition_path(tmp_path / "inputs", "S1_TEST.zip")]
-    assert prepared == [True]
+    assert prepared == []
     assert captured.get("roi") == ROI
 
 
@@ -505,7 +505,7 @@ def test_from_search_downloads_safes_in_selection_order(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_search(_asf_search([slow, fast]), work_dir=tmp_path, provider="asf")
+    _materialize_selected(_asf_search([slow, fast]), work_dir=tmp_path, provider="asf")
 
     # Both burst zips are staged, then reassembled into one path-SAFE that
     # from_safes opens (not the raw staged zips).
@@ -542,7 +542,7 @@ def test_from_search_downloads_every_selected_burst_item(
         "from_safes",
         classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
     )
-    S1Stack.from_search(_asf_search(items), work_dir=tmp_path, provider="asf")
+    _materialize_selected(_asf_search(items), work_dir=tmp_path, provider="asf")
 
     assert downloaded == ["S1_0", "S1_1", "S1_2"]
 
@@ -573,7 +573,7 @@ def test_from_search_does_not_construct_stack_after_download_failure(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(RuntimeError, match="burst generation failed"):
-        S1Stack.from_search(
+        _materialize_selected(
             _asf_search([first, second]), work_dir=tmp_path, provider="asf"
         )
     assert not stack_constructed
@@ -613,7 +613,7 @@ def test_from_search_rejects_tiff_xml_without_burst_extractor_safe(
     )
 
     with pytest.raises(ValueError, match="exactly one complete SAFE ZIP"):
-        S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
+        _materialize_selected(_asf_search([item]), work_dir=tmp_path, provider="asf")
 
     assert downloads == []
 
@@ -636,7 +636,7 @@ def test_from_search_rejects_ambiguous_safe_zips_before_download(
     )
 
     with pytest.raises(ValueError, match="found 2"):
-        S1Stack.from_search(_asf_search([item]), work_dir=tmp_path, provider="asf")
+        _materialize_selected(_asf_search([item]), work_dir=tmp_path, provider="asf")
 
     assert downloads == []
 
@@ -711,7 +711,7 @@ def test_from_search_asf_items_rediscover_on_cdse(
             lambda _cls, _paths, **_kw: type("S", (), {"prepare": lambda self: None})()
         ),
     )
-    S1Stack.from_search(
+    _materialize_selected(
         _asf_search([item]),
         work_dir=tmp_path,
         provider="cdse",
@@ -894,7 +894,7 @@ def test_search_rejects_none_polarizations(monkeypatch: pytest.MonkeyPatch) -> N
 def test_from_search_accepts_stack_search_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``S1Stack.from_search(S1Stack.search(...))`` composes directly."""
+    """``_materialize_selected(S1Stack.search(...))`` composes directly."""
     _fake_remote_search(monkeypatch, [_item(_asset())])
     monkeypatch.setattr(remote, "download", _fake_burst_download)
 
@@ -905,7 +905,7 @@ def test_from_search_accepts_stack_search_result(
     monkeypatch.setattr(
         S1Stack, "from_safes", classmethod(lambda _cls, _paths, **_kw: FakeStack())
     )
-    result = S1Stack.from_search(S1Stack.search(ROI), work_dir=tmp_path, provider="asf")
+    result = _materialize_selected(S1Stack.search(ROI), work_dir=tmp_path, provider="asf")
     assert isinstance(result, FakeStack)
 
 
@@ -920,3 +920,7 @@ def test_search_invalid_limit_has_consistent_query_error(
     budget = remote.RemoteResourceBudget() if explicit_budget else None
     with pytest.raises(RemoteQueryError, match="invalid_limit"):
         S1Stack.search(ROI, limit=limit, budget=budget)
+
+
+def _materialize_selected(search, *, work_dir, provider="cdse", granularity="roi", polarizations=("VV",), coreg_mode="geometry", orbit_group=None, orbit_paths=None, aux_cal_paths=None, roi=None, **kwargs):
+    return S1Stack._materialize_from_search(search, work_dir=work_dir, provider=provider, granularity="burst" if provider == "asf" else granularity, polarizations=polarizations, coreg_mode=coreg_mode, orbit_group=orbit_group, orbit_paths=orbit_paths, aux_cal_paths=aux_cal_paths, effective_roi=roi or search.spatial, kwargs=kwargs)

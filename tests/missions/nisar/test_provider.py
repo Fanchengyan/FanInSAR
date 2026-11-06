@@ -171,6 +171,7 @@ def _stack(
             resolution_m=(10.0, 10.0),
         )
     stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work", **config)
+    stack.prepare_data()
     return stack, paths, handles
 
 
@@ -180,7 +181,7 @@ def test_nisar_radar_provider_runs_shared_stack_lifecycle(
     """Radar RSLC windows publish scenes consumed by shared IFG formation."""
     stack, paths, handles = _stack(tmp_path, monkeypatch)
 
-    stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
+    stack.coregister_scenes().form_interferograms(multilook=(1, 1))
 
     store = CoregisteredSceneStore.open(tmp_path / "work" / "coreg" / "20240113")
     assert store.domain == "radar"
@@ -217,7 +218,7 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
     monkeypatch.setattr(RadarSLC, "rdr2geo", fake_rdr2geo)
     stack, _paths, _handles = _stack(tmp_path, monkeypatch, domain="geo")
 
-    stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
+    stack.coregister_scenes().form_interferograms(multilook=(1, 1))
 
     store = CoregisteredSceneStore.open(tmp_path / "work" / "coreg" / "20240113")
     assert store.domain == "geo"
@@ -1006,7 +1007,8 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         coregistration_grid="radar",
         extra={"nisar_tile_shape": (2, 3)},
     )
-    radar_stack.prepare_scenes().coregister_scenes().form_interferograms(
+    radar_stack.prepare_data()
+    radar_stack.coregister_scenes().form_interferograms(
         multilook=(1, 1)
     )
     assert len(radar_stack.ifg_dirs) == 3
@@ -1098,7 +1100,8 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         coregistration_grid="geo",
         extra={"nisar_tile_shape": (2, 3)},
     )
-    geo_stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
+    geo_stack.prepare_data()
+    geo_stack.coregister_scenes().form_interferograms(multilook=(1, 1))
     assert len(geo_stack.ifg_dirs) == 3
     reference_store = geo_stack.reference_scene
     reference_coverage = np.zeros(reference_store.grid_shape, dtype=np.int8)

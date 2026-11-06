@@ -6,6 +6,8 @@ NESD is opt-in: tests that exercise measure/invert/apply pass
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 import inspect
 from pathlib import Path
 
@@ -72,7 +74,7 @@ def test_from_safes_keyword_defaults_are_geometry_all_swaths_all_bursts(
     assert s1_params["swaths"].default is None
     assert s1_params["bursts"].default is None
 
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
     )
@@ -85,7 +87,7 @@ def test_from_safes_keyword_defaults_are_geometry_all_swaths_all_bursts(
 
 def test_burst_kwargs_pass_none_bursts_through(tmp_path: Path) -> None:
     """Default burst kwargs keep None rather than rewriting to first-burst IW1."""
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
     )
@@ -96,7 +98,7 @@ def test_burst_kwargs_pass_none_bursts_through(tmp_path: Path) -> None:
 
 def test_coreg_resume_identity_serializes_none_swaths(tmp_path: Path) -> None:
     """All-swath selection serializes without list(None) and is not first-burst."""
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         _two_date_safe_paths(tmp_path),
         work_dir=tmp_path / "out",
     )

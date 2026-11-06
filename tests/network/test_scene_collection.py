@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -25,7 +27,7 @@ def _stack_with_scenes(tmp_path: Path) -> S1Stack:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
         path.mkdir()
         paths.append(path)
-    stack = S1Stack.from_safes(
+    stack = LocalStack.from_paths(
         paths,
         work_dir=tmp_path / "out",
         pairs=Pairs.from_names(["20240101_20240113", "20240113_20240125"]),

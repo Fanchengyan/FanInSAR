@@ -11,6 +11,8 @@ and never relaxes the strict planned-network check on product discovery
 
 from __future__ import annotations
 
+from tests.support.local_stack import LocalStack
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -82,7 +84,7 @@ def coregistered_stack(tmp_path: Path) -> Stack:
         safe.mkdir()
         paths.append(safe)
     model = _toy_geometry()
-    instance = Stack(
+    instance = LocalStack(
         catalog=SceneCatalog.from_paths(paths),
         config=StackConfig(
             work_dir=tmp_path / "work",
