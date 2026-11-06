@@ -398,7 +398,7 @@ def search_acquisitions(
     track: int | Sequence[int] | None = None,
     burst_id: int | Sequence[int] | None = None,
     auth_profile: str | None = "earthdata-asf",
-    limit: int = 10_000,
+    limit: int | None = None,
     budget: RemoteResourceBudget | None = None,
     **filters: Any,
 ) -> S1Search:
@@ -453,13 +453,13 @@ def search_acquisitions(
         Translated to the ASF ``absoluteBurstID`` filter.
     auth_profile : str, default ``"earthdata-asf"``
         ASF authentication profile.
-    limit : int, default ``10000``
-        Maximum number of items returned.  The provider stops collecting
-        candidates at this bound (it also sizes the default budget's
-        ``max_items``); canonical ordering and polarization filtering run
-        on those candidates before the final local truncation to ``limit``.
+    limit : int or None, default None
+        Maximum number of matching items returned. None exhausts provider
+        pagination. Multi-channel polarization filtering runs before the
+        final local truncation to a positive limit.
     budget : RemoteResourceBudget, optional
-        Advanced resource limits; ``limit`` already sizes ``max_items``.
+        Advanced resource guards. An explicit ``max_items`` guards candidate
+        traversal and fails if exceeded rather than truncating the query.
     **filters : Any
         Advanced ASF query aliases for fields with no dedicated parameter,
         validated by the ASF adapter.  Accepted keys:
@@ -541,10 +541,8 @@ def search_acquisitions(
         lo, hi = datetime_range
         parsed_range = (_parse_date(lo), _parse_date(hi))
 
-    if limit <= 0:
+    if limit is not None and (type(limit) is not int or limit <= 0):
         _fail(RemoteQueryError, "invalid_limit")
-    if budget is None:
-        budget = remote.RemoteResourceBudget(max_items=limit)
     items = remote.search(
         roi,
         catalog=catalog,
@@ -553,7 +551,9 @@ def search_acquisitions(
         flight_direction=direction,
         filters=merged,
         auth_profile=auth_profile,
-        limit=limit,
+        limit=None
+        if selected_polarizations != "all" and len(selected_polarizations) > 1
+        else limit,
         budget=budget,
     )
     # Canonical local finishing precedes the final local truncation.

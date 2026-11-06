@@ -17,7 +17,7 @@ from shapely.ops import unary_union
 from faninsar.data.query import BoundingBox, Points, Polygons
 
 from .access import _canonicalize_url
-from .errors import RemoteAccessError, RemoteQueryError, _fail
+from .errors import RemoteAccessError, RemoteLimitError, RemoteQueryError, _fail
 from .protocols import _Adapter, _adapter_items, _adapter_query, _CallLedger
 from .records import (
     AcquisitionMetadata,
@@ -209,12 +209,17 @@ def search(
     flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
     filters: Mapping[str, Any] | None = None,
     auth_profile: str | None = None,
-    limit: int = 100,
+    limit: int | None = None,
     budget: RemoteResourceBudget | None = None,
 ) -> list[CatalogItem]:
-    """Search a registered catalog using exact FanInSAR spatial semantics."""
+    """Search a catalog, exhausting matching records when ``limit`` is None.
+
+    A positive ``limit`` caps matching unique results. An explicit budget
+    ``max_items`` guards candidate traversal and raises on exhaustion; it never
+    silently truncates a complete query.
+    """
     budget = budget or RemoteResourceBudget()
-    if limit <= 0 or limit > budget.max_items:
+    if limit is not None and (type(limit) is not int or limit <= 0):
         _fail(RemoteQueryError, "invalid_limit")
     query, query_kind, point_geometries = _query_geometry(spatial)
     adapter = _ADAPTERS.get(catalog)
@@ -251,11 +256,7 @@ def search(
     prepared_filters = prepared.get("filters", query_filters)
     if not isinstance(prepared_filters, Mapping):
         _fail(RemoteQueryError, "query_translation_failed", "filters must be a mapping")
-    traversal_limit = (
-        budget.max_items
-        if prepared.get("requires_complete_traversal", False)
-        else limit
-    )
+    complete_traversal = prepared.get("requires_complete_traversal", False)
     ledger = _CallLedger(budget)
     raw_items = _adapter_items(
         adapter,
@@ -266,14 +267,20 @@ def search(
         collections=tuple(collections) if collections is not None else None,
         filters=prepared_filters,
         auth_profile=profile,
-        limit=traversal_limit,
+        limit=None,
         budget=budget,
         ledger=ledger,
     )
     results: list[CatalogItem] = []
     seen: set[tuple[str, str, str | None, str]] = set()
-    for raw in raw_items:
+    for count, raw in enumerate(raw_items, start=1):
         ledger.check_elapsed()
+        if budget.max_items is not None and count > budget.max_items:
+            _fail(
+                RemoteLimitError,
+                "max_items",
+                "max_items: catalog traversal is incomplete",
+            )
         if collections is not None and raw.get("collection") not in collections:
             continue
         item = _normalize_record(raw, catalog, adapter, profile)
@@ -304,6 +311,8 @@ def search(
         )
         results.append(item)
         seen.add(identity)
+        if limit is not None and len(results) >= limit and not complete_traversal:
+            break
     return results[:limit]
 
 

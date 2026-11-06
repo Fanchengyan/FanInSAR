@@ -113,15 +113,17 @@ def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
             _validate_url(url, adapter, redirect=True)
 
 
+@pytest.mark.parametrize("page_size", [1, 100])
 def test_cmr_json_pagination_uses_search_after_and_collection_identity(
     monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
 ) -> None:
     """Pages advance using the response token and retain registered identity."""
     adapter = CMRCollectionAdapter(
         provider="FIXTURE",
         collection="C123",
         endpoint="https://cmr.invalid/search/granules.json",
-        page_size=1,
+        page_size=page_size,
     )
     pages = [
         _ResponseFixture(

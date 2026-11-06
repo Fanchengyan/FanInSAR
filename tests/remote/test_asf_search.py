@@ -242,6 +242,33 @@ def test_remote_search_fetches_terminal_page_before_applying_public_limit() -> N
     assert len(session.posts) == 2
 
 
+def test_asf_unlimited_search_does_not_set_max_results() -> None:
+    module = _ASFModule(_product())
+    adapter = ASFSearchAdapter(
+        collection="S1-SLC",
+        package=module,
+        session_factory=lambda: _Session(_Response(b"{}")),
+    )
+    assert len(list(adapter.items())) == 1
+    assert module.options.values.get("maxResults") is None
+
+
+def test_asf_incomplete_terminal_page_is_failure() -> None:
+    class Incomplete(_ASFModule):
+        def search_generator(self, *, opts):
+            yield _Page([self.product], False)
+
+    module = Incomplete(_product())
+    adapter = ASFSearchAdapter(
+        collection="S1-SLC",
+        package=module,
+        session_factory=lambda: _Session(_Response(b"{}")),
+    )
+    with pytest.raises(ASFSearchError) as error:
+        list(adapter.items())
+    assert error.value.reason == "incomplete_results"
+
+
 def test_asf_search_registers_current_download_redirect_origins() -> None:
     """Current ASF Data Pool and OAuth hops are admitted internally."""
     adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))

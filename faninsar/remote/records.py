@@ -15,12 +15,14 @@ from .errors import RemoteQueryError, _fail
 
 @dataclass(frozen=True, slots=True)
 class RemoteResourceBudget:
-    """Finite limits for remote search and complete-file transfer.
+    """Resource guards for remote search and complete-file transfer.
 
     Parameters
     ----------
-    max_items : int
-        Maximum number of catalog items returned.
+    max_items : int or None
+        Optional candidate traversal guard. Exceeding it fails the search
+        rather than publishing an incomplete result. None leaves item count
+        unrestricted; request, byte, and elapsed-time guards still apply.
     max_requests : int
         Maximum number of transfer attempts.
     max_poll_attempts : int
@@ -37,7 +39,7 @@ class RemoteResourceBudget:
 
     """
 
-    max_items: int = 100
+    max_items: int | None = None
     max_requests: int = 256
     max_redirects: int = 5
     max_retries: int = 4
@@ -55,8 +57,12 @@ class RemoteResourceBudget:
 
     def __post_init__(self) -> None:
         """Reject non-finite or non-positive resource limits."""
+        if self.max_items is not None and (
+            type(self.max_items) is not int or self.max_items <= 0
+        ):
+            msg = "max_items must be a positive integer or None"
+            raise ValueError(msg)
         for name in (
-            "max_items",
             "max_requests",
             "max_redirects",
             "max_retries",

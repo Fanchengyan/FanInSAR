@@ -193,4 +193,6 @@ def test_search_propagates_normalized_query_to_capable_adapter() -> None:
     assert adapter.query["collections"] == ("C123",)
     assert adapter.query["datetime_range"][0].tzinfo is not None
     assert adapter.query["auth_profile"] == "anonymous"
-    assert adapter.query["limit"] == 3
+    # The public matching-result cap is applied after exact geometry and
+    # deduplication; provider candidates must not be capped before those steps.
+    assert adapter.query["limit"] is None

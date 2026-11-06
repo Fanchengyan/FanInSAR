@@ -1179,23 +1179,13 @@ class ASFSearchAdapter:
                 return options
 
     def _pages(self, package: Any, options: Any) -> Iterable[Any]:
-        """Invoke only ASF discovery APIs, preferring bounded page iteration.
-
-        ``asf_search.search`` is preferred over ``search_generator``: it
-        pages through CMR internally, tolerates ASF's occasional incomplete
-        terminal page (logging a warning instead of failing the whole
-        traversal), and returns a single result list.  ``search_generator``
-        exposes each raw page, and the SLC-BURST CMR collection has been
-        observed to return ``searchComplete=False`` on its final page for
-        multi-satellite windows — which would abort the entire query even
-        though every hit was delivered.
-        """
-        search = getattr(package, "search", None)
-        if callable(search):
-            return (search(opts=options),)
+        """Iterate discovery pages so terminal completion remains observable."""
         generator = getattr(package, "search_generator", None)
         if callable(generator):
             return generator(opts=options)
+        search = getattr(package, "search", None)
+        if callable(search):
+            return (search(opts=options),)
         _error(
             ASFSearchError,
             "missing_search_api",
@@ -1287,7 +1277,7 @@ class ASFSearchAdapter:
             return
         if auth_profile is not None and auth_profile not in self.profiles:
             _error(ASFSearchError, "unknown_auth_profile", "unknown ASF auth profile")
-        if limit is not None and (limit <= 0 or limit > ledger.budget.max_items):
+        if limit is not None and (type(limit) is not int or limit <= 0):
             _error(ASFSearchError, "invalid_limit", "invalid ASF search limit")
         session: Any | None = None
         restore: Callable[[], None] | None = None
@@ -1322,7 +1312,7 @@ class ASFSearchAdapter:
             # The public ``limit`` is applied by ``remote.search`` only after
             # the complete provider traversal.  Limiting ASF's own page
             # traversal here would make an incomplete first page look final.
-            parameters["maxResults"] = ledger.budget.max_items
+            parameters["maxResults"] = None
             options = self._options(package, session, parameters)
             previous_timeout: Any = None
             internal = getattr(package, "INTERNAL", None)
@@ -1366,7 +1356,11 @@ class ASFSearchAdapter:
                     else (page,)
                 )
                 for product in values:
-                    if produced >= parameters["maxResults"]:
+                    ledger.check_elapsed()
+                    if (
+                        ledger.budget.max_items is not None
+                        and produced >= ledger.budget.max_items
+                    ):
                         _error(
                             ASFSearchError,
                             "incomplete_results",
@@ -1388,21 +1382,11 @@ class ASFSearchAdapter:
                         normalized["collection"] = self.collection
                         yield _merge_science_properties(normalized, science)
                     produced += 1
-                if not complete and produced >= parameters["maxResults"]:
-                    _error(
-                        ASFSearchError,
-                        "incomplete_results",
-                        "ASF result budget was reached before completion",
-                    )
             if saw_page and not last_page_complete:
-                # ``asf_search.search`` already returned every hit CMR
-                # delivered; its ``searchComplete=False`` terminal flag is
-                # unreliable on the SLC-BURST collection (ASF logs
-                # "Results may be incomplete" yet returns the full set).
-                # Treat it as a warning, not a reason to discard the hits.
-                logger.warning(
-                    "ASF flagged the terminal page as incomplete; "
-                    "publishing the hits it returned anyway"
+                _error(
+                    ASFSearchError,
+                    "incomplete_results",
+                    "ASF flagged the terminal page as incomplete",
                 )
         except (RemoteLimitError, ASFSearchError):
             raise

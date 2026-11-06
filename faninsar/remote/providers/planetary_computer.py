@@ -412,9 +412,7 @@ class PlanetaryComputerAdapter:
         parameters: dict[str, Any] = {
             "collections": [self.collection],
             "bbox": bbox,
-            "max_items": min(limit, ledger.budget.max_items)
-            if limit is not None
-            else ledger.budget.max_items,
+            "max_items": limit,
         }
         if datetime_range is not None:
             parameters["datetime"] = "/".join(
@@ -504,7 +502,7 @@ class PlanetaryComputerAdapter:
 
             geometry, _kind, _points = _query_geometry(spatial)
             bounds = geometry.bounds
-        return self.search(
+        return self._records(
             bounds,
             ledger=ledger,
             datetime_range=datetime_range,
@@ -522,7 +520,26 @@ class PlanetaryComputerAdapter:
         limit: int | None = None,
     ) -> list[Mapping[str, Any]]:
         """Discover one WGS84 bbox and return provider-neutral records."""
-        records: list[Mapping[str, Any]] = []
+        return list(
+            self._records(
+                bounds,
+                ledger=ledger,
+                datetime_range=datetime_range,
+                filters=filters,
+                limit=limit,
+            )
+        )
+
+    def _records(
+        self,
+        bounds: tuple[float, float, float, float],
+        *,
+        ledger: _CallLedger | None = None,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        filters: Mapping[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        """Normalize lazily so finite matching searches can stop pagination."""
         item_stream = self._search_items(
             list(bounds),
             ledger,
@@ -593,12 +610,11 @@ class PlanetaryComputerAdapter:
                     catalog=self.provider,
                     collection=self.collection,
                 )
-                records.append(record)
+                yield record
         finally:
             close = getattr(item_stream, "close", None)
             if callable(close):
                 close()
-        return records
 
 
 def register_planetary_computer(

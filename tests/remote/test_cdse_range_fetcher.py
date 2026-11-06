@@ -108,6 +108,26 @@ class _RecordingRangeSession:
         return _FakeRangeResponse(self._payload, int(start_s), int(end_s))
 
 
+def test_cdse_range_fetcher_forwards_network_budget(
+    isolated_cdse_catalog,
+    fake_cdse_token,
+):
+    from faninsar.remote import RemoteResourceBudget
+    from faninsar.remote.protocols import _CallLedger
+
+    budget = RemoteResourceBudget(max_workers=1, max_items=1)
+    ledger = _CallLedger(budget)
+
+    async def run():
+        async with cdse_range_fetcher((), budget=budget, ledger=ledger) as fetcher:
+            assert fetcher._ledger is ledger
+            assert fetcher.window == 1
+            assert fetcher._session.timeout.sock_connect == 10
+            assert fetcher._session.timeout.sock_read == 120
+
+    asyncio.run(run())
+
+
 def test_cdse_range_fetcher_yields_open_fetcher_for_empty_spans(
     isolated_cdse_catalog: None,
     fake_cdse_token: list[str],

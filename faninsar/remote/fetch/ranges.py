@@ -17,10 +17,13 @@ from faninsar.remote.errors import (
     RemoteIntegrityError,
     _fail,
 )
+from faninsar.remote.protocols import _CallLedger
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
     from types import TracebackType
+
+    from faninsar.remote.records import RemoteResourceBudget
 
 logger = setup_logger(__name__)
 
@@ -97,6 +100,8 @@ class RangeFetcher:
         *,
         token: str | None = None,
         refresh: Callable[[], Awaitable[str]] | None = None,
+        budget: RemoteResourceBudget | None = None,
+        ledger: _CallLedger | None = None,
     ) -> None:
         """Create a fetcher; the session is opened by ``async with``.
 
@@ -108,18 +113,40 @@ class RangeFetcher:
             Async callable returning a replacement token. Concurrent 401
             responses share one in-flight refresh; each span is requeued
             once after that result.
+        budget : RemoteResourceBudget, optional
+            Network guards shared by all spans in this context. Item-count and
+            disk/cache quotas do not apply to range transfer. Omission retains
+            the existing AIMD and socket defaults.
+        ledger : _CallLedger, optional
+            Existing operation accounting. Its budget is authoritative; a
+            conflicting explicit budget is rejected.
 
         """
+        if ledger is not None and budget is not None and ledger.budget != budget:
+            reject(
+                "budget must match the supplied range ledger", ValueError, logger=logger
+            )
+        self._ledger = (
+            ledger
+            if ledger is not None
+            else (_CallLedger(budget) if budget is not None else None)
+        )
+        self._budget = self._ledger.budget if self._ledger is not None else None
+        self._ceiling = (
+            min(_AIMD_SEED, self._budget.max_workers)
+            if self._budget is not None
+            else _AIMD_SEED
+        )
         self._session: Any = None
         self._connector: Any = None
         self._token = token
         self._refresh = refresh
         self._refresh_lock = asyncio.Lock()
         self._generation = 0
-        self._window = _AIMD_SEED
+        self._window = self._ceiling
         self._lo = 0
-        self._hi = _AIMD_SEED + 1
-        self._origin = _AIMD_SEED
+        self._hi = self._ceiling + 1
+        self._origin = self._ceiling
         self._ladder: list[int] = []
         self._virgin = 0
         self._congested = False
@@ -135,7 +162,7 @@ class RangeFetcher:
 
     def _set_window(self, value: int) -> None:
         """Keep the AIMD window and connector limit on the same integer."""
-        self._window = max(1, value)
+        self._window = max(1, min(value, self._ceiling))
         if self._connector is not None:
             self._connector._limit = self._window
 
@@ -183,7 +210,7 @@ class RangeFetcher:
         self._congested = True
         self._hi = min(self._hi, sent)
         nxt = self._retreat(sent)
-        nxt = max(1, min(nxt, self._window, _AIMD_SEED))
+        nxt = max(1, min(nxt, self._window, self._ceiling))
         if self._hi > 1:
             nxt = min(nxt, self._hi - 1)
         if self._lo >= nxt:
@@ -216,7 +243,7 @@ class RangeFetcher:
             return
         if sent != self._window or self._window >= self._hi - 1:
             return
-        nxt = min(_AIMD_SEED, (self._window + self._hi) // 2)
+        nxt = min(self._ceiling, (self._window + self._hi) // 2)
         if nxt != self._window:
             logger.info(
                 "range AIMD window %d -> %d (lo=%d hi=%d)",
@@ -267,9 +294,13 @@ class RangeFetcher:
             headers={"Accept-Encoding": "identity"},
             trust_env=False,
             timeout=aiohttp.ClientTimeout(
-                total=None,
-                sock_connect=_SOCK_CONNECT_S,
-                sock_read=_SOCK_READ_S,
+                total=self._budget.max_elapsed_seconds if self._budget else None,
+                sock_connect=self._budget.connect_timeout_seconds
+                if self._budget
+                else _SOCK_CONNECT_S,
+                sock_read=self._budget.read_timeout_seconds
+                if self._budget
+                else _SOCK_READ_S,
             ),
         )
         return self
@@ -520,6 +551,7 @@ async def _attempt_span_stream(
                 received,
                 token=fetcher._token,
                 revision=revision,
+                ledger=fetcher._ledger,
             )
         except RemoteAccessError as error:
             last_access_error = error
@@ -528,6 +560,8 @@ async def _attempt_span_stream(
                 and allow_refresh
                 and fetcher._refresh is not None
             ):
+                if fetcher._ledger is not None:
+                    fetcher._ledger.retry()
                 await fetcher._refresh_token(generation)
                 await _attempt_span_stream(
                     fetcher,
@@ -543,6 +577,8 @@ async def _attempt_span_stream(
             # Rate-limited: pin the window this span first sent at. Retries
             # after a cut would otherwise look like the new window 429'd.
             if attempt < _RATE_LIMIT_ATTEMPTS - 1:
+                if fetcher._ledger is not None:
+                    fetcher._ledger.retry()
                 await fetcher._wait_rate_limit(origin_window, attempt)
             else:
                 fetcher._on_rate_limit(origin_window)
@@ -575,6 +611,7 @@ async def _stream_span(
     *,
     token: str | None = None,
     revision: _Revision | None = None,
+    ledger: _CallLedger | None = None,
 ) -> None:
     """Stream one span into ``write``; mid-stream drops resume the suffix.
 
@@ -601,14 +638,24 @@ async def _stream_span(
     while attempt < _CONNECT_ATTEMPTS:
         attempt += 1
         if attempt > 1:
+            if ledger is not None:
+                ledger.retry()
             await asyncio.sleep(_CONNECT_BACKOFF_S * (attempt - 1))
         if received() >= expected:
             return
         try:
             await _request_span_once(
-                session, span, write, received(), token=token, revision=revision
+                session,
+                span,
+                write,
+                received(),
+                token=token,
+                revision=revision,
+                ledger=ledger,
             )
         except retryable as error:
+            if ledger is not None:
+                ledger.check_elapsed()
             last_error = error
             logger.warning(
                 "range request stream failed on attempt %d/%d "
@@ -648,6 +695,7 @@ async def _request_span_once(
     *,
     token: str | None = None,
     revision: _Revision | None = None,
+    ledger: _CallLedger | None = None,
 ) -> None:
     """GET the missing suffix once; 429 is retryable, a mismatched 206 is not.
 
@@ -668,6 +716,9 @@ async def _request_span_once(
     if_range = revision.etag if revision is not None and received > 0 else None
     if if_range:
         headers["If-Range"] = if_range
+    if ledger is not None:
+        ledger.check_elapsed()
+        ledger.request()
     async with session.get(
         span.url,
         headers=headers,
@@ -745,8 +796,14 @@ async def _request_span_once(
                 revision.etag = etag
                 if revision.on_etag is not None:
                     revision.on_etag(etag)
+        response_total = 0
         async for chunk in response.content.iter_chunked(_STREAM_CHUNK_BYTES):
+            response_total += len(chunk)
+            if ledger is not None:
+                ledger.response_bytes(len(chunk), response_total=response_total)
             write(bytes(chunk))
+        if ledger is not None:
+            ledger.check_elapsed()
 
 
 def _proxy_for_url(url: str) -> str | None:

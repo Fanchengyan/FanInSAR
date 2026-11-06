@@ -811,11 +811,7 @@ class CMRCollectionAdapter:
         request_headers: Mapping[str, str] | None = None,
     ) -> Iterator[Mapping[str, Any]]:
         """Yield CMR granule mappings while following Search-After."""
-        page_size = min(
-            self.page_size,
-            limit if limit is not None else self.page_size,
-            ledger.budget.max_items,
-        )
+        page_size = min(self.page_size, limit) if limit is not None else self.page_size
         params: dict[str, str] = {"page_size": str(page_size)}
         if self.provider:
             params["provider"] = self.provider
@@ -833,6 +829,7 @@ class CMRCollectionAdapter:
             )
         search_after: str | None = None
         emitted = 0
+        seen_tokens: set[str] = set()
         for _ in range(self.max_pages):
             # Registrations may pin a deterministic granule with an endpoint
             # query (for example, ``concept_id=G...``).  Preserve that
@@ -877,6 +874,15 @@ class CMRCollectionAdapter:
                         "malformed_entry",
                         "CMR entry must be an object",
                     )
+                if (
+                    ledger.budget.max_items is not None
+                    and emitted >= ledger.budget.max_items
+                ):
+                    _error(
+                        RemoteLimitError,
+                        "max_items",
+                        "CMR candidate traversal exceeded max_items",
+                    )
                 yield entry
                 emitted += 1
             token = response_headers.get("cmr-search-after") or response_headers.get(
@@ -888,14 +894,15 @@ class CMRCollectionAdapter:
                     "incomplete_results",
                     "CMR result budget was reached before the terminal page",
                 )
-            if not token or not entries or len(entries) < page_size:
+            if not token or not entries:
                 return
-            if token == search_after:
+            if token in seen_tokens:
                 _error(
                     CMRDiscoveryError,
                     "pagination_loop",
                     "CMR Search-After token did not advance",
                 )
+            seen_tokens.add(token)
             search_after = token
         _error(RemoteLimitError, "max_pages", "CMR pagination exceeded max_pages")
 
@@ -1108,7 +1115,7 @@ class CMRCollectionAdapter:
         datetime_range: tuple[datetime, datetime] | None = None,
         collections: tuple[str, ...] | None = None,
         auth_profile: str = "anonymous",
-        limit: int = 100,
+        limit: int | None = None,
         budget: RemoteResourceBudget | None = None,
         ledger: _CallLedger | None = None,
     ) -> Iterable[Mapping[str, Any]]:
@@ -1124,7 +1131,7 @@ class CMRCollectionAdapter:
                 "budget_mismatch",
                 "budget must match the supplied operation ledger",
             )
-        if limit <= 0:
+        if limit is not None and (type(limit) is not int or limit <= 0):
             _error(CMRDiscoveryError, "invalid_limit", "limit must be positive")
         request_headers = self._auth_headers(auth_profile)
         for entry in self._pages(

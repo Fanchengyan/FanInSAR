@@ -13,6 +13,10 @@ from typing import Any
 
 import pytest
 
+import io
+import json
+import urllib.request
+
 from faninsar import remote
 from faninsar.data.query import BoundingBox
 from faninsar.remote.auth import _no_auth
@@ -122,6 +126,40 @@ def _stac_feature(
         },
         "assets": assets,
     }
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_http_search_follows_validated_continuation_links(monkeypatch, repeat):
+    first = _stac_feature()
+    second = {**first, "id": "second-product"}
+    calls = []
+
+    class Response(io.BytesIO):
+        headers = {}
+
+    class Opener:
+        def open(self, request, **kwargs):
+            calls.append(request)
+            index = len(calls)
+            link = {"rel": "next", "href": f"{CDSE_STAC_ENDPOINT}/search?page=2"}
+            document = {
+                "features": [first if index == 1 else second],
+                "links": [link] if index == 1 or repeat else [],
+            }
+            return Response(json.dumps(document).encode())
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())
+    adapter = CDSESearchAdapter()
+    if repeat:
+        with pytest.raises(RemoteAccessError) as error:
+            list(adapter.items(spatial=ROI))
+        assert error.value.reason == "pagination_loop"
+    else:
+        assert [r["id"] for r in adapter.items(spatial=ROI)] == [
+            _PRODUCT_ID,
+            "second-product",
+        ]
+    assert len(calls) == 2
 
 
 class _FakeCDSEClient:

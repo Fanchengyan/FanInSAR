@@ -259,6 +259,9 @@ def _needs_cdse_bearer(url: str) -> bool:
 @asynccontextmanager
 async def cdse_range_fetcher(
     spans: Sequence[RangeSpan],
+    *,
+    budget: RemoteResourceBudget | None = None,
+    ledger: _CallLedger | None = None,
 ) -> AsyncIterator[RangeFetcher]:
     """Validate OData range URLs and yield a credential RangeFetcher.
 
@@ -273,6 +276,11 @@ async def cdse_range_fetcher(
     ----------
     spans : sequence of RangeSpan
         Already-sized inclusive byte intervals on CDSE OData ``$value`` URLs.
+    budget : RemoteResourceBudget, optional
+        Network guards forwarded to the shared range fetcher, not item or
+        disk quotas. Omitting it retains the existing transfer defaults.
+    ledger : _CallLedger, optional
+        Existing operation meter; its budget must match an explicit budget.
 
     Yields
     ------
@@ -301,7 +309,9 @@ async def cdse_range_fetcher(
             message = "CDSE range URL is not an OData Nodes(...)/$value href"
             _fail(RemoteAccessError, "invalid_endpoint", message)
     token = request_cdse_token()
-    async with RangeFetcher(token=token, refresh=refresh_cdse_token) as fetcher:
+    async with RangeFetcher(
+        token=token, refresh=refresh_cdse_token, budget=budget, ledger=ledger
+    ) as fetcher:
         yield fetcher
 
 
@@ -437,16 +447,16 @@ class CDSESearchAdapter:
             collection=self.collection,
         )
         orbit = _filter_orbit(filters)
-        records: list[Mapping[str, Any]] = []
+        emitted = 0
         for feature in features:
             if not isinstance(feature, Mapping):
                 continue
             record = self._record_from_feature(feature, orbit=orbit)
             if record is not None:
-                records.append(record)
-            if limit is not None and len(records) >= limit:
+                yield record
+                emitted += 1
+            if limit is not None and emitted >= limit:
                 break
-        return records
 
     def _search_features(
         self,
@@ -466,7 +476,8 @@ class CDSESearchAdapter:
             kwargs: dict[str, Any] = {
                 "collections": [collection],
                 "bbox": bbox,
-                "limit": limit or 100,
+                "limit": min(limit or 100, 100),
+                "max_items": limit,
             }
             interval = _datetime_interval(datetime_range)
             if interval is not None:
@@ -476,7 +487,7 @@ class CDSESearchAdapter:
             values = items() if callable(items) else result
             if values is None or isinstance(values, (str, bytes, Mapping)):
                 return ()
-            return list(values)
+            return values
         return self._http_search(
             bbox,
             ledger,
@@ -494,52 +505,114 @@ class CDSESearchAdapter:
         limit: int | None,
         collection: str,
     ) -> Iterable[Mapping[str, Any]]:
-        """POST one anonymous STAC search against the registered endpoint."""
+        """Follow anonymous STAC pages within the registered endpoint trust."""
         url = f"{self.endpoint.rstrip('/')}/search"
-        _safe_url(url, self)
-        if ledger is None:
-            ledger = _CallLedger(RemoteResourceBudget())
-        body: dict[str, Any] = {
+        ledger = ledger or _CallLedger(RemoteResourceBudget())
+        body: dict[str, Any] | None = {
             "collections": [collection],
             "bbox": bbox,
-            "limit": min(limit or 100, ledger.budget.max_items),
+            "limit": min(limit or 100, 100),
         }
         interval = _datetime_interval(datetime_range)
         if interval is not None:
             body["datetime"] = interval
-        payload = json.dumps(body).encode("utf-8")
-        ledger.request()
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            method="POST",
-            headers={
-                "Accept": "application/geo+json, application/json",
-                "Accept-Encoding": "identity",
-                "Content-Type": "application/json",
-            },
-        )
+        method = "POST"
+        seen: set[tuple[str, str, str]] = set()
         opener = urllib.request.build_opener(
             _RedirectHandler(self, ledger.budget, ledger)
         )
-        try:
-            with opener.open(
-                request, timeout=ledger.budget.read_timeout_seconds
-            ) as response:
-                if response.headers.get("Content-Encoding", "identity") != "identity":
-                    message = "CDSE STAC response used a compressed Content-Encoding"
-                    _fail(RemoteAccessError, "unexpected_content_encoding", message)
-                ledger.begin_response()
-                chunks: list[bytes] = []
-                for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                    ledger.response_bytes(len(chunk))
-                    chunks.append(chunk)
-                document = json.loads(b"".join(chunks))
-        except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-            logger.exception("CDSE STAC request failed")
-            _fail(RemoteAccessError, "request_failed", str(error))
-        features = document.get("features", []) if isinstance(document, Mapping) else []
-        return features if isinstance(features, list) else ()
+        while True:
+            _safe_url(url, self)
+            identity = (url, method, json.dumps(body, sort_keys=True))
+            if identity in seen:
+                _fail(
+                    RemoteAccessError,
+                    "pagination_loop",
+                    "CDSE pagination did not advance",
+                )
+            seen.add(identity)
+            ledger.check_elapsed()
+            ledger.request()
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode() if body is not None else None,
+                method=method,
+                headers={
+                    "Accept": "application/geo+json, application/json",
+                    "Accept-Encoding": "identity",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with opener.open(
+                    request, timeout=ledger.budget.read_timeout_seconds
+                ) as response:
+                    if (
+                        response.headers.get("Content-Encoding", "identity")
+                        != "identity"
+                    ):
+                        _fail(RemoteAccessError, "unexpected_content_encoding")
+                    ledger.begin_response()
+                    chunks: list[bytes] = []
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        ledger.response_bytes(len(chunk))
+                        chunks.append(chunk)
+                    document = json.loads(b"".join(chunks))
+            except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+                logger.exception("CDSE STAC request failed")
+                _fail(RemoteAccessError, "request_failed", str(error))
+            if not isinstance(document, Mapping) or not isinstance(
+                document.get("features"), list
+            ):
+                _fail(
+                    RemoteAccessError,
+                    "malformed_results",
+                    "CDSE returned no feature list",
+                )
+            yield from document["features"]
+            links = document.get("links", [])
+            if not isinstance(links, list):
+                _fail(
+                    RemoteAccessError,
+                    "malformed_results",
+                    "CDSE returned invalid links",
+                )
+            continuations = [
+                link
+                for link in links
+                if isinstance(link, Mapping) and link.get("rel") == "next"
+            ]
+            if not continuations:
+                return
+            if len(continuations) != 1:
+                _fail(
+                    RemoteAccessError,
+                    "malformed_results",
+                    "CDSE returned ambiguous continuation",
+                )
+            link = continuations[0]
+            href = link.get("href")
+            method = str(link.get("method", "GET")).upper()
+            if not isinstance(href, str) or not href or method not in {"GET", "POST"}:
+                _fail(
+                    RemoteAccessError,
+                    "malformed_results",
+                    "CDSE returned invalid continuation",
+                )
+            url = urllib.parse.urljoin(url, href)
+            next_body = link.get("body")
+            if next_body is not None and not isinstance(next_body, Mapping):
+                _fail(
+                    RemoteAccessError,
+                    "malformed_results",
+                    "CDSE returned invalid continuation body",
+                )
+            if method == "GET":
+                body = None
+            elif link.get("merge", False):
+                body = {**(body or {}), **(next_body or {})}
+            else:
+                body = dict(next_body or {})
 
     def _record_from_feature(
         self,

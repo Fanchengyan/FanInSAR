@@ -39,7 +39,7 @@ class _Adapter(Protocol):
         collections: tuple[str, ...] | None = None,
         filters: Mapping[str, Any] | None = None,
         auth_profile: str = "anonymous",
-        limit: int = 100,
+        limit: int | None = None,
         budget: RemoteResourceBudget | None = None,
         ledger: _CallLedger | None = None,
     ) -> Iterable[Mapping[str, Any]]: ...
@@ -126,20 +126,28 @@ class _CallLedger:
         """Start accounting for one response body."""
         self._local.response_bytes = 0
 
-    def response_bytes(self, count: int) -> None:
+    def response_bytes(self, count: int, *, response_total: int | None = None) -> None:
         """Charge bytes from the current response body.
 
         Parameters
         ----------
         count : int
             Number of newly consumed response bytes.
+        response_total : int, optional
+            Caller-owned cumulative response size for concurrent async streams.
+            Omit for the existing thread-local synchronous response accounting.
 
         """
         if count < 0:
             msg = "response byte count must be non-negative"
             raise ValueError(msg)
-        response_bytes = getattr(self._local, "response_bytes", 0) + count
-        self._local.response_bytes = response_bytes
+        response_bytes = (
+            getattr(self._local, "response_bytes", 0) + count
+            if response_total is None
+            else response_total
+        )
+        if response_total is None:
+            self._local.response_bytes = response_bytes
         with self._lock:
             self.response_bytes_total += count
             operation_bytes = self.response_bytes_total
@@ -172,7 +180,7 @@ def _adapter_items(
     collections: tuple[str, ...] | None,
     filters: Mapping[str, Any] | None = None,
     auth_profile: str,
-    limit: int,
+    limit: int | None,
     budget: RemoteResourceBudget,
     ledger: _CallLedger,
 ) -> Iterable[Mapping[str, Any]]:
