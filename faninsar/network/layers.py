@@ -929,15 +929,15 @@ class ProductLayer:
     def to_xarray(self) -> Any:
         """Return a lazy ``xarray.DataArray`` view of this layer.
 
-        Merge-on-read layers compute through :meth:`read`, so they share the
-        committed midpoint selector. Other scene layers open each selected
-        unit's persisted zarr lazily and mosaic with the first-valid-sample
-        overlap rule (matching ``mosaic_slc``); the ``slc`` mosaic then
-        derives ``amplitude``, ``intensity``, ``phase``, or ``valid_mask``.
-        ``validate_source`` runs at build time. Merge-on-read ``.compute()``
-        re-validates through :meth:`read`; other lazy mosaics do not —
-        callers needing a staleness re-check use :attr:`values` or
-        :meth:`validate_source`.
+        Merge-on-read layers and virtual IFG layers (``wrapped_phase``,
+        ``amplitude``) compute through :meth:`read`. Other scene layers open
+        each selected unit's persisted zarr lazily and mosaic with the
+        first-valid-sample overlap rule (matching ``mosaic_slc``); the
+        ``slc`` mosaic then derives ``amplitude``, ``intensity``, ``phase``,
+        or ``valid_mask``. ``validate_source`` runs at build time. Paths that
+        compute through :meth:`read` re-validate on ``.compute()``; other
+        lazy mosaics do not — callers needing a staleness re-check use
+        :attr:`values` or :meth:`validate_source`.
 
         Returns
         -------
@@ -953,7 +953,7 @@ class ProductLayer:
         self.validate_source()
         product = self._product
         is_scene = self._product.kind == "scene"
-        if self._merge_on_read:
+        if self._merge_on_read or self.name in _VIRTUAL_IFG_LAYERS:
             from dask import delayed
 
             data = da.from_delayed(
@@ -1029,20 +1029,6 @@ class ProductLayer:
             data = da.from_delayed(delayed(_compose)(*blocks), shape=frame, dtype=dtype)
         else:
             data = da.from_zarr(str(self.path), chunks=self.shape)
-            if self.name in _VIRTUAL_IFG_LAYERS:
-                complex_block = data
-                if self.name == "amplitude":
-                    data = da.map_blocks(
-                        lambda b: np.abs(b).astype(np.float32),
-                        complex_block,
-                        dtype=np.float32,
-                    )
-                elif self.name == "wrapped_phase":
-                    data = da.map_blocks(
-                        lambda b: np.angle(b).astype(np.float32),
-                        complex_block,
-                        dtype=np.float32,
-                    )
         attrs = {
             "shape": self.shape,
             "multilook": self.multilook,

@@ -13,7 +13,7 @@ full network.
 from __future__ import annotations
 
 import shutil
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -513,7 +513,6 @@ class StackInterferogramCollection(InterferogramCollection):
         """Build the validated lazy-layer view for one committed Pair product."""
         from faninsar.io.storage.ifg_store import IFG_KIND, InterferogramArtifactStore
         from faninsar.io.storage.product import open_product
-        from faninsar.io.storage.scene_store import SCENE_KIND, CoregisteredSceneStore
         from faninsar.network.layers import InterferogramLayers
         from faninsar.processing.errors import reject_invalid_state
 
@@ -534,30 +533,16 @@ class StackInterferogramCollection(InterferogramCollection):
             reject_invalid_state(
                 "IFG and Reference scene use different coordinate grids"
             )
-        upstream = [open_product(reference.root)]
-        for role, date_id in zip(("primary", "secondary"), store.pair, strict=True):
-            if date_id == self._stack.reference:
-                expected = reference.write_id
-            else:
-                scene_product = open_product(
-                    self._stack._scene_dir(date_id, self._selection.polygon),
-                    kind=SCENE_KIND,
-                )
-                scene = CoregisteredSceneStore.open(scene_product.path)
-                if scene.inputs.get("reference") != reference.write_id:
-                    reject_invalid_state("IFG source is bound to a replaced Reference")
-                expected = scene.write_id
-                upstream.append(scene_product)
-            if store.source_manifest_digests.get(role) != expected:
-                reject_invalid_state(
-                    "IFG source or Reference was replaced; recompute the IFG"
-                )
+        upstream, expected = _ifg_endpoint_expectations(
+            self._stack, self._selection.polygon, store.pair
+        )
+        _require_current_ifg_sources(store.source_manifest_digests, expected)
         return InterferogramLayers(
             open_product(store.root, kind=IFG_KIND),
             reference.grid_shape,
             store.looks,
             store.crs,
-            tuple(upstream),
+            upstream,
             _session=self._stack,
         )
 
@@ -588,6 +573,15 @@ class StackInterferogramCollection(InterferogramCollection):
             reject_invalid_state(
                 "the Reference scene is missing; run coregister_scenes"
             )
+        raw_pair = handle.properties.get("faninsar:pair")
+        if not isinstance(raw_pair, list | tuple) or len(raw_pair) != 2:
+            reject_invalid_state("burst IFG pair metadata is invalid")
+        pair = (str(raw_pair[0]), str(raw_pair[1]))
+        upstream, expected = _ifg_endpoint_expectations(
+            self._stack, self._selection.polygon, pair
+        )
+        for product in burst_products:
+            _require_current_ifg_sources(product.inputs, expected)
         grid = handle.properties.get(
             "faninsar:grid_shape", handle.properties["faninsar:shape"]
         )
@@ -595,12 +589,19 @@ class StackInterferogramCollection(InterferogramCollection):
         layout, layout_product = _opened_merge_layout(
             self._stack, polygon=self._selection.polygon
         )
+        _validate_layout_against_reference(
+            layout,
+            layout_product,
+            reference=reference,
+            stack=self._stack,
+            polygon=self._selection.polygon,
+        )
         return InterferogramLayers(
             handle,
             shape,
             self.looks,
             handle.properties.get("proj:code"),
-            (open_product(reference.root),),
+            upstream,
             _session=self._stack,
             _merge_on_read=True,
             _merge_layout=layout,
@@ -1057,35 +1058,113 @@ def _pair_id(store: InterferogramArtifactStore) -> str:
     return f"{store.pair[0]}_{store.pair[1]}"
 
 
-def _merge_layout_dir(stack: Stack, polygon: int | None = None) -> Path:
-    """Return the layout directory published for this Reference.
+def _ifg_endpoint_expectations(
+    stack: Stack,
+    polygon: int | None,
+    pair: tuple[str, str],
+) -> tuple[tuple[Product, ...], dict[str, str]]:
+    """Return upstream products and current primary/secondary write ids."""
+    from faninsar.io.storage.product import open_product
+    from faninsar.io.storage.scene_store import SCENE_KIND, CoregisteredSceneStore
+    from faninsar.processing.errors import reject_invalid_state
 
-    Mission coregistration writes ``{work_dir}/layout/{reference}``. A
-    multi-polygon subtree may also place the product at ``.../pN`` or,
-    when the scene lives at ``coreg/<date>/pN``, beside that coreg tree
-    using the same walk-up as ``publish_reference_merge_layout``.
+    reference = stack._reference_scene_for(polygon)
+    if reference is None:
+        reject_invalid_state("the Reference scene is missing; run coregister_scenes")
+    upstream = [open_product(reference.root)]
+    expected: dict[str, str] = {}
+    for role, date_id in zip(("primary", "secondary"), pair, strict=True):
+        if date_id == stack.reference:
+            expected[role] = reference.write_id
+            continue
+        scene_product = open_product(
+            stack._scene_dir(date_id, polygon), kind=SCENE_KIND
+        )
+        scene = CoregisteredSceneStore.open(scene_product.path)
+        if scene.inputs.get("reference") != reference.write_id:
+            reject_invalid_state("IFG source is bound to a replaced Reference")
+        expected[role] = scene.write_id
+        upstream.append(scene_product)
+    return tuple(upstream), expected
+
+
+def _require_current_ifg_sources(
+    digests: Mapping[str, object], expected: Mapping[str, str]
+) -> None:
+    """Reject IFG products whose endpoint write ids no longer match the scenes."""
+    from faninsar.processing.errors import reject_invalid_state
+
+    for role, write_id in expected.items():
+        if digests.get(role) != write_id:
+            reject_invalid_state(
+                "IFG source or Reference was replaced; recompute the IFG"
+            )
+
+
+def _validate_layout_against_reference(
+    layout: MergeLayoutWindow | None,
+    layout_product: Product | None,
+    *,
+    reference: CoregisteredSceneStore,
+    stack: Stack,
+    polygon: int | None = None,
+) -> None:
+    """Reject a layout whose scope or declared inputs do not match Reference.
+
+    Layouts published before the Reference Item may omit a ``reference``
+    input; that absence is not a binding. Declared write ids and the
+    layout scope's reference/grid identities must match the live scene.
+    A ``sel(polygon=N)`` view must open ``layout/<reference>/pN``; the
+    Reference-root product is a different polygon's binding.
     """
-    reference = str(stack.reference)
-    canonical = stack.config.work_dir / "layout" / reference
+    from faninsar.processing.errors import reject_invalid_state
+
+    if layout is None:
+        return
+    if layout.scope.reference_id != str(stack.reference):
+        reject_invalid_state(
+            "merge layout reference_id does not match the Stack Reference"
+        )
+    if layout.scope.grid_identity != reference.grid_identity:
+        reject_invalid_state(
+            "merge layout and Reference scene use different coordinate grids"
+        )
+    if layout_product is None:
+        return
+    if polygon is not None and layout_product.path.name != f"p{polygon}":
+        reject_invalid_state(
+            "merge layout is not the committed binding for the selected polygon"
+        )
+    declared = layout_product.inputs.get("reference")
+    if declared is not None and declared != reference.write_id:
+        reject_invalid_state(
+            "merge layout is bound to a replaced Reference; republish the layout"
+        )
+
+
+def _merge_layout_dir(stack: Stack, polygon: int | None = None) -> Path:
+    """Return the canonical layout directory for this Reference and polygon.
+
+    The committed binding is ``{work_dir}/layout/{reference}`` for the
+    unscoped view and ``{work_dir}/layout/{reference}/pN`` for
+    ``sel(polygon=N)``. Collection reads never fall back from ``pN`` to
+    the Reference root or walk the coreg tree: a missing nested product
+    is a missing layout, not another polygon's owner map.
+    """
+    canonical = stack.config.work_dir / "layout" / str(stack.reference)
     if polygon is None:
         return canonical
-    nested = canonical / f"p{polygon}"
-    if (nested / "item.json").is_file():
-        return nested
-    if (canonical / "item.json").is_file():
-        return canonical
-    parent = stack._scene_dir(reference, polygon).parent
-    root = parent.parent if parent.name == "coreg" else parent
-    return root / "layout" / reference
+    return canonical / f"p{polygon}"
 
 
 def _opened_merge_layout(
     stack: Stack, polygon: int | None = None
 ) -> tuple[MergeLayoutWindow | None, Product | None]:
-    """Open ``work_dir/layout/<reference>`` when that product exists.
+    """Open the canonical ``layout/<reference>[/pN]`` product when it exists.
 
     Collection views never call :func:`build_merge_layout` to invent owner
-    labels from burst bounding boxes. Missing layouts stay ``None`` so
+    labels from burst bounding boxes, and they never search sibling
+    polygon products. Missing layouts stay ``None`` so
     ``merge_bursts()`` can still return a lazy collection; the read path
     rejects the missing layout.
     """
@@ -1528,6 +1607,13 @@ class StackSceneCollection(dict):
         bound = replace(store, _session=self._stack, _upstream=upstream)
         if not self._merge_on_read:
             return bound
+        if reference is not None:
+            _validate_layout_against_reference(
+                self._merge_layout,
+                self._layout_product,
+                reference=reference,
+                stack=self._stack,
+            )
         return _MergeBoundSceneStore(
             bound,
             self._merge_layout,

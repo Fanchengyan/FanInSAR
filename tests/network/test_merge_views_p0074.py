@@ -263,7 +263,12 @@ def test_plot_crop_true_reads_tight_interior_window(tmp_path: Path) -> None:
     np.testing.assert_allclose(im.get_extent(), (2.5, 4.5, 3.5, 1.5))
 
 
-def _merge_scope(stack: object) -> object:
+def _merge_scope(
+    stack: object,
+    *,
+    polygon_identity: str = "poly-0",
+    grid_identity: str | None = None,
+) -> object:
     """Return a radar MergeScope bound to the Stack Reference grid."""
     from faninsar.processing.mosaicking import MergeScope
 
@@ -273,8 +278,8 @@ def _merge_scope(stack: object) -> object:
         track_id="T000_A",
         channel="vv",
         reference_id=str(stack.reference),
-        grid_identity=str(store.grid_identity),
-        polygon_identity="poly-0",
+        grid_identity=str(grid_identity or store.grid_identity),
+        polygon_identity=polygon_identity,
     )
 
 
@@ -283,6 +288,10 @@ def _publish_stack_layout(
     *,
     source_ids: tuple[str, str],
     window: tuple[int, int, int, int] | None = None,
+    inputs: dict[str, object] | None = None,
+    target: Path | None = None,
+    polygon_identity: str = "poly-0",
+    grid_identity: str | None = None,
 ) -> None:
     """Publish a unique-coverage radar layout for one Stack Reference."""
     from faninsar.io.storage.merge_layout import publish_merge_layout
@@ -303,12 +312,17 @@ def _publish_stack_layout(
                 "IW2",
             ),
         ),
-        scope=_merge_scope(stack),
+        scope=_merge_scope(
+            stack,
+            polygon_identity=polygon_identity,
+            grid_identity=grid_identity,
+        ),
         window=window,
     )
     publish_merge_layout(
-        stack.config.work_dir / "layout" / str(stack.reference),
+        target or (stack.config.work_dir / "layout" / str(stack.reference)),
         layout,
+        inputs=inputs,
         overwrite=True,
     )
 
@@ -712,3 +726,300 @@ def test_interferograms_merge_uses_persisted_physical_burst_id(
     values = stack.interferograms.merge_bursts()["20240101_20240113"].complex.read()
     np.testing.assert_allclose(values[:, :8], 1.0)
     np.testing.assert_allclose(values[:, 8:], 2.0)
+
+
+def test_virtual_ifg_to_xarray_matches_read(tmp_path: Path) -> None:
+    """Virtual IFG layers have no zarr path; lazy xarray still uses public read."""
+    layers = _write_ifg(tmp_path / "ifg")
+    for name in ("wrapped_phase", "amplitude"):
+        layer = getattr(layers, name)
+        assert layer.path is None
+        np.testing.assert_array_equal(
+            np.asarray(layer.to_xarray().compute()),
+            layer.read(),
+        )
+
+
+def test_merged_ifg_rejects_replaced_endpoint_scene(tmp_path: Path) -> None:
+    """Replacing a pair endpoint without rebuilding burst IFGs fails merged read."""
+    from faninsar.io.storage.ifg_store import ifg_artifact_dir, write_ifg_artifact
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
+    pair = ("20240101", "20240113")
+    primary = stack.scenes["20240101"].write_id
+    secondary = stack.scenes["20240113"].write_id
+    for burst_id, payload, col0 in (
+        ("f0_IW1_b0", np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64), 0),
+        ("f0_IW2_b0", np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64), 8),
+    ):
+        write_ifg_artifact(
+            ifg_artifact_dir(
+                stack.config.work_dir,
+                (1, 1),
+                pair,
+                representation="burst",
+                burst_id=burst_id,
+            ),
+            pair=pair,
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": primary, "secondary": secondary},
+            complex_ifg=payload,
+            valid_mask=np.ones((8, 8), dtype=bool),
+            representation="burst",
+            burst_id=burst_id,
+            row_origin=0,
+            col_origin=col0,
+            grid_shape=(8, 16),
+        )
+    np.testing.assert_allclose(
+        stack.interferograms.merge_bursts()["20240101_20240113"].complex.read()[:, :8],
+        1.0,
+    )
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 9.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 9.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+    )
+    with pytest.raises(InvalidProcessingStateError, match="replaced"):
+        stack.interferograms.merge_bursts()["20240101_20240113"].complex.read()
+
+
+def test_merge_rejects_replaced_reference_when_layout_declares_input(
+    tmp_path: Path,
+) -> None:
+    """A layout bound to a replaced Reference write_id must not keep reading."""
+    from faninsar.io.storage.product import open_product
+    from faninsar.io.storage.scene_store import write_scene
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+    from tests.support.scene_stores import coreg_dir
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+    )
+    reference = open_product(stack.scenes[stack.reference].root)
+    _publish_stack_layout(
+        stack,
+        source_ids=("f0_IW1_b0", "f0_IW2_b0"),
+        inputs={"reference": reference},
+    )
+    np.testing.assert_allclose(
+        stack.scenes.merge_bursts()["20240113"].layers.slc.read()[:, :8],
+        1.0,
+    )
+    write_scene(
+        coreg_dir(stack.config.work_dir, stack.reference),
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        domain="radar",
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 9.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 9.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+        grid_shape=(8, 16),
+        overwrite=True,
+    )
+    with pytest.raises(InvalidProcessingStateError, match="replaced"):
+        stack.scenes.merge_bursts()["20240113"].layers.slc.read()
+
+
+def _write_polygon_scene(
+    stack: object,
+    date_id: str,
+    polygon: int,
+    left: float,
+    right: float,
+    *,
+    reference_write_id: str | None = None,
+) -> object:
+    """Commit one polygon-suffixed scene product with unique-coverage bursts."""
+    from faninsar.io.storage.scene_store import write_scene
+
+    inputs = None if reference_write_id is None else {"reference": reference_write_id}
+    return write_scene(
+        stack.config.work_dir / "coreg" / date_id / f"p{polygon}",
+        date_id=date_id,
+        reference_id=stack.reference,
+        domain="radar",
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), left + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), right + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+        grid_shape=(8, 16),
+        inputs=inputs,
+        overwrite=True,
+    )
+
+
+def _write_polygon_burst_ifgs(
+    stack: object,
+    polygon: int,
+    *,
+    primary: str,
+    secondary: str,
+    left: float,
+    right: float,
+) -> None:
+    """Commit burst IFGs under ``ifg/bursts/.../<burst>/pN``."""
+    from faninsar.io.storage.ifg_store import ifg_artifact_dir, write_ifg_artifact
+
+    pair = ("20240101", "20240113")
+    for burst_id, value, col0 in (
+        ("f0_IW1_b0", left, 0),
+        ("f0_IW2_b0", right, 8),
+    ):
+        write_ifg_artifact(
+            ifg_artifact_dir(
+                stack.config.work_dir,
+                (1, 1),
+                pair,
+                representation="burst",
+                burst_id=burst_id,
+                polygon=polygon,
+            ),
+            pair=pair,
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": primary, "secondary": secondary},
+            complex_ifg=np.full((8, 8), value + 0.0j, dtype=np.complex64),
+            valid_mask=np.ones((8, 8), dtype=bool),
+            representation="burst",
+            burst_id=burst_id,
+            row_origin=0,
+            col_origin=col0,
+            grid_shape=(8, 16),
+        )
+
+
+def test_polygon_merge_uses_nested_layout_not_reference_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two polygons of one Reference keep distinct layout ids; pN does not fall back."""
+    import shutil
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    monkeypatch.setattr(type(stack), "roi_polygon_count", property(lambda _self: 2))
+    ref0 = _write_polygon_scene(stack, stack.reference, 0, 1.0, 2.0)
+    sec0 = _write_polygon_scene(
+        stack, "20240113", 0, 1.0, 2.0, reference_write_id=ref0.write_id
+    )
+    ref1 = _write_polygon_scene(stack, stack.reference, 1, 3.0, 4.0)
+    sec1 = _write_polygon_scene(
+        stack, "20240113", 1, 3.0, 4.0, reference_write_id=ref1.write_id
+    )
+    layout_root = stack.config.work_dir / "layout" / str(stack.reference)
+    _publish_stack_layout(
+        stack,
+        source_ids=("f0_IW1_b0", "f0_IW2_b0"),
+        target=layout_root,
+        polygon_identity="poly-decoy",
+        grid_identity=ref0.grid_identity,
+    )
+    _publish_stack_layout(
+        stack,
+        source_ids=("f0_IW1_b0", "f0_IW2_b0"),
+        target=layout_root / "p0",
+        polygon_identity="poly-0",
+        grid_identity=ref0.grid_identity,
+    )
+    _publish_stack_layout(
+        stack,
+        source_ids=("f0_IW1_b0", "f0_IW2_b0"),
+        target=layout_root / "p1",
+        polygon_identity="poly-1",
+        grid_identity=ref1.grid_identity,
+    )
+    _write_polygon_burst_ifgs(
+        stack, 0, primary=ref0.write_id, secondary=sec0.write_id, left=1.0, right=2.0
+    )
+    _write_polygon_burst_ifgs(
+        stack, 1, primary=ref1.write_id, secondary=sec1.write_id, left=3.0, right=4.0
+    )
+    pair = "20240101_20240113"
+    values0 = stack.interferograms.sel(polygon=0).merge_bursts()[pair].complex.read()
+    values1 = stack.interferograms.sel(polygon=1).merge_bursts()[pair].complex.read()
+    np.testing.assert_allclose(values0[:, :8], 1.0)
+    np.testing.assert_allclose(values0[:, 8:], 2.0)
+    np.testing.assert_allclose(values1[:, :8], 3.0)
+    np.testing.assert_allclose(values1[:, 8:], 4.0)
+    assert (
+        stack.interferograms.sel(polygon=0)
+        .merge_bursts()[pair]
+        .complex._merge_layout.scope.polygon_identity
+        == "poly-0"
+    )
+    assert (
+        stack.interferograms.sel(polygon=1)
+        .merge_bursts()[pair]
+        .complex._merge_layout.scope.polygon_identity
+        == "poly-1"
+    )
+    shutil.rmtree(layout_root / "p1")
+    with pytest.raises(InvalidProcessingStateError, match="merge_layout"):
+        stack.interferograms.sel(polygon=1).merge_bursts()[pair].complex.read()
