@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -20,13 +21,25 @@ from faninsar.io.storage.product import ProductWriter, open_product
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.interferometry.pair import (
     InterferogramProduct,
-    _sliding_coherence,
     form_interferogram,
+    form_interferogram_from_fields,
     goldstein_filter,
     mask_invalid_looks,
 )
+from faninsar.processing.mosaicking import (
+    BurstWindow,
+    LayoutSourceWindow,
+    MergedWindow,
+    MergeLayoutWindow,
+    MergeScope,
+    MergeSeam,
+    build_merge_layout,
+    merge_bursts,
+)
+from faninsar.processing.mosaicking.windows import intersect_windows
 
 SCENE_KIND = "scene"
+MERGED_SCENE_UNIT_TAG = "merged"
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -1092,13 +1105,357 @@ def _validate_pair_binding(
     return common
 
 
-def _phase_screen(store: CoregisteredSceneStore, tag: str) -> np.ndarray:
+def _phase_screen(
+    store: CoregisteredSceneStore,
+    tag: str,
+    window: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
     """Return one unit's range-offset phase screen, zero for the Reference."""
     unit = store.unit_map()[tag]
-    screen = None if store.is_reference else store.read_phase_screen(tag)
+    screen = None if store.is_reference else store.read_phase_screen(tag, window=window)
     if screen is None:
-        return np.zeros(unit.shape, dtype=np.float32)
+        return np.zeros(_payload_window_shape(unit.shape, window), dtype=np.float32)
     return screen
+
+
+def _unit_burst_id(unit: SceneUnit) -> str:
+    """Return the physical burst identity, falling back to the unit tag."""
+    return unit.burst_id or unit.tag
+
+
+def _unit_parent_window(unit: SceneUnit) -> tuple[int, int, int, int]:
+    """Return the unit's half-open window on the parent scene grid."""
+    return (
+        int(unit.row_origin),
+        int(unit.row_origin + unit.shape[0]),
+        int(unit.col_origin),
+        int(unit.col_origin + unit.shape[1]),
+    )
+
+
+def _scene_merge_scope(store: CoregisteredSceneStore) -> MergeScope:
+    """Build the merge identity from persisted scene metadata."""
+    properties = store.properties
+    track = properties.get("faninsar:track_id")
+    channel = properties.get("faninsar:channel")
+    polygon = properties.get("faninsar:polygon_identity")
+    return MergeScope(
+        domain=store.domain,  # type: ignore[arg-type]
+        track_id=track if isinstance(track, str) and track else "stack",
+        channel=channel if isinstance(channel, str) and channel else "slc",
+        reference_id=store.reference_id,
+        grid_identity=store.grid_identity,
+        polygon_identity=(polygon if isinstance(polygon, str) and polygon else "none"),
+    )
+
+
+def _parent_azimuth_seams(units: Sequence[SceneUnit]) -> tuple[MergeSeam, ...]:
+    """Return midpoint cuts from parent-grid overlap, never from a ROI crop."""
+    by_swath: dict[str, list[SceneUnit]] = {}
+    for unit in units:
+        by_swath.setdefault(_tag_swath(unit.tag), []).append(unit)
+    seams: list[MergeSeam] = []
+    for group in by_swath.values():
+        ordered = sorted(
+            group, key=lambda item: (item.row_origin, item.col_origin, item.tag)
+        )
+        for earlier, later in pairwise(ordered):
+            row0 = max(earlier.row_origin, later.row_origin)
+            row1 = min(
+                earlier.row_origin + earlier.shape[0],
+                later.row_origin + later.shape[0],
+            )
+            col0 = max(earlier.col_origin, later.col_origin)
+            col1 = min(
+                earlier.col_origin + earlier.shape[1],
+                later.col_origin + later.shape[1],
+            )
+            if row1 <= row0 or col1 <= col0:
+                continue
+            seams.append(
+                MergeSeam(
+                    "azimuth",
+                    (row0 + row1) // 2,
+                    _unit_burst_id(earlier),
+                    _unit_burst_id(later),
+                )
+            )
+    return tuple(seams)
+
+
+def _local_read_window(
+    unit: SceneUnit, parent_window: tuple[int, int, int, int]
+) -> tuple[int, int, int, int] | None:
+    """Return the unit-local window covering ``parent_window``, if any."""
+    overlap = intersect_windows(_unit_parent_window(unit), parent_window)
+    if overlap is None:
+        return None
+    return (
+        overlap[0] - unit.row_origin,
+        overlap[1] - unit.row_origin,
+        overlap[2] - unit.col_origin,
+        overlap[3] - unit.col_origin,
+    )
+
+
+def _scene_parent_window(
+    store: CoregisteredSceneStore,
+) -> tuple[int, int, int, int]:
+    """Return the full parent-grid window of one scene product."""
+    return (
+        0,
+        int(store.grid_shape[0]),
+        0,
+        int(store.grid_shape[1]),
+    )
+
+
+def _as_merge_window(
+    window: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Return ``window`` as Python ints for the merge-window contract."""
+    return (int(window[0]), int(window[1]), int(window[2]), int(window[3]))
+
+
+def _store_unit_support(
+    store: CoregisteredSceneStore,
+    tag: str,
+    payload: np.ndarray,
+    local_window: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Return explicit or inferred native support for one unit window."""
+    mask = store.read_valid_mask(tag, window=local_window)
+    finite = np.isfinite(payload.real) & np.isfinite(payload.imag)
+    if mask is None:
+        return np.asarray(valid_samples(payload) & finite, dtype=bool)
+    return np.asarray(mask & finite, dtype=bool)
+
+
+def _read_unit_on_layout(
+    store: CoregisteredSceneStore,
+    unit: SceneUnit,
+    layout_window: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+    """Read one unit's layout overlap as a window-local payload and mask."""
+    local_window = _local_read_window(unit, layout_window)
+    if local_window is None:
+        return None
+    overlap = intersect_windows(_unit_parent_window(unit), layout_window)
+    if overlap is None:
+        return None
+    read_window = (
+        None
+        if local_window == (0, int(unit.shape[0]), 0, int(unit.shape[1]))
+        else local_window
+    )
+    payload, _ = store.read(unit.tag, window=read_window)
+    support = _store_unit_support(store, unit.tag, payload, read_window)
+    return _as_merge_window(overlap), payload, support
+
+
+def build_scene_merge_layout(
+    store: CoregisteredSceneStore,
+    *,
+    window: tuple[int, int, int, int] | None = None,
+) -> MergeLayoutWindow:
+    """Assemble a parent-geometry merge layout from one scene product.
+
+    Radar azimuth seams are overlap midpoints on the uncropped parent grid.
+    Geographic overlap stays unowned. ``scope.reference_id`` is the
+    acquisition key; this helper does not bind a Reference write id.
+
+    Parameters
+    ----------
+    store : CoregisteredSceneStore
+        Typically the Stack Reference scene whose burst geometry owns the
+        layout.
+    window : tuple of int, optional
+        Layout window. Default is the full parent scene grid.
+
+    Returns
+    -------
+    MergeLayoutWindow
+        Owner map for :func:`~faninsar.processing.mosaicking.merge_bursts`.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If no unit intersects the layout window.
+
+    """
+    layout_window = (
+        _as_merge_window(window) if window is not None else _scene_parent_window(store)
+    )
+    sources: list[LayoutSourceWindow] = []
+    for unit in store.units:
+        loaded = _read_unit_on_layout(store, unit, layout_window)
+        if loaded is None:
+            continue
+        overlap, _, support = loaded
+        sources.append(
+            LayoutSourceWindow(
+                burst_id=_unit_burst_id(unit),
+                window=overlap,
+                scientific_support=support,
+                swath=_tag_swath(unit.tag),
+            )
+        )
+    if not sources:
+        reject_invalid_state("scene product has no unit inside the merge window")
+    seams = _parent_azimuth_seams(store.units) if store.domain == "radar" else ()
+    return build_merge_layout(
+        sources,
+        scope=_scene_merge_scope(store),
+        seams=seams,
+        window=layout_window,
+    )
+
+
+def merge_scene_slc(
+    store: CoregisteredSceneStore,
+    *,
+    layout: MergeLayoutWindow,
+) -> MergedWindow:
+    """Select one scene's burst SLCs onto ``layout`` with the midpoint kernel.
+
+    Parameters
+    ----------
+    store : CoregisteredSceneStore
+        Burst scene product to select from. Inputs remain unmodified.
+    layout : MergeLayoutWindow
+        Preferred-owner map, typically from the Reference scene.
+
+    Returns
+    -------
+    MergedWindow
+        Layout-window SLC samples and explicit support.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the scene has no burst that intersects the layout.
+
+    """
+    source_ids = set(layout.source_ids)
+    products: list[BurstWindow] = []
+    for unit in store.units:
+        burst_id = _unit_burst_id(unit)
+        if burst_id not in source_ids:
+            continue
+        loaded = _read_unit_on_layout(store, unit, layout.window)
+        if loaded is None:
+            continue
+        overlap, payload, support = loaded
+        products.append(
+            BurstWindow(
+                scope=layout.scope,
+                burst_id=burst_id,
+                acquisitions=(store.date_id,),
+                write_ids=(store.write_id,),
+                phase_convention="slc",
+                window=overlap,
+                complex=np.asarray(payload, dtype=np.complex64),
+                valid_mask=support,
+            )
+        )
+    if not products:
+        reject_invalid_state("scene product has no burst window on the merge layout")
+    return merge_bursts(products, layout=layout)
+
+
+def _unit_scientific_support(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+    tag: str,
+    primary: np.ndarray,
+    secondary: np.ndarray,
+    local_window: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Return explicit or inferred native support for one unit window."""
+    primary_mask = primary_store.read_valid_mask(tag, window=local_window)
+    secondary_mask = secondary_store.read_valid_mask(tag, window=local_window)
+    if primary_mask is None and secondary_mask is None:
+        support = valid_samples(primary) & valid_samples(secondary)
+    else:
+        support = np.ones(primary.shape, dtype=bool)
+        if primary_mask is not None:
+            support &= primary_mask
+        if secondary_mask is not None:
+            support &= secondary_mask
+    finite = (
+        np.isfinite(primary.real)
+        & np.isfinite(primary.imag)
+        & np.isfinite(secondary.real)
+        & np.isfinite(secondary.imag)
+    )
+    return np.asarray(support & finite, dtype=bool)
+
+
+def _finish_looked_interferogram(
+    product: InterferogramProduct,
+    *,
+    goldstein_alpha: float,
+    device: str,
+    dask_client: object | None,
+    phase_filter: PhaseFilter | None,
+) -> InterferogramProduct:
+    """Apply the runtime filter to an already-looked selected-field product."""
+    if phase_filter is not None:
+        import torch
+
+        filter_device = device
+        if filter_device in {"", "auto"}:
+            filter_device = "cuda" if torch.cuda.is_available() else "cpu"
+        tensor = torch.as_tensor(product.complex, device=filter_device)
+        filter_support = torch.as_tensor(
+            product.valid_mask, dtype=torch.bool, device=filter_device
+        )
+        filtered = _apply_phase_filter_contract(phase_filter, tensor, filter_support)
+        result_ifg = filtered.interferogram.detach().cpu().numpy()
+        result_mask = filtered.valid_mask.detach().cpu().numpy()
+        result_ifg[~result_mask] = np.nan + 1j * np.nan
+        coherence = np.asarray(product.coherence, dtype=np.float32)
+        coherence[~result_mask] = np.nan
+        wrapped = np.angle(result_ifg).astype(np.float32)
+        wrapped[~result_mask] = np.nan
+        return InterferogramProduct(
+            complex=result_ifg,
+            coherence=coherence,
+            wrapped_phase=wrapped,
+            amplitude=np.abs(result_ifg).astype(np.float32),
+            valid_mask=result_mask,
+        )
+    if goldstein_alpha <= 0.0:
+        return product
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
+
+    if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
+        device, dask_client, kernel="goldstein_filter"
+    ):
+        from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
+
+        filtered = run_goldstein_filter(
+            product.complex,
+            alpha=goldstein_alpha,
+            window=32,
+            device=device,
+            client=dask_client,
+        )
+    else:
+        filtered = goldstein_filter(product.complex, alpha=goldstein_alpha)
+    support = np.asarray(product.valid_mask, dtype=bool)
+    filtered = np.asarray(filtered)
+    filtered[~support] = np.nan + 1j * np.nan
+    coherence = np.asarray(product.coherence, dtype=np.float32)
+    wrapped = np.angle(filtered).astype(np.float32)
+    wrapped[~support] = np.nan
+    return InterferogramProduct(
+        complex=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        amplitude=np.abs(filtered).astype(np.float32),
+        valid_mask=support,
+    )
 
 
 def validate_scene_ownership(store: CoregisteredSceneStore) -> None:
@@ -1217,11 +1574,14 @@ def form_merged_scene_interferogram(
 ) -> InterferogramProduct:
     """Form one common-grid complex IFG from all persisted scene units.
 
-    The accumulator is the persisted-scene equivalent of the production Pair
-    burst merge. Radar swaths are accumulated independently and then composed
-    in swath order; geographic units share one common accumulator. Burst
-    overlap is resolved before spatial unwrapping and no interpolation kernel
-    or feathering is introduced.
+    Native per-burst cross-products and endpoint powers are selected with
+    :func:`~faninsar.processing.mosaicking.merge_bursts` on a parent-grid
+    midpoint layout, then looked by
+    :func:`~faninsar.processing.interferometry.pair.form_interferogram_from_fields`.
+    Radar azimuth seams are parent-grid overlap midpoints, never ROI-crop
+    inferences. Geographic overlap stays unowned unless a finished owner map
+    is supplied. Explicit ``valid_mask`` assets keep supported zero-amplitude
+    samples, including two-sample cancellation looks.
 
     Parameters
     ----------
@@ -1271,234 +1631,97 @@ def form_merged_scene_interferogram(
     out_cols = primary_store.grid_shape[1] // rg_looks
     if out_rows < 1 or out_cols < 1:
         reject_invalid_state("multilook factors exceed the common scene grid")
-    if len(primary_units) == 1:
-        tag = next(iter(primary_units))
-        primary_unit = primary_units[tag]
-        if (
-            primary_unit.row_origin == 0
-            and primary_unit.col_origin == 0
-            and primary_unit.shape == primary_store.grid_shape
-        ):
-            primary, _ = primary_store.read(tag)
-            secondary, _ = secondary_store.read(tag)
-            flatten_screen = None
-            if flatten_stage == "interferogram":
-                flatten_screen = _phase_screen(secondary_store, tag) - _phase_screen(
-                    primary_store, tag
-                )
-            return _form_unit_pair_interferogram(
-                primary,
-                secondary,
-                support=_pair_unit_support(
-                    primary_store, secondary_store, tag, primary.shape
-                ),
-                flatten_screen=flatten_screen,
-                multilook=multilook,
-                goldstein_alpha=goldstein_alpha,
-                device=device,
-                dask_client=dask_client,
-                coherence_window=coherence_window,
-                phase_filter=phase_filter,
-            )
-
-    groups = (
-        {"geo": sorted(primary_units)}
-        if primary_store.domain == "geo"
-        else {
-            swath: sorted(
-                (tag for tag in primary_units if _tag_swath(tag) == swath),
-                key=lambda tag: primary_units[tag].row_origin,
-                reverse=True,
-            )
-            for swath in sorted({_tag_swath(tag) for tag in primary_units})
-        }
-    )
-    group_products: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    looks_per_window = az_looks * rg_looks
-    explicit_support_used = False
-    for group, tags in groups.items():
-        ifg_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
-        primary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
-        secondary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
-        coherence_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
-        coherence_count = np.zeros((out_rows, out_cols), dtype=np.int32)
-        claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
-        for tag in tags:
-            primary, primary_unit = primary_store.read(tag)
-            secondary, _ = secondary_store.read(tag)
-            support = _pair_unit_support(
-                primary_store, secondary_store, tag, primary.shape
-            )
-            if support is not None:
-                explicit_support_used = True
-                primary = primary.copy()
-                secondary = secondary.copy()
-                invalid = ~support
-                primary[invalid] = np.nan + 1j * np.nan
-                secondary[invalid] = np.nan + 1j * np.nan
-            ifg = primary * np.conjugate(secondary)
-            if flatten_stage == "interferogram":
-                ifg *= np.exp(
-                    -1j
-                    * (
-                        _phase_screen(secondary_store, tag)
-                        - _phase_screen(primary_store, tag)
-                    )
-                )
-            primary_power = primary.real**2 + primary.imag**2
-            secondary_power = secondary.real**2 + secondary.imag**2
-            valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag)
-            if support is None:
-                valid &= np.abs(ifg) > 0
-            else:
-                valid &= support
-            rows = primary_unit.row_origin + np.arange(primary_unit.shape[0])
-            cols = primary_unit.col_origin + np.arange(primary_unit.shape[1])
-            output_rows = rows[:, None] // az_looks
-            output_cols = cols[None, :] // rg_looks
-            in_bounds = (
-                (output_rows >= 0)
-                & (output_rows < out_rows)
-                & (output_cols >= 0)
-                & (output_cols < out_cols)
-                & valid
-            )
-            row_indices, col_indices = np.broadcast_arrays(output_rows, output_cols)
-            valid_rows = row_indices[in_bounds]
-            valid_cols = col_indices[in_bounds]
-            free = claimed[valid_rows, valid_cols] < looks_per_window
-            free_rows = valid_rows[free]
-            free_cols = valid_cols[free]
-            np.add.at(
-                ifg_acc,
-                (free_rows, free_cols),
-                ifg[in_bounds][free].astype(np.complex128),
-            )
-            np.add.at(
-                primary_power_acc,
-                (free_rows, free_cols),
-                primary_power[in_bounds][free],
-            )
-            np.add.at(
-                secondary_power_acc,
-                (free_rows, free_cols),
-                secondary_power[in_bounds][free],
-            )
-            np.add.at(claimed, (free_rows, free_cols), 1)
-            if coherence_window is not None:
-                unit_coherence = _sliding_coherence(
-                    primary, secondary, coherence_window
-                )
-                finite_coh = np.isfinite(unit_coherence)
-                coh_values = np.where(finite_coh, unit_coherence, 0.0)
-                np.add.at(
-                    coherence_acc,
-                    (free_rows, free_cols),
-                    coh_values[in_bounds][free],
-                )
-                np.add.at(
-                    coherence_count,
-                    (free_rows, free_cols),
-                    finite_coh[in_bounds][free].astype(np.int32),
-                )
-        has_data = claimed > 0
-        denominator = np.where(has_data, claimed, 1)
-        group_ifg = np.where(has_data, ifg_acc / denominator, 0).astype(np.complex64)
-        if coherence_window is None:
-            coherence_denominator = np.sqrt(
-                np.maximum(
-                    (primary_power_acc / denominator)
-                    * (secondary_power_acc / denominator),
-                    1e-30,
-                )
-            )
-            group_coherence = np.clip(
-                np.abs(group_ifg) / coherence_denominator, 0.0, 1.0
-            ).astype(np.float32)
-        else:
-            # Documented window semantics: a stride-one local coherence MLE
-            # accumulated per fine sample and averaged over each look block,
-            # never a degenerate single-sample MLE under (1, 1) looks.
-            group_coherence = np.where(
-                coherence_count > 0,
-                coherence_acc / np.maximum(coherence_count, 1),
-                np.nan,
-            ).astype(np.float32)
-        group_coherence[~has_data] = np.nan
-        group_products[group] = group_ifg, group_coherence, has_data
-
-    merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
-    coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
-    merged_support = np.zeros((out_rows, out_cols), dtype=bool)
-    for group in sorted(group_products):
-        group_ifg, group_coherence, group_support = group_products[group]
-        valid = group_support if explicit_support_used else np.abs(group_ifg) > 0
-        merged_ifg[valid] = group_ifg[valid]
-        coherence[valid] = group_coherence[valid]
-        merged_support |= np.asarray(valid, dtype=bool)
-    if explicit_support_used:
-        merged_ifg = merged_ifg.copy()
-        merged_ifg[~merged_support] = np.nan + 1j * np.nan
-        coherence[~merged_support] = np.nan
-    if phase_filter is not None:
-        import torch
-
-        filter_device = device
-        if filter_device in {"", "auto"}:
-            filter_device = "cuda" if torch.cuda.is_available() else "cpu"
-        tensor = torch.as_tensor(merged_ifg, device=filter_device)
-        support = torch.as_tensor(
-            np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag),
-            dtype=torch.bool,
-            device=filter_device,
+    layout_window = _scene_parent_window(primary_store)
+    units = [primary_units[tag] for tag in common]
+    scope = _scene_merge_scope(primary_store)
+    sources: list[LayoutSourceWindow] = []
+    products: list[BurstWindow] = []
+    for tag in common:
+        unit = primary_units[tag]
+        local_window = _local_read_window(unit, layout_window)
+        if local_window is None:
+            continue
+        read_window = (
+            None
+            if local_window == (0, unit.shape[0], 0, unit.shape[1])
+            else local_window
         )
-        filtered = _apply_phase_filter_contract(phase_filter, tensor, support)
-        merged_ifg = filtered.interferogram.detach().cpu().numpy()
-        filtered_mask = filtered.valid_mask.detach().cpu().numpy()
-        merged_ifg[~filtered_mask] = np.nan + 1j * np.nan
-    elif goldstein_alpha > 0.0:
-        from faninsar.processing.runtime.dask_gpu import should_accelerate
-
-        if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
-            device, dask_client, kernel="goldstein_filter"
-        ):
-            from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
-
-            merged_ifg = run_goldstein_filter(
-                merged_ifg,
-                alpha=goldstein_alpha,
-                window=32,
-                device=device,
-                client=dask_client,
+        primary, _ = primary_store.read(tag, window=read_window)
+        secondary, _ = secondary_store.read(tag, window=read_window)
+        if flatten_stage == "interferogram":
+            screen = _phase_screen(
+                secondary_store, tag, window=read_window
+            ) - _phase_screen(primary_store, tag, window=read_window)
+            secondary = secondary * np.exp(1j * screen)
+        support = _unit_scientific_support(
+            primary_store,
+            secondary_store,
+            tag,
+            primary,
+            secondary,
+            read_window,
+        )
+        overlap = intersect_windows(_unit_parent_window(unit), layout_window)
+        if overlap is None:
+            continue
+        overlap = _as_merge_window(overlap)
+        burst_id = _unit_burst_id(unit)
+        sources.append(
+            LayoutSourceWindow(
+                burst_id=burst_id,
+                window=overlap,
+                scientific_support=support,
+                swath=_tag_swath(unit.tag),
             )
-        else:
-            merged_ifg = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
-    if explicit_support_used:
-        if phase_filter is not None:
-            merged_support = filtered_mask & merged_support
-        coherence_out = coherence
-        wrapped = np.angle(merged_ifg).astype(np.float32)
-        wrapped[~merged_support] = np.nan
-        coherence_out = np.asarray(coherence_out, dtype=np.float32)
-        coherence_out[~merged_support] = np.nan
-        valid_mask = merged_support
-    else:
-        merged_ifg, coherence_out, wrapped = mask_invalid_looks(merged_ifg, coherence)
-        if phase_filter is not None:
-            valid_mask = (
-                filtered_mask
-                & np.isfinite(merged_ifg.real)
-                & np.isfinite(merged_ifg.imag)
+        )
+        products.append(
+            BurstWindow(
+                scope=scope,
+                burst_id=burst_id,
+                acquisitions=(primary_store.date_id, secondary_store.date_id),
+                write_ids=(primary_store.write_id, secondary_store.write_id),
+                phase_convention="wrapped_primary_conj_secondary",
+                window=overlap,
+                complex=np.asarray(
+                    primary * np.conjugate(secondary), dtype=np.complex64
+                ),
+                valid_mask=support,
+                primary_power=np.asarray(
+                    primary.real**2 + primary.imag**2, dtype=np.float32
+                ),
+                secondary_power=np.asarray(
+                    secondary.real**2 + secondary.imag**2, dtype=np.float32
+                ),
             )
-        else:
-            valid_mask = np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
-    assert coherence_out is not None
-    return InterferogramProduct(
-        complex=merged_ifg,
-        coherence=coherence_out,
-        wrapped_phase=wrapped,
-        amplitude=np.abs(merged_ifg).astype(np.float32),
-        valid_mask=valid_mask,
+        )
+    if not sources:
+        reject_invalid_state("scene products share no unit inside the merge window")
+    seams = _parent_azimuth_seams(units) if primary_store.domain == "radar" else ()
+    layout = build_merge_layout(
+        sources,
+        scope=scope,
+        seams=seams,
+        window=layout_window,
+    )
+    selected = merge_bursts(products, layout=layout)
+    if selected.primary_power is None or selected.secondary_power is None:
+        reject_invalid_state("selected merge window is missing endpoint powers")
+    product = form_interferogram_from_fields(
+        selected.complex,
+        selected.primary_power,
+        selected.secondary_power,
+        selected.valid_mask,
+        native_origin=(int(layout.window[0]), int(layout.window[2])),
+        output_window=_as_merge_window(layout.window),
+        multilook=multilook,
+        coherence_window=coherence_window,
+    )
+    return _finish_looked_interferogram(
+        product,
+        goldstein_alpha=goldstein_alpha,
+        device=device,
+        dask_client=dask_client,
+        phase_filter=phase_filter,
     )
 
 
@@ -1985,15 +2208,18 @@ class SceneLayers:
 
 
 __all__ = [
+    "MERGED_SCENE_UNIT_TAG",
     "NISAR_GEO_COVERAGE_POLICY",
     "SCENE_KIND",
     "CoregisteredSceneStore",
     "SceneLayers",
     "SceneUnit",
     "SceneWriter",
+    "build_scene_merge_layout",
     "form_burst_scene_interferogram",
     "form_merged_scene_interferogram",
     "form_scene_interferograms",
+    "merge_scene_slc",
     "scene_grid_identity",
     "valid_samples",
     "validate_reference_binding",

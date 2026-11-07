@@ -18,8 +18,11 @@ from faninsar.io.storage.ifg_store import (
 )
 from faninsar.io.storage.product import open_product, publish_product
 from faninsar.io.storage.scene_store import (
+    MERGED_SCENE_UNIT_TAG,
     CoregisteredSceneStore,
+    build_scene_merge_layout,
     form_merged_scene_interferogram,
+    merge_scene_slc,
     write_scene,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
@@ -158,6 +161,8 @@ def test_scene_persists_explicit_valid_mask_and_physical_burst_id(
     )
     unit = store.unit_map()["IW1_b0"]
     assert unit.burst_id == "IW1_b0"
+    assert unit.valid_mask_path is not None
+    np.testing.assert_array_equal(read_zarr_array(unit.valid_mask_path), valid_mask)
     np.testing.assert_array_equal(store.read_valid_mask("IW1_b0"), valid_mask)
     slc, _ = store.read("IW1_b0")
     np.testing.assert_array_equal(slc, payload)
@@ -244,6 +249,15 @@ def test_supported_zero_look_is_not_erased_as_missing_support(tmp_path: Path) ->
     assert product.valid_mask is not None
     assert bool(product.valid_mask[0, 0])
     np.testing.assert_allclose(product.coherence[0, 0], 0.0, atol=1e-6)
+    for store, tag in (
+        (reference_store, "IW1_b0"),
+        (reference_store, "IW1_b1"),
+        (secondary_store, "IW1_b0"),
+        (secondary_store, "IW1_b1"),
+    ):
+        mask_path = store.unit_map()[tag].valid_mask_path
+        assert mask_path is not None
+        np.testing.assert_array_equal(read_zarr_array(mask_path), support)
 
 
 def test_single_input_roi_hole_is_excluded_before_look_statistics(
@@ -271,6 +285,10 @@ def test_single_input_roi_hole_is_excluded_before_look_statistics(
     np.testing.assert_allclose(product.complex[0, 0], 1.0 + 0.0j, atol=1e-6)
     assert product.valid_mask is not None
     assert bool(product.valid_mask[0, 0])
+    for store in (reference_store, secondary_store):
+        mask_path = store.unit_map()["IW1_b0"].valid_mask_path
+        assert mask_path is not None
+        np.testing.assert_array_equal(read_zarr_array(mask_path), valid_mask)
 
 
 def test_ifg_merged_path_stays_under_ml_and_defaults_representation(
@@ -393,3 +411,68 @@ def test_ifg_burst_id_must_be_a_basename(tmp_path: Path) -> None:
             representation="burst",
             burst_id="../IW1_b0",
         )
+
+
+def test_radar_overlap_uses_parent_grid_azimuth_midpoint(tmp_path: Path) -> None:
+    """Selected IFG samples follow the parent-grid midpoint, not a blend."""
+    ones = np.ones((3, 1), dtype=np.complex64)
+    later_secondary = np.full((3, 1), 1.0j, dtype=np.complex64)
+    support = np.ones((3, 1), dtype=bool)
+    reference_store, secondary_store = _write_pair(
+        tmp_path,
+        ones,
+        ones,
+        reference_units=[
+            *_scene_units(ones, tag="IW1_b0", valid_mask=support),
+            *_scene_units(ones, tag="IW1_b1", row_origin=1, valid_mask=support),
+        ],
+        secondary_units=[
+            *_scene_units(ones, tag="IW1_b0", valid_mask=support),
+            *_scene_units(
+                later_secondary, tag="IW1_b1", row_origin=1, valid_mask=support
+            ),
+        ],
+        grid_shape=(4, 1),
+    )
+    for store, tag in (
+        (reference_store, "IW1_b0"),
+        (reference_store, "IW1_b1"),
+        (secondary_store, "IW1_b0"),
+        (secondary_store, "IW1_b1"),
+    ):
+        mask_path = store.unit_map()[tag].valid_mask_path
+        assert mask_path is not None
+        np.testing.assert_array_equal(read_zarr_array(mask_path), support)
+    product = form_merged_scene_interferogram(
+        reference_store,
+        secondary_store,
+        multilook=(1, 1),
+    )
+    expected = np.array([[1.0 + 0.0j], [1.0 + 0.0j], [-1.0j], [-1.0j]], dtype=np.complex64)
+    np.testing.assert_allclose(product.complex, expected, atol=1e-6)
+    assert product.valid_mask is not None
+    assert bool(product.valid_mask.all())
+
+
+def test_merge_scene_slc_selects_parent_midpoint_samples(tmp_path: Path) -> None:
+    """Explicit merged SLCs copy the preferred burst, not an average."""
+    earlier = np.full((3, 1), 1.0 + 0.0j, dtype=np.complex64)
+    later = np.full((3, 1), 2.0 + 0.0j, dtype=np.complex64)
+    support = np.ones((3, 1), dtype=bool)
+    store = write_scene(
+        tmp_path / "scene",
+        date_id=REFERENCE_ID,
+        reference_id=REFERENCE_ID,
+        domain="radar",
+        units=[
+            *_scene_units(earlier, tag="IW1_b0", valid_mask=support),
+            *_scene_units(later, tag="IW1_b1", row_origin=1, valid_mask=support),
+        ],
+        grid_shape=(4, 1),
+    )
+    layout = build_scene_merge_layout(store)
+    selected = merge_scene_slc(store, layout=layout)
+    expected = np.array([[1.0], [1.0], [2.0], [2.0]], dtype=np.complex64)
+    np.testing.assert_array_equal(selected.complex, expected)
+    assert selected.valid_mask.all()
+    assert MERGED_SCENE_UNIT_TAG == "merged"

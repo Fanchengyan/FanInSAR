@@ -35,12 +35,22 @@ from typing import (
 
 import numpy as np
 
-from faninsar.io.storage.ifg_store import UNWRAP_KIND
+from faninsar.io.storage.ifg_store import (
+    BURST_REPRESENTATION,
+    MERGED_REPRESENTATION,
+    UNWRAP_KIND,
+    ifg_artifact_dir,
+)
 from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import (
+    MERGED_SCENE_UNIT_TAG,
     CoregisteredSceneStore,
+    build_scene_merge_layout,
+    form_burst_scene_interferogram,
     form_merged_scene_interferogram,
+    merge_scene_slc,
     validate_reference_binding,
+    write_scene,
 )
 from faninsar.logging import reject, setup_logger
 from faninsar.network.network import Network, NetworkContract
@@ -1171,6 +1181,20 @@ class Stack(NetworkContract, ABC):
             return base
         return base / f"p{polygon}"
 
+    def _layout_dir(self, polygon: int | None = None) -> Path:
+        """Return the merge-layout product directory of one ROI subtree."""
+        base = self.config.work_dir / "layout" / str(self.reference)
+        if polygon is None:
+            return base
+        return base / f"p{polygon}"
+
+    def _merged_scene_dir(self, date_id: str, polygon: int | None = None) -> Path:
+        """Return the distinct merged-SLC product directory of one date."""
+        base = self.config.work_dir / "coreg" / "merged" / date_id
+        if polygon is None:
+            return base
+        return base / f"p{polygon}"
+
     @property
     def scenes(self) -> StackSceneCollection:
         """Return the committed scene products by acquisition date.
@@ -1192,7 +1216,11 @@ class Stack(NetworkContract, ABC):
         for product in discover_products(
             self.config.work_dir / "coreg", kind=SCENE_KIND
         ):
+            if product.path.name == "merged":
+                continue
             store = CoregisteredSceneStore.open(product.path)
+            if store.representation == "merged":
+                continue
             found[store.date_id] = store
         return StackSceneCollection(self, dict(sorted(found.items())))
 
@@ -1210,12 +1238,18 @@ class Stack(NetworkContract, ABC):
         if not coreg_root.is_dir():
             return found
         for date_dir in sorted(coreg_root.iterdir()):
-            if not date_dir.is_dir() or date_dir.name.startswith("."):
+            if (
+                not date_dir.is_dir()
+                or date_dir.name.startswith(".")
+                or date_dir.name == "merged"
+            ):
                 continue
             scene_root = date_dir if polygon is None else date_dir / f"p{polygon}"
             if not (scene_root / "item.json").is_file():
                 continue
             store = CoregisteredSceneStore.open(scene_root)
+            if store.representation == MERGED_REPRESENTATION:
+                continue
             found[store.date_id] = store
         return found
 
@@ -4116,6 +4150,7 @@ class Stack(NetworkContract, ABC):
         *,
         dates: Sequence[str] | None = None,
         overwrite: bool = False,
+        merge: bool = False,
     ) -> Self:
         """Coregister each non-Reference date onto the Reference scene.
 
@@ -4128,7 +4163,12 @@ class Stack(NetworkContract, ABC):
         ``coreg_mode="nesd"`` requires :attr:`date_misreg` unless measure
         warned and skipped because the selection had no overlap windows.
         ``geometry`` applies zero date constants.
+        ``merge=False`` (the default) keeps per-burst scene products.
+        ``merge=True`` publishes a distinct ``coreg/merged/<date>`` product
+        through ``merge_bursts`` without overwriting the burst inputs.
         """
+        if merge:
+            self._require_scene_merge_kernel()
         self._ensure_prepared()
         self._ensure_precise_orbits()
         self._ensure_raster_dem()
@@ -4247,7 +4287,159 @@ class Stack(NetworkContract, ABC):
                 del state
                 gc.collect()
                 self._reclaim_accelerator("persist")
+        if merge:
+            self._publish_merged_scenes(target_dates, polygons, overwrite=overwrite)
         return self
+
+    def _require_scene_merge_kernel(self) -> None:
+        """Reject explicit scene merge when the shared selector is unavailable."""
+        try:
+            import inspect
+
+            from faninsar.processing.mosaicking import merge_bursts
+        except ImportError:
+            merge_bursts = None
+        if merge_bursts is None or not callable(merge_bursts):
+            reject_invalid_state(
+                "coregister_scenes(merge=True) requires "
+                "processing.mosaicking.merge_bursts with BurstWindow "
+                "(P0074 midpoint kernel)"
+            )
+        if "layout" not in inspect.signature(merge_bursts).parameters:
+            reject_invalid_state(
+                "coregister_scenes(merge=True) requires the P0074 "
+                "merge_bursts(layout=...) midpoint kernel"
+            )
+        try:
+            from faninsar.io.storage.merge_layout import open_merge_layout
+        except ImportError:
+            open_merge_layout = None
+        if open_merge_layout is None:
+            reject_invalid_state(
+                "coregister_scenes(merge=True) requires io.storage.merge_layout"
+            )
+
+    def _ensure_merge_layout(
+        self,
+        reference: CoregisteredSceneStore,
+        polygon: int | None,
+        *,
+        overwrite: bool,
+    ) -> Product:
+        """Publish or reuse the Reference merge layout of one ROI subtree."""
+        from faninsar.io.storage.merge_layout import LAYOUT_KIND, open_merge_layout
+        from faninsar.io.storage.product import open_product
+
+        layout = build_scene_merge_layout(reference)
+        target = self._layout_dir(polygon)
+        if (target / "item.json").is_file() and not overwrite:
+            existing = open_merge_layout(target)
+            if (
+                existing.scope.reference_id != layout.scope.reference_id
+                or existing.scope.grid_identity != layout.scope.grid_identity
+                or existing.window != layout.window
+                or existing.source_ids != layout.source_ids
+            ):
+                reject_invalid_state(
+                    "persisted merge_layout does not match the current Reference; "
+                    "pass overwrite=True"
+                )
+            return open_product(target, kind=LAYOUT_KIND)
+        from faninsar.io.storage.merge_layout import publish_merge_layout
+
+        return publish_merge_layout(target, layout, overwrite=overwrite)
+
+    def _publish_merged_scenes(
+        self,
+        dates: Sequence[str],
+        polygons: Sequence[int | None],
+        *,
+        overwrite: bool,
+    ) -> None:
+        """Persist distinct merged SLC products beside the burst scene inputs."""
+        date_set = set(dates)
+        for polygon in polygons:
+            reference = self._reference_scene_for(polygon)
+            if reference is None:
+                reject_invalid_state(
+                    "merged scene publication requires a Reference scene product"
+                )
+            layout_product = self._ensure_merge_layout(
+                reference, polygon, overwrite=overwrite
+            )
+            layout = build_scene_merge_layout(reference)
+            stores = self._scene_stores(polygon)
+            for date_id, store in stores.items():
+                if date_id != self.reference and date_id not in date_set:
+                    continue
+                target = self._merged_scene_dir(date_id, polygon)
+                if (target / "item.json").is_file() and not overwrite:
+                    existing = CoregisteredSceneStore.open(target)
+                    if (
+                        existing.representation == MERGED_REPRESENTATION
+                        and existing.layout_id == layout_product.write_id
+                        and existing.inputs.get("scene") == store.write_id
+                    ):
+                        logger.info("Reusing merged scene %s", date_id)
+                        continue
+                    reject_invalid_state(
+                        f"merged scene {target} exists with different layout or "
+                        "burst scene lineage; pass overwrite=True"
+                    )
+                selected = merge_scene_slc(store, layout=layout)
+                properties = {
+                    key: value
+                    for key, value in store.properties.items()
+                    if key
+                    not in {
+                        "datetime",
+                        "faninsar:date",
+                        "faninsar:domain",
+                        "faninsar:flatten_stage",
+                        "faninsar:grid_identity",
+                        "faninsar:inputs",
+                        "faninsar:kind",
+                        "faninsar:reference",
+                        "faninsar:role",
+                        "faninsar:shape",
+                        "faninsar:wavelength_m",
+                        "faninsar:write_id",
+                        "proj:code",
+                        "proj:transform",
+                    }
+                }
+                properties["faninsar:representation"] = MERGED_REPRESENTATION
+                properties["faninsar:layout_id"] = layout_product.write_id
+                inputs = dict(store.inputs)
+                inputs["layout"] = layout_product.write_id
+                inputs["scene"] = store.write_id
+                write_scene(
+                    target,
+                    date_id=store.date_id,
+                    reference_id=store.reference_id,
+                    domain=store.domain,
+                    units=[
+                        {
+                            "tag": MERGED_SCENE_UNIT_TAG,
+                            "payload": np.asarray(selected.complex, dtype=np.complex64),
+                            "row_origin": int(layout.window[0]),
+                            "col_origin": int(layout.window[2]),
+                            "valid_mask": np.asarray(selected.valid_mask, dtype=bool),
+                            "phase_state": {
+                                "flatten_stage": store.flatten_stage,
+                            },
+                        }
+                    ],
+                    grid_shape=store.grid_shape,
+                    wavelength_m=store.wavelength_m,
+                    grid_identity=store.grid_identity,
+                    crs=store.crs,
+                    transform=store.transform,
+                    inputs=inputs,
+                    properties=properties,
+                    overwrite=overwrite,
+                )
+                logger.info("Published merged scene %s → %s", date_id, target)
 
     def _scene_misreg_inputs(self) -> dict[str, str]:
         """Return the misreg product binding of a secondary scene, if any."""
@@ -4307,6 +4499,7 @@ class Stack(NetworkContract, ABC):
         phase_filter: PhaseFilter | None = _DEFAULT_PHASE_FILTER,
         goldstein_alpha: float | None = None,
         overwrite: bool = False,
+        merge: bool = True,
     ) -> Self:
         """Form wrapped interferograms from persisted Reference-aligned scenes.
 
@@ -4346,9 +4539,15 @@ class Stack(NetworkContract, ABC):
             An explicitly supplied ``phase_filter`` (including ``None``)
             takes precedence.
         overwrite : bool, default=False
-            Replace existing IFG products (``work_dir/ifg/ml_AxR/<pair>``).
-            Without it a current product is reused and a stale or
-            differently configured one is rejected.
+            Replace existing IFG products (``work_dir/ifg/ml_AxR/<pair>`` or
+            ``work_dir/ifg/bursts/ml_AxR/<pair>/<burst>``). Without it a
+            current product is reused and a stale or differently configured
+            one is rejected.
+        merge : bool, default=True
+            ``True`` writes the default merged Pair product under
+            ``ifg/ml_AxR/<pair>``. ``False`` writes independent burst products
+            under ``ifg/bursts/ml_AxR/<pair>/<burst_id>`` and does not create
+            the merged product. Unwrap and Network consume merged products.
 
         Returns
         -------
@@ -4417,7 +4616,7 @@ class Stack(NetworkContract, ABC):
         selected_filter = None if legacy_filter else phase_filter
         selected_coherence_window = None if legacy_filter else coherence_window
         filter_name, filter_parameters = _phase_filter_metadata(selected_filter)
-        base_out = self.config.work_dir / "ifg"
+        representation = MERGED_REPRESENTATION if merge else BURST_REPRESENTATION
         formation_ledger = (
             ResourceAdmissionLedger(self.config.resource_budget, self.config.work_dir)
             if self.config.resource_budget is not None
@@ -4431,6 +4630,16 @@ class Stack(NetworkContract, ABC):
         scenes_by_polygon = {
             polygon: self._scene_stores(polygon) for polygon in polygons
         }
+        layout_ids: dict[int | None, str] = {}
+        if merge:
+            for polygon in polygons:
+                reference = self._reference_scene_for(polygon)
+                if reference is None:
+                    continue
+                layout_product = self._ensure_merge_layout(
+                    reference, polygon, overwrite=overwrite
+                )
+                layout_ids[polygon] = layout_product.write_id
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
                 continue
@@ -4438,9 +4647,6 @@ class Stack(NetworkContract, ABC):
                 az_l, rg_l = looks
                 for polygon in polygons:
                     scenes = scenes_by_polygon[polygon]
-                    sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
-                    if polygon is not None:
-                        sub = sub / f"p{polygon}"
                     if primary not in scenes or secondary not in scenes:
                         if polygon is not None:
                             # A secondary that covers none of this polygon's
@@ -4477,150 +4683,238 @@ class Stack(NetworkContract, ABC):
                             ).identity
                     expected_filter_name = filter_name
                     expected_filter_parameters = filter_parameters
-                    if (sub / "item.json").exists() and not overwrite:
-                        from faninsar.io.storage.ifg_store import (
-                            InterferogramArtifactStore,
+                    if merge:
+                        burst_jobs: list[tuple[str | None, str | None]] = [(None, None)]
+                    else:
+                        common = sorted(
+                            set(primary_store.unit_map())
+                            & set(secondary_store.unit_map())
                         )
-
-                        existing_store = InterferogramArtifactStore.open(sub)
-                        observed = {
-                            "pair": existing_store.pair,
-                            "looks": existing_store.looks,
-                            "domain": existing_store.domain,
-                            "wavelength_m": existing_store.wavelength_m,
-                            "grid_identity": existing_store.grid_identity,
-                            "filter_name": existing_store.filter_name,
-                            "filter_parameters": existing_store.filter_parameters,
-                            # Products written before the runtime fingerprint was
-                            # removed still carry a ``runtime`` entry next to the
-                            # real scene digests; it is not a source, so it does
-                            # not participate in the lineage comparison.
-                            "sources": {
-                                role: digest
-                                for role, digest in (
-                                    existing_store.source_manifest_digests.items()
-                                )
-                                if role != "runtime"
-                            },
-                            "flatten_stage": existing_store.flatten_stage,
-                            "phase_screen_model": existing_store.phase_screen_model,
-                            "phase_screen_digests": existing_store.phase_screen_digests,
-                            "phase_screen_domain": existing_store.phase_screen_domain,
-                            "phase_screen_grid_identity": (
-                                existing_store.phase_screen_grid_identity
-                            ),
-                            "mask_plan_identity": existing_store.mask_plan_identity,
-                            "mask_identity": existing_store.mask_identity,
-                        }
-                        expected = {
-                            "pair": (primary, secondary),
-                            "looks": looks,
-                            "domain": primary_store.domain,
-                            "wavelength_m": primary_store.wavelength_m,
-                            "grid_identity": primary_store.grid_identity,
-                            "filter_name": expected_filter_name,
-                            "filter_parameters": expected_filter_parameters,
-                            "sources": expected_sources,
-                            "flatten_stage": flatten_stage,
-                            "phase_screen_model": phase_screen_model,
-                            "phase_screen_digests": phase_screen_digests,
-                            "phase_screen_domain": primary_store.domain,
-                            "phase_screen_grid_identity": primary_store.grid_identity,
-                            "mask_plan_identity": mask_plan_identity,
-                            "mask_identity": mask_identity,
-                        }
-                        mismatched = [
-                            name
-                            for name, expected_value in expected.items()
-                            if observed[name] != expected_value
-                        ]
-                        if mismatched:
+                        if not common:
                             reject_invalid_state(
-                                "persisted IFG artifact does not match current scene "
-                                "lineage or processing parameters: "
-                                f"{', '.join(sorted(mismatched))} differ"
+                                "scene products share no unit for "
+                                f"{primary}_{secondary}"
                             )
-                        existing_store.read()
-                        self.ifg_dirs.append(sub)
-                        continue
-                    if sub.exists() and not overwrite:
-                        reject_invalid_state(
-                            f"{sub} exists without item.json; it is not an IFG "
-                            "product of this FanInSAR version "
-                            "(pass overwrite=True to replace it)"
+                        burst_jobs = [
+                            (primary_store.unit_map()[tag].burst_id or tag, tag)
+                            for tag in common
+                        ]
+                    for burst_id, tag in burst_jobs:
+                        sub = ifg_artifact_dir(
+                            self.config.work_dir,
+                            looks,
+                            (primary, secondary),
+                            representation=representation,
+                            burst_id=burst_id,
+                            polygon=polygon,
                         )
-                    reservation = None
-                    if formation_ledger is not None:
-                        estimate = estimate_formation_resources(
-                            shape=primary_store.grid_shape,
-                            multilook=looks,
-                            coherence_window=selected_coherence_window,
-                            phase_filter=selected_filter,
+                        if tag is None:
+                            row_origin = 0
+                            col_origin = 0
+                            look_origin = (0, 0)
+                        else:
+                            unit = primary_store.unit_map()[tag]
+                            row_origin = unit.row_origin
+                            col_origin = unit.col_origin
+                            look_origin = (
+                                unit.row_origin // az_l,
+                                unit.col_origin // rg_l,
+                            )
+                        parent_grid = (
+                            primary_store.grid_shape[0] // az_l,
+                            primary_store.grid_shape[1] // rg_l,
                         )
-                        reservation = reserve_estimate(formation_ledger, estimate)
-                    try:
-                        product = form_merged_scene_interferogram(
-                            primary_store,
-                            secondary_store,
-                            multilook=looks,
-                            goldstein_alpha=alpha,
-                            coherence_window=selected_coherence_window,
-                            phase_filter=selected_filter,
-                            device=self.config.device,
-                            dask_client=self.dask_client,
+                        layout_id = layout_ids.get(polygon) or primary_store.layout_id
+                        if (sub / "item.json").exists() and not overwrite:
+                            from faninsar.io.storage.ifg_store import (
+                                InterferogramArtifactStore,
+                            )
+
+                            existing_store = InterferogramArtifactStore.open(sub)
+                            observed = {
+                                "pair": existing_store.pair,
+                                "looks": existing_store.looks,
+                                "domain": existing_store.domain,
+                                "wavelength_m": existing_store.wavelength_m,
+                                "grid_identity": existing_store.grid_identity,
+                                "filter_name": existing_store.filter_name,
+                                "filter_parameters": existing_store.filter_parameters,
+                                # Products written before the runtime fingerprint was
+                                # removed still carry a ``runtime`` entry next to the
+                                # real scene digests; it is not a source, so it does
+                                # not participate in the lineage comparison.
+                                "sources": {
+                                    role: digest
+                                    for role, digest in (
+                                        existing_store.source_manifest_digests.items()
+                                    )
+                                    if role != "runtime"
+                                },
+                                "flatten_stage": existing_store.flatten_stage,
+                                "phase_screen_model": existing_store.phase_screen_model,
+                                "phase_screen_digests": (
+                                    existing_store.phase_screen_digests
+                                ),
+                                "phase_screen_domain": (
+                                    existing_store.phase_screen_domain
+                                ),
+                                "phase_screen_grid_identity": (
+                                    existing_store.phase_screen_grid_identity
+                                ),
+                                "mask_plan_identity": existing_store.mask_plan_identity,
+                                "mask_identity": existing_store.mask_identity,
+                                "representation": existing_store.representation,
+                                "burst_id": existing_store.burst_id,
+                                "look_origin": existing_store.look_origin,
+                                "layout_id": existing_store.layout_id,
+                            }
+                            expected = {
+                                "pair": (primary, secondary),
+                                "looks": looks,
+                                "domain": primary_store.domain,
+                                "wavelength_m": primary_store.wavelength_m,
+                                "grid_identity": primary_store.grid_identity,
+                                "filter_name": expected_filter_name,
+                                "filter_parameters": expected_filter_parameters,
+                                "sources": expected_sources,
+                                "flatten_stage": flatten_stage,
+                                "phase_screen_model": phase_screen_model,
+                                "phase_screen_digests": phase_screen_digests,
+                                "phase_screen_domain": primary_store.domain,
+                                "phase_screen_grid_identity": (
+                                    primary_store.grid_identity
+                                ),
+                                "mask_plan_identity": mask_plan_identity,
+                                "mask_identity": mask_identity,
+                                "representation": representation,
+                                "burst_id": burst_id,
+                                "look_origin": look_origin,
+                                "layout_id": layout_id,
+                            }
+                            mismatched = [
+                                name
+                                for name, expected_value in expected.items()
+                                if observed[name] != expected_value
+                            ]
+                            if mismatched:
+                                reject_invalid_state(
+                                    "persisted IFG artifact does not match "
+                                    "current scene lineage or processing "
+                                    f"parameters: {', '.join(sorted(mismatched))} "
+                                    "differ"
+                                )
+                            existing_store.read()
+                            self.ifg_dirs.append(sub)
+                            continue
+                        if sub.exists() and not overwrite:
+                            reject_invalid_state(
+                                f"{sub} exists without item.json; it is not an IFG "
+                                "product of this FanInSAR version "
+                                "(pass overwrite=True to replace it)"
+                            )
+                        reservation = None
+                        if formation_ledger is not None:
+                            estimate = estimate_formation_resources(
+                                shape=primary_store.grid_shape,
+                                multilook=looks,
+                                coherence_window=selected_coherence_window,
+                                phase_filter=selected_filter,
+                            )
+                            reservation = reserve_estimate(formation_ledger, estimate)
+                        try:
+                            if merge:
+                                product = form_merged_scene_interferogram(
+                                    primary_store,
+                                    secondary_store,
+                                    multilook=looks,
+                                    goldstein_alpha=alpha,
+                                    coherence_window=selected_coherence_window,
+                                    phase_filter=selected_filter,
+                                    device=self.config.device,
+                                    dask_client=self.dask_client,
+                                    flatten_stage=flatten_stage,
+                                )
+                            else:
+                                if tag is None:
+                                    reject_invalid_state(
+                                        "burst IFG formation requires a scene unit tag"
+                                    )
+                                product = form_burst_scene_interferogram(
+                                    primary_store,
+                                    secondary_store,
+                                    tag,
+                                    multilook=looks,
+                                    goldstein_alpha=alpha,
+                                    coherence_window=selected_coherence_window,
+                                    phase_filter=selected_filter,
+                                    device=self.config.device,
+                                    dask_client=self.dask_client,
+                                    flatten_stage=flatten_stage,
+                                )
+                        finally:
+                            if reservation is not None:
+                                reservation.release()
+                        from faninsar.io.storage.ifg_store import write_ifg_artifact
+
+                        # PROPOSAL-0039 (AC-5): the active mask is a support input
+                        # intersected into the persisted valid_mask AFTER formation
+                        # and filtering. It never routes through the PhaseFilter and
+                        # never touches the complex/phase numerics.
+                        valid_mask = product.valid_mask
+                        if merge:
+                            mask_plane = self._ifg_mask_plane(
+                                domain=primary_store.domain,
+                                looks=looks,
+                                expected_shape=(
+                                    valid_mask.shape
+                                    if valid_mask is not None
+                                    else product.complex.shape
+                                ),
+                            )
+                            if mask_plane is not None:
+                                if valid_mask is None:
+                                    valid_mask = np.isfinite(product.complex)
+                                valid_mask = _apply_mask_to_valid_mask(
+                                    valid_mask, mask_plane
+                                )
+
+                        write_ifg_artifact(
+                            sub,
+                            pair=(primary, secondary),
+                            looks=looks,
+                            domain=primary_store.domain,
+                            wavelength_m=primary_store.wavelength_m,
+                            grid_identity=primary_store.grid_identity,
+                            crs=primary_store.crs,
+                            transform=_scale_geo_artifact_transform(
+                                primary_store.transform, looks
+                            ),
+                            filter_name=expected_filter_name,
+                            filter_parameters=expected_filter_parameters,
+                            source_manifest_digests=expected_sources,
+                            mask_plan_identity=mask_plan_identity,
+                            mask_identity=mask_identity,
                             flatten_stage=flatten_stage,
+                            phase_screen_model=phase_screen_model,
+                            phase_screen_digests=phase_screen_digests,
+                            phase_screen_domain=primary_store.domain,
+                            phase_screen_grid_identity=primary_store.grid_identity,
+                            complex_ifg=product.complex,
+                            coherence=product.coherence,
+                            valid_mask=valid_mask,
+                            replace_existing=overwrite,
+                            representation=representation,
+                            burst_id=burst_id,
+                            row_origin=row_origin,
+                            col_origin=col_origin,
+                            grid_shape=parent_grid,
+                            look_origin=look_origin,
+                            layout_id=layout_id or None,
+                            polygon_identity=(
+                                None if polygon is None else str(polygon)
+                            ),
                         )
-                    finally:
-                        if reservation is not None:
-                            reservation.release()
-                    from faninsar.io.storage.ifg_store import write_ifg_artifact
-
-                    # PROPOSAL-0039 (AC-5): the active mask is a support input
-                    # intersected into the persisted valid_mask AFTER formation
-                    # and filtering. It never routes through the PhaseFilter and
-                    # never touches the complex/phase numerics.
-                    valid_mask = product.valid_mask
-                    mask_plane = self._ifg_mask_plane(
-                        domain=primary_store.domain,
-                        looks=looks,
-                        expected_shape=(
-                            valid_mask.shape
-                            if valid_mask is not None
-                            else product.complex.shape
-                        ),
-                    )
-                    if mask_plane is not None:
-                        if valid_mask is None:
-                            valid_mask = np.isfinite(product.complex)
-                        valid_mask = _apply_mask_to_valid_mask(valid_mask, mask_plane)
-
-                    write_ifg_artifact(
-                        sub,
-                        pair=(primary, secondary),
-                        looks=looks,
-                        domain=primary_store.domain,
-                        wavelength_m=primary_store.wavelength_m,
-                        grid_identity=primary_store.grid_identity,
-                        crs=primary_store.crs,
-                        transform=_scale_geo_artifact_transform(
-                            primary_store.transform, looks
-                        ),
-                        filter_name=expected_filter_name,
-                        filter_parameters=expected_filter_parameters,
-                        source_manifest_digests=expected_sources,
-                        mask_plan_identity=mask_plan_identity,
-                        mask_identity=mask_identity,
-                        flatten_stage=flatten_stage,
-                        phase_screen_model=phase_screen_model,
-                        phase_screen_digests=phase_screen_digests,
-                        phase_screen_domain=primary_store.domain,
-                        phase_screen_grid_identity=primary_store.grid_identity,
-                        complex_ifg=product.complex,
-                        coherence=product.coherence,
-                        valid_mask=valid_mask,
-                        replace_existing=overwrite,
-                    )
-                    self.ifg_dirs.append(sub)
+                        self.ifg_dirs.append(sub)
         return self
 
     def _extend_plan(self, pairs: Pairs) -> None:
