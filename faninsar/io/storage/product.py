@@ -165,9 +165,32 @@ class Product:
             reject_invalid_state(f"product {self.path} has no asset {name!r}")
         return self.path / _basename(self.assets[name]["href"])
 
-    def read(self, name: str) -> np.ndarray:
-        """Read one Zarr asset."""
-        return read_zarr_array(self.asset_path(name))
+    def read(
+        self, name: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray:
+        """Read one Zarr asset, optionally a local 2-D window.
+
+        ``window`` is a half-open ``(r0, r1, c0, c1)`` in the asset array's
+        own coordinates. The path is still restricted to a basename under
+        this product root. ``None`` reads the whole asset.
+
+        Parameters
+        ----------
+        name : str
+            Asset name in ``item.json``.
+        window : tuple of int, optional
+            Local half-open row/column window.
+
+        Returns
+        -------
+        numpy.ndarray
+            Selected samples.
+
+        """
+        path = self.asset_path(name)
+        if window is None:
+            return read_zarr_array(path)
+        return read_zarr_array(path, window=window)
 
     def stale_inputs(self, current: Mapping[str, Product | str]) -> list[str]:
         """Return input names whose recorded write id differs from ``current``.

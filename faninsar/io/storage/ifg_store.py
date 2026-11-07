@@ -13,6 +13,7 @@ reads validate the Item, shapes, and dtypes without re-hashing payloads.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -21,6 +22,7 @@ import numpy as np
 
 from faninsar.io.storage._zarr_stac import (
     read_zarr_array,
+    require_basename,
     validate_spatial_metadata,
     write_zarr_array,
 )
@@ -40,6 +42,8 @@ logger = setup_logger(__name__)
 
 IFG_KIND = "ifg"
 UNWRAP_KIND = "unwrap"
+MERGED_REPRESENTATION = "merged"
+BURST_REPRESENTATION = "burst"
 #: Persisted IFG layers; ``wrapped_phase`` and ``amplitude`` are virtual.
 _IFG_LAYERS = ("complex", "coherence", "valid_mask")
 _REQUIRED_IFG_LAYERS = ("complex",)
@@ -111,12 +115,80 @@ def _is_source_identity(value: object) -> bool:
     return is_write_id(value) or _is_sha256(value)
 
 
-def unwrap_root(ifg_root: str | Path) -> Path:
+def ifg_artifact_dir(
+    work_dir: str | Path,
+    looks: tuple[int, int],
+    pair: tuple[str, str],
+    *,
+    representation: str = MERGED_REPRESENTATION,
+    burst_id: str | None = None,
+    polygon: int | None = None,
+) -> Path:
+    """Return the product directory of one merged or burst interferogram.
+
+    Merged products keep ``<work>/ifg/ml_AxR/<pair>[/pN]``. Burst products
+    live at ``<work>/ifg/bursts/ml_AxR/<pair>/<burst_id>[/pN]``.
+    """
+    if representation not in {MERGED_REPRESENTATION, BURST_REPRESENTATION}:
+        reject_invalid_state("IFG representation must be merged or burst")
+    pair_id = f"{pair[0]}_{pair[1]}"
+    looks_name = f"ml_{int(looks[0])}x{int(looks[1])}"
+    root = Path(work_dir) / "ifg"
+    if representation == BURST_REPRESENTATION:
+        if burst_id is None:
+            reject_invalid_state("burst IFG path requires a burst_id")
+        require_basename(burst_id, "IFG burst_id")
+        target = root / "bursts" / looks_name / pair_id / burst_id
+    else:
+        target = root / looks_name / pair_id
+    if polygon is not None:
+        target = target / f"p{int(polygon)}"
+    return target
+
+
+def unwrap_root(
+    ifg_root: str | Path,
+    *,
+    allow_burst: bool = False,
+    representation: str | None = None,
+) -> Path:
     """Return the unwrap product directory paired with an IFG product.
 
     ``<work>/ifg/ml_AxR/<pair>`` maps to ``<work>/unwrap/ml_AxR/<pair>``.
+    Burst products are rejected unless ``allow_burst=True``.
     """
     root = Path(ifg_root)
+    resolved = representation
+    item = root / "item.json"
+    if resolved is None and item.is_file():
+        try:
+            payload = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            payload = {}
+        properties = payload.get("properties") if isinstance(payload, dict) else None
+        if isinstance(properties, dict):
+            resolved = str(
+                properties.get("faninsar:representation", MERGED_REPRESENTATION)
+            )
+    if "bursts" in root.parts or resolved == BURST_REPRESENTATION:
+        if not allow_burst:
+            reject_invalid_state(
+                "unwrap consumes merged IFGs; burst products require allow_burst=True"
+            )
+        if root.parent.parent.parent.name != "bursts":
+            reject_invalid_state(
+                "burst IFG product is not under "
+                f"ifg/bursts/ml_AxR/<pair>/<burst>: {root}"
+            )
+        work = root.parent.parent.parent.parent.parent
+        return (
+            work
+            / "unwrap"
+            / "bursts"
+            / root.parent.parent.name
+            / root.parent.name
+            / root.name
+        )
     if root.parent.parent.name != "ifg":
         reject_invalid_state(
             f"IFG product is not under an ifg/ml_AxR/<pair> layout: {root}"
@@ -243,6 +315,14 @@ class InterferogramArtifactStore:
     mask_identity: str | None = None
     crs: str | None = None
     transform: tuple[float, ...] | None = None
+    representation: str = MERGED_REPRESENTATION
+    burst_id: str | None = None
+    row_origin: int = 0
+    col_origin: int = 0
+    grid_shape: tuple[int, int] | None = None
+    look_origin: tuple[int, int] = (0, 0)
+    layout_id: str = ""
+    polygon_identity: str = ""
 
     @property
     def write_id(self) -> str:
@@ -333,6 +413,28 @@ class InterferogramArtifactStore:
         if missing:
             reject_invalid_state(f"IFG product is missing layers: {missing}")
         raw_wavelength = p.get("faninsar:wavelength_m")
+        representation = str(p.get("faninsar:representation", MERGED_REPRESENTATION))
+        if representation not in {MERGED_REPRESENTATION, BURST_REPRESENTATION}:
+            reject_invalid_state("artifact representation must be merged or burst")
+        raw_burst_id = p.get("faninsar:burst_id")
+        burst_id = (
+            require_basename(raw_burst_id, "IFG burst_id")
+            if raw_burst_id is not None
+            else None
+        )
+        if representation == BURST_REPRESENTATION and burst_id is None:
+            reject_invalid_state("burst IFG artifacts require faninsar:burst_id")
+        raw_grid_shape = p.get("faninsar:grid_shape", list(shape))
+        if not isinstance(raw_grid_shape, list) or len(raw_grid_shape) != 2:
+            reject_invalid_state("artifact grid_shape is invalid")
+        parent_grid = (int(raw_grid_shape[0]), int(raw_grid_shape[1]))
+        raw_look_origin = p.get("faninsar:look_origin", [0, 0])
+        if not isinstance(raw_look_origin, list) or len(raw_look_origin) != 2:
+            reject_invalid_state("artifact look_origin is invalid")
+        look_origin = (int(raw_look_origin[0]), int(raw_look_origin[1]))
+        layout_id = str(
+            p.get("faninsar:layout_id") or product.inputs.get("layout") or ""
+        )
         return cls(
             root=product.path,
             pair=(raw_pair[0], raw_pair[1]),
@@ -357,6 +459,14 @@ class InterferogramArtifactStore:
             shape=shape,
             manifest_digest=product.write_id,
             _payloads=payloads,
+            representation=representation,
+            burst_id=burst_id,
+            row_origin=int(p.get("faninsar:row_origin", 0)),
+            col_origin=int(p.get("faninsar:col_origin", 0)),
+            grid_shape=parent_grid,
+            look_origin=look_origin,
+            layout_id=layout_id,
+            polygon_identity=str(p.get("faninsar:polygon_identity", "")),
         )
 
     def close(self) -> None:
@@ -369,13 +479,24 @@ class InterferogramArtifactStore:
     def __exit__(self, *_: object) -> None:
         """Release nothing."""
 
-    def _layer(self, name: str) -> np.ndarray:
+    def _layer(
+        self, name: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray:
         path = self.root / str(self._payloads[name]["href"])
         try:
-            array = read_zarr_array(path)
+            array = (
+                read_zarr_array(path)
+                if window is None
+                else read_zarr_array(path, window=window)
+            )
         except (OSError, ValueError, EOFError) as error:
             reject_invalid_state(f"IFG layer {name} cannot be loaded: {error}")
-        if array.shape != self.shape:
+        expected = (
+            self.shape
+            if window is None
+            else (window[1] - window[0], window[3] - window[2])
+        )
+        if array.shape != expected:
             reject_invalid_state(f"IFG layer {name} shape differs from the Item")
         return array
 
@@ -388,17 +509,21 @@ class InterferogramArtifactStore:
         if name == "valid_mask" and array.dtype != np.bool_:
             reject_invalid_state("artifact IFG valid_mask dtype is incompatible")
 
-    def _read_persisted_layer(self, name: str) -> np.ndarray:
+    def _read_persisted_layer(
+        self, name: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray:
         """Read and validate one persisted IFG layer."""
         if name not in _IFG_LAYERS:
             reject_invalid_state(f"unknown IFG layer: {name!r}")
         if name not in self._payloads:
             reject_invalid_state(f"IFG product has no layer {name!r}")
-        array = self._layer(name)
+        array = self._layer(name, window=window)
         self._check_layer_dtype(name, array)
         return array
 
-    def read_layer(self, name: str) -> np.ndarray:
+    def read_layer(
+        self, name: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray:
         """Read one canonical IFG layer by name.
 
         Parameters
@@ -409,6 +534,8 @@ class InterferogramArtifactStore:
             ``abs``; they are never persisted. Where a persisted
             ``valid_mask`` is False, derived samples are NaN. The other names
             read their persisted payloads.
+        window : tuple of int, optional
+            Local half-open ``(r0, r1, c0, c1)`` in the layer array.
 
         Returns
         -------
@@ -424,16 +551,18 @@ class InterferogramArtifactStore:
 
         """
         if name in _VIRTUAL_IFG_LAYERS:
-            complex_ifg = self._read_persisted_layer("complex")
+            complex_ifg = self._read_persisted_layer("complex", window=window)
             valid_mask = (
-                self._read_persisted_layer("valid_mask")
+                self._read_persisted_layer("valid_mask", window=window)
                 if "valid_mask" in self._payloads
                 else None
             )
             return _derive_virtual_layer(name, complex_ifg, valid_mask)
-        return self._read_persisted_layer(name)
+        return self._read_persisted_layer(name, window=window)
 
-    def read(self) -> InterferogramArtifact:
+    def read(
+        self, window: tuple[int, int, int, int] | None = None
+    ) -> InterferogramArtifact:
         """Read all IFG layers, deriving wrapped phase and amplitude.
 
         The canonical ``complex_ifg`` is loaded once; ``wrapped_phase`` and
@@ -452,14 +581,14 @@ class InterferogramArtifactStore:
             shape.
 
         """
-        complex_ifg = self._read_persisted_layer("complex")
+        complex_ifg = self._read_persisted_layer("complex", window=window)
         coherence = (
-            self._read_persisted_layer("coherence")
+            self._read_persisted_layer("coherence", window=window)
             if "coherence" in self._payloads
             else None
         )
         valid_mask = (
-            self._read_persisted_layer("valid_mask")
+            self._read_persisted_layer("valid_mask", window=window)
             if "valid_mask" in self._payloads
             else None
         )
@@ -476,7 +605,7 @@ class InterferogramArtifactStore:
     @property
     def unwrap_root(self) -> Path:
         """Return the unwrap product directory for this Pair."""
-        return unwrap_root(self.root)
+        return unwrap_root(self.root, representation=self.representation)
 
     def has_unwrapped(self) -> bool:
         """Return whether a current unwrap product is bound to this IFG."""
@@ -566,9 +695,17 @@ def write_ifg_artifact(
     phase_screen_domain: str | None = None,
     phase_screen_grid_identity: str | None = None,
     complex_ifg: np.ndarray,
-    coherence: np.ndarray | None,
+    coherence: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
     replace_existing: bool = False,
+    representation: str = MERGED_REPRESENTATION,
+    burst_id: str | None = None,
+    row_origin: int = 0,
+    col_origin: int = 0,
+    grid_shape: tuple[int, int] | None = None,
+    look_origin: tuple[int, int] = (0, 0),
+    layout_id: str | None = None,
+    polygon_identity: str | None = None,
 ) -> InterferogramArtifactStore:
     """Commit one interferogram product.
 
@@ -615,6 +752,20 @@ def write_ifg_artifact(
         persisted.
     replace_existing : bool, optional
         Replace an existing product.
+    representation : {"merged", "burst"}, optional
+        Product kind. Merged is the default unwrap/network input.
+    burst_id : str, optional
+        Basename burst identifier; required when ``representation="burst"``.
+    row_origin, col_origin : int, optional
+        Unit placement on the parent scene grid, in SLC pixels.
+    grid_shape : tuple[int, int], optional
+        Parent looked grid shape. Defaults to this product's array shape.
+    look_origin : tuple[int, int], optional
+        Look-grid origin of this product on the parent looked grid.
+    layout_id : str, optional
+        Write id of the separate ``merge_layout`` product, if any.
+    polygon_identity : str, optional
+        Multi-polygon ROI identity recorded on the Item.
 
     Returns
     -------
@@ -680,6 +831,23 @@ def write_ifg_artifact(
     ):
         reject_invalid_state("IFG phase-screen grid differs from IFG grid")
     screens = _validate_phase_screen_digests(dict(phase_screen_digests or {}))
+    if representation not in {MERGED_REPRESENTATION, BURST_REPRESENTATION}:
+        reject_invalid_state("IFG representation must be merged or burst")
+    resolved_burst_id = (
+        require_basename(burst_id, "IFG burst_id") if burst_id is not None else None
+    )
+    if representation == BURST_REPRESENTATION and resolved_burst_id is None:
+        reject_invalid_state("burst IFG artifacts require a burst_id")
+    if representation == MERGED_REPRESENTATION and resolved_burst_id is not None:
+        reject_invalid_state("merged IFG artifacts must not carry a burst_id")
+    parent_grid = (
+        (int(shape[0]), int(shape[1]))
+        if grid_shape is None
+        else (int(grid_shape[0]), int(grid_shape[1]))
+    )
+    if len(look_origin) != 2:
+        reject_invalid_state("IFG look_origin must be a 2-tuple")
+    resolved_look_origin = (int(look_origin[0]), int(look_origin[1]))
     if phase_screen_model not in {None, "nisar_ellipsoidal_v1"}:
         reject_invalid_state("IFG phase_screen_model is invalid")
     if flatten_stage == "coregistration" and (phase_screen_model or screens):
@@ -701,8 +869,10 @@ def write_ifg_artifact(
     inputs = {
         name: value
         for name, value in sources.items()
-        if name in {"primary", "secondary"}
+        if name in {"primary", "secondary", "layout"}
     }
+    if layout_id:
+        inputs["layout"] = str(layout_id)
     runtime = {name: value for name, value in sources.items() if name not in inputs}
     properties: dict[str, object] = {
         "faninsar:pair": list(pair),
@@ -723,7 +893,16 @@ def write_ifg_artifact(
         "faninsar:runtime": runtime,
         "faninsar:mask_plan_identity": mask_plan_identity,
         "faninsar:mask_identity": mask_identity,
+        "faninsar:representation": representation,
+        "faninsar:row_origin": int(row_origin),
+        "faninsar:col_origin": int(col_origin),
+        "faninsar:grid_shape": [int(parent_grid[0]), int(parent_grid[1])],
+        "faninsar:look_origin": [resolved_look_origin[0], resolved_look_origin[1]],
+        "faninsar:layout_id": str(layout_id or ""),
+        "faninsar:polygon_identity": str(polygon_identity or ""),
     }
+    if resolved_burst_id is not None:
+        properties["faninsar:burst_id"] = resolved_burst_id
     if resolved_crs is not None:
         properties["proj:code"] = resolved_crs
         properties["proj:transform"] = list(resolved_transform or ())
@@ -861,6 +1040,7 @@ __all__ = [
     "InterferogramArtifact",
     "InterferogramArtifactStore",
     "UnwrappedArtifact",
+    "ifg_artifact_dir",
     "unwrap_root",
     "write_ifg_artifact",
     "write_unwrapped_artifact",

@@ -12,6 +12,7 @@ import numpy as np
 
 from faninsar.io.storage._zarr_stac import (
     read_zarr_array,
+    require_basename,
     validate_spatial_metadata,
     write_zarr_array,
 )
@@ -161,17 +162,7 @@ def _scene_role(date_id: str, reference_id: str) -> str:
 
 def _require_basename(value: object, field: str) -> str:
     """Validate a generated filename component before joining it to a root."""
-    if not isinstance(value, str):
-        reject_invalid_state(f"scene {field} must be a filename component")
-    candidate = Path(value)
-    if (
-        candidate.is_absolute()
-        or len(candidate.parts) != 1
-        or candidate.name != value
-        or value in {"", ".", ".."}
-    ):
-        reject_invalid_state(f"scene {field} must be a basename")
-    return value
+    return require_basename(value, f"scene {field}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +177,8 @@ class SceneUnit:
     scientific_lineage: tuple[dict[str, str], ...] = ()
     phase_state: dict[str, object] | None = None
     phase_screen_path: Path | None = None
+    burst_id: str | None = None
+    valid_mask_path: Path | None = None
 
     def __post_init__(self) -> None:
         """Validate the unit's bounded shape."""
@@ -218,6 +211,8 @@ class CoregisteredSceneStore:
     crs: str | None = None
     transform: tuple[float, ...] | None = None
     flatten_stage: str = "coregistration"
+    representation: str = "burst"
+    layout_id: str = ""
     inputs: dict[str, str] = field(default_factory=dict)
     properties: dict[str, object] = field(default_factory=dict, repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
@@ -342,6 +337,13 @@ class CoregisteredSceneStore:
             if asset.get("faninsar:role") != "slc":
                 continue
             phase_name = asset.get("faninsar:phase_screen")
+            raw_burst_id = asset.get("faninsar:burst_id")
+            burst_id = (
+                require_basename(raw_burst_id, "scene burst_id")
+                if raw_burst_id is not None
+                else None
+            )
+            valid_name = f"{name}.valid"
             unit = SceneUnit(
                 tag=str(name),
                 payload_path=product.asset_path(name),
@@ -361,6 +363,12 @@ class CoregisteredSceneStore:
                 phase_screen_path=(
                     product.asset_path(str(phase_name)) if phase_name else None
                 ),
+                burst_id=burst_id,
+                valid_mask_path=(
+                    product.asset_path(valid_name)
+                    if valid_name in product.assets
+                    else None
+                ),
             )
             if (
                 unit.row_origin < 0
@@ -375,6 +383,12 @@ class CoregisteredSceneStore:
         flatten_stage = str(properties.get("faninsar:flatten_stage", "coregistration"))
         if flatten_stage not in {"coregistration", "interferogram"}:
             reject_invalid_state("scene product flatten_stage is unsupported")
+        representation = str(properties.get("faninsar:representation", "burst"))
+        if representation not in {"burst", "merged"}:
+            reject_invalid_state("scene representation must be burst or merged")
+        layout_id = str(
+            properties.get("faninsar:layout_id") or product.inputs.get("layout") or ""
+        )
         raw_wavelength = properties.get("faninsar:wavelength_m")
         wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
         _, _, grid_identity, crs, transform = validate_spatial_metadata(
@@ -397,6 +411,8 @@ class CoregisteredSceneStore:
             crs=crs,
             transform=transform,
             flatten_stage=flatten_stage,
+            representation=representation,
+            layout_id=layout_id,
             inputs=product.inputs,
             properties=properties,
         )
@@ -478,29 +494,67 @@ class CoregisteredSceneStore:
                 stale.append(name)
         return stale
 
-    def read_phase_screen(self, tag: str) -> np.ndarray | None:
-        """Read one persisted range-offset phase screen, if present."""
+    def read_phase_screen(
+        self, tag: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray | None:
+        """Read one persisted range-offset phase screen, if present.
+
+        ``window`` is local to the unit payload, matching :meth:`read`.
+        """
         unit = self.unit_map().get(tag)
         if unit is None:
             reject_invalid_state(f"scene unit {tag!r} is not in the product")
         if unit.phase_screen_path is None:
             return None
-        screen = read_zarr_array(unit.phase_screen_path)
-        if screen.shape != unit.shape or screen.dtype != np.float32:
+        screen = (
+            read_zarr_array(unit.phase_screen_path)
+            if window is None
+            else read_zarr_array(unit.phase_screen_path, window=window)
+        )
+        expected = _payload_window_shape(unit.shape, window)
+        if screen.shape != expected or screen.dtype != np.float32:
             reject_invalid_state(f"scene phase screen shape mismatch for {tag!r}")
         return np.asarray(screen, dtype=np.float32)
+
+    def read_valid_mask(
+        self, tag: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray | None:
+        """Read one unit's explicit boolean support, if persisted.
+
+        No-ROI products omit this asset; callers then keep the legacy
+        amplitude-inferred support used by NISAR non-overlap checks.
+        """
+        unit = self.unit_map().get(tag)
+        if unit is None:
+            reject_invalid_state(f"scene unit {tag!r} is not in the product")
+        if unit.valid_mask_path is None:
+            return None
+        mask = (
+            read_zarr_array(unit.valid_mask_path)
+            if window is None
+            else read_zarr_array(unit.valid_mask_path, window=window)
+        )
+        expected = _payload_window_shape(unit.shape, window)
+        if mask.shape != expected or mask.dtype != np.bool_:
+            reject_invalid_state(f"scene valid_mask shape mismatch for {tag!r}")
+        return np.asarray(mask, dtype=bool)
 
     def unit_map(self) -> dict[str, SceneUnit]:
         """Return units keyed by their stable burst tag."""
         return {unit.tag: unit for unit in self.units}
 
-    def read(self, tag: str) -> tuple[np.ndarray, SceneUnit]:
+    def read(
+        self, tag: str, window: tuple[int, int, int, int] | None = None
+    ) -> tuple[np.ndarray, SceneUnit]:
         """Read one unit payload and validate its shape and dtype.
 
         Parameters
         ----------
         tag : str
             Stable unit identifier within the product.
+        window : tuple of int, optional
+            Local half-open ``(r0, r1, c0, c1)`` in the unit payload. Placement
+            on the parent grid remains on the returned :class:`SceneUnit`.
 
         Returns
         -------
@@ -516,8 +570,13 @@ class CoregisteredSceneStore:
         unit = self.unit_map().get(tag)
         if unit is None:
             reject_invalid_state(f"scene unit {tag!r} is not in the product")
-        payload = read_zarr_array(unit.payload_path)
-        if payload.shape != unit.shape:
+        payload = (
+            read_zarr_array(unit.payload_path)
+            if window is None
+            else read_zarr_array(unit.payload_path, window=window)
+        )
+        expected = _payload_window_shape(unit.shape, window)
+        if payload.shape != expected:
             reject_invalid_state(f"scene unit {tag!r} shape mismatch")
         if payload.dtype != np.complex64:
             reject_invalid_state(f"scene unit {tag!r} dtype mismatch")
@@ -536,6 +595,8 @@ class _PendingUnit:
     lineage: list[dict[str, str]]
     phase_state: dict[str, object] | None
     phase_screen: bool
+    burst_id: str | None = None
+    valid_mask: bool = False
 
 
 class SceneWriter:
@@ -625,6 +686,8 @@ class SceneWriter:
         scientific_lineage: Sequence[Mapping[str, str]] | None = None,
         phase_state: Mapping[str, object] | None = None,
         phase_screen: np.ndarray | None = None,
+        valid_mask: np.ndarray | None = None,
+        burst_id: str | None = None,
     ) -> None:
         """Stage one aligned unit payload."""
         _require_basename(tag, "tag")
@@ -650,9 +713,24 @@ class SceneWriter:
             or not np.all(np.isfinite(phase_screen))
         ):
             reject_invalid_state("phase screen must be finite matching float32 array")
+        if valid_mask is not None and (
+            valid_mask.ndim != 2
+            or valid_mask.shape != payload.shape
+            or valid_mask.dtype != np.bool_
+        ):
+            reject_invalid_state(
+                "scene valid_mask must be a boolean array matching payload"
+            )
+        resolved_burst_id = (
+            require_basename(burst_id, "scene burst_id")
+            if burst_id is not None
+            else None
+        )
         write_zarr_array(self.staging / f"{tag}.slc.zarr", payload)
         if phase_screen is not None:
             write_zarr_array(self.staging / f"{tag}.phase.zarr", phase_screen)
+        if valid_mask is not None:
+            write_zarr_array(self.staging / f"{tag}.valid.zarr", np.asarray(valid_mask))
         self._units[tag] = _PendingUnit(
             tag=tag,
             rows=int(payload.shape[0]),
@@ -662,6 +740,8 @@ class SceneWriter:
             lineage=[dict(item) for item in (scientific_lineage or ())],
             phase_state=dict(phase_state) if phase_state is not None else None,
             phase_screen=phase_screen is not None,
+            burst_id=resolved_burst_id,
+            valid_mask=valid_mask is not None,
         )
 
     def commit(
@@ -696,6 +776,11 @@ class SceneWriter:
         if flatten_stage not in {"coregistration", "interferogram"}:
             self._writer.abort()
             reject_invalid_state("scene flatten_stage is unsupported")
+        extra_properties = dict(properties or {})
+        representation = extra_properties.get("faninsar:representation", "burst")
+        if representation not in {"burst", "merged"}:
+            self._writer.abort()
+            reject_invalid_state("scene representation must be burst or merged")
         for tag, unit in sorted(self._units.items()):
             fields: dict[str, object] = {
                 "faninsar:role": "slc",
@@ -706,10 +791,18 @@ class SceneWriter:
                 "faninsar:lineage": unit.lineage,
                 "faninsar:phase_state": unit.phase_state,
             }
+            if unit.burst_id is not None:
+                fields["faninsar:burst_id"] = unit.burst_id
             if unit.phase_screen:
                 fields["faninsar:phase_screen"] = f"{tag}.phase"
                 self._writer.add_asset(
                     f"{tag}.phase", f"{tag}.phase.zarr", **{"faninsar:role": "phase"}
+                )
+            if unit.valid_mask:
+                self._writer.add_asset(
+                    f"{tag}.valid",
+                    f"{tag}.valid.zarr",
+                    **{"faninsar:role": "valid_mask"},
                 )
             self._writer.add_asset(tag, f"{tag}.slc.zarr", **fields)
         header: dict[str, object] = {
@@ -721,7 +814,7 @@ class SceneWriter:
             "faninsar:wavelength_m": self.wavelength_m,
             "faninsar:grid_identity": self.grid_identity,
             "faninsar:flatten_stage": flatten_stage,
-            **dict(properties or {}),
+            **extra_properties,
         }
         if self.crs is not None:
             header["proj:code"] = self.crs
@@ -870,6 +963,16 @@ def _validate_store_compatibility(
         reject_invalid_state("scene artifact coordinate grids do not match")
 
 
+def _payload_window_shape(
+    shape: tuple[int, int],
+    window: tuple[int, int, int, int] | None,
+) -> tuple[int, int]:
+    """Return the 2-D shape of a local payload window."""
+    if window is None:
+        return shape
+    return (window[1] - window[0], window[3] - window[2])
+
+
 def _tag_swath(tag: str) -> str:
     """Extract the stable swath component from a production burst tag."""
     parts = tag.split("_")
@@ -886,6 +989,25 @@ NISAR_GEO_COVERAGE_POLICY = "reference_first_valid_row_major_v1"
 def valid_samples(values: np.ndarray) -> np.ndarray:
     """Return the finite, non-zero support mask of one complex payload."""
     return np.isfinite(values.real) & np.isfinite(values.imag) & (np.abs(values) > 0)
+
+
+def _pair_unit_support(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+    tag: str,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Return joint explicit support, or ``None`` when both units omit a mask."""
+    primary_mask = primary_store.read_valid_mask(tag)
+    secondary_mask = secondary_store.read_valid_mask(tag)
+    if primary_mask is None and secondary_mask is None:
+        return None
+    support = np.ones(shape, dtype=bool)
+    if primary_mask is not None:
+        support &= primary_mask
+    if secondary_mask is not None:
+        support &= secondary_mask
+    return support
 
 
 def _requires_nisar_geo_ownership(store: CoregisteredSceneStore) -> bool:
@@ -1000,6 +1122,87 @@ def validate_scene_ownership(store: CoregisteredSceneStore) -> None:
         )
 
 
+def _form_unit_pair_interferogram(
+    primary: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    support: np.ndarray | None,
+    flatten_screen: np.ndarray | None,
+    multilook: tuple[int, int],
+    goldstein_alpha: float,
+    device: str,
+    dask_client: object | None,
+    coherence_window: tuple[int, int] | None,
+    phase_filter: PhaseFilter | None,
+) -> InterferogramProduct:
+    """Form one unit-local interferogram through the Pair kernel."""
+    if support is not None:
+        primary = primary.copy()
+        secondary = secondary.copy()
+        invalid = ~support
+        primary[invalid] = np.nan + 1j * np.nan
+        secondary[invalid] = np.nan + 1j * np.nan
+    if flatten_screen is not None:
+        # Multiplying the secondary by exp(+j screen) makes the resulting
+        # native IFG carry the required exp(-j screen) before multilooking.
+        secondary = secondary * np.exp(1j * flatten_screen)
+    product = form_interferogram(
+        primary,
+        secondary,
+        multilook=multilook,
+        coherence_window=coherence_window,
+    )
+    if phase_filter is not None:
+        import torch
+
+        filter_device = device
+        if filter_device in {"", "auto"}:
+            filter_device = "cuda" if torch.cuda.is_available() else "cpu"
+        tensor = torch.as_tensor(product.complex, device=filter_device)
+        filter_support = torch.as_tensor(
+            product.valid_mask, dtype=torch.bool, device=filter_device
+        )
+        filtered = _apply_phase_filter_contract(phase_filter, tensor, filter_support)
+        result_ifg = filtered.interferogram.detach().cpu().numpy()
+        result_mask = filtered.valid_mask.detach().cpu().numpy()
+        result_ifg[~result_mask] = np.nan + 1j * np.nan
+        _, result_coh, result_phase = mask_invalid_looks(result_ifg, product.coherence)
+        assert result_coh is not None
+        return InterferogramProduct(
+            complex=result_ifg,
+            coherence=result_coh,
+            wrapped_phase=result_phase,
+            amplitude=np.abs(result_ifg).astype(np.float32),
+            valid_mask=result_mask,
+        )
+    if goldstein_alpha <= 0.0:
+        return product
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
+
+    if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
+        device, dask_client, kernel="goldstein_filter"
+    ):
+        from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
+
+        filtered = run_goldstein_filter(
+            product.complex,
+            alpha=goldstein_alpha,
+            window=32,
+            device=device,
+            client=dask_client,
+        )
+    else:
+        filtered = goldstein_filter(product.complex, alpha=goldstein_alpha)
+    filtered, coherence, wrapped = mask_invalid_looks(filtered, product.coherence)
+    assert coherence is not None
+    return InterferogramProduct(
+        complex=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        amplitude=np.abs(filtered).astype(np.float32),
+    )
+
+
 def form_merged_scene_interferogram(
     primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
@@ -1078,73 +1281,24 @@ def form_merged_scene_interferogram(
         ):
             primary, _ = primary_store.read(tag)
             secondary, _ = secondary_store.read(tag)
+            flatten_screen = None
             if flatten_stage == "interferogram":
-                screen = _phase_screen(secondary_store, tag) - _phase_screen(
+                flatten_screen = _phase_screen(secondary_store, tag) - _phase_screen(
                     primary_store, tag
                 )
-                # Multiplying the secondary by exp(+j screen) makes the
-                # resulting native IFG carry the required exp(-j screen)
-                # before the Pair kernel performs multilooking.
-                secondary = secondary * np.exp(1j * screen)
-            product = form_interferogram(
+            return _form_unit_pair_interferogram(
                 primary,
                 secondary,
+                support=_pair_unit_support(
+                    primary_store, secondary_store, tag, primary.shape
+                ),
+                flatten_screen=flatten_screen,
                 multilook=multilook,
+                goldstein_alpha=goldstein_alpha,
+                device=device,
+                dask_client=dask_client,
                 coherence_window=coherence_window,
-            )
-            if phase_filter is not None:
-                import torch
-
-                filter_device = device
-                if filter_device in {"", "auto"}:
-                    filter_device = "cuda" if torch.cuda.is_available() else "cpu"
-                tensor = torch.as_tensor(product.complex, device=filter_device)
-                support = torch.as_tensor(
-                    product.valid_mask, dtype=torch.bool, device=filter_device
-                )
-                filtered = _apply_phase_filter_contract(phase_filter, tensor, support)
-                result_ifg = filtered.interferogram.detach().cpu().numpy()
-                result_mask = filtered.valid_mask.detach().cpu().numpy()
-                result_ifg[~result_mask] = np.nan + 1j * np.nan
-                _, result_coh, result_phase = mask_invalid_looks(
-                    result_ifg, product.coherence
-                )
-                assert result_coh is not None
-                return InterferogramProduct(
-                    complex=result_ifg,
-                    coherence=result_coh,
-                    wrapped_phase=result_phase,
-                    amplitude=np.abs(result_ifg).astype(np.float32),
-                    valid_mask=result_mask,
-                )
-            if goldstein_alpha <= 0.0:
-                return product
-            from faninsar.processing.runtime.dask_gpu import should_accelerate
-
-            if (
-                dask_client is not None or device.lower() == "cuda"
-            ) and should_accelerate(device, dask_client, kernel="goldstein_filter"):
-                from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
-
-                filtered = run_goldstein_filter(
-                    product.complex,
-                    alpha=goldstein_alpha,
-                    window=32,
-                    device=device,
-                    client=dask_client,
-                )
-            else:
-                filtered = goldstein_filter(product.complex, alpha=goldstein_alpha)
-            filtered, coherence, wrapped = mask_invalid_looks(
-                filtered,
-                product.coherence,
-            )
-            assert coherence is not None
-            return InterferogramProduct(
-                complex=filtered,
-                coherence=coherence,
-                wrapped_phase=wrapped,
-                amplitude=np.abs(filtered).astype(np.float32),
+                phase_filter=phase_filter,
             )
 
     groups = (
@@ -1159,8 +1313,9 @@ def form_merged_scene_interferogram(
             for swath in sorted({_tag_swath(tag) for tag in primary_units})
         }
     )
-    group_products: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    group_products: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     looks_per_window = az_looks * rg_looks
+    explicit_support_used = False
     for group, tags in groups.items():
         ifg_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
         primary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
@@ -1171,6 +1326,16 @@ def form_merged_scene_interferogram(
         for tag in tags:
             primary, primary_unit = primary_store.read(tag)
             secondary, _ = secondary_store.read(tag)
+            support = _pair_unit_support(
+                primary_store, secondary_store, tag, primary.shape
+            )
+            if support is not None:
+                explicit_support_used = True
+                primary = primary.copy()
+                secondary = secondary.copy()
+                invalid = ~support
+                primary[invalid] = np.nan + 1j * np.nan
+                secondary[invalid] = np.nan + 1j * np.nan
             ifg = primary * np.conjugate(secondary)
             if flatten_stage == "interferogram":
                 ifg *= np.exp(
@@ -1182,7 +1347,11 @@ def form_merged_scene_interferogram(
                 )
             primary_power = primary.real**2 + primary.imag**2
             secondary_power = secondary.real**2 + secondary.imag**2
-            valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag) & (np.abs(ifg) > 0)
+            valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag)
+            if support is None:
+                valid &= np.abs(ifg) > 0
+            else:
+                valid &= support
             rows = primary_unit.row_origin + np.arange(primary_unit.shape[0])
             cols = primary_unit.col_origin + np.arange(primary_unit.shape[1])
             output_rows = rows[:, None] // az_looks
@@ -1256,15 +1425,21 @@ def form_merged_scene_interferogram(
                 np.nan,
             ).astype(np.float32)
         group_coherence[~has_data] = np.nan
-        group_products[group] = group_ifg, group_coherence
+        group_products[group] = group_ifg, group_coherence, has_data
 
     merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
     coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
+    merged_support = np.zeros((out_rows, out_cols), dtype=bool)
     for group in sorted(group_products):
-        group_ifg, group_coherence = group_products[group]
-        valid = np.abs(group_ifg) > 0
+        group_ifg, group_coherence, group_support = group_products[group]
+        valid = group_support if explicit_support_used else np.abs(group_ifg) > 0
         merged_ifg[valid] = group_ifg[valid]
         coherence[valid] = group_coherence[valid]
+        merged_support |= np.asarray(valid, dtype=bool)
+    if explicit_support_used:
+        merged_ifg = merged_ifg.copy()
+        merged_ifg[~merged_support] = np.nan + 1j * np.nan
+        coherence[~merged_support] = np.nan
     if phase_filter is not None:
         import torch
 
@@ -1298,13 +1473,25 @@ def form_merged_scene_interferogram(
             )
         else:
             merged_ifg = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
-    merged_ifg, coherence_out, wrapped = mask_invalid_looks(merged_ifg, coherence)
-    if phase_filter is not None:
-        valid_mask = (
-            filtered_mask & np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
-        )
+    if explicit_support_used:
+        if phase_filter is not None:
+            merged_support = filtered_mask & merged_support
+        coherence_out = coherence
+        wrapped = np.angle(merged_ifg).astype(np.float32)
+        wrapped[~merged_support] = np.nan
+        coherence_out = np.asarray(coherence_out, dtype=np.float32)
+        coherence_out[~merged_support] = np.nan
+        valid_mask = merged_support
     else:
-        valid_mask = np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
+        merged_ifg, coherence_out, wrapped = mask_invalid_looks(merged_ifg, coherence)
+        if phase_filter is not None:
+            valid_mask = (
+                filtered_mask
+                & np.isfinite(merged_ifg.real)
+                & np.isfinite(merged_ifg.imag)
+            )
+        else:
+            valid_mask = np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
     assert coherence_out is not None
     return InterferogramProduct(
         complex=merged_ifg,
@@ -1312,6 +1499,87 @@ def form_merged_scene_interferogram(
         wrapped_phase=wrapped,
         amplitude=np.abs(merged_ifg).astype(np.float32),
         valid_mask=valid_mask,
+    )
+
+
+def form_burst_scene_interferogram(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+    tag: str,
+    *,
+    multilook: tuple[int, int] = (1, 1),
+    goldstein_alpha: float = 0.0,
+    device: str = "auto",
+    dask_client: object | None = None,
+    flatten_stage: str = "coregistration",
+    coherence_window: tuple[int, int] | None = None,
+    phase_filter: PhaseFilter | None = None,
+) -> InterferogramProduct:
+    """Form one burst-local 2-D interferogram from a shared scene unit.
+
+    Unlike :func:`form_merged_scene_interferogram`, the result stays on the
+    unit payload after looks; parent-grid placement is the caller's metadata.
+
+    Parameters
+    ----------
+    primary_store, secondary_store : CoregisteredSceneStore
+        Persisted acquisition stores bound to the same Reference payloads.
+    tag : str
+        Shared unit identifier.
+    multilook : tuple[int, int], optional
+        Azimuth and range boxcar look factors on the unit payload.
+    goldstein_alpha : float, optional
+        Goldstein filter exponent. Zero disables filtering.
+    device : str, optional
+        Numerical device policy for the qualified Goldstein stage.
+    dask_client : object, optional
+        Explicitly trusted Dask client for qualified remote Goldstein work.
+    flatten_stage : {"coregistration", "interferogram"}, optional
+        Stage at which the NISAR range-offset phase screen is applied.
+    coherence_window : tuple[int, int] or None, optional
+        Coherence MLE support passed to the pair kernel.
+    phase_filter : PhaseFilter or None, optional
+        Runtime filter applied after multilooking.
+
+    Returns
+    -------
+    InterferogramProduct
+        Unit-local interferogram and quality layers.
+
+    """
+    common = _validate_pair_binding(primary_store, secondary_store)
+    if tag not in common:
+        reject_invalid_state(f"scene unit {tag!r} is not shared by both dates")
+    if flatten_stage not in {"coregistration", "interferogram"}:
+        reject_invalid_state("unsupported interferogram flattening stage")
+    if (
+        primary_store.flatten_stage != flatten_stage
+        or secondary_store.flatten_stage != flatten_stage
+    ):
+        reject_invalid_state("scene artifacts mix flattening stages")
+    az_looks, rg_looks = multilook
+    if az_looks < 1 or rg_looks < 1:
+        reject_invalid_state("multilook factors must be >= 1")
+    primary, primary_unit = primary_store.read(tag)
+    secondary, _ = secondary_store.read(tag)
+    if primary_unit.shape[0] // az_looks < 1 or primary_unit.shape[1] // rg_looks < 1:
+        reject_invalid_state("multilook factors exceed the burst unit")
+    flatten_screen = None
+    if flatten_stage == "interferogram":
+        flatten_screen = _phase_screen(secondary_store, tag) - _phase_screen(
+            primary_store, tag
+        )
+    return _form_unit_pair_interferogram(
+        primary,
+        secondary,
+        support=_pair_unit_support(primary_store, secondary_store, tag, primary.shape),
+        flatten_screen=flatten_screen,
+        multilook=multilook,
+        goldstein_alpha=goldstein_alpha,
+        device=device,
+        dask_client=dask_client,
+        coherence_window=coherence_window,
+        phase_filter=phase_filter,
     )
 
 
@@ -1723,6 +1991,7 @@ __all__ = [
     "SceneLayers",
     "SceneUnit",
     "SceneWriter",
+    "form_burst_scene_interferogram",
     "form_merged_scene_interferogram",
     "form_scene_interferograms",
     "scene_grid_identity",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import operator
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,44 @@ def digest_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def require_basename(value: object, field: str) -> str:
+    """Return ``value`` when it is a single path basename, else reject."""
+    if not isinstance(value, str):
+        reject_invalid_state(f"{field} must be a filename component")
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or len(candidate.parts) != 1
+        or candidate.name != value
+        or value in {"", ".", ".."}
+    ):
+        reject_invalid_state(f"{field} must be a basename: {value!r}")
+    return value
+
+
+def normalize_read_window(
+    window: object,
+    shape: tuple[int, ...],
+) -> tuple[slice, slice]:
+    """Validate a local half-open ``(r0, r1, c0, c1)`` window on a 2-D array."""
+    if len(shape) != 2:
+        reject_invalid_state("windowed Zarr reads require a 2-D array")
+    if not isinstance(window, tuple) or len(window) != 4:
+        reject_invalid_state("read window must be a 4-tuple of ints (r0, r1, c0, c1)")
+    if any(isinstance(value, bool) for value in window):
+        reject_invalid_state("read window must be a 4-tuple of ints (r0, r1, c0, c1)")
+    try:
+        r0, r1, c0, c1 = (operator.index(value) for value in window)
+    except TypeError:
+        reject_invalid_state("read window must be a 4-tuple of ints (r0, r1, c0, c1)")
+    rows, cols = int(shape[0]), int(shape[1])
+    if not (0 <= r0 < r1 <= rows and 0 <= c0 < c1 <= cols):
+        reject_invalid_state(
+            f"read window {window!r} is outside array shape {(rows, cols)}"
+        )
+    return slice(r0, r1), slice(c0, c1)
+
+
 def write_zarr_array(path: Path, value: np.ndarray) -> None:
     """Write one array as a self-contained Zarr directory."""
     import zarr
@@ -70,14 +109,46 @@ def write_zarr_array(path: Path, value: np.ndarray) -> None:
     array.attrs["faninsar:format"] = "stac-zarr"
 
 
-def read_zarr_array(path: Path) -> np.ndarray:
-    """Read one validated Zarr array from a canonical asset directory."""
+def read_zarr_array(
+    path: Path, window: tuple[int, int, int, int] | None = None
+) -> np.ndarray:
+    """Read one validated Zarr array, optionally a local 2-D window.
+
+    ``window`` is a half-open ``(r0, r1, c0, c1)`` in the array's own
+    coordinates. The slice is taken from the opened Zarr array before
+    materializing a full ndarray. ``None`` reads the whole array.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Canonical Zarr asset directory.
+    window : tuple of int, optional
+        Local half-open row/column window.
+
+    Returns
+    -------
+    numpy.ndarray
+        The selected samples.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the asset is missing or unsafe, or ``window`` is not a valid
+        in-bounds 2-D selection.
+
+    """
     import zarr
 
     if not path.is_dir() or path.is_symlink():
         reject_invalid_state(f"Zarr payload is missing or unsafe: {path}")
     try:
-        return np.asarray(zarr.open_array(store=str(path), mode="r"))
+        array = zarr.open_array(store=str(path), mode="r")
+        if window is None:
+            return np.asarray(array)
+        row_slice, col_slice = normalize_read_window(
+            window, tuple(int(size) for size in array.shape)
+        )
+        return np.asarray(array[row_slice, col_slice])
     except (OSError, ValueError, TypeError) as error:
         reject_invalid_state(f"Zarr payload cannot be read: {error}")
 
@@ -214,7 +285,9 @@ def validate_stac_item(
 
 __all__ = [
     "digest_path",
+    "normalize_read_window",
     "read_zarr_array",
+    "require_basename",
     "validate_spatial_metadata",
     "validate_stac_item",
     "write_stac_item",
