@@ -26,6 +26,7 @@ from faninsar.io.storage.scene_store import (
     write_scene,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.mosaicking import MergeSeam
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -413,8 +414,32 @@ def test_ifg_burst_id_must_be_a_basename(tmp_path: Path) -> None:
         )
 
 
-def test_radar_overlap_uses_parent_grid_azimuth_midpoint(tmp_path: Path) -> None:
-    """Selected IFG samples follow the parent-grid midpoint, not a blend."""
+def test_overlapping_units_reject_inferred_seams(tmp_path: Path) -> None:
+    """Overlap without physical seams or an owner raster fails closed."""
+    payload = np.ones((3, 1), dtype=np.complex64)
+    support = np.ones((3, 1), dtype=bool)
+    store, secondary = _write_pair(
+        tmp_path,
+        payload,
+        payload,
+        reference_units=[
+            *_scene_units(payload, tag="IW1_b0", valid_mask=support),
+            *_scene_units(payload, tag="IW1_b1", row_origin=1, valid_mask=support),
+        ],
+        secondary_units=[
+            *_scene_units(payload, tag="IW1_b0", valid_mask=support),
+            *_scene_units(payload, tag="IW1_b1", row_origin=1, valid_mask=support),
+        ],
+        grid_shape=(4, 1),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
+        build_scene_merge_layout(store)
+    with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
+        form_merged_scene_interferogram(store, secondary, multilook=(1, 1))
+
+
+def test_radar_overlap_follows_explicit_azimuth_seam(tmp_path: Path) -> None:
+    """Selected IFG samples follow a supplied physical seam, not a blend."""
     ones = np.ones((3, 1), dtype=np.complex64)
     later_secondary = np.full((3, 1), 1.0j, dtype=np.complex64)
     support = np.ones((3, 1), dtype=bool)
@@ -423,13 +448,27 @@ def test_radar_overlap_uses_parent_grid_azimuth_midpoint(tmp_path: Path) -> None
         ones,
         ones,
         reference_units=[
-            *_scene_units(ones, tag="IW1_b0", valid_mask=support),
-            *_scene_units(ones, tag="IW1_b1", row_origin=1, valid_mask=support),
+            *_scene_units(
+                ones, tag="IW1_b0", valid_mask=support, burst_id="IW1-anx0"
+            ),
+            *_scene_units(
+                ones,
+                tag="IW1_b1",
+                row_origin=1,
+                valid_mask=support,
+                burst_id="IW1-anx1000000",
+            ),
         ],
         secondary_units=[
-            *_scene_units(ones, tag="IW1_b0", valid_mask=support),
             *_scene_units(
-                later_secondary, tag="IW1_b1", row_origin=1, valid_mask=support
+                ones, tag="IW1_b0", valid_mask=support, burst_id="IW1-anx0"
+            ),
+            *_scene_units(
+                later_secondary,
+                tag="IW1_b1",
+                row_origin=1,
+                valid_mask=support,
+                burst_id="IW1-anx1000000",
             ),
         ],
         grid_shape=(4, 1),
@@ -443,10 +482,24 @@ def test_radar_overlap_uses_parent_grid_azimuth_midpoint(tmp_path: Path) -> None
         mask_path = store.unit_map()[tag].valid_mask_path
         assert mask_path is not None
         np.testing.assert_array_equal(read_zarr_array(mask_path), support)
+    layout = build_scene_merge_layout(
+        reference_store,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=2,
+                earlier_id="IW1-anx0",
+                later_id="IW1-anx1000000",
+            ),
+        ),
+    )
+    assert layout.source_ids == ("IW1-anx0", "IW1-anx1000000")
     product = form_merged_scene_interferogram(
         reference_store,
         secondary_store,
         multilook=(1, 1),
+        layout=layout,
+        native_tile=1,
     )
     expected = np.array([[1.0 + 0.0j], [1.0 + 0.0j], [-1.0j], [-1.0j]], dtype=np.complex64)
     np.testing.assert_allclose(product.complex, expected, atol=1e-6)
@@ -454,7 +507,7 @@ def test_radar_overlap_uses_parent_grid_azimuth_midpoint(tmp_path: Path) -> None
     assert bool(product.valid_mask.all())
 
 
-def test_merge_scene_slc_selects_parent_midpoint_samples(tmp_path: Path) -> None:
+def test_merge_scene_slc_selects_explicit_seam_samples(tmp_path: Path) -> None:
     """Explicit merged SLCs copy the preferred burst, not an average."""
     earlier = np.full((3, 1), 1.0 + 0.0j, dtype=np.complex64)
     later = np.full((3, 1), 2.0 + 0.0j, dtype=np.complex64)
@@ -465,14 +518,144 @@ def test_merge_scene_slc_selects_parent_midpoint_samples(tmp_path: Path) -> None
         reference_id=REFERENCE_ID,
         domain="radar",
         units=[
-            *_scene_units(earlier, tag="IW1_b0", valid_mask=support),
-            *_scene_units(later, tag="IW1_b1", row_origin=1, valid_mask=support),
+            *_scene_units(
+                earlier, tag="IW1_b0", valid_mask=support, burst_id="IW1-anx0"
+            ),
+            *_scene_units(
+                later,
+                tag="IW1_b1",
+                row_origin=1,
+                valid_mask=support,
+                burst_id="IW1-anx1000000",
+            ),
         ],
         grid_shape=(4, 1),
     )
-    layout = build_scene_merge_layout(store)
+    layout = build_scene_merge_layout(
+        store,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=2,
+                earlier_id="IW1-anx0",
+                later_id="IW1-anx1000000",
+            ),
+        ),
+    )
     selected = merge_scene_slc(store, layout=layout)
     expected = np.array([[1.0], [1.0], [2.0], [2.0]], dtype=np.complex64)
     np.testing.assert_array_equal(selected.complex, expected)
     assert selected.valid_mask.all()
     assert MERGED_SCENE_UNIT_TAG == "merged"
+
+
+def test_bounded_tiles_match_full_frame_across_seam_and_roi_hole(
+    tmp_path: Path,
+) -> None:
+    """Small native tiles match a large tile across a seam, Goldstein, and holes."""
+    rows, cols = 40, 32
+    earlier = np.ones((28, cols), dtype=np.complex64)
+    later = np.ones((28, cols), dtype=np.complex64)
+    earlier_secondary = np.ones((28, cols), dtype=np.complex64)
+    later_secondary = np.full((28, cols), 1.0j, dtype=np.complex64)
+    earlier_mask = np.ones((28, cols), dtype=bool)
+    later_mask = np.ones((28, cols), dtype=bool)
+    earlier_mask[4, 4] = False
+    later_mask[18, 4] = False
+    earlier[6, 6] = 0.0 + 0.0j
+    reference_store, secondary_store = _write_pair(
+        tmp_path,
+        earlier,
+        earlier_secondary,
+        reference_units=[
+            *_scene_units(
+                earlier,
+                tag="IW1_b0",
+                valid_mask=earlier_mask,
+                burst_id="IW1-anx0",
+            ),
+            *_scene_units(
+                later,
+                tag="IW1_b1",
+                row_origin=12,
+                valid_mask=later_mask,
+                burst_id="IW1-anx1000000",
+            ),
+        ],
+        secondary_units=[
+            *_scene_units(
+                earlier_secondary,
+                tag="IW1_b0",
+                valid_mask=earlier_mask,
+                burst_id="IW1-anx0",
+            ),
+            *_scene_units(
+                later_secondary,
+                tag="IW1_b1",
+                row_origin=12,
+                valid_mask=later_mask,
+                burst_id="IW1-anx1000000",
+            ),
+        ],
+        grid_shape=(rows, cols),
+    )
+    for store, tag, mask in (
+        (reference_store, "IW1_b0", earlier_mask),
+        (reference_store, "IW1_b1", later_mask),
+        (secondary_store, "IW1_b0", earlier_mask),
+        (secondary_store, "IW1_b1", later_mask),
+    ):
+        mask_path = store.unit_map()[tag].valid_mask_path
+        assert mask_path is not None
+        np.testing.assert_array_equal(read_zarr_array(mask_path), mask)
+    layout = build_scene_merge_layout(
+        reference_store,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=20,
+                earlier_id="IW1-anx0",
+                later_id="IW1-anx1000000",
+            ),
+        ),
+    )
+    unfiltered = form_merged_scene_interferogram(
+        reference_store,
+        secondary_store,
+        multilook=(1, 1),
+        coherence_window=(5, 5),
+        layout=layout,
+        native_tile=8,
+    )
+    assert unfiltered.valid_mask is not None
+    assert not bool(unfiltered.valid_mask[4, 4])
+    assert not bool(unfiltered.valid_mask[30, 4])
+    assert bool(unfiltered.valid_mask[6, 6])
+    np.testing.assert_allclose(unfiltered.complex[6, 6], 0.0 + 0.0j, atol=1e-6)
+    np.testing.assert_allclose(unfiltered.complex[0, 0], 1.0 + 0.0j, atol=1e-6)
+    np.testing.assert_allclose(unfiltered.complex[36, 0], 0.0 - 1.0j, atol=1e-6)
+    assert np.isfinite(unfiltered.coherence[20, 10])
+    small = form_merged_scene_interferogram(
+        reference_store,
+        secondary_store,
+        multilook=(1, 1),
+        coherence_window=(5, 5),
+        goldstein_alpha=0.5,
+        layout=layout,
+        native_tile=8,
+    )
+    large = form_merged_scene_interferogram(
+        reference_store,
+        secondary_store,
+        multilook=(1, 1),
+        coherence_window=(5, 5),
+        goldstein_alpha=0.5,
+        layout=layout,
+        native_tile=512,
+    )
+    np.testing.assert_allclose(small.complex, large.complex, atol=1e-5)
+    np.testing.assert_allclose(small.coherence, large.coherence, atol=1e-5, equal_nan=True)
+    np.testing.assert_array_equal(small.valid_mask, large.valid_mask)
+    assert small.valid_mask is not None
+    assert not bool(small.valid_mask[4, 4])
+    assert not bool(small.valid_mask[30, 4])

@@ -12,13 +12,20 @@ from tests.support.scene_stores import write_test_scene
 
 from faninsar.io.storage.ifg_store import InterferogramArtifactStore, ifg_artifact_dir
 from faninsar.io.storage._zarr_stac import read_zarr_array
-from faninsar.io.storage.merge_layout import LAYOUT_KIND, open_merge_layout
+from faninsar.io.storage.merge_layout import (
+    LAYOUT_KIND,
+    open_merge_layout,
+    publish_merge_layout,
+)
 from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import (
     MERGED_SCENE_UNIT_TAG,
     CoregisteredSceneStore,
+    build_scene_merge_layout,
     write_scene,
 )
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.mosaicking import MergeSeam
 from faninsar.stack.session import Stack
 
 if TYPE_CHECKING:
@@ -46,6 +53,21 @@ def _two_date_stack(tmp_path: Path) -> Stack:
             reference_payload=reference,
             tag=("IW1_b0", "IW1_b1"),
         )
+    reference_store = CoregisteredSceneStore.open(
+        stack.config.work_dir / "coreg" / dates[0]
+    )
+    layout = build_scene_merge_layout(
+        reference_store,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=1,
+                earlier_id="IW1_b0",
+                later_id="IW1_b1",
+            ),
+        ),
+    )
+    publish_merge_layout(stack.config.work_dir / "layout" / dates[0], layout)
     return stack
 
 
@@ -156,10 +178,10 @@ def test_merged_scene_product_is_distinct_from_burst_date_root(
     assert stack._scene_stores()["20160113"].root == burst_root
 
 
-def test_publish_merged_scenes_writes_layout_and_keeps_burst_root(
+def test_publish_merged_scenes_consumes_layout_and_keeps_burst_root(
     tmp_path: Path,
 ) -> None:
-    """Explicit scene merge publishes layout plus distinct merged SLCs."""
+    """Explicit scene merge consumes the committed layout and keeps burst SLCs."""
     stack = _two_date_stack(tmp_path)
     burst_root = stack.config.work_dir / "coreg" / "20160113"
     burst = CoregisteredSceneStore.open(burst_root)
@@ -185,3 +207,29 @@ def test_publish_merged_scenes_writes_layout_and_keeps_burst_root(
     assert layout.source_ids == ("IW1_b0", "IW1_b1")
     assert "merged" not in stack._scene_stores()
     assert stack._scene_stores()["20160113"].root == burst_root
+
+
+def test_form_interferograms_rejects_overlap_without_committed_layout(
+    tmp_path: Path,
+) -> None:
+    """Merged formation fails closed when overlapping units have no layout product."""
+    dates = ("20160101", "20160113")
+    safe_paths = []
+    for date_id in dates:
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
+        path.mkdir()
+        safe_paths.append(path)
+    stack = LocalStack.from_paths(safe_paths, work_dir=tmp_path / "out")
+    stack.prepare_data()
+    payload = np.ones((2, 3), dtype=np.complex64)
+    for date_id in dates:
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=date_id,
+            reference_id=dates[0],
+            payload=payload,
+            reference_payload=payload,
+            tag=("IW1_b0", "IW1_b1"),
+        )
+    with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
+        stack.form_interferograms(multilook=(1, 1), phase_filter=None)

@@ -45,10 +45,10 @@ from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import (
     MERGED_SCENE_UNIT_TAG,
     CoregisteredSceneStore,
-    build_scene_merge_layout,
     form_burst_scene_interferogram,
     form_merged_scene_interferogram,
     merge_scene_slc,
+    scene_units_overlap,
     validate_reference_binding,
     write_scene,
 )
@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.mosaicking.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.windows import MergeLayoutWindow
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
@@ -4319,35 +4320,67 @@ class Stack(NetworkContract, ABC):
                 "coregister_scenes(merge=True) requires io.storage.merge_layout"
             )
 
-    def _ensure_merge_layout(
-        self,
-        reference: CoregisteredSceneStore,
-        polygon: int | None,
-        *,
-        overwrite: bool,
-    ) -> Product:
-        """Publish or reuse the Reference merge layout of one ROI subtree."""
+    def _open_committed_layout(self, polygon: int | None) -> Product | None:
+        """Open the Reference merge layout at ``layout/{reference}[/pN]``.
+
+        The path is canonical. This method does not fall back to another ROI's
+        layout, including the unsuffixed ``layout/{reference}`` product, when
+        ``pN`` is requested.
+
+        Returns
+        -------
+        Product or None
+            The layout product, or ``None`` when no layout was published at
+            the canonical path.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If a layout exists but its write id disagrees with the Reference
+            ``faninsar:layout_id`` / ``inputs.layout`` binding, or its merge
+            scope disagrees with the Reference scene.
+
+        """
         from faninsar.io.storage.merge_layout import LAYOUT_KIND, open_merge_layout
-        from faninsar.io.storage.product import open_product
 
-        layout = build_scene_merge_layout(reference)
         target = self._layout_dir(polygon)
-        if (target / "item.json").is_file() and not overwrite:
-            existing = open_merge_layout(target)
-            if (
-                existing.scope.reference_id != layout.scope.reference_id
-                or existing.scope.grid_identity != layout.scope.grid_identity
-                or existing.window != layout.window
-                or existing.source_ids != layout.source_ids
-            ):
+        if not (target / "item.json").is_file():
+            return None
+        product = open_product(target, kind=LAYOUT_KIND)
+        layout = open_merge_layout(product)
+        reference = self._reference_scene_for(polygon)
+        if reference is not None:
+            expected = reference.layout_id or str(reference.inputs.get("layout") or "")
+            if expected and expected != product.write_id:
                 reject_invalid_state(
-                    "persisted merge_layout does not match the current Reference; "
-                    "pass overwrite=True"
+                    "committed merge_layout write_id does not match the "
+                    "Reference layout binding"
                 )
-            return open_product(target, kind=LAYOUT_KIND)
-        from faninsar.io.storage.merge_layout import publish_merge_layout
+            if layout.scope.reference_id != reference.reference_id:
+                reject_invalid_state(
+                    "committed merge_layout reference_id does not match the "
+                    "Reference scene"
+                )
+            if layout.scope.grid_identity != reference.grid_identity:
+                reject_invalid_state(
+                    "committed merge_layout grid_identity does not match the "
+                    "Reference scene"
+                )
+            if layout.scope.domain != reference.domain:
+                reject_invalid_state(
+                    "committed merge_layout domain does not match the Reference scene"
+                )
+        return product
 
-        return publish_merge_layout(target, layout, overwrite=overwrite)
+    def _require_committed_layout(self, polygon: int | None) -> Product:
+        """Return the committed layout or reject overlapping-merge work."""
+        product = self._open_committed_layout(polygon)
+        if product is None:
+            reject_invalid_state(
+                "committed merge_layout is missing; publish the Reference "
+                "layout before merging scenes or forming merged interferograms"
+            )
+        return product
 
     def _publish_merged_scenes(
         self,
@@ -4364,10 +4397,10 @@ class Stack(NetworkContract, ABC):
                 reject_invalid_state(
                     "merged scene publication requires a Reference scene product"
                 )
-            layout_product = self._ensure_merge_layout(
-                reference, polygon, overwrite=overwrite
-            )
-            layout = build_scene_merge_layout(reference)
+            layout_product = self._require_committed_layout(polygon)
+            from faninsar.io.storage.merge_layout import open_merge_layout
+
+            layout = open_merge_layout(layout_product)
             stores = self._scene_stores(polygon)
             for date_id, store in stores.items():
                 if date_id != self.reference and date_id not in date_set:
@@ -4631,14 +4664,21 @@ class Stack(NetworkContract, ABC):
             polygon: self._scene_stores(polygon) for polygon in polygons
         }
         layout_ids: dict[int | None, str] = {}
+        layouts: dict[int | None, MergeLayoutWindow] = {}
         if merge:
+            from faninsar.io.storage.merge_layout import open_merge_layout
+
             for polygon in polygons:
-                reference = self._reference_scene_for(polygon)
-                if reference is None:
+                layout_product = self._open_committed_layout(polygon)
+                if layout_product is None:
+                    reference = self._reference_scene_for(polygon)
+                    if reference is not None and scene_units_overlap(reference):
+                        reject_invalid_state(
+                            "overlapping scene units require a committed "
+                            "physical merge_layout"
+                        )
                     continue
-                layout_product = self._ensure_merge_layout(
-                    reference, polygon, overwrite=overwrite
-                )
+                layouts[polygon] = open_merge_layout(layout_product)
                 layout_ids[polygon] = layout_product.write_id
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
@@ -4709,9 +4749,18 @@ class Stack(NetworkContract, ABC):
                             polygon=polygon,
                         )
                         if tag is None:
-                            row_origin = 0
-                            col_origin = 0
-                            look_origin = (0, 0)
+                            layout = layouts.get(polygon)
+                            if layout is not None:
+                                window = layout.window
+                                first_i = (int(window[0]) + az_l - 1) // az_l
+                                first_j = (int(window[2]) + rg_l - 1) // rg_l
+                                row_origin = int(first_i * az_l)
+                                col_origin = int(first_j * rg_l)
+                                look_origin = (int(first_i), int(first_j))
+                            else:
+                                row_origin = 0
+                                col_origin = 0
+                                look_origin = (0, 0)
                         else:
                             unit = primary_store.unit_map()[tag]
                             row_origin = unit.row_origin
@@ -4833,6 +4882,7 @@ class Stack(NetworkContract, ABC):
                                     device=self.config.device,
                                     dask_client=self.dask_client,
                                     flatten_stage=flatten_stage,
+                                    layout=layouts.get(polygon),
                                 )
                             else:
                                 if tag is None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -36,7 +35,7 @@ from faninsar.processing.mosaicking import (
     build_merge_layout,
     merge_bursts,
 )
-from faninsar.processing.mosaicking.windows import intersect_windows
+from faninsar.processing.mosaicking.windows import intersect_windows, window_slices
 
 SCENE_KIND = "scene"
 MERGED_SCENE_UNIT_TAG = "merged"
@@ -1149,38 +1148,69 @@ def _scene_merge_scope(store: CoregisteredSceneStore) -> MergeScope:
     )
 
 
-def _parent_azimuth_seams(units: Sequence[SceneUnit]) -> tuple[MergeSeam, ...]:
-    """Return midpoint cuts from parent-grid overlap, never from a ROI crop."""
-    by_swath: dict[str, list[SceneUnit]] = {}
-    for unit in units:
-        by_swath.setdefault(_tag_swath(unit.tag), []).append(unit)
-    seams: list[MergeSeam] = []
-    for group in by_swath.values():
-        ordered = sorted(
-            group, key=lambda item: (item.row_origin, item.col_origin, item.tag)
-        )
-        for earlier, later in pairwise(ordered):
-            row0 = max(earlier.row_origin, later.row_origin)
-            row1 = min(
-                earlier.row_origin + earlier.shape[0],
-                later.row_origin + later.shape[0],
-            )
-            col0 = max(earlier.col_origin, later.col_origin)
-            col1 = min(
-                earlier.col_origin + earlier.shape[1],
-                later.col_origin + later.shape[1],
-            )
-            if row1 <= row0 or col1 <= col0:
-                continue
-            seams.append(
-                MergeSeam(
-                    "azimuth",
-                    (row0 + row1) // 2,
-                    _unit_burst_id(earlier),
-                    _unit_burst_id(later),
-                )
-            )
-    return tuple(seams)
+def _scene_units_overlap(units: Sequence[SceneUnit]) -> bool:
+    """Return whether any two scene units share parent-grid samples."""
+    ordered = tuple(units)
+    for index, left in enumerate(ordered):
+        left_window = _unit_parent_window(left)
+        for right in ordered[index + 1 :]:
+            if intersect_windows(left_window, _unit_parent_window(right)) is not None:
+                return True
+    return False
+
+
+def scene_units_overlap(store: CoregisteredSceneStore) -> bool:
+    """Return whether any two units of ``store`` share parent-grid samples.
+
+    Parameters
+    ----------
+    store : CoregisteredSceneStore
+        Scene product to inspect.
+
+    Returns
+    -------
+    bool
+        ``True`` when any pair of units intersects on the parent grid.
+
+    """
+    return _scene_units_overlap(store.units)
+
+
+def _crop_merge_layout(
+    layout: MergeLayoutWindow, window: tuple[int, int, int, int]
+) -> MergeLayoutWindow | None:
+    """Return ``layout`` restricted to ``window``, or ``None`` if empty."""
+    overlap = intersect_windows(layout.window, _as_merge_window(window))
+    if overlap is None:
+        return None
+    rows, cols = window_slices(layout.window, overlap)
+    support = np.asarray(layout.scientific_support[rows, cols], dtype=bool)
+    if not np.any(support):
+        return None
+    return MergeLayoutWindow(
+        scope=layout.scope,
+        window=overlap,
+        source_ids=layout.source_ids,
+        owner=np.asarray(layout.owner[rows, cols]),
+        scientific_support=support,
+        seams=layout.seams,
+        source_windows=layout.source_windows,
+    )
+
+
+def _complete_look_indices(
+    native_window: tuple[int, int, int, int],
+    multilook: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return ``(first_i, last_i, first_j, last_j)`` complete global looks."""
+    az_looks, rg_looks = multilook
+    row0, row1, col0, col1 = native_window
+    return (
+        (row0 + az_looks - 1) // az_looks,
+        row1 // az_looks,
+        (col0 + rg_looks - 1) // rg_looks,
+        col1 // rg_looks,
+    )
 
 
 def _local_read_window(
@@ -1253,24 +1283,141 @@ def _read_unit_on_layout(
     return _as_merge_window(overlap), payload, support
 
 
+def _expand_native_window(
+    window: tuple[int, int, int, int],
+    *,
+    halo: tuple[int, int],
+    clip: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Expand ``window`` by ``halo`` and clip it to ``clip``."""
+    row0, row1, col0, col1 = window
+    halo_az, halo_rg = halo
+    expanded = (
+        int(row0) - int(halo_az),
+        int(row1) + int(halo_az),
+        int(col0) - int(halo_rg),
+        int(col1) + int(halo_rg),
+    )
+    overlap = intersect_windows(_as_merge_window(expanded), _as_merge_window(clip))
+    if overlap is None:
+        reject_invalid_state("native tile does not intersect the merge layout window")
+    return overlap
+
+
+def _validate_consumed_layout(
+    layout: MergeLayoutWindow,
+    store: CoregisteredSceneStore,
+) -> None:
+    """Reject a layout that does not belong to this scene grid."""
+    if not isinstance(layout, MergeLayoutWindow):
+        reject_invalid_state(
+            "form_merged_scene_interferogram requires a MergeLayoutWindow"
+        )
+    if layout.scope.domain != store.domain:
+        reject_invalid_state(
+            "committed merge_layout domain does not match the scene product"
+        )
+    if layout.scope.grid_identity != store.grid_identity:
+        reject_invalid_state(
+            "committed merge_layout grid_identity does not match the scene product"
+        )
+    if layout.scope.reference_id != store.reference_id:
+        reject_invalid_state(
+            "committed merge_layout reference_id does not match the scene product"
+        )
+
+
+def _pair_burst_windows(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+    tags: Sequence[str],
+    *,
+    layout: MergeLayoutWindow,
+    flatten_stage: str,
+) -> list[BurstWindow]:
+    """Read unit-local pair fields that intersect ``layout.window``."""
+    source_ids = set(layout.source_ids)
+    primary_units = primary_store.unit_map()
+    products: list[BurstWindow] = []
+    for tag in tags:
+        unit = primary_units[tag]
+        burst_id = _unit_burst_id(unit)
+        if burst_id not in source_ids:
+            continue
+        local_window = _local_read_window(unit, layout.window)
+        if local_window is None:
+            continue
+        read_window = (
+            None
+            if local_window == (0, int(unit.shape[0]), 0, int(unit.shape[1]))
+            else local_window
+        )
+        primary, _ = primary_store.read(tag, window=read_window)
+        secondary, _ = secondary_store.read(tag, window=read_window)
+        if flatten_stage == "interferogram":
+            screen = _phase_screen(
+                secondary_store, tag, window=read_window
+            ) - _phase_screen(primary_store, tag, window=read_window)
+            secondary = secondary * np.exp(1j * screen)
+        support = _unit_scientific_support(
+            primary_store,
+            secondary_store,
+            tag,
+            primary,
+            secondary,
+            read_window,
+        )
+        overlap = intersect_windows(_unit_parent_window(unit), layout.window)
+        if overlap is None:
+            continue
+        products.append(
+            BurstWindow(
+                scope=layout.scope,
+                burst_id=burst_id,
+                acquisitions=(primary_store.date_id, secondary_store.date_id),
+                write_ids=(primary_store.write_id, secondary_store.write_id),
+                phase_convention="wrapped_primary_conj_secondary",
+                window=_as_merge_window(overlap),
+                complex=np.asarray(
+                    primary * np.conjugate(secondary), dtype=np.complex64
+                ),
+                valid_mask=support,
+                primary_power=np.asarray(
+                    primary.real**2 + primary.imag**2, dtype=np.float32
+                ),
+                secondary_power=np.asarray(
+                    secondary.real**2 + secondary.imag**2, dtype=np.float32
+                ),
+            )
+        )
+    return products
+
+
 def build_scene_merge_layout(
     store: CoregisteredSceneStore,
     *,
     window: tuple[int, int, int, int] | None = None,
+    seams: Sequence[MergeSeam] = (),
+    owner: np.ndarray | None = None,
 ) -> MergeLayoutWindow:
-    """Assemble a parent-geometry merge layout from one scene product.
+    """Assemble a merge layout from scene support without inventing cuts.
 
-    Radar azimuth seams are overlap midpoints on the uncropped parent grid.
-    Geographic overlap stays unowned. ``scope.reference_id`` is the
-    acquisition key; this helper does not bind a Reference write id.
+    Overlapping units require caller-supplied physical ``seams`` or a finished
+    ``owner`` raster. This helper never infers midpoints from ROI-cropped
+    ``row_origin``/``shape``. ``scope.reference_id`` is the acquisition key
+    and is not a product write id.
 
     Parameters
     ----------
     store : CoregisteredSceneStore
-        Typically the Stack Reference scene whose burst geometry owns the
-        layout.
+        Typically the Stack Reference scene.
     window : tuple of int, optional
         Layout window. Default is the full parent scene grid.
+    seams : sequence of MergeSeam, optional
+        Physical cuts from mission parent geometry. Required when units
+        overlap and ``owner`` is omitted.
+    owner : numpy.ndarray, optional
+        Finished preferred-owner labels on ``window``.
 
     Returns
     -------
@@ -1280,12 +1427,18 @@ def build_scene_merge_layout(
     Raises
     ------
     InvalidProcessingStateError
-        If no unit intersects the layout window.
+        If no unit intersects the window, or overlapping units are supplied
+        without physical seams or an owner raster.
 
     """
     layout_window = (
         _as_merge_window(window) if window is not None else _scene_parent_window(store)
     )
+    if _scene_units_overlap(store.units) and not seams and owner is None:
+        reject_invalid_state(
+            "overlapping scene units require a committed physical merge_layout; "
+            "do not infer seams from ROI-cropped origins"
+        )
     sources: list[LayoutSourceWindow] = []
     for unit in store.units:
         loaded = _read_unit_on_layout(store, unit, layout_window)
@@ -1302,11 +1455,11 @@ def build_scene_merge_layout(
         )
     if not sources:
         reject_invalid_state("scene product has no unit inside the merge window")
-    seams = _parent_azimuth_seams(store.units) if store.domain == "radar" else ()
     return build_merge_layout(
         sources,
         scope=_scene_merge_scope(store),
         seams=seams,
+        owner=owner,
         window=layout_window,
     )
 
@@ -1571,17 +1724,22 @@ def form_merged_scene_interferogram(
     flatten_stage: str = "coregistration",
     coherence_window: tuple[int, int] | None = None,
     phase_filter: PhaseFilter | None = None,
+    layout: MergeLayoutWindow | None = None,
+    native_tile: int = 512,
 ) -> InterferogramProduct:
-    """Form one common-grid complex IFG from all persisted scene units.
+    """Form one looked IFG from selected native pair fields.
 
     Native per-burst cross-products and endpoint powers are selected with
-    :func:`~faninsar.processing.mosaicking.merge_bursts` on a parent-grid
-    midpoint layout, then looked by
+    :func:`~faninsar.processing.mosaicking.merge_bursts` on the committed
+    Reference :class:`~faninsar.processing.mosaicking.windows.MergeLayoutWindow`,
+    then looked by
     :func:`~faninsar.processing.interferometry.pair.form_interferogram_from_fields`.
-    Radar azimuth seams are parent-grid overlap midpoints, never ROI-crop
-    inferences. Geographic overlap stays unowned unless a finished owner map
-    is supplied. Explicit ``valid_mask`` assets keep supported zero-amplitude
-    samples, including two-sample cancellation looks.
+    Overlapping coverage requires that layout (or explicit seams when building
+    a generic non-production helper). This function never infers physical cuts
+    from ROI-cropped ``row_origin``/``shape``. Bounded native tiles cover
+    complete looks plus the coherence halo; the returned object is the assembled
+    looked interferogram. Explicit ``valid_mask`` assets keep supported
+    zero-amplitude samples, including two-sample cancellation looks.
 
     Parameters
     ----------
@@ -1603,13 +1761,19 @@ def form_merged_scene_interferogram(
         Coherence MLE support passed to the pair kernel. ``None`` computes
         direct MLE in each multilook block.
     phase_filter : PhaseFilter or None, optional
-        Runtime filter applied after multilooking. ``None`` leaves the
-        multilooked complex interferogram unchanged.
+        Runtime filter applied after the assembled looked interferogram.
+        ``None`` leaves the multilooked complex interferogram unchanged.
+    layout : MergeLayoutWindow, optional
+        Committed Reference owner map. ``None`` is allowed only for
+        non-overlapping unique coverage (generic NISAR).
+    native_tile : int, optional
+        Maximum native pixel extent of one formation tile before the
+        coherence halo. Default ``512``.
 
     Returns
     -------
     InterferogramProduct
-        One merged common-grid interferogram and its quality layers.
+        Looked interferogram covering the complete looks in ``layout.window``.
 
     """
     common = _validate_pair_binding(primary_store, secondary_store)
@@ -1622,99 +1786,90 @@ def form_merged_scene_interferogram(
         reject_invalid_state("scene artifacts mix flattening stages")
     validate_scene_ownership(primary_store)
     validate_scene_ownership(secondary_store)
-    all_units = primary_store.unit_map()
-    primary_units = {tag: all_units[tag] for tag in common}
     az_looks, rg_looks = multilook
-    if az_looks < 1 or rg_looks < 1:
+    if (
+        type(az_looks) is not int
+        or type(rg_looks) is not int
+        or az_looks < 1
+        or rg_looks < 1
+    ):
         reject_invalid_state("multilook factors must be >= 1")
-    out_rows = primary_store.grid_shape[0] // az_looks
-    out_cols = primary_store.grid_shape[1] // rg_looks
-    if out_rows < 1 or out_cols < 1:
-        reject_invalid_state("multilook factors exceed the common scene grid")
-    layout_window = _scene_parent_window(primary_store)
-    units = [primary_units[tag] for tag in common]
-    scope = _scene_merge_scope(primary_store)
-    sources: list[LayoutSourceWindow] = []
-    products: list[BurstWindow] = []
-    for tag in common:
-        unit = primary_units[tag]
-        local_window = _local_read_window(unit, layout_window)
-        if local_window is None:
-            continue
-        read_window = (
-            None
-            if local_window == (0, unit.shape[0], 0, unit.shape[1])
-            else local_window
-        )
-        primary, _ = primary_store.read(tag, window=read_window)
-        secondary, _ = secondary_store.read(tag, window=read_window)
-        if flatten_stage == "interferogram":
-            screen = _phase_screen(
-                secondary_store, tag, window=read_window
-            ) - _phase_screen(primary_store, tag, window=read_window)
-            secondary = secondary * np.exp(1j * screen)
-        support = _unit_scientific_support(
-            primary_store,
-            secondary_store,
-            tag,
-            primary,
-            secondary,
-            read_window,
-        )
-        overlap = intersect_windows(_unit_parent_window(unit), layout_window)
-        if overlap is None:
-            continue
-        overlap = _as_merge_window(overlap)
-        burst_id = _unit_burst_id(unit)
-        sources.append(
-            LayoutSourceWindow(
-                burst_id=burst_id,
-                window=overlap,
-                scientific_support=support,
-                swath=_tag_swath(unit.tag),
+    if type(native_tile) is not int or native_tile < 1:
+        reject_invalid_state("native_tile must be a positive int")
+    if layout is None:
+        layout = build_scene_merge_layout(primary_store)
+    else:
+        _validate_consumed_layout(layout, primary_store)
+    first_i, last_i, first_j, last_j = _complete_look_indices(layout.window, multilook)
+    n_i = last_i - first_i
+    n_j = last_j - first_j
+    if n_i < 1 or n_j < 1:
+        reject_invalid_state("multilook factors exceed the merge layout window")
+    halo = (0, 0)
+    if coherence_window is not None:
+        halo = (int(coherence_window[0]) // 2, int(coherence_window[1]) // 2)
+    look_tile_az = max(1, native_tile // az_looks)
+    look_tile_rg = max(1, native_tile // rg_looks)
+    assembled_complex = np.full((n_i, n_j), np.nan + 1j * np.nan, dtype=np.complex64)
+    assembled_coh = np.full((n_i, n_j), np.nan, dtype=np.float32)
+    assembled_mask = np.zeros((n_i, n_j), dtype=bool)
+    for i0 in range(first_i, last_i, look_tile_az):
+        i1 = min(i0 + look_tile_az, last_i)
+        for j0 in range(first_j, last_j, look_tile_rg):
+            j1 = min(j0 + look_tile_rg, last_j)
+            out_native = (
+                int(i0 * az_looks),
+                int(i1 * az_looks),
+                int(j0 * rg_looks),
+                int(j1 * rg_looks),
             )
-        )
-        products.append(
-            BurstWindow(
-                scope=scope,
-                burst_id=burst_id,
-                acquisitions=(primary_store.date_id, secondary_store.date_id),
-                write_ids=(primary_store.write_id, secondary_store.write_id),
-                phase_convention="wrapped_primary_conj_secondary",
-                window=overlap,
-                complex=np.asarray(
-                    primary * np.conjugate(secondary), dtype=np.complex64
-                ),
-                valid_mask=support,
-                primary_power=np.asarray(
-                    primary.real**2 + primary.imag**2, dtype=np.float32
-                ),
-                secondary_power=np.asarray(
-                    secondary.real**2 + secondary.imag**2, dtype=np.float32
-                ),
+            read_native = _expand_native_window(
+                out_native, halo=halo, clip=layout.window
             )
-        )
-    if not sources:
-        reject_invalid_state("scene products share no unit inside the merge window")
-    seams = _parent_azimuth_seams(units) if primary_store.domain == "radar" else ()
-    layout = build_merge_layout(
-        sources,
-        scope=scope,
-        seams=seams,
-        window=layout_window,
-    )
-    selected = merge_bursts(products, layout=layout)
-    if selected.primary_power is None or selected.secondary_power is None:
-        reject_invalid_state("selected merge window is missing endpoint powers")
-    product = form_interferogram_from_fields(
-        selected.complex,
-        selected.primary_power,
-        selected.secondary_power,
-        selected.valid_mask,
-        native_origin=(int(layout.window[0]), int(layout.window[2])),
-        output_window=_as_merge_window(layout.window),
-        multilook=multilook,
-        coherence_window=coherence_window,
+            cropped = _crop_merge_layout(layout, read_native)
+            if cropped is None:
+                continue
+            products = _pair_burst_windows(
+                primary_store,
+                secondary_store,
+                common,
+                layout=cropped,
+                flatten_stage=flatten_stage,
+            )
+            if not products:
+                continue
+            selected = merge_bursts(products, layout=cropped)
+            if selected.primary_power is None or selected.secondary_power is None:
+                reject_invalid_state("selected merge window is missing endpoint powers")
+            piece = form_interferogram_from_fields(
+                selected.complex,
+                selected.primary_power,
+                selected.secondary_power,
+                selected.valid_mask,
+                native_origin=(int(cropped.window[0]), int(cropped.window[2])),
+                output_window=_as_merge_window(out_native),
+                multilook=multilook,
+                coherence_window=coherence_window,
+            )
+            dest = (
+                slice(i0 - first_i, i1 - first_i),
+                slice(j0 - first_j, j1 - first_j),
+            )
+            assembled_complex[dest] = piece.complex
+            assembled_coh[dest] = piece.coherence
+            if piece.valid_mask is not None:
+                assembled_mask[dest] = piece.valid_mask
+    wrapped = np.angle(assembled_complex).astype(np.float32)
+    amplitude = np.abs(assembled_complex).astype(np.float32)
+    wrapped[~assembled_mask] = np.nan
+    amplitude[~assembled_mask] = np.nan
+    assembled_coh[~assembled_mask] = np.nan
+    product = InterferogramProduct(
+        complex=assembled_complex,
+        coherence=assembled_coh,
+        wrapped_phase=wrapped,
+        amplitude=amplitude,
+        valid_mask=assembled_mask,
     )
     return _finish_looked_interferogram(
         product,
@@ -2221,6 +2376,7 @@ __all__ = [
     "form_scene_interferograms",
     "merge_scene_slc",
     "scene_grid_identity",
+    "scene_units_overlap",
     "valid_samples",
     "validate_reference_binding",
     "validate_scene_ownership",
