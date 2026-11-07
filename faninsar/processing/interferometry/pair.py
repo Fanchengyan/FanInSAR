@@ -322,6 +322,233 @@ def _block_finite_mean(array: np.ndarray, multilook: tuple[int, int]) -> np.ndar
     return output
 
 
+def _sliding_coherence_from_fields(
+    cross: np.ndarray,
+    primary_power: np.ndarray,
+    secondary_power: np.ndarray,
+    valid_mask: np.ndarray,
+    window: tuple[int, int],
+) -> np.ndarray:
+    """Native-window MLE ratios from selected cross-products and powers."""
+    from scipy.ndimage import uniform_filter
+
+    size = (int(window[0]), int(window[1]))
+    support = np.asarray(valid_mask, dtype=bool)
+    cross_z = np.where(support, cross, 0).astype(np.complex128)
+    power_pri = np.where(support, primary_power, 0).astype(np.float64)
+    power_sec = np.where(support, secondary_power, 0).astype(np.float64)
+
+    def box(values: np.ndarray) -> np.ndarray:
+        return uniform_filter(values, size=size, mode="constant", cval=0.0)
+
+    numerator = np.hypot(box(cross_z.real), box(cross_z.imag))
+    denominator = np.sqrt(
+        np.maximum(box(power_pri), 0.0) * np.maximum(box(power_sec), 0.0)
+    )
+    counts = box(support.astype(np.float64)) * float(size[0] * size[1])
+    valid = (counts >= 2.0) & (denominator > 0.0)
+    output = np.full(cross.shape, np.nan, dtype=np.float64)
+    np.divide(numerator, denominator, out=output, where=valid)
+    output[~valid] = np.nan
+    return output
+
+
+def _complete_look_bounds(
+    native_origin: tuple[int, int],
+    input_shape: tuple[int, int],
+    output_window: tuple[int, int, int, int],
+    multilook: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return ``(first_i, last_i, first_j, last_j)`` for complete global looks."""
+    az_looks, rg_looks = multilook
+    row0, row1, col0, col1 = output_window
+    first_i = (row0 + az_looks - 1) // az_looks
+    last_i = row1 // az_looks
+    first_j = (col0 + rg_looks - 1) // rg_looks
+    last_j = col1 // rg_looks
+    if last_i <= first_i or last_j <= first_j:
+        return first_i, last_i, first_j, last_j
+    native_row0 = first_i * az_looks
+    native_row1 = last_i * az_looks
+    native_col0 = first_j * rg_looks
+    native_col1 = last_j * rg_looks
+    input_row0, input_col0 = native_origin
+    input_row1 = input_row0 + input_shape[0]
+    input_col1 = input_col0 + input_shape[1]
+    if (
+        native_row0 < input_row0
+        or native_row1 > input_row1
+        or native_col0 < input_col0
+        or native_col1 > input_col1
+    ):
+        reject_invalid_state(
+            "selected-field interferogram input coverage does not contain the "
+            "requested complete look blocks"
+        )
+    return first_i, last_i, first_j, last_j
+
+
+def form_interferogram_from_fields(
+    cross: np.ndarray,
+    primary_power: np.ndarray,
+    secondary_power: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    native_origin: tuple[int, int],
+    output_window: tuple[int, int, int, int],
+    multilook: tuple[int, int] = (1, 1),
+    coherence_window: tuple[int, int] | None = None,
+) -> InterferogramProduct:
+    """Form an IFG from selected native cross-products and endpoint powers.
+
+    Looks are aligned to global native origin ``(0, 0)``. Direct MLE
+    (``coherence_window is None``) averages valid samples in each complete
+    look and requires two jointly valid samples for coherence. Optional
+    sliding MLE computes native-window ratios first, then finite-only look
+    means. Supported zero-valued looks, including two-sample cancellation,
+    remain valid.
+
+    Parameters
+    ----------
+    cross, primary_power, secondary_power : numpy.ndarray
+        Window-local selected native fields. ``cross`` is complex.
+    valid_mask : numpy.ndarray
+        Explicit scientific support; amplitude is not used as a proxy.
+    native_origin : tuple of int
+        Global native coordinates of ``cross[0, 0]``.
+    output_window : tuple of int
+        Half-open global native window ``(r0, r1, c0, c1)`` whose complete
+        looks are returned.
+    multilook : tuple of int, optional
+        ``(azimuth, range)`` look factors.
+    coherence_window : tuple of int or None, optional
+        Odd native sliding support, or ``None`` for direct block MLE.
+
+    Returns
+    -------
+    InterferogramProduct
+        Look-grid complex IFG, coherence, wrapped phase, amplitude, and mask.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If shapes disagree, looks are invalid, or the input crop does not
+        cover a requested complete look block.
+
+    """
+    coherence_window = validate_coherence_window(coherence_window)
+    cross_arr = np.asarray(cross)
+    power_pri = np.asarray(primary_power)
+    power_sec = np.asarray(secondary_power)
+    support = np.asarray(valid_mask, dtype=bool)
+    if cross_arr.ndim != 2 or not np.iscomplexobj(cross_arr):
+        reject_invalid_state("selected-field cross must be a 2-D complex array")
+    if power_pri.shape != cross_arr.shape or power_sec.shape != cross_arr.shape:
+        reject_invalid_state("selected-field powers must match the cross shape")
+    if support.shape != cross_arr.shape:
+        reject_invalid_state("selected-field valid_mask must match the cross shape")
+    if (
+        not isinstance(native_origin, tuple)
+        or len(native_origin) != 2
+        or any(type(value) is not int for value in native_origin)
+    ):
+        reject_invalid_state("native_origin must be a tuple of two ints")
+    if (
+        not isinstance(output_window, tuple)
+        or len(output_window) != 4
+        or any(type(value) is not int for value in output_window)
+        or output_window[1] <= output_window[0]
+        or output_window[3] <= output_window[2]
+    ):
+        reject_invalid_state(
+            "output_window must be a non-empty half-open (r0, r1, c0, c1)"
+        )
+    if (
+        not isinstance(multilook, tuple)
+        or len(multilook) != 2
+        or any(type(axis) is not int or axis < 1 for axis in multilook)
+    ):
+        reject_invalid_state("multilook factors must be positive integers")
+    az_looks, rg_looks = multilook
+    first_i, last_i, first_j, last_j = _complete_look_bounds(
+        native_origin, cross_arr.shape, output_window, multilook
+    )
+    n_i = last_i - first_i
+    n_j = last_j - first_j
+    if n_i <= 0 or n_j <= 0:
+        empty = np.zeros((0, 0), dtype=np.complex64)
+        empty_f = np.zeros((0, 0), dtype=np.float32)
+        empty_m = np.zeros((0, 0), dtype=bool)
+        return InterferogramProduct(
+            complex=empty,
+            coherence=empty_f,
+            wrapped_phase=empty_f,
+            amplitude=empty_f,
+            valid_mask=empty_m,
+        )
+    native_row0 = first_i * az_looks
+    native_col0 = first_j * rg_looks
+    loc_r0 = native_row0 - native_origin[0]
+    loc_c0 = native_col0 - native_origin[1]
+    loc_r1 = loc_r0 + n_i * az_looks
+    loc_c1 = loc_c0 + n_j * rg_looks
+    region_support = support[loc_r0:loc_r1, loc_c0:loc_c1]
+    region_cross = np.where(region_support, cross_arr[loc_r0:loc_r1, loc_c0:loc_c1], 0)
+    region_p1 = np.where(
+        region_support, power_pri[loc_r0:loc_r1, loc_c0:loc_c1], 0
+    ).astype(np.float64)
+    region_p2 = np.where(
+        region_support, power_sec[loc_r0:loc_r1, loc_c0:loc_c1], 0
+    ).astype(np.float64)
+    shaped = (n_i, az_looks, n_j, rg_looks)
+    counts = region_support.reshape(shaped).sum(axis=(1, 3))
+    sum_cross = region_cross.reshape(shaped).sum(axis=(1, 3))
+    sum_p1 = region_p1.reshape(shaped).sum(axis=(1, 3))
+    sum_p2 = region_p2.reshape(shaped).sum(axis=(1, 3))
+    safe = np.maximum(counts, 1)
+    ifg = (sum_cross / safe).astype(np.complex64)
+    mean_p1 = sum_p1 / safe
+    mean_p2 = sum_p2 / safe
+    valid_out = counts > 0
+    ifg = np.where(valid_out, ifg, np.complex64(np.nan + 1j * np.nan))
+    if coherence_window is None:
+        denominator = np.sqrt(np.maximum(mean_p1, 0.0) * np.maximum(mean_p2, 0.0))
+        direct = np.divide(
+            np.abs(ifg.astype(np.complex128)),
+            denominator,
+            out=np.full(ifg.shape, np.nan, dtype=np.float64),
+            where=(counts >= 2) & (denominator > 0.0),
+        )
+        coherence = np.where(counts >= 2, direct, np.nan)
+    else:
+        native_gamma = _sliding_coherence_from_fields(
+            cross_arr, power_pri, power_sec, support, coherence_window
+        )
+        look_gamma = native_gamma[loc_r0:loc_r1, loc_c0:loc_c1]
+        coherence = np.empty((n_i, n_j), dtype=np.float64)
+        for row in range(n_i):
+            for col in range(n_j):
+                block = look_gamma[
+                    row * az_looks : (row + 1) * az_looks,
+                    col * rg_looks : (col + 1) * rg_looks,
+                ]
+                finite = block[np.isfinite(block)]
+                coherence[row, col] = finite.mean() if finite.size else np.nan
+    coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
+    coherence = np.where(valid_out, coherence, np.float32(np.nan))
+    amplitude = np.abs(ifg).astype(np.float32)
+    amplitude = np.where(valid_out, amplitude, np.float32(np.nan))
+    wrapped = np.angle(ifg).astype(np.float32)
+    wrapped = np.where(valid_out, wrapped, np.float32(np.nan))
+    return InterferogramProduct(
+        complex=ifg.astype(np.complex64, copy=False),
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        amplitude=amplitude,
+        valid_mask=valid_out,
+    )
+
+
 def form_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
@@ -398,10 +625,6 @@ def form_interferogram(
             _sliding_coherence(primary, secondary, coherence_window), multilook
         )
     coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
-    # ``valid_mask`` describes whether the complex look itself is supported.
-    # Coherence has a stricter statistical requirement: a singleton look is a
-    # valid complex sample but has no two-sample MLE, so its coherence remains
-    # NaN without discarding the IFG sample.
     invalid = ~valid_out | ~np.isfinite(ifg.real) | ~np.isfinite(ifg.imag)
     if np.any(invalid):
         ifg[invalid] = np.nan + 1j * np.nan

@@ -19,6 +19,7 @@ from .flatten import (
 from .pair import (
     InterferogramProduct,
     form_interferogram,
+    form_interferogram_from_fields,
     goldstein_filter,
     mask_invalid_looks,
     validate_coherence_window,
@@ -70,6 +71,7 @@ __all__ = [
     "estimate_residual_topographic_scale",
     "estimate_tiled_residual_height_screen",
     "form_interferogram",
+    "form_interferogram_from_fields",
     "goldstein_filter",
     "mask_invalid_looks",
     "remove_azimuth_phase_ramp",

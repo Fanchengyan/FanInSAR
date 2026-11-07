@@ -30,6 +30,11 @@ if TYPE_CHECKING:
         write_ion_correction_artifact,
         write_ionosphere_artifact,
     )
+    from faninsar.io.storage.merge_layout import (
+        LAYOUT_KIND,
+        open_merge_layout,
+        publish_merge_layout,
+    )
     from faninsar.io.storage.product import (
         Product,
         ProductWriter,
@@ -62,6 +67,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "InterferogramArtifact": ("ifg_store", "InterferogramArtifact"),
     "InterferogramArtifactStore": ("ifg_store", "InterferogramArtifactStore"),
     "InMemoryArrayStore": ("arrays", "InMemoryArrayStore"),
+    "LAYOUT_KIND": ("merge_layout", "LAYOUT_KIND"),
     "IonosphereArtifact": ("ion_store", "IonosphereArtifact"),
     "IonosphereArtifactStore": ("ion_store", "IonosphereArtifactStore"),
     "SceneUnit": ("scene_store", "SceneUnit"),
@@ -76,7 +82,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ProductWriter": ("product", "ProductWriter"),
     "publish_product": ("product", "publish_product"),
     "discover_products": ("product", "discover_products"),
+    "open_merge_layout": ("merge_layout", "open_merge_layout"),
     "open_product": ("product", "open_product"),
+    "publish_merge_layout": ("merge_layout", "publish_merge_layout"),
     "verify_product": ("product", "verify_product"),
     "write_unwrapped_artifact": ("ifg_store", "write_unwrapped_artifact"),
     "ProcessingEvent": ("provenance", "ProcessingEvent"),
@@ -104,6 +112,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "LAYOUT_KIND",
     "ChunkAccessLog",
     "ChunkedZarrArrayStore",
     "CoregisteredSceneStore",
@@ -123,7 +132,9 @@ __all__ = [
     "StacProvenanceProperties",
     "UnwrappedArtifact",
     "discover_products",
+    "open_merge_layout",
     "open_product",
+    "publish_merge_layout",
     "publish_product",
     "read_ion_correction_artifact",
     "validate_pipeline_rebuild_manifest",

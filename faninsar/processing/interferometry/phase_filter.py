@@ -10,6 +10,7 @@ import torch
 from torch.nn import functional
 
 from faninsar.logging import reject
+from faninsar.processing.errors import reject_invalid_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,31 @@ def _validate_input(
         message = "phase filter valid_mask must be bool on the input device"
         reject(message, ValueError)
     return valid_mask & finite
+
+
+def _as_window(window: object, *, name: str) -> tuple[int, int, int, int]:
+    """Validate a half-open global window."""
+    if (
+        not isinstance(window, tuple)
+        or len(window) != 4
+        or any(type(value) is not int for value in window)
+        or window[1] <= window[0]
+        or window[3] <= window[2]
+    ):
+        reject_invalid_state(f"{name} must be a non-empty half-open (r0, r1, c0, c1)")
+    return window[0], window[1], window[2], window[3]
+
+
+def _window_inside(
+    inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]
+) -> bool:
+    """Return whether ``inner`` is contained in ``outer``."""
+    return (
+        inner[0] >= outer[0]
+        and inner[1] <= outer[1]
+        and inner[2] >= outer[2]
+        and inner[3] <= outer[3]
+    )
 
 
 class PhaseFilter(ABC):
@@ -97,6 +123,46 @@ class PhaseFilter(ABC):
         rules.
 
         """
+
+    def apply_window(
+        self,
+        interferogram: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+        input_window: tuple[int, int, int, int],
+        output_window: tuple[int, int, int, int],
+        image_shape: tuple[int, int],
+    ) -> PhaseFilterResult:
+        """Filter a tile of a larger logical image.
+
+        Custom strategies do not implement bounded execution and are rejected
+        so callers cannot silently restart filter patches per tile.
+
+        Parameters
+        ----------
+        interferogram : torch.Tensor
+            Complex samples covering ``input_window``.
+        valid_mask : torch.Tensor, optional
+            Boolean support on the same tile.
+        input_window, output_window : tuple of int
+            Half-open global ``(r0, r1, c0, c1)`` windows.
+        image_shape : tuple of int
+            Logical full-image ``(azimuth, range)`` shape used for patch
+            origins and the small-image bypass.
+
+        Returns
+        -------
+        PhaseFilterResult
+            Filtered samples cropped to ``output_window``.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the strategy does not support bounded windows.
+
+        """
+        _ = (interferogram, valid_mask, input_window, output_window, image_shape)
+        reject_invalid_state("phase filter does not support bounded window execution")
 
     def describe(self) -> FilterProvenance:
         """Return inert provenance; custom strategies default to ``custom``."""
@@ -207,6 +273,136 @@ class GoldsteinWerner(PhaseFilter):
         output = output * scale
         finite = torch.isfinite(output.real) & torch.isfinite(output.imag)
         result_mask = support & finite
+        return PhaseFilterResult(output, result_mask)
+
+    def apply_window(
+        self,
+        interferogram: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+        input_window: tuple[int, int, int, int],
+        output_window: tuple[int, int, int, int],
+        image_shape: tuple[int, int],
+    ) -> PhaseFilterResult:
+        """Filter one tile using global Goldstein patch origins.
+
+        Patch stride is ``patch_size // 2`` on the logical image, not the
+        tile. Invalid samples are zero-filled inside each FFT patch. A tile
+        must include every in-image patch that overlaps the output window.
+        """
+        support = _validate_input(interferogram, valid_mask)
+        if (
+            not isinstance(image_shape, tuple)
+            or len(image_shape) != 2
+            or any(type(size) is not int or size <= 0 for size in image_shape)
+        ):
+            reject_invalid_state("image_shape must be a positive (azimuth, range) pair")
+        in_window = _as_window(input_window, name="input_window")
+        out_window = _as_window(output_window, name="output_window")
+        height, width = image_shape
+        expected = (in_window[1] - in_window[0], in_window[3] - in_window[2])
+        if interferogram.shape != expected:
+            reject_invalid_state("phase filter tile shape must match input_window")
+        if not _window_inside(out_window, in_window):
+            reject_invalid_state("output_window must lie inside input_window")
+        if not _window_inside(in_window, (0, height, 0, width)):
+            reject_invalid_state("input_window must lie inside image_shape")
+        out_slice = (
+            slice(out_window[0] - in_window[0], out_window[1] - in_window[0]),
+            slice(out_window[2] - in_window[2], out_window[3] - in_window[2]),
+        )
+        patch = self.patch_size
+        if height < patch or width < patch:
+            return PhaseFilterResult(
+                interferogram[out_slice].clone(),
+                support[out_slice].clone(),
+            )
+        step = patch // 2
+        for row in range(0, height, step):
+            for col in range(0, width, step):
+                rows = min(patch, height - row)
+                cols = min(patch, width - col)
+                patch_window = (row, row + rows, col, col + cols)
+                overlaps_output = not (
+                    patch_window[1] <= out_window[0]
+                    or patch_window[0] >= out_window[1]
+                    or patch_window[3] <= out_window[2]
+                    or patch_window[2] >= out_window[3]
+                )
+                if overlaps_output and not _window_inside(patch_window, in_window):
+                    reject_invalid_state(
+                        "Goldstein tile is missing halo for a global patch that "
+                        "overlaps the output window"
+                    )
+        taper_1d = 1.0 - torch.abs(
+            2.0
+            * (
+                torch.arange(patch, device=interferogram.device, dtype=torch.float32)
+                - patch / 2
+            )
+            / (patch + 1)
+        )
+        taper = torch.outer(taper_1d, taper_1d)
+        source = torch.where(support, interferogram, torch.zeros_like(interferogram))
+        output = torch.zeros(
+            (out_window[1] - out_window[0], out_window[3] - out_window[2]),
+            dtype=interferogram.dtype,
+            device=interferogram.device,
+        )
+        for row in range(0, height, step):
+            for col in range(0, width, step):
+                rows = min(patch, height - row)
+                cols = min(patch, width - col)
+                patch_window = (row, row + rows, col, col + cols)
+                if (
+                    patch_window[1] <= out_window[0]
+                    or patch_window[0] >= out_window[1]
+                    or patch_window[3] <= out_window[2]
+                    or patch_window[2] >= out_window[3]
+                ):
+                    continue
+                local = (
+                    slice(row - in_window[0], row - in_window[0] + rows),
+                    slice(col - in_window[2], col - in_window[2] + cols),
+                )
+                block = torch.zeros(
+                    (patch, patch),
+                    dtype=interferogram.dtype,
+                    device=interferogram.device,
+                )
+                block[:rows, :cols] = source[local]
+                spectrum = torch.fft.fft2(block)
+                magnitude = torch.abs(spectrum)
+                weight = torch.pow(magnitude, self.alpha)
+                filtered = torch.fft.ifft2(spectrum * weight) * float(patch * patch)
+                overlap_r0 = max(patch_window[0], out_window[0])
+                overlap_r1 = min(patch_window[1], out_window[1])
+                overlap_c0 = max(patch_window[2], out_window[2])
+                overlap_c1 = min(patch_window[3], out_window[3])
+                output[
+                    overlap_r0 - out_window[0] : overlap_r1 - out_window[0],
+                    overlap_c0 - out_window[2] : overlap_c1 - out_window[2],
+                ] += (
+                    filtered[
+                        overlap_r0 - row : overlap_r1 - row,
+                        overlap_c0 - col : overlap_c1 - col,
+                    ]
+                    * taper[
+                        overlap_r0 - row : overlap_r1 - row,
+                        overlap_c0 - col : overlap_c1 - col,
+                    ]
+                )
+        input_tile = interferogram[out_slice]
+        input_magnitude = torch.abs(input_tile)
+        output_magnitude = torch.abs(output)
+        scale = torch.where(
+            (output_magnitude > 0) & (input_magnitude > 0),
+            input_magnitude / output_magnitude.clamp_min(1e-12),
+            torch.ones_like(output_magnitude),
+        )
+        output = output * scale
+        finite = torch.isfinite(output.real) & torch.isfinite(output.imag)
+        result_mask = support[out_slice] & finite
         return PhaseFilterResult(output, result_mask)
 
 

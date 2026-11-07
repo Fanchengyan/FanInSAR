@@ -1,287 +1,296 @@
-"""Tests for the unified merge-methods gateway (methods.merge_bursts).
-
-Covers all selectable methods listed in ``MergeMethod`` and confirms:
- - perfectly-aligned bursts are recovered by every alignment-bearing method,
- - a known constant offset is removed,
- - a range ramp is removed by ``faninsar_network`` / ``faninsar_weighted``
-   (the only methods that estimate a slope),
- - legacy ``merge_burst_products(mode=...)`` maps onto the new gateway.
-"""
+"""Public merge_bursts midpoint selection and VALID fallback (PROPOSAL-0074)."""
 
 from __future__ import annotations
-
-from datetime import date
 
 import numpy as np
 import pytest
 
-from faninsar.processing.mosaicking.grid import GeoGridSpec
-from faninsar.processing.mosaicking.methods import (
-    NON_REFERENCE_METHODS,
-    MergeMethod,
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.mosaicking import (
+    BurstWindow,
+    MergeLayoutWindow,
+    MergeScope,
     merge_bursts,
 )
-from faninsar.processing.mosaicking.mosaic import merge_burst_products
-from faninsar.processing.mosaicking.overlap import compute_feather
-from faninsar.processing.mosaicking.products import BurstGeoProduct
+
+SCOPE = MergeScope(
+    domain="radar",
+    track_id="T100_A",
+    channel="vv",
+    reference_id="ref-20240101",
+    grid_identity="a" * 64,
+    polygon_identity="poly-0",
+)
 
 
-def _grid(width: int = 40, height: int = 20) -> GeoGridSpec:
-    return GeoGridSpec(
-        crs="EPSG:32633",
-        transform=(0.0, 10.0, 0.0, 1000.0, 0.0, -10.0),
-        width=width,
-        height=height,
-        resolution_m=(10.0, 10.0),
-    )
+def _scope(**changes: object) -> MergeScope:
+    payload = {
+        "domain": SCOPE.domain,
+        "track_id": SCOPE.track_id,
+        "channel": SCOPE.channel,
+        "reference_id": SCOPE.reference_id,
+        "grid_identity": SCOPE.grid_identity,
+        "polygon_identity": SCOPE.polygon_identity,
+        **changes,
+    }
+    return MergeScope(**payload)  # type: ignore[arg-type]
 
 
-def _make_product(
+def _burst(
     burst_id: str,
-    phase_offset_rad: float = 0.0,
-    valid_slice: tuple[slice, slice] = (slice(0, 20), slice(0, 40)),
+    window: tuple[int, int, int, int],
+    values: np.ndarray,
+    valid: np.ndarray,
     *,
-    z_field: np.ndarray | None = None,
-    coh_val: float = 1.0,
-    path_id: str = "T1_A",
-    look: str = "ascending",
-) -> BurstGeoProduct:
-    """Build a synthetic burst product with a constant-phase field.
-
-    If ``z_field`` is provided it is used directly (e.g. for range-ramp
-    scenarios); otherwise the burst is a unit-modulus disk at
-    ``phase_offset_rad`` on the valid region.
-    """
-    g = _grid()
-    h, w = g.shape
-    mask = np.zeros((h, w), dtype=bool)
-    mask[valid_slice] = True
-    if z_field is None:
-        z = np.zeros((h, w), dtype=np.complex64)
-        z[mask] = np.exp(1j * phase_offset_rad, dtype=np.complex64)
-    else:
-        z = z_field.astype(np.complex64)
-    weight = compute_feather(mask, feather_width_px=0.0)
-    coh = np.zeros((h, w), dtype=np.float32)
-    coh[mask] = coh_val
-    return BurstGeoProduct(
+    acquisitions: tuple[str, ...] = ("20240101", "20240113"),
+    phase_convention: str = "reramped",
+    coherence: np.ndarray | None = None,
+    primary_power: np.ndarray | None = None,
+    secondary_power: np.ndarray | None = None,
+    scope: MergeScope = SCOPE,
+) -> BurstWindow:
+    return BurstWindow(
+        scope=scope,
         burst_id=burst_id,
-        path_id=path_id,
-        swath="IW1",
-        date=date(2024, 1, 1),
-        grid=g,
-        complex=z,
-        weight=weight,
-        coherence=coh,
-        look_direction=look,
+        acquisitions=acquisitions,
+        write_ids=(f"{burst_id}-w1", f"{burst_id}-w2"),
+        phase_convention=phase_convention,
+        window=window,
+        complex=np.asarray(values, dtype=np.complex64),
+        valid_mask=np.asarray(valid, dtype=bool),
+        coherence=coherence,
+        primary_power=primary_power,
+        secondary_power=secondary_power,
     )
 
 
-ALL_METHODS = [
-    "complex_average",
-    "faninsar_network",
-    "isce2_avg",
-    "isce2_top",
-    "insardev_equal",
-    "insardev_ramp",
-    "insardev_weighted",
-    "faninsar_weighted",
-    "gmtsar_cut",
-]
+def _two_burst_azimuth_layout() -> tuple[list[BurstWindow], MergeLayoutWindow]:
+    """Two same-swath bursts overlapping in azimuth on a 6x4 ROI.
 
-# Methods that perform an inter-burst phase alignment (constant offset).
-ALIGNING_METHODS = [
-    m for m in ALL_METHODS if m not in ("complex_average", "gmtsar_cut")
-]
-
-
-@pytest.mark.parametrize("method", ALIGNING_METHODS)
-def test_aligned_bursts_recovered(method: MergeMethod) -> None:
-    """Two bursts with the SAME phase merge to |z|~1 everywhere with alignment."""
-    p_i = _make_product("a", 0.0, (slice(0, 20), slice(0, 20)))
-    p_j = _make_product("b", 0.0, (slice(0, 20), slice(10, 30)))
-    mosaic = merge_bursts(
-        [p_i, p_j], method=method, min_overlap_px=10, min_edge_coherence=0.0
-    )
-    overlap = (p_i.weight > 0) & (p_j.weight > 0)
-    assert overlap.sum() > 50
-    mag = np.abs(mosaic.complex[overlap]).mean()
-    # Aligning methods should drive the overlap to coherent |z| close to 1.
-    assert mag > 0.85, f"{method}: overlap |z|={mag:.3f} expected > 0.85"
-
-
-@pytest.mark.parametrize("method", ALIGNING_METHODS)
-def test_constant_phase_offset_removed(method: MergeMethod) -> None:
-    """A 0.8 rad constant offset between bursts is removed by aligning methods."""
-    p_i = _make_product("a", 0.0, (slice(0, 20), slice(0, 20)))
-    p_j = _make_product("b", 0.8, (slice(0, 20), slice(10, 30)))
-    mosaic = merge_bursts(
-        [p_i, p_j], method=method, min_overlap_px=10, min_edge_coherence=0.0
-    )
-    overlap = (p_i.weight > 0) & (p_j.weight > 0)
-    mag = np.abs(mosaic.complex[overlap]).mean()
-    assert mag > 0.85, f"{method}: overlap |z|={mag:.3f} expected > 0.85"
-
-
-def test_range_ramp_removed_by_faninsar_network() -> None:
-    """``faninsar_network`` (const + range-slope LS) removes a range-ramp seam.
-
-    Mirrors ``test_solve_network_and_mosaic_remove_range_seam`` but drives the
-    new gateway directly: a 0.025 rad/col ramp on the right burst is absorbed
-    by the slope unknowns of ``solve_network``.
+    Burst A occupies rows ``[0, 4)``, burst B rows ``[2, 6)``. Overlap
+    ``[2, 4)`` cuts at ``2 + 2 // 2 = 3``: rows ``< 3`` prefer A, rows
+    ``>= 3`` prefer B.
     """
-    g = _grid()
-    h, w = g.shape
-    cols = np.arange(w, dtype=np.float64)
-    left = _make_product(
-        "lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22))
+    window_a = (0, 4, 0, 4)
+    window_b = (2, 6, 0, 4)
+    layout_window = (0, 6, 0, 4)
+    values_a = np.full((4, 4), 1 + 0j, dtype=np.complex64)
+    values_b = np.full((4, 4), 2 + 0j, dtype=np.complex64)
+    valid_a = np.ones((4, 4), dtype=bool)
+    valid_b = np.ones((4, 4), dtype=bool)
+    products = [
+        _burst("iw1-b1", window_a, values_a, valid_a),
+        _burst("iw1-b2", window_b, values_b, valid_b),
+    ]
+    owner = np.zeros((6, 4), dtype=np.uint16)
+    owner[0:3] = 1
+    owner[3:6] = 2
+    support = np.ones((6, 4), dtype=bool)
+    layout = MergeLayoutWindow(
+        scope=SCOPE,
+        window=layout_window,
+        source_ids=("iw1-b1", "iw1-b2"),
+        owner=owner,
+        scientific_support=support,
     )
-    # Right burst: phase = 0.3 + 0.025 * col (relative to left's zero).
-    z_right = np.zeros((h, w), dtype=np.complex64)
-    mask_r = np.zeros((h, w), dtype=bool)
-    mask_r[slice(0, 20), slice(12, 40)] = True
-    for c in range(w):
-        if mask_r[:, c].any():
-            z_right[:, c][mask_r[:, c]] = np.exp(
-                1j * (0.3 + 0.025 * c), dtype=np.complex64
-            )
-    right = _make_product(
-        "rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40))
-    )
-    mosaic = merge_bursts(
-        [left, right],
-        method="faninsar_network",
-        min_overlap_px=10,
-        min_edge_coherence=0.0,
-    )
-    z = mosaic.complex
-    # Right-only region (cols 30..38): phase should be near left's 0 reference.
-    right_only = z[:, 30:38]
-    valid = np.abs(right_only) > 0.5
-    assert int(valid.sum()) > 20
-    phases = np.angle(right_only[valid])
-    assert float(np.std(phases)) < 0.15
-    assert abs(float(np.mean(phases))) < 0.25
+    return products, layout
 
 
-def test_range_ramp_not_removed_when_no_slope_method() -> None:
-    """``insardev_ramp`` skips small-x-extent ramps (x_range < 100 guard).
+def test_midpoint_owner_selects_earlier_then_later_burst() -> None:
+    """Preferred midpoint labels copy native samples without averaging."""
+    products, layout = _two_burst_azimuth_layout()
+    merged = merge_bursts(products, layout=layout)
+    assert merged.window == layout.window
+    assert merged.complex.dtype == np.complex64
+    np.testing.assert_array_equal(merged.complex[:3], 1 + 0j)
+    np.testing.assert_array_equal(merged.complex[3:], 2 + 0j)
+    np.testing.assert_array_equal(merged.valid_mask, True)
+    np.testing.assert_array_equal(merged.source[:3], 1)
+    np.testing.assert_array_equal(merged.source[3:], 2)
 
-    Confirm that with a narrow overlap (x_extent < 100 px) the insardev_ramp
-    estimator does NOT pick up the range ramp — leaving a column-dependent
-    residual that ``faninsar_network`` (which always estimates a slope) absorbs.
-    The comparison is *relative*: the residual std under insardev_ramp must
-    exceed the residual std under faninsar_network, which is the observed-
-    data consequence of the x_range > 100 guard in InSAR.dev ``fit``.
-    """
-    g = _grid()
-    h, w = g.shape
-    left = _make_product(
-        "lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22))
-    )
-    z_right = np.zeros((h, w), dtype=np.complex64)
-    mask_r = np.zeros((h, w), dtype=bool)
-    mask_r[slice(0, 20), slice(12, 40)] = True
-    for c in range(w):
-        if mask_r[:, c].any():
-            z_right[:, c][mask_r[:, c]] = np.exp(
-                1j * (0.3 + 0.025 * c), dtype=np.complex64
-            )
-    right = _make_product(
-        "rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40))
-    )
 
-    def _resid_std(method: MergeMethod) -> float:
-        mosaic = merge_bursts(
-            [left, right],
-            method=method,
-            min_overlap_px=10,
-            min_edge_coherence=0.0,
+def test_input_order_does_not_change_midpoint_output() -> None:
+    """Selection keys on layout source_ids, not caller list order."""
+    products, layout = _two_burst_azimuth_layout()
+    forward = merge_bursts(products, layout=layout)
+    reversed_products = list(reversed(products))
+    backward = merge_bursts(reversed_products, layout=layout)
+    np.testing.assert_array_equal(forward.complex, backward.complex)
+    np.testing.assert_array_equal(forward.source, backward.source)
+    np.testing.assert_array_equal(forward.valid_mask, backward.valid_mask)
+
+
+def test_valid_fallback_uses_next_covering_burst() -> None:
+    """When the preferred owner is invalid, the next VALID source fills."""
+    products, layout = _two_burst_azimuth_layout()
+    preferred = products[0]
+    hole = np.array(preferred.valid_mask, copy=True)
+    hole[2, 1] = False
+    products[0] = _burst(
+        preferred.burst_id,
+        preferred.window,
+        preferred.complex,
+        hole,
+    )
+    merged = merge_bursts(products, layout=layout)
+    assert merged.complex[2, 1] == pytest.approx(2 + 0j)
+    assert bool(merged.valid_mask[2, 1])
+    assert merged.source[2, 1] == 2
+    assert merged.complex[2, 0] == pytest.approx(1 + 0j)
+    assert merged.source[2, 0] == 1
+
+
+def test_supported_zero_complex_is_not_treated_as_nodata() -> None:
+    """Explicit masks keep a valid 0j sample; amplitude is not the support test."""
+    products, layout = _two_burst_azimuth_layout()
+    values = np.array(products[0].complex, copy=True)
+    values[0, 0] = 0 + 0j
+    products[0] = _burst(
+        products[0].burst_id,
+        products[0].window,
+        values,
+        products[0].valid_mask,
+    )
+    merged = merge_bursts(products, layout=layout)
+    assert merged.complex[0, 0] == pytest.approx(0 + 0j)
+    assert bool(merged.valid_mask[0, 0])
+    assert merged.source[0, 0] == 1
+
+
+def test_optional_fields_follow_the_same_selected_candidate() -> None:
+    """Coherence and endpoint powers are copied from the chosen burst only."""
+    products, layout = _two_burst_azimuth_layout()
+    for index, product in enumerate(products, start=1):
+        coh = np.full(product.complex.shape, float(index) * 0.1, dtype=np.float32)
+        primary = np.full(product.complex.shape, float(index) * 3.0, dtype=np.float32)
+        secondary = np.full(product.complex.shape, float(index) * 5.0, dtype=np.float32)
+        products[index - 1] = _burst(
+            product.burst_id,
+            product.window,
+            product.complex,
+            product.valid_mask,
+            coherence=coh,
+            primary_power=primary,
+            secondary_power=secondary,
         )
-        z = mosaic.complex
-        right_only = z[:, 30:38]
-        valid = np.abs(right_only) > 0.5
-        return float(np.std(np.angle(right_only[valid])))
-
-    std_rramp = _resid_std("insardev_ramp")
-    std_fsnet = _resid_std("faninsar_network")
-    # insardev_ramp MUST leave a larger residual than faninsar_network
-    # because it skips the slope. Quantitative values depend on the synthetic
-    # ramp magnitude; only the ordering is asserted.
-    assert std_rramp > std_fsnet, (
-        f"insardev_ramp residual {std_rramp:.4f} should exceed "
-        f"faninsar_network residual {std_fsnet:.4f} (insardev_ramp skips slope)"
+    hole = np.array(products[0].valid_mask, copy=True)
+    hole[2, 1] = False
+    first = products[0]
+    products[0] = _burst(
+        first.burst_id,
+        first.window,
+        first.complex,
+        hole,
+        coherence=first.coherence,
+        primary_power=first.primary_power,
+        secondary_power=first.secondary_power,
     )
+    merged = merge_bursts(products, layout=layout)
+    assert merged.coherence is not None
+    assert merged.primary_power is not None
+    assert merged.secondary_power is not None
+    assert merged.coherence[0, 0] == pytest.approx(0.1)
+    assert merged.primary_power[0, 0] == pytest.approx(3.0)
+    assert merged.coherence[2, 1] == pytest.approx(0.2)
+    assert merged.primary_power[2, 1] == pytest.approx(6.0)
+    assert merged.secondary_power[2, 1] == pytest.approx(10.0)
 
 
-def test_legacy_mode_phase_network_maps_to_faninsar_network() -> None:
-    """Legacy ``mode='phase_network'`` delegates to ``faninsar_network``.
-
-    Ensures the wrong-sign ``insardev_ramp`` default does NOT silently
-    break legacy callers expecting range-slope LS behaviour.
-    """
-    p_i = _make_product("a", 0.0, (slice(0, 20), slice(0, 20)))
-    p_j = _make_product("b", 0.5, (slice(0, 20), slice(10, 26)))
-    legacy = merge_burst_products(
-        [p_i, p_j], mode="phase_network", min_overlap_px=10, min_edge_coherence=0.0
+def test_uncovered_preferred_pixel_without_fallback_is_invalid() -> None:
+    """No VALID covering burst leaves nodata, not a manufactured sample."""
+    products, layout = _two_burst_azimuth_layout()
+    hole_a = np.array(products[0].valid_mask, copy=True)
+    hole_a[0, 0] = False
+    products[0] = _burst(
+        products[0].burst_id,
+        products[0].window,
+        products[0].complex,
+        hole_a,
     )
-    direct = merge_bursts(
-        [p_i, p_j],
-        method="faninsar_network",
-        min_overlap_px=10,
-        min_edge_coherence=0.0,
+    merged = merge_bursts(products, layout=layout)
+    assert not bool(merged.valid_mask[0, 0])
+    assert merged.source[0, 0] == 0
+    assert merged.complex[0, 0] == pytest.approx(0 + 0j)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"domain": "geo"},
+        {"track_id": "T101_A"},
+        {"channel": "vh"},
+        {"reference_id": "other-ref"},
+        {"grid_identity": "b" * 64},
+        {"polygon_identity": "poly-1"},
+    ],
+)
+def test_incompatible_scope_is_rejected(changes: dict[str, str]) -> None:
+    """Every MergeScope field is part of the admission key."""
+    products, layout = _two_burst_azimuth_layout()
+    products[0] = _burst(
+        products[0].burst_id,
+        products[0].window,
+        products[0].complex,
+        products[0].valid_mask,
+        scope=_scope(**changes),
     )
-    assert np.allclose(legacy.complex, direct.complex, atol=1e-6)
+    with pytest.raises(InvalidProcessingStateError, match="scope"):
+        merge_bursts(products, layout=layout)
 
 
-def test_legacy_mode_complex_average_maps_to_complex_average() -> None:
-    p_i = _make_product("a", 0.0, (slice(0, 20), slice(0, 20)))
-    p_j = _make_product("b", 0.8, (slice(0, 20), slice(10, 30)))
-    legacy = merge_burst_products(
-        [p_i, p_j], mode="complex_average", min_overlap_px=10, min_edge_coherence=0.0
+def test_mismatched_acquisitions_and_conventions_are_rejected() -> None:
+    """IFG pairing requires matching endpoints and phase convention."""
+    products, layout = _two_burst_azimuth_layout()
+    products[1] = _burst(
+        products[1].burst_id,
+        products[1].window,
+        products[1].complex,
+        products[1].valid_mask,
+        acquisitions=("20240101", "20240125"),
     )
-    direct = merge_bursts(
-        [p_i, p_j],
-        method="complex_average",
-        min_overlap_px=10,
-        min_edge_coherence=0.0,
+    with pytest.raises(InvalidProcessingStateError, match="acquisition"):
+        merge_bursts(products, layout=layout)
+    products, layout = _two_burst_azimuth_layout()
+    products[1] = _burst(
+        products[1].burst_id,
+        products[1].window,
+        products[1].complex,
+        products[1].valid_mask,
+        phase_convention="deramped",
     )
-    assert np.allclose(legacy.complex, direct.complex, atol=1e-6)
+    with pytest.raises(InvalidProcessingStateError, match="phase_convention"):
+        merge_bursts(products, layout=layout)
 
 
-def test_non_reference_methods_set_is_documented() -> None:
-    """``faninsar_weighted`` must be flagged as not grounded in any reference."""
-    assert "faninsar_weighted" in NON_REFERENCE_METHODS
-    assert "insardev_ramp" not in NON_REFERENCE_METHODS
-    assert "isce2_avg" not in NON_REFERENCE_METHODS
-
-
-@pytest.mark.parametrize("method", ALL_METHODS)
-def test_output_shapes_and_dtypes(method: MergeMethod) -> None:
-    """Every method emits a MosaicProduct with the expected shape/dtype."""
-    p_i = _make_product("a", 0.0, (slice(0, 20), slice(0, 16)))
-    p_j = _make_product("b", 0.5, (slice(0, 20), slice(10, 26)))
-    g = _grid()
-    mosaic = merge_bursts(
-        [p_i, p_j], method=method, min_overlap_px=10, min_edge_coherence=0.0
-    )
-    assert mosaic.complex.shape == g.shape
-    assert mosaic.complex.dtype == np.complex64
-    assert mosaic.weight_sum.shape == g.shape
-    assert mosaic.n_bursts.dtype == np.uint8
-    assert mosaic.component_id.shape == g.shape
-
-
-def test_empty_products_raises() -> None:
-    with pytest.raises(ValueError):
-        merge_bursts([], method="insardev_ramp")
-    with pytest.raises(ValueError):
-        merge_burst_products([], mode="phase_network")
-
-
-@pytest.mark.parametrize("method", ALL_METHODS)
-def test_single_product_passes_through(method: MergeMethod) -> None:
-    """A single burst is the identity for all methods (no overlap possible)."""
-    p = _make_product("a", 0.4, (slice(0, 20), slice(0, 20)))
-    mosaic = merge_bursts([p], method=method)
-    assert np.allclose(mosaic.complex[p.weight > 0], p.complex[p.weight > 0])
+def test_unwrapped_and_merged_inputs_are_rejected() -> None:
+    """The kernel only accepts original complex burst windows."""
+    products, layout = _two_burst_azimuth_layout()
+    with pytest.raises(InvalidProcessingStateError, match="phase_domain"):
+        BurstWindow(
+            scope=SCOPE,
+            burst_id="iw1-b1",
+            acquisitions=("20240101",),
+            write_ids=("w1",),
+            phase_convention="reramped",
+            window=(0, 1, 0, 1),
+            complex=np.ones((1, 1), dtype=np.complex64),
+            valid_mask=np.ones((1, 1), dtype=bool),
+            phase_domain="unwrapped",
+        )
+    with pytest.raises(InvalidProcessingStateError, match="representation"):
+        merge_bursts(
+            [
+                BurstWindow(
+                    scope=SCOPE,
+                    burst_id="iw1-b1",
+                    acquisitions=products[0].acquisitions,
+                    write_ids=products[0].write_ids,
+                    phase_convention=products[0].phase_convention,
+                    window=products[0].window,
+                    complex=products[0].complex,
+                    valid_mask=products[0].valid_mask,
+                    representation="merged",
+                )
+            ],
+            layout=layout,
+        )
