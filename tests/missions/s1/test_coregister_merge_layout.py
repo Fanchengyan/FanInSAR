@@ -22,7 +22,11 @@ from faninsar.missions.s1.coregister import (
     S1ReferenceUnit,
     prepare_s1_reference,
 )
-from faninsar.missions.s1.merge_layout import polygon_identity, track_identity
+from faninsar.missions.s1.merge_layout import (
+    layout_product_dir,
+    polygon_identity,
+    track_identity,
+)
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
@@ -268,10 +272,13 @@ def _layout_path(
     tmp_path: Path,
     *,
     reference_id: str = "20200101",
-    roi: BoundingBox | None = None,
+    polygon: int | None = None,
 ) -> Path:
     """Return the committed layout product directory for this Reference."""
-    return tmp_path / "layout" / reference_id / polygon_identity(roi)
+    base = tmp_path / "layout" / reference_id
+    if polygon is None:
+        return base
+    return base / f"p{polygon}"
 
 
 def _read_item(path: Path) -> dict[str, object]:
@@ -293,6 +300,9 @@ def test_radar_reference_publishes_parent_azimuth_midpoint_layout(
     assert expected_parent == _PARENT_MIDPOINT
 
     layout_dir = _layout_path(tmp_path)
+    assert layout_dir == tmp_path / "layout" / "20200101"
+    assert "full-frame" not in layout_dir.parts
+    assert not (layout_dir / "full-frame").exists()
     assert (layout_dir / "item.json").is_file()
     item = _read_item(context.product.root)
     properties = item["properties"]
@@ -368,9 +378,7 @@ def test_radar_layout_parent_midpoint_is_invariant_to_roi_crop(
 
     def _seam_parent(context: S1ReferenceContext) -> int:
         item = _read_item(context.product.root)
-        layout = open_merge_layout(
-            _layout_path(context.product.root.parent.parent, roi=_COVERING_ROI)
-        )
+        layout = open_merge_layout(_layout_path(context.product.root.parent.parent))
         assert item["properties"]["faninsar:layout_id"]
         assert layout.source_ids == _PHYSICAL_IDS
         unit = context.units["f0_IW1_b0"]
@@ -567,6 +575,21 @@ def test_absolute_orbit_is_not_a_track_key(tmp_path: Path) -> None:
     assert track_identity(staged) != f"{staged.mission_id}-{staged.absolute_orbit}"
 
 
+def test_layout_product_dir_uses_pn_not_polygon_hash(tmp_path: Path) -> None:
+    """Formation/views spelling is layout/ref[/pN], never a WKT hash suffix."""
+    reference_id = "20200101"
+    unsuffixed = layout_product_dir(tmp_path / "coreg" / reference_id, reference_id)
+    assert unsuffixed == tmp_path / "layout" / reference_id
+    assert "full-frame" not in unsuffixed.parts
+    hashed = polygon_identity(_COVERING_ROI)
+    p0 = layout_product_dir(tmp_path / "coreg" / reference_id / "p0", reference_id)
+    p1 = layout_product_dir(tmp_path / "coreg" / reference_id / "p1", reference_id)
+    assert p0 == tmp_path / "layout" / reference_id / "p0"
+    assert p1 == tmp_path / "layout" / reference_id / "p1"
+    assert p0.name != hashed
+    assert hashed != "p0"
+
+
 def test_two_polygons_publish_independent_layouts(
     two_burst_s1: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,7 +603,7 @@ def test_two_polygons_publish_independent_layouts(
     )
     first = prepare_s1_reference(
         tmp_path / REFERENCE,
-        output_scene=tmp_path / "coreg" / "20200101-a",
+        output_scene=tmp_path / "coreg" / "20200101" / "p0",
         dem=ConstantDEM(0.0),
         swaths=("IW1",),
         bursts={"IW1": [0, 1]},
@@ -588,15 +611,18 @@ def test_two_polygons_publish_independent_layouts(
     )
     second = prepare_s1_reference(
         tmp_path / REFERENCE,
-        output_scene=tmp_path / "coreg" / "20200101-b",
+        output_scene=tmp_path / "coreg" / "20200101" / "p1",
         dem=ConstantDEM(0.0),
         swaths=("IW1",),
         bursts={"IW1": [0, 1]},
         roi=_SECOND_POLYGON,
     )
-    path_a = _layout_path(tmp_path, roi=_COVERING_ROI)
-    path_b = _layout_path(tmp_path, roi=_SECOND_POLYGON)
+    path_a = _layout_path(tmp_path, polygon=0)
+    path_b = _layout_path(tmp_path, polygon=1)
     assert path_a != path_b
+    assert path_a.name == "p0"
+    assert path_b.name == "p1"
+    assert path_a.parent == tmp_path / "layout" / "20200101"
     assert (path_a / "item.json").is_file()
     assert (path_b / "item.json").is_file()
     layout_a = open_merge_layout(path_a)
@@ -604,6 +630,7 @@ def test_two_polygons_publish_independent_layouts(
     assert layout_a.scope.track_id == layout_b.scope.track_id == _TRACK_KEY
     assert layout_a.scope.polygon_identity != layout_b.scope.polygon_identity
     assert layout_a.scope.polygon_identity == polygon_identity(_COVERING_ROI)
+    assert path_a.name != layout_a.scope.polygon_identity
     assert first.product.inputs["layout"] != second.product.inputs["layout"]
 
 

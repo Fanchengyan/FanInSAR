@@ -9,6 +9,7 @@ each unit's LUT native coordinates, never a cropped Geo bounding-box midpoint.
 from __future__ import annotations
 
 import hashlib
+import re
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -41,6 +42,7 @@ logger = setup_logger(__name__)
 # and ~1e-11 px in range. Residuals at this scale are a common lattice.
 LATTICE_ORIGIN_TOLERANCE_PX = 1.0e-3
 _SPACING_RELATIVE_TOLERANCE = 1.0e-9
+_POLYGON_DIR_NAME = re.compile(r"^p\d+$")
 
 
 class _ReferenceUnit(Protocol):
@@ -322,6 +324,42 @@ def build_s1_reference_layout(
     return layout
 
 
+def layout_product_dir(output_scene: Path, reference_id: str) -> Path:
+    """Return the frozen layout product directory for one Reference scene.
+
+    Formation and views open ``{work_dir}/layout/{reference_id}`` for the
+    unscoped (full-frame or single-polygon) view and
+    ``{work_dir}/layout/{reference_id}/pN`` when the scene lives at
+    ``{work_dir}/coreg/{date}/pN``. The MergeScope polygon-identity hash is
+    validation metadata, not a path component.
+
+    Parameters
+    ----------
+    output_scene : pathlib.Path
+        Reference scene directory, ``coreg/<date>`` or ``coreg/<date>/pN``.
+    reference_id : str
+        MergeScope reference id (a single path basename).
+
+    Returns
+    -------
+    pathlib.Path
+        Canonical layout product directory.
+
+    """
+    scene = Path(output_scene)
+    polygon_dir: str | None = None
+    if _POLYGON_DIR_NAME.fullmatch(scene.name) and scene.parent.parent.name == "coreg":
+        polygon_dir = require_basename(scene.name, "layout polygon directory")
+        scene = scene.parent
+    parent = scene.parent
+    work_dir = parent.parent if parent.name == "coreg" else parent
+    reference = require_basename(reference_id, "layout reference_id")
+    target = work_dir / "layout" / reference
+    if polygon_dir is not None:
+        return target / polygon_dir
+    return target
+
+
 def publish_reference_merge_layout(
     output_scene: Path,
     layout: MergeLayoutWindow,
@@ -333,12 +371,13 @@ def publish_reference_merge_layout(
     Parameters
     ----------
     output_scene : pathlib.Path
-        Reference scene directory, typically ``<work_dir>/coreg/<date>``.
+        Reference scene directory, ``<work_dir>/coreg/<date>`` or
+        ``<work_dir>/coreg/<date>/pN``.
     layout : MergeLayoutWindow
         Layout to persist. The product directory is
-        ``<work_dir>/layout/<reference_id>/<polygon_identity>`` so distinct
-        polygons of one Reference do not collide. MergeScope still records
-        the selection track key.
+        ``<work_dir>/layout/<reference_id>`` with an optional ``pN`` suffix
+        copied from ``output_scene``. Polygon-identity hashes stay in
+        MergeScope for validation.
     overwrite : bool, optional
         Replace an existing layout product.
 
@@ -348,13 +387,7 @@ def publish_reference_merge_layout(
         The committed ``merge_layout`` product.
 
     """
-    work_dir = Path(output_scene).parent
-    root = work_dir.parent if work_dir.name == "coreg" else work_dir
-    reference_id = require_basename(layout.scope.reference_id, "layout reference_id")
-    polygon_id = require_basename(
-        layout.scope.polygon_identity, "layout polygon_identity"
-    )
-    target = root / "layout" / reference_id / polygon_id
+    target = layout_product_dir(output_scene, layout.scope.reference_id)
     return publish_merge_layout(target, layout, overwrite=overwrite)
 
 
