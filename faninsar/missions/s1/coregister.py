@@ -10,6 +10,7 @@ are never re-read from SAFE nor re-deramped per date.
 
 from __future__ import annotations
 
+import inspect
 import shutil
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -96,6 +97,9 @@ class S1ReferenceUnit:
         Placement of the persisted unit on the scene grid.
     lut : Geo2RdrLUT or None
         Reference geo2rdr LUT (geo runs only).
+    scientific_support : numpy.ndarray or None
+        Exact ROI support of the published window (geometry and native
+        validity). Stored independently of sample amplitude.
 
     """
 
@@ -110,6 +114,7 @@ class S1ReferenceUnit:
     row_origin: int = 0
     col_origin: int = 0
     lut: Geo2RdrLUT | None = None
+    scientific_support: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -346,11 +351,14 @@ def prepare_s1_reference(
             unit.scene = _without_pixels(scene)
             units[tag] = unit
             if writer is not None and payload is not None:
-                writer.add_unit(
+                _stage_scene_unit(
+                    writer,
                     tag=tag,
                     payload=payload,
                     row_origin=unit.row_origin,
                     col_origin=unit.col_origin,
+                    valid_mask=unit.scientific_support,
+                    burst_id=tag,
                     scientific_lineage=[
                         {
                             "stage": "s1_reference_burst",
@@ -512,25 +520,45 @@ def _prepare_radar_unit(
             unit.crop = reference_window_crop(unit.roi_window, unit.native_shape)
             unit.row_origin += unit.crop[0]
             unit.col_origin += unit.crop[2]
-    if not compute:
-        return None
-    deramped = np.where(
-        scene.array.valid_mask, deramp(scene.array.samples, scene.carrier), 0
-    )
-    row0 = col0 = 0
-    if unit.crop is not None:
-        row0, row1, col0, col1 = unit.crop
+    crop = unit.crop
+    if crop is None:
+        crop = (0, unit.native_shape[0], 0, unit.native_shape[1])
+    native_valid = _window_native_valid(scene.array.valid_mask, crop)
+    payload: np.ndarray | None = None
+    if compute:
+        deramped = np.where(
+            scene.array.valid_mask, deramp(scene.array.samples, scene.carrier), 0
+        )
+        row0, row1, col0, col1 = crop
         deramped = deramped[row0:row1, col0:col1]
-    return np.asarray(
-        reramp(
-            deramped,
-            scene.carrier,
-            row0=row0,
-            col0=col0,
-            native_height=unit.native_shape[0],
-        ),
-        dtype=np.complex64,
-    )
+        payload = np.asarray(
+            reramp(
+                deramped,
+                scene.carrier,
+                row0=row0,
+                col0=col0,
+                native_height=unit.native_shape[0],
+            ),
+            dtype=np.complex64,
+        )
+    if roi is not None:
+        from faninsar.missions.s1.roi_support import (
+            apply_scientific_support,
+            radar_scientific_support,
+        )
+
+        support = radar_scientific_support(
+            scene.geometry,
+            dem,
+            crop=crop,
+            native_valid=native_valid,
+            roi=roi,
+            device=device,
+        )
+        unit.scientific_support = support
+        if payload is not None:
+            payload = apply_scientific_support(payload, support)
+    return payload
 
 
 def _prepare_geo_unit(
@@ -566,19 +594,38 @@ def _prepare_geo_unit(
     unit.lut = lut
     unit.row_origin = int(lut.row0)
     unit.col_origin = int(lut.col0)
-    if not compute:
-        return None
-    deramped = np.where(
-        scene.array.valid_mask, deramp(scene.array.samples, scene.carrier), 0
-    )
-    reference_geo, _ = geocode_reference_slc_chunked(
-        deramped,
-        reference_carrier=scene.carrier,
-        reference_lut=lut,
-        output_dir=work_dir / "slc",
-        device=device,
-    )
-    return np.array(reference_geo, dtype=np.complex64)
+    payload: np.ndarray | None = None
+    if compute:
+        deramped = np.where(
+            scene.array.valid_mask, deramp(scene.array.samples, scene.carrier), 0
+        )
+        reference_geo, _ = geocode_reference_slc_chunked(
+            deramped,
+            reference_carrier=scene.carrier,
+            reference_lut=lut,
+            output_dir=work_dir / "slc",
+            device=device,
+        )
+        payload = np.array(reference_geo, dtype=np.complex64)
+    if roi is not None:
+        from faninsar.missions.s1.roi_support import (
+            apply_scientific_support,
+            geo_scientific_support,
+        )
+
+        window = payload.shape if payload is not None else tuple(lut.valid.shape)
+        support = geo_scientific_support(
+            geo_grid,
+            row0=int(lut.row0),
+            col0=int(lut.col0),
+            shape=window,
+            native_valid=np.asarray(lut.valid, dtype=bool),
+            roi=roi,
+        )
+        unit.scientific_support = support
+        if payload is not None:
+            payload = apply_scientific_support(payload, support)
+    return payload
 
 
 def _materialize_lut(lut: Geo2RdrLUT) -> Geo2RdrLUT:
@@ -751,11 +798,14 @@ def coregister_s1_secondary(
                         f"{tag}: secondary shape {payload.shape} differs from "
                         f"the Reference {placed.shape}"
                     )
-                writer.add_unit(
+                _stage_scene_unit(
+                    writer,
                     tag=tag,
                     payload=payload,
                     row_origin=placed.row_origin,
                     col_origin=placed.col_origin,
+                    valid_mask=unit.scientific_support,
+                    burst_id=tag,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )
@@ -946,6 +996,7 @@ def _coregister_unit(
     payload = np.array(state.secondary_aligned, dtype=np.complex64)
     if domain == "radar" and unit.crop is not None:
         payload = _crop_to_reference_window(state, unit.crop, payload, tag=unit.tag)
+    payload = _apply_unit_roi_support(context, unit, payload)
     state.secondary_aligned = None
     return payload, state
 
@@ -968,6 +1019,113 @@ def _crop_to_reference_window(
             f"{tag}: pair ROI crop does not contain the Reference ROI crop"
         )
     return np.ascontiguousarray(secondary[row0:row1, col0:col1])
+
+
+def _window_native_valid(
+    valid_mask: np.ndarray | None,
+    crop: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    """Return native validity on ``crop``, or ``None`` when it is unavailable."""
+    if valid_mask is None:
+        return None
+    row0, row1, col0, col1 = crop
+    native = np.asarray(valid_mask, dtype=bool)
+    if native.ndim != 2:
+        return None
+    return native[row0:row1, col0:col1]
+
+
+def _apply_unit_roi_support(
+    context: S1ReferenceContext,
+    unit: S1ReferenceUnit,
+    payload: np.ndarray,
+) -> np.ndarray:
+    """Apply exact ROI support to a resampled payload before publication."""
+    if context.roi is None:
+        return payload
+    from faninsar.missions.s1.roi_support import apply_scientific_support
+
+    support = unit.scientific_support
+    if support is None:
+        support = _compute_unit_support(context, unit, payload.shape)
+        unit.scientific_support = support
+    if support.shape != payload.shape:
+        reject_invalid_state(
+            f"{unit.tag}: ROI support {support.shape} does not match payload "
+            f"{payload.shape}"
+        )
+    return apply_scientific_support(payload, support)
+
+
+def _compute_unit_support(
+    context: S1ReferenceContext,
+    unit: S1ReferenceUnit,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Compute exact ROI support for one published unit window."""
+    from faninsar.missions.s1.roi_support import (
+        geo_scientific_support,
+        radar_scientific_support,
+    )
+
+    if context.coregistration_grid == "geo":
+        if unit.lut is None or context.geo_grid is None:
+            reject_invalid_state(
+                f"{unit.tag}: geo ROI support requires a Reference LUT"
+            )
+        return geo_scientific_support(
+            context.geo_grid,
+            row0=int(unit.lut.row0),
+            col0=int(unit.lut.col0),
+            shape=shape,
+            native_valid=np.asarray(unit.lut.valid, dtype=bool),
+            roi=context.roi,
+        )
+    crop = unit.crop
+    if crop is None:
+        crop = (0, unit.native_shape[0], 0, unit.native_shape[1])
+    return radar_scientific_support(
+        unit.scene.geometry,
+        context.dem,
+        crop=crop,
+        native_valid=_window_native_valid(
+            getattr(unit.scene.array, "valid_mask", None),
+            crop,
+        ),
+        roi=context.roi,
+        device="auto",
+    )
+
+
+def _stage_scene_unit(
+    writer: SceneWriter,
+    *,
+    tag: str,
+    payload: np.ndarray,
+    row_origin: int,
+    col_origin: int,
+    valid_mask: np.ndarray | None,
+    burst_id: str,
+    scientific_lineage: Sequence[Mapping[str, str]] | None = None,
+    phase_state: Mapping[str, object] | None = None,
+) -> None:
+    """Publish one unit, passing frozen ``valid_mask`` when the writer accepts it."""
+    kwargs: dict[str, object] = {
+        "tag": tag,
+        "payload": payload,
+        "row_origin": row_origin,
+        "col_origin": col_origin,
+    }
+    if scientific_lineage is not None:
+        kwargs["scientific_lineage"] = scientific_lineage
+    if phase_state is not None:
+        kwargs["phase_state"] = phase_state
+    parameters = inspect.signature(writer.add_unit).parameters
+    if "valid_mask" in parameters:
+        kwargs["valid_mask"] = valid_mask
+    if "burst_id" in parameters:
+        kwargs["burst_id"] = burst_id
+    writer.add_unit(**kwargs)
 
 
 def coregister_s1_scene(
