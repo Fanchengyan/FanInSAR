@@ -13,6 +13,7 @@ import pytest
 from shapely.geometry import Point, Polygon
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.data.query import BoundingBox
 from faninsar.data.query.polygons import Polygons
 from faninsar.missions.protocols import DopplerCentroidPolynomial
 from faninsar.missions.s1 import coregister as coreg_module
@@ -22,6 +23,7 @@ from faninsar.missions.s1.coregister import (
     prepare_s1_reference,
 )
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 from faninsar.processing.geometry import ConstantDEM, RadarGeometryModel
 from faninsar.processing.geometry.coordinates import RadarGrid
@@ -269,27 +271,11 @@ def _expected_support() -> np.ndarray:
     return support
 
 
-def _read_valid_mask(product: object, tag: str) -> np.ndarray | None:
-    """Return a persisted unit valid mask when the formation asset exists."""
-    reader = getattr(product, "read_valid_mask", None)
-    if callable(reader):
-        mask = reader(tag)
-        return np.asarray(mask, dtype=bool)
-    unit_map = product.unit_map()
-    unit = unit_map[tag]
-    for name in ("valid_path", "valid_mask_path"):
-        path = getattr(unit, name, None)
-        if path is not None and Path(path).exists():
-            from faninsar.io.storage._zarr_stac import read_zarr_array
-
-            return np.asarray(read_zarr_array(Path(path)), dtype=bool)
-    root = Path(product.root)
-    candidate = root / f"{tag}.valid.zarr"
-    if candidate.exists():
-        from faninsar.io.storage._zarr_stac import read_zarr_array
-
-        return np.asarray(read_zarr_array(candidate), dtype=bool)
-    return None
+def _assert_valid_mask(product: object, tag: str, expected: np.ndarray) -> None:
+    """Assert the persisted unit valid_mask matches ``expected``."""
+    mask = product.read_valid_mask(tag)
+    assert mask is not None
+    np.testing.assert_array_equal(np.asarray(mask, dtype=bool), expected)
 
 
 def test_radar_reference_publication_excludes_hole_and_canvas_fill(
@@ -326,11 +312,10 @@ def test_radar_reference_publication_excludes_hole_and_canvas_fill(
     assert not np.isfinite(payload[_HOLE_PIXEL].real)
     assert not np.isfinite(payload[_BBOX_CORNER].real)
     assert not np.isfinite(payload[_CANVAS_INVALID].real)
-    mask = _read_valid_mask(context.product, "f0_IW1_b0")
-    if mask is not None:
-        np.testing.assert_array_equal(mask, expected)
-        assert bool(mask[_INTERIOR_ZERO])
-        assert not bool(mask[_CANVAS_INVALID])
+    _assert_valid_mask(context.product, "f0_IW1_b0", expected)
+    mask = context.product.read_valid_mask("f0_IW1_b0")
+    assert bool(mask[_INTERIOR_ZERO])
+    assert not bool(mask[_CANVAS_INVALID])
     assert (tmp_path / REFERENCE / "manifest.safe").is_file()
 
 
@@ -382,9 +367,7 @@ def test_radar_secondary_publication_matches_reference_roi_support(
         payload[interior],
         np.full(int(interior.sum()), 1.0 + 1.0j, dtype=np.complex64),
     )
-    mask = _read_valid_mask(product, "f0_IW1_b0")
-    if mask is not None:
-        np.testing.assert_array_equal(mask, expected)
+    _assert_valid_mask(product, "f0_IW1_b0", expected)
     assert (tmp_path / SECONDARY / "manifest.safe").is_file()
     assert (tmp_path / REFERENCE / "manifest.safe").is_file()
 
@@ -500,9 +483,7 @@ def test_geo_publication_uses_pixel_centers_and_excludes_holes(
         payload[interior],
         np.full(int(interior.sum()), 3.0, dtype=np.complex64),
     )
-    mask = _read_valid_mask(context.product, "f0_IW1_b0")
-    if mask is not None:
-        np.testing.assert_array_equal(mask, expected)
+    _assert_valid_mask(context.product, "f0_IW1_b0", expected)
     secondary = coregister_s1_secondary(
         context,
         tmp_path / SECONDARY,
@@ -513,4 +494,30 @@ def test_geo_publication_uses_pixel_centers_and_excludes_holes(
     sec_payload, _ = secondary.read("f0_IW1_b0")
     assert not np.isfinite(sec_payload.real[outside]).any()
     assert not np.isfinite(sec_payload[geo_hole].real)
+    _assert_valid_mask(secondary, "f0_IW1_b0", expected)
     assert (tmp_path / SECONDARY / "manifest.safe").is_file()
+
+
+def test_radar_scientific_support_rejects_unknown_geometry() -> None:
+    """Unknown geometry must not publish the full crop as ROI support."""
+    from faninsar.missions.s1.roi_support import radar_scientific_support
+
+    crop = (0, _LINES, 0, _SAMPLES)
+    native = np.ones((_LINES, _SAMPLES), dtype=bool)
+    roi = BoundingBox(10.0, 45.0, 10.08, 45.08)
+    with pytest.raises(InvalidProcessingStateError, match="RadarGeometryModel"):
+        radar_scientific_support(
+            MagicMock(),
+            ConstantDEM(0.0),
+            crop=crop,
+            native_valid=native,
+            roi=roi,
+        )
+    support = radar_scientific_support(
+        MagicMock(),
+        ConstantDEM(0.0),
+        crop=crop,
+        native_valid=native,
+        roi=None,
+    )
+    np.testing.assert_array_equal(support, native)

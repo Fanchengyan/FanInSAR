@@ -102,8 +102,8 @@ def radar_scientific_support(
     Parameters
     ----------
     geometry : RadarGeometryModel
-        Destination burst geometry. A non-model stand-in skips the ground
-        test rather than inventing a four-corner affine.
+        Destination burst geometry. A non-model stand-in is rejected when
+        ``roi`` is set rather than publishing the full crop as support.
     dem : DEM or None
         Height sampler forwarded to rdr2geo.
     crop : tuple of int
@@ -121,29 +121,25 @@ def radar_scientific_support(
         Boolean support with shape ``(row1 - row0, col1 - col0)``.
 
     """
-    from faninsar.processing.geometry.prepare_production import (
-        run_rdr2geo as production_rdr2geo,
-    )
+    from faninsar.processing.geometry.prepare_production import run_rdr2geo
     from faninsar.processing.geometry.transforms import RadarGeometryModel
-
-    solver = globals().get("run_rdr2geo", production_rdr2geo)
 
     row0, row1, col0, col1 = (int(value) for value in crop)
     shape = (row1 - row0, col1 - col0)
     if any(size <= 0 for size in shape):
         reject_invalid_state("radar ROI crop must have positive shape")
-    if roi is None or not isinstance(geometry, RadarGeometryModel):
-        if roi is not None and not isinstance(geometry, RadarGeometryModel):
-            logger.warning(
-                "exact radar ROI support needs RadarGeometryModel; "
-                "crop window is unchanged"
-            )
+    if roi is None:
         support = np.ones(shape, dtype=bool)
+    elif not isinstance(geometry, RadarGeometryModel):
+        reject_invalid_state(
+            "exact radar ROI support requires RadarGeometryModel; "
+            "unknown geometry cannot publish full-window support"
+        )
     else:
         rows = np.arange(row0, row1, dtype=np.float64)
         cols = np.arange(col0, col1, dtype=np.float64)
         azimuth, slant = np.meshgrid(rows, cols, indexing="ij")
-        result = solver(geometry, azimuth, slant, dem, device=device)
+        result = run_rdr2geo(geometry, azimuth, slant, dem, device=device)
         converged = np.asarray(result.converged, dtype=bool)
         if converged.shape != shape:
             reject_invalid_state("rdr2geo support shape must match the radar crop")

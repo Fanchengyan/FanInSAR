@@ -10,7 +10,6 @@ are never re-read from SAFE nor re-deramped per date.
 
 from __future__ import annotations
 
-import inspect
 import shutil
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -95,6 +94,8 @@ class S1ReferenceUnit:
         Pair-independent Reference crop of ``roi_window``.
     row_origin, col_origin : int
         Placement of the persisted unit on the scene grid.
+    parent_row0, parent_col0 : int
+        Full-burst origin on the parent radar lattice, before ROI cropping.
     lut : Geo2RdrLUT or None
         Reference geo2rdr LUT (geo runs only).
     scientific_support : numpy.ndarray or None
@@ -113,6 +114,8 @@ class S1ReferenceUnit:
     crop: tuple[int, int, int, int] | None = None
     row_origin: int = 0
     col_origin: int = 0
+    parent_row0: int = 0
+    parent_col0: int = 0
     lut: Geo2RdrLUT | None = None
     scientific_support: np.ndarray | None = None
 
@@ -244,6 +247,7 @@ def prepare_s1_reference(
     reference_id = _scene_id(primary_paths[0])
     output_scene = Path(output_scene)
     reuse = (output_scene / "item.json").is_file() and not overwrite
+    reused_store = CoregisteredSceneStore.open(output_scene) if reuse else None
     scene_row0 = 0
     scene_col0 = 0
     if coregistration_grid == "geo":
@@ -308,6 +312,14 @@ def prepare_s1_reference(
                     **header,
                 )
             unit = units.get(tag)
+            parent_row0 = int(
+                next(
+                    azimuth_offset
+                    for f_i, b_i, azimuth_offset in units_by_swath[swath]
+                    if f_i == frame_index and b_i == burst_index
+                )
+            )
+            parent_col0 = int(range_offsets[swath])
             if unit is None:
                 unit = S1ReferenceUnit(
                     tag=tag,
@@ -319,16 +331,21 @@ def prepare_s1_reference(
                         int(scene.array.samples.shape[0]),
                         int(scene.array.samples.shape[1]),
                     ),
-                    row_origin=int(
-                        next(
-                            azimuth_offset
-                            for f_i, b_i, azimuth_offset in units_by_swath[swath]
-                            if f_i == frame_index and b_i == burst_index
-                        )
-                        - scene_row0
-                    ),
-                    col_origin=int(range_offsets[swath] - scene_col0),
+                    row_origin=int(parent_row0 - scene_row0),
+                    col_origin=int(parent_col0 - scene_col0),
+                    parent_row0=parent_row0,
+                    parent_col0=parent_col0,
                 )
+            else:
+                unit.parent_row0 = parent_row0
+                unit.parent_col0 = parent_col0
+            if reused_store is not None:
+                persisted = reused_store.read_valid_mask(tag)
+                if persisted is None:
+                    reject_invalid_state(
+                        f"{tag}: reused Reference is missing persisted valid_mask"
+                    )
+                unit.scientific_support = np.asarray(persisted, dtype=bool)
             unit.scene = scene
             if coregistration_grid == "radar":
                 payload = _prepare_radar_unit(
@@ -351,6 +368,8 @@ def prepare_s1_reference(
             unit.scene = _without_pixels(scene)
             units[tag] = unit
             if writer is not None and payload is not None:
+                from faninsar.missions.s1.merge_layout import physical_burst_id
+
                 _stage_scene_unit(
                     writer,
                     tag=tag,
@@ -358,7 +377,7 @@ def prepare_s1_reference(
                     row_origin=unit.row_origin,
                     col_origin=unit.col_origin,
                     valid_mask=unit.scientific_support,
-                    burst_id=tag,
+                    burst_id=physical_burst_id(unit),
                     scientific_lineage=[
                         {
                             "stage": "s1_reference_burst",
@@ -384,7 +403,31 @@ def prepare_s1_reference(
             # The Reference is its own baseline origin (PROPOSAL-0065).
             properties["faninsar:baseline_parallel_m"] = 0.0
             properties["faninsar:baseline_perpendicular_m"] = 0.0
-            product = writer.commit(properties=properties)
+            from faninsar.missions.s1.merge_layout import (
+                build_s1_reference_layout,
+                publish_reference_merge_layout,
+                track_identity,
+            )
+
+            first_swath = next(iter(units.values())).scene.swath
+            layout = build_s1_reference_layout(
+                units,
+                domain=coregistration_grid,
+                reference_id=reference_id,
+                track_id=track_identity(primary_products[0]),
+                channel=str(first_swath.polarization).lower(),
+                grid_identity=writer.grid_identity,
+                roi=roi,
+                scene_offset=(scene_row0, scene_col0),
+            )
+            layout_product = publish_reference_merge_layout(
+                output_scene, layout, overwrite=overwrite
+            )
+            properties["faninsar:layout_id"] = layout_product.write_id
+            product = writer.commit(
+                properties=properties,
+                inputs={"layout": layout_product.write_id},
+            )
         else:
             product = CoregisteredSceneStore.open(output_scene)
             _check_reused_reference(product, reference_id, units, coregistration_grid)
@@ -462,6 +505,8 @@ def _radar_roi_units(
                 native_shape=native_shape,
                 row_origin=int(azimuth_offset),
                 col_origin=int(range_offsets[swath]),
+                parent_row0=int(azimuth_offset),
+                parent_col0=int(range_offsets[swath]),
             )
             unit.roi_window = _roi_burst_window(
                 roi,
@@ -541,23 +586,31 @@ def _prepare_radar_unit(
             ),
             dtype=np.complex64,
         )
-    if roi is not None:
-        from faninsar.missions.s1.roi_support import (
-            apply_scientific_support,
-            radar_scientific_support,
-        )
+    shape = (int(crop[1] - crop[0]), int(crop[3] - crop[2]))
+    if unit.scientific_support is None:
+        if roi is not None:
+            if not compute:
+                reject_invalid_state(
+                    f"{unit.tag}: reused Reference is missing persisted valid_mask"
+                )
+            from faninsar.missions.s1.roi_support import radar_scientific_support
 
-        support = radar_scientific_support(
-            scene.geometry,
-            dem,
-            crop=crop,
-            native_valid=native_valid,
-            roi=roi,
-            device=device,
-        )
-        unit.scientific_support = support
-        if payload is not None:
-            payload = apply_scientific_support(payload, support)
+            unit.scientific_support = radar_scientific_support(
+                scene.geometry,
+                dem,
+                crop=crop,
+                native_valid=native_valid,
+                roi=roi,
+                device=device,
+            )
+        elif native_valid is not None:
+            unit.scientific_support = np.asarray(native_valid, dtype=bool)
+        else:
+            unit.scientific_support = np.ones(shape, dtype=bool)
+    if payload is not None and roi is not None:
+        from faninsar.missions.s1.roi_support import apply_scientific_support
+
+        payload = apply_scientific_support(payload, unit.scientific_support)
     return payload
 
 
@@ -607,24 +660,29 @@ def _prepare_geo_unit(
             device=device,
         )
         payload = np.array(reference_geo, dtype=np.complex64)
-    if roi is not None:
-        from faninsar.missions.s1.roi_support import (
-            apply_scientific_support,
-            geo_scientific_support,
-        )
+    window = payload.shape if payload is not None else tuple(lut.valid.shape)
+    if unit.scientific_support is None:
+        if roi is not None:
+            if not compute:
+                reject_invalid_state(
+                    f"{unit.tag}: reused Reference is missing persisted valid_mask"
+                )
+            from faninsar.missions.s1.roi_support import geo_scientific_support
 
-        window = payload.shape if payload is not None else tuple(lut.valid.shape)
-        support = geo_scientific_support(
-            geo_grid,
-            row0=int(lut.row0),
-            col0=int(lut.col0),
-            shape=window,
-            native_valid=np.asarray(lut.valid, dtype=bool),
-            roi=roi,
-        )
-        unit.scientific_support = support
-        if payload is not None:
-            payload = apply_scientific_support(payload, support)
+            unit.scientific_support = geo_scientific_support(
+                geo_grid,
+                row0=int(lut.row0),
+                col0=int(lut.col0),
+                shape=window,
+                native_valid=np.asarray(lut.valid, dtype=bool),
+                roi=roi,
+            )
+        else:
+            unit.scientific_support = np.asarray(lut.valid, dtype=bool)
+    if payload is not None and roi is not None:
+        from faninsar.missions.s1.roi_support import apply_scientific_support
+
+        payload = apply_scientific_support(payload, unit.scientific_support)
     return payload
 
 
@@ -798,6 +856,8 @@ def coregister_s1_secondary(
                         f"{tag}: secondary shape {payload.shape} differs from "
                         f"the Reference {placed.shape}"
                     )
+                from faninsar.missions.s1.merge_layout import physical_burst_id
+
                 _stage_scene_unit(
                     writer,
                     tag=tag,
@@ -805,7 +865,7 @@ def coregister_s1_secondary(
                     row_origin=placed.row_origin,
                     col_origin=placed.col_origin,
                     valid_mask=unit.scientific_support,
-                    burst_id=tag,
+                    burst_id=physical_burst_id(unit),
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )
@@ -1109,23 +1169,18 @@ def _stage_scene_unit(
     scientific_lineage: Sequence[Mapping[str, str]] | None = None,
     phase_state: Mapping[str, object] | None = None,
 ) -> None:
-    """Publish one unit, passing frozen ``valid_mask`` when the writer accepts it."""
-    kwargs: dict[str, object] = {
-        "tag": tag,
-        "payload": payload,
-        "row_origin": row_origin,
-        "col_origin": col_origin,
-    }
-    if scientific_lineage is not None:
-        kwargs["scientific_lineage"] = scientific_lineage
-    if phase_state is not None:
-        kwargs["phase_state"] = phase_state
-    parameters = inspect.signature(writer.add_unit).parameters
-    if "valid_mask" in parameters:
-        kwargs["valid_mask"] = valid_mask
-    if "burst_id" in parameters:
-        kwargs["burst_id"] = burst_id
-    writer.add_unit(**kwargs)
+    """Publish one unit with declared ``valid_mask`` and physical ``burst_id``."""
+    mask = None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
+    writer.add_unit(
+        tag=tag,
+        payload=payload,
+        row_origin=row_origin,
+        col_origin=col_origin,
+        scientific_lineage=scientific_lineage,
+        phase_state=phase_state,
+        valid_mask=mask,
+        burst_id=burst_id,
+    )
 
 
 def coregister_s1_scene(
@@ -1374,6 +1429,12 @@ def _unit_placement(
     range_offsets: dict[str, int],
 ) -> tuple[dict[str, list[tuple[int, int, int]]], int, int]:
     """Place selected bursts on one shared absolute radar grid."""
+    from faninsar.missions.s1.merge_layout import (
+        integer_lattice_offset,
+        qualify_radar_lattice,
+    )
+
+    qualify_radar_lattice(primary_products, resolved, swath_tuple, range_offsets)
     primary_swath0 = _first_swath(primary_products, swath_tuple[0])
     dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
@@ -1397,11 +1458,12 @@ def _unit_placement(
                 continue
             swath_obj = primary_products[frame_index].swath(swath)
             for burst_index in indices:
-                azimuth_offset = round(
-                    (
-                        swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
-                    ).total_seconds()
-                    / dt
+                raw = (
+                    swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
+                ).total_seconds() / dt
+                azimuth_offset = integer_lattice_offset(
+                    raw,
+                    name=f"f{frame_index}_{swath}_b{burst_index} azimuth origin",
                 )
                 units.append((frame_index, burst_index, azimuth_offset))
         units.sort(key=lambda unit: unit[2], reverse=True)

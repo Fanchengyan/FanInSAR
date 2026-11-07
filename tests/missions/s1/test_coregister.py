@@ -6,6 +6,7 @@ import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -27,7 +28,8 @@ from faninsar.missions.s1.coregister import (
 )
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.geometry import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM, RadarGeometryModel
+from faninsar.processing.geometry.coordinates import RadarGrid
 from faninsar.processing.geometry.record import radar_geometry_from_record
 
 REFERENCE = "S1A_IW_SLC__1SDV_20200101T000000.SAFE"
@@ -103,6 +105,7 @@ def test_coregister_s1_scene_rejects_non_finite_misreg(
 _ORIGIN = datetime(2020, 1, 1, tzinfo=UTC)
 _LINES = 8
 _SAMPLES = 8
+_COVERING_ROI = BoundingBox(9.99, 44.99, 10.08, 45.08)
 
 
 def _burst() -> S1Burst:
@@ -187,22 +190,48 @@ class _Recorder:
         self.coregister_kwargs: list[dict[str, object]] = []
 
 
+def _geometry(path: Path) -> RadarGeometryModel:
+    """Return a real radar geometry model so ROI support is not fail-closed."""
+    swath = _product(path).swaths[0]
+    grid = RadarGrid(
+        shape=(_LINES, _SAMPLES),
+        starting_slant_range_m=float(swath.slant_range_time_s * 299_792_458.0 / 2.0),
+        range_spacing_m=float(swath.range_pixel_spacing_m),
+        sensing_start=_ORIGIN,
+        azimuth_time_interval_s=float(swath.azimuth_time_interval_s),
+        wavelength_m=0.05546576,
+        look_direction="right",
+    )
+    return RadarGeometryModel.from_radar_grid(grid, swath.orbit)
+
+
+def _linear_rdr2geo(
+    _model: object,
+    azimuth_index: np.ndarray,
+    range_index: np.ndarray,
+    dem: object | None = None,
+    **_kwargs: object,
+) -> SimpleNamespace:
+    """Map every radar sample to lon/lat; never a four-corner affine."""
+    del dem
+    azimuth = np.asarray(azimuth_index, dtype=np.float64)
+    slant = np.asarray(range_index, dtype=np.float64)
+    return SimpleNamespace(
+        latitude_deg=45.0 + 0.01 * azimuth,
+        longitude_deg=10.0 + 0.01 * slant,
+        converged=np.ones(azimuth.shape, dtype=bool),
+    )
+
+
 def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     """Return a production-scene stand-in with the fields apply needs."""
     scene = MagicMock()
     scene.scene_id = scene_id
     scene.path = path
-    scene.burst.index = 0
-    scene.burst.azimuth_time = _ORIGIN
-    scene.swath = _product(path).swaths[0]
-    scene.geometry.wavelength_m = 0.05546576
-    # Real azimuth_time so the baseline orbit interpolator gets a tz-aware
-    # datetime inside the fake orbit's coverage (PROPOSAL-0065).
-    scene.geometry.azimuth_time = (
-        lambda line, _burst=scene.swath.bursts[0], _dt=scene.swath.azimuth_time_interval_s: (
-            _burst.azimuth_time + timedelta(seconds=float(line) * _dt)
-        )
-    )
+    product = _product(path)
+    scene.burst = product.swaths[0].bursts[0]
+    scene.swath = product.swaths[0]
+    scene.geometry = _geometry(path)
     scene.array.samples = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
     scene.array.valid_mask = np.ones((_LINES, _SAMPLES), dtype=bool)
     scene.array.row0 = 0
@@ -262,6 +291,10 @@ def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
     monkeypatch.setattr(f"{module}.stage_coregister", fake_coregister)
     monkeypatch.setattr(f"{module}._without_pixels", lambda scene: scene)
     monkeypatch.setattr(f"{module}._phase_state_manifest", lambda _state: None)
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        _linear_rdr2geo,
+    )
     return recorder
 
 
@@ -320,6 +353,7 @@ def test_secondary_persists_signed_scene_baseline(
     tmp_path: Path, fake_s1: _Recorder
 ) -> None:
     """A coregistered secondary carries its baseline-vs-Reference record."""
+    del fake_s1
     context = _prepare(tmp_path)
     product = coregister_s1_secondary(
         context,
@@ -411,7 +445,7 @@ def test_reused_reference_rejects_a_changed_selection(
             tmp_path,
             swaths=("IW1",),
             bursts={"IW1": [0]},
-            roi=BoundingBox(0.0, 0.0, 1.0, 1.0),
+            roi=_COVERING_ROI,
         )
 
 
@@ -440,7 +474,7 @@ def test_wrapper_keeps_explicit_bursts_when_roi_is_set(
         misreg_rg_px=0.0,
         swaths=("IW1",),
         bursts={"IW1": [0]},
-        roi=BoundingBox(0.0, 0.0, 1.0, 1.0),
+        roi=_COVERING_ROI,
     )
     assert product.date_id == "20200113"
     assert isinstance(product, CoregisteredSceneStore)
@@ -462,7 +496,7 @@ def test_reference_grid_is_bounded_by_the_roi_crop(
         tmp_path,
         swaths=("IW1",),
         bursts={"IW1": [0]},
-        roi=BoundingBox(0.0, 0.0, 1.0, 1.0),
+        roi=_COVERING_ROI,
     )
     assert context.grid_shape == (crop[1] - crop[0], crop[3] - crop[2])
     unit = context.units["f0_IW1_b0"]
@@ -493,13 +527,14 @@ def _multi_swath_product(path: Path) -> S1Product:
     base = _product(path).swaths[0]
     swaths = []
     for index, name in enumerate(("IW1", "IW2", "IW3")):
-        start = _ORIGIN + timedelta(seconds=0.3 * index)
+        start = _ORIGIN + timedelta(seconds=index)
         bursts = tuple(
             replace(
                 _burst(),
                 index=burst,
-                azimuth_time=start + timedelta(seconds=_LINES * burst * 0.9),
-                sensing_time=start + timedelta(seconds=_LINES * burst * 0.9),
+                azimuth_time=start + timedelta(seconds=_LINES * burst * 0.5),
+                sensing_time=start + timedelta(seconds=_LINES * burst * 0.5),
+                azimuth_anx_time_s=float(index * 10 + burst),
             )
             for burst in range(2)
         )
@@ -510,7 +545,7 @@ def _multi_swath_product(path: Path) -> S1Product:
                 lines=2 * _LINES,
                 slant_range_time_s=base.slant_range_time_s + 1e-5 * index,
                 range_pixel_spacing_m=base.range_pixel_spacing_m + 0.01 * index,
-                azimuth_time_interval_s=1.0 + 0.001 * index,
+                azimuth_time_interval_s=1.0,
                 bursts=bursts,
             )
         )
