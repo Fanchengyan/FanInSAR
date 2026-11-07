@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -20,7 +20,10 @@ if TYPE_CHECKING:
     from faninsar.processing.geocoding.product import GeocodeSession
     from faninsar.processing.geometry.grids import GridSpec
 
-__all__ = ["InterferogramLayers", "ProductLayer"]
+__all__ = ["InterferogramLayers", "MergedBurstLayers", "ProductLayer"]
+
+#: Half-open raster window ``(r0, r1, c0, c1)`` in row/column coordinates.
+Window = tuple[int, int, int, int]
 
 logger = setup_logger(__name__)
 
@@ -52,6 +55,176 @@ _SCENE_GEOMETRY_ASSETS = (
     "azimuth",
     "geom_flags",
 )
+
+
+def _as_window(window: object) -> Window:
+    """Validate a half-open ``(r0, r1, c0, c1)`` window."""
+    if (
+        not isinstance(window, tuple)
+        or len(window) != 4
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in window
+        )
+    ):
+        message = (
+            f"window must be a half-open (r0, r1, c0, c1) integer tuple; got {window!r}"
+        )
+        raise TypeError(message)
+    row0, row1, col0, col1 = window
+    if row0 > row1 or col0 > col1:
+        message = f"window bounds are not half-open: {window!r}"
+        raise ValueError(message)
+    return row0, row1, col0, col1
+
+
+def _window_shape(window: Window) -> tuple[int, int]:
+    """Return ``(rows, cols)`` of a half-open window."""
+    row0, row1, col0, col1 = window
+    return row1 - row0, col1 - col0
+
+
+def _overlap_window(first: Window, second: Window) -> Window | None:
+    """Return the overlapping half-open window, or ``None``."""
+    row0 = max(first[0], second[0])
+    row1 = min(first[1], second[1])
+    col0 = max(first[2], second[2])
+    col1 = min(first[3], second[3])
+    if row0 >= row1 or col0 >= col1:
+        return None
+    return row0, row1, col0, col1
+
+
+def _tight_support_window(mask: np.ndarray, origin: Window) -> Window | None:
+    """Return the grid window of True samples, preserving holes and gaps.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Boolean support sampled on ``origin``.
+    origin : tuple of int
+        Grid window that *mask* occupies.
+
+    Returns
+    -------
+    tuple of int or None
+        Tight bounding window in grid coordinates, or ``None`` when empty.
+
+    """
+    if mask.shape[0] == 0 or mask.shape[1] == 0 or not np.any(mask):
+        return None
+    rows, cols = np.nonzero(mask)
+    row0, row1 = int(rows.min()), int(rows.max()) + 1
+    col0, col1 = int(cols.min()), int(cols.max()) + 1
+    return (
+        origin[0] + row0,
+        origin[0] + row1,
+        origin[2] + col0,
+        origin[2] + col1,
+    )
+
+
+def _unit_grid_box(unit: Any) -> Window:
+    """Return a scene unit's footprint on the shared grid."""
+    row0 = int(unit.row_origin)
+    col0 = int(unit.col_origin)
+    return row0, row0 + int(unit.shape[0]), col0, col0 + int(unit.shape[1])
+
+
+def _phase_convention(value: object) -> str:
+    """Return a non-empty phase-convention label for a BurstWindow."""
+    if isinstance(value, str) and value:
+        return value
+    return "primary_minus_secondary"
+
+
+def _unwrap_payload(payload: object) -> np.ndarray:
+    """Return the array from a store payload that may be ``(array, unit)``."""
+    if isinstance(payload, tuple):
+        payload = payload[0]
+    return np.asarray(payload)
+
+
+def _crop_committed_layout(layout: Any, grid_window: Window) -> Any:
+    """Crop a committed layout to *grid_window* without reassembling owners.
+
+    ``build_merge_layout`` is an assembler only and does not infer physical
+    Geo midpoints from ROI boxes. Collection reads must open a published
+    ``merge_layout`` and slice it; they must not rebuild owner labels from
+    burst footprints.
+    """
+    from faninsar.processing.mosaicking import LayoutSourceWindow, MergeLayoutWindow
+
+    if not isinstance(layout, MergeLayoutWindow):
+        reject_invalid_state(
+            "merged layer read requires a committed merge_layout at "
+            "work_dir/layout/<reference>; owner labels are not assembled "
+            "from burst bounding boxes"
+        )
+    layout_window = _as_window(tuple(layout.window))
+    overlap = _overlap_window(layout_window, grid_window)
+    if overlap is None:
+        reject_invalid_state(
+            f"read window {grid_window!r} does not intersect merge layout "
+            f"{layout_window!r}"
+        )
+    if overlap == layout_window:
+        return layout
+    row0 = overlap[0] - layout_window[0]
+    row1 = overlap[1] - layout_window[0]
+    col0 = overlap[2] - layout_window[2]
+    col1 = overlap[3] - layout_window[2]
+    sources: list[Any] = []
+    for source in layout.source_windows:
+        source_window = _as_window(tuple(source.window))
+        source_overlap = _overlap_window(source_window, overlap)
+        if source_overlap is None:
+            continue
+        src_row0 = source_overlap[0] - source_window[0]
+        src_row1 = source_overlap[1] - source_window[0]
+        src_col0 = source_overlap[2] - source_window[2]
+        src_col1 = source_overlap[3] - source_window[2]
+        sources.append(
+            LayoutSourceWindow(
+                burst_id=source.burst_id,
+                window=source_overlap,
+                scientific_support=np.asarray(source.scientific_support)[
+                    src_row0:src_row1, src_col0:src_col1
+                ],
+                swath=source.swath,
+            )
+        )
+    return MergeLayoutWindow(
+        scope=layout.scope,
+        window=overlap,
+        source_ids=tuple(layout.source_ids),
+        owner=np.asarray(layout.owner, dtype=np.uint16)[row0:row1, col0:col1],
+        scientific_support=np.asarray(layout.scientific_support, dtype=bool)[
+            row0:row1, col0:col1
+        ],
+        seams=tuple(layout.seams),
+        source_windows=tuple(sources),
+    )
+
+
+def _shift_affine(
+    transform: object, row0: int, col0: int
+) -> tuple[float, float, float, float, float, float] | None:
+    """Return a 6-parameter affine whose origin is the window's (0, 0)."""
+    try:
+        values = tuple(float(item) for item in transform)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 6:
+        return None
+    a, b, c, d, e, f = values
+    return (
+        a,
+        b,
+        c + a * col0 + b * row0,
+        d,
+        e,
+        f + d * col0 + e * row0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +271,9 @@ class ProductLayer:
     )
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
+    _merge_on_read: bool = field(default=False, repr=False, compare=False)
+    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def source(self) -> Product:
@@ -180,7 +356,7 @@ class ProductLayer:
 
     def validate_source(self) -> None:
         """Reject a handle whose owning or upstream product was replaced."""
-        for recorded in (self._product, *self._upstream):
+        for recorded in (self._product, *self._upstream, *self._burst_products):
             current = open_product(recorded.path, kind=recorded.kind)
             if current.write_id != recorded.write_id:
                 reject_invalid_state(
@@ -198,7 +374,49 @@ class ProductLayer:
         if references != [write_id]:
             reject_invalid_state("layer and Stack use different Reference products")
 
-    def _read_virtual(self, name: str) -> np.ndarray:
+    def _grid_box(self) -> Window:
+        """Return this layer's footprint on the source grid."""
+        row0, col0 = self.origin
+        rows, cols = self.shape
+        return row0, row0 + rows, col0, col0 + cols
+
+    def _localize_window(self, window: Window | None) -> Window | None:
+        """Translate a source-grid window into this layer's local array."""
+        if window is None:
+            return None
+        overlap = _overlap_window(_as_window(window), self._grid_box())
+        if overlap is None:
+            reject_invalid_state(
+                f"layer {self.name!r} window {window!r} does not overlap "
+                f"origin={self.origin} shape={self.shape}"
+            )
+        row0, col0 = self.origin
+        return (
+            overlap[0] - row0,
+            overlap[1] - row0,
+            overlap[2] - col0,
+            overlap[3] - col0,
+        )
+
+    def _grid_from_local(self, window: Window | None) -> Window:
+        """Return the source-grid window of a local array window."""
+        if window is None:
+            return self._grid_box()
+        row0, col0 = self.origin
+        return (
+            window[0] + row0,
+            window[1] + row0,
+            window[2] + col0,
+            window[3] + col0,
+        )
+
+    def _read_product_array(self, name: str, window: Window | None) -> np.ndarray:
+        """Read one product asset, forwarding a local window to storage."""
+        if window is None:
+            return self._product.read(name)
+        return self._product.read(name, window=window)
+
+    def _read_virtual(self, name: str, window: Window | None = None) -> np.ndarray:
         """Derive one virtual IFG layer through the owning artifact store."""
         from faninsar.io.storage.ifg_store import (
             IFG_KIND,
@@ -209,15 +427,17 @@ class ProductLayer:
             reject_invalid_state(
                 f"layer {self.name!r} is virtual and requires an IFG product source"
             )
-        return InterferogramArtifactStore.open(self._product.path).read_layer(name)
+        return InterferogramArtifactStore.open(self._product.path).read_layer(
+            name, window=window
+        )
 
-    def _read_scene_layer(self, name: str) -> np.ndarray:
+    def _read_scene_layer(self, name: str, window: Window | None = None) -> np.ndarray:
         """Read one scene layer through its store's mosaic reader.
 
         ``slc`` mosaics the selected unit payloads onto their union bounding
         box (or the common grid for a ``.full()`` layer); ``amplitude``,
         ``intensity``, and ``phase`` derive from that mosaic; ``valid_mask``
-        computes ``isfinite(real) & isfinite(imag) & (|slc| > 0)``.
+        uses persisted ``{tag}.valid`` assets when present.
         """
         from faninsar.io.storage.scene_store import (
             SCENE_KIND,
@@ -232,7 +452,11 @@ class ProductLayer:
         store = CoregisteredSceneStore.open(self._product.path)
         if self._scene_selection is not None:
             store = store.select_units(self._scene_selection)
-        mosaic = store.mosaic_slc(full=self.extent is None)
+        full_local = (0, self.shape[0], 0, self.shape[1])
+        if (window is None or window == full_local) and not self._merge_on_read:
+            mosaic = store.mosaic_slc(full=self.extent is None)
+        else:
+            mosaic = self._compose_scene_window(store, window)
         if name == "slc":
             return mosaic
         if name == "amplitude":
@@ -242,9 +466,295 @@ class ProductLayer:
         if name == "phase":
             return np.angle(mosaic).astype(np.float32)
         if name == "valid_mask":
-            return valid_samples(mosaic)
+            if window is None and not self._merge_on_read:
+                return valid_samples(mosaic)
+            return self._compose_scene_valid_mask(store, window, mosaic)
         message = f"unknown scene layer: {name!r}"
         raise FileNotFoundError(message)
+
+    def _compose_scene_window(
+        self,
+        store: Any,
+        window: Window | None,
+    ) -> np.ndarray:
+        """Compose a local scene window, using the merge kernel when requested."""
+        local = window if window is not None else (0, self.shape[0], 0, self.shape[1])
+        if self._merge_on_read:
+            return self._merge_scene_window(store, local)
+        return self._mosaic_scene_window(store, local)
+
+    def _mosaic_scene_window(self, store: Any, local: Window) -> np.ndarray:
+        """Place intersecting unit windows onto one local frame."""
+        from faninsar.io.storage.scene_store import valid_samples
+
+        rows, cols = _window_shape(local)
+        out = np.full((rows, cols), np.nan + 1j * np.nan, dtype=np.complex64)
+        grid_window = self._grid_from_local(local)
+        for unit in store.selected_units():
+            overlap = _overlap_window(grid_window, _unit_grid_box(unit))
+            if overlap is None:
+                continue
+            unit_window = (
+                overlap[0] - unit.row_origin,
+                overlap[1] - unit.row_origin,
+                overlap[2] - unit.col_origin,
+                overlap[3] - unit.col_origin,
+            )
+            payload = store.read(unit.tag, window=unit_window)
+            if isinstance(payload, tuple):
+                payload = payload[0]
+            dest = out[
+                overlap[0] - grid_window[0] : overlap[1] - grid_window[0],
+                overlap[2] - grid_window[2] : overlap[3] - grid_window[2],
+            ]
+            invalid = ~valid_samples(dest)
+            dest[invalid] = payload[invalid]
+        return out
+
+    def _compose_scene_valid_mask(
+        self,
+        store: Any,
+        window: Window | None,
+        mosaic: np.ndarray,
+    ) -> np.ndarray:
+        """Read per-unit valid masks, falling back to mosaic support."""
+        from faninsar.io.storage.scene_store import valid_samples
+
+        local = window if window is not None else (0, self.shape[0], 0, self.shape[1])
+        rows, cols = _window_shape(local)
+        out = np.zeros((rows, cols), dtype=np.bool_)
+        grid_window = self._grid_from_local(local)
+        read_valid = getattr(store, "read_valid_mask", None)
+        filled = False
+        for unit in store.selected_units():
+            overlap = _overlap_window(grid_window, _unit_grid_box(unit))
+            if overlap is None:
+                continue
+            unit_window = (
+                overlap[0] - unit.row_origin,
+                overlap[1] - unit.row_origin,
+                overlap[2] - unit.col_origin,
+                overlap[3] - unit.col_origin,
+            )
+            mask = None
+            if read_valid is not None:
+                mask = read_valid(unit.tag, window=unit_window)
+            else:
+                asset = f"{unit.tag}.valid"
+                if asset in self._product.assets:
+                    mask = self._read_product_array(asset, unit_window)
+            if mask is None:
+                continue
+            dest = out[
+                overlap[0] - grid_window[0] : overlap[1] - grid_window[0],
+                overlap[2] - grid_window[2] : overlap[3] - grid_window[2],
+            ]
+            dest |= np.asarray(mask, dtype=np.bool_)
+            filled = True
+        if filled:
+            return out
+        return valid_samples(mosaic)
+
+    def _merge_scene_window(self, store: Any, local: Window) -> np.ndarray:
+        """Apply the shared merge kernel to bounded burst windows."""
+        merged = self._merge_window(store, local, kind="scene")
+        if merged is None:
+            return np.zeros(_window_shape(local), dtype=np.complex64)
+        return self._place_merged_array(
+            np.asarray(merged.complex), merged.window, local, fill=np.complex64(0)
+        )
+
+    def _merge_window(
+        self,
+        store: Any,
+        local: Window,
+        *,
+        kind: Literal["scene", "ifg"],
+    ) -> Any:
+        """Run :func:`merge_bursts` on one local window, or ``None`` if empty."""
+        from faninsar.processing.mosaicking import merge_bursts
+
+        layout = self._layout_for_window(local)
+        products = self._burst_windows_for_read(store, local, kind=kind, layout=layout)
+        if not products:
+            return None
+        return merge_bursts(products, layout=layout)
+
+    def _burst_windows_for_read(
+        self,
+        store: Any,
+        local: Window,
+        *,
+        kind: Literal["scene", "ifg"],
+        layout: Any,
+    ) -> list[Any]:
+        """Build bounded BurstWindow inputs for one local read."""
+        grid_window = self._grid_from_local(local)
+        if kind == "ifg":
+            windows = [
+                self._ifg_burst_window(product, grid_window, layout)
+                for product in self._burst_products
+            ]
+            return [item for item in windows if item is not None]
+        windows = [
+            self._scene_burst_window(store, unit, grid_window, layout)
+            for unit in store.selected_units()
+        ]
+        return [item for item in windows if item is not None]
+
+    def _ifg_burst_window(
+        self, product: Product, grid_window: Window, layout: Any
+    ) -> Any | None:
+        """Return one IFG BurstWindow overlapping *grid_window*, or ``None``."""
+        from faninsar.processing.mosaicking import BurstWindow
+
+        properties = product.properties
+        row0 = int(properties.get("faninsar:row_origin", 0))
+        col0 = int(properties.get("faninsar:col_origin", 0))
+        shape = properties["faninsar:shape"]
+        box = (row0, row0 + int(shape[0]), col0, col0 + int(shape[1]))
+        overlap = _overlap_window(grid_window, box)
+        if overlap is None:
+            return None
+        unit_window = (
+            overlap[0] - row0,
+            overlap[1] - row0,
+            overlap[2] - col0,
+            overlap[3] - col0,
+        )
+        payload, mask = self._read_burst_payload(
+            product, "complex", "valid_mask", unit_window
+        )
+        pair = properties.get("faninsar:pair", ())
+        acquisitions = (
+            tuple(str(item) for item in pair)
+            if isinstance(pair, list | tuple) and pair
+            else (str(product.path.parent.name),)
+        )
+        return BurstWindow(
+            scope=layout.scope,
+            burst_id=str(properties.get("faninsar:burst_id", product.path.name)),
+            acquisitions=acquisitions,
+            write_ids=(product.write_id,),
+            phase_convention=_phase_convention(
+                properties.get("faninsar:phase_convention")
+            ),
+            window=overlap,
+            complex=payload,
+            valid_mask=np.asarray(mask, dtype=np.bool_),
+        )
+
+    def _scene_burst_window(
+        self, store: Any, unit: Any, grid_window: Window, layout: Any
+    ) -> Any | None:
+        """Return one scene BurstWindow overlapping *grid_window*, or ``None``."""
+        from faninsar.processing.mosaicking import BurstWindow
+
+        overlap = _overlap_window(grid_window, _unit_grid_box(unit))
+        if overlap is None:
+            return None
+        unit_window = (
+            overlap[0] - unit.row_origin,
+            overlap[1] - unit.row_origin,
+            overlap[2] - unit.col_origin,
+            overlap[3] - unit.col_origin,
+        )
+        payload = self._read_scene_unit_payload(store, unit, unit_window)
+        mask = self._read_scene_unit_mask(store, unit, unit_window, payload)
+        return BurstWindow(
+            scope=layout.scope,
+            burst_id=str(getattr(unit, "burst_id", None) or unit.tag),
+            acquisitions=(str(store.date_id),),
+            write_ids=(store.write_id,),
+            phase_convention=_phase_convention(
+                (unit.phase_state or {}).get("convention")
+            ),
+            window=overlap,
+            complex=payload,
+            valid_mask=np.asarray(mask, dtype=np.bool_),
+        )
+
+    def _read_burst_payload(
+        self,
+        product: Product,
+        complex_name: str,
+        mask_name: str,
+        unit_window: Window,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Read one burst IFG payload through the public windowed product seam."""
+        payload = product.read(complex_name, window=unit_window)
+        mask = (
+            product.read(mask_name, window=unit_window)
+            if mask_name in product.assets
+            else np.ones(_window_shape(unit_window), dtype=np.bool_)
+        )
+        return payload, np.asarray(mask, dtype=np.bool_)
+
+    def _read_scene_unit_payload(
+        self, store: Any, unit: Any, unit_window: Window
+    ) -> np.ndarray:
+        """Read one scene unit through the public windowed store seam."""
+        return _unwrap_payload(store.read(unit.tag, window=unit_window))
+
+    def _read_scene_unit_mask(
+        self,
+        store: Any,
+        unit: Any,
+        unit_window: Window,
+        payload: np.ndarray,
+    ) -> np.ndarray:
+        """Read one scene unit's support mask through the windowed store seam."""
+        from faninsar.io.storage.scene_store import valid_samples
+
+        read_valid = getattr(store, "read_valid_mask", None)
+        if read_valid is not None:
+            mask = read_valid(unit.tag, window=unit_window)
+            if mask is not None:
+                return np.asarray(mask, dtype=np.bool_)
+        asset = f"{unit.tag}.valid"
+        if asset in self._product.assets:
+            return np.asarray(
+                self._read_product_array(asset, unit_window), dtype=np.bool_
+            )
+        return valid_samples(payload)
+
+    def _layout_for_window(self, local: Window) -> Any:
+        """Return the committed merge layout cropped to the local read window."""
+        return _crop_committed_layout(self._merge_layout, self._grid_from_local(local))
+
+    def _place_merged_array(
+        self,
+        field: np.ndarray,
+        merged_window: Window,
+        local: Window,
+        *,
+        fill: object,
+    ) -> np.ndarray:
+        """Paste a MergedWindow field into the local read canvas."""
+        canvas = np.full(_window_shape(local), fill, dtype=field.dtype)
+        grid = self._grid_from_local(local)
+        overlap = _overlap_window(_as_window(tuple(merged_window)), grid)
+        if overlap is None:
+            return canvas
+        dest = (
+            slice(overlap[0] - grid[0], overlap[1] - grid[0]),
+            slice(overlap[2] - grid[2], overlap[3] - grid[2]),
+        )
+        src = (
+            slice(overlap[0] - merged_window[0], overlap[1] - merged_window[0]),
+            slice(overlap[2] - merged_window[2], overlap[3] - merged_window[2]),
+        )
+        canvas[dest] = field[src]
+        return canvas
+
+    def _scene_store(self) -> Any:
+        """Open the scene store honoring the current unit selection."""
+        from faninsar.io.storage.scene_store import CoregisteredSceneStore
+
+        store = CoregisteredSceneStore.open(self._product.path)
+        if self._scene_selection is not None:
+            store = store.select_units(self._scene_selection)
+        return store
 
     def _read_scene_los(self, name: str) -> np.ndarray:
         """Derive one LOS unit-vector layer from the Reference geometry assets.
@@ -267,38 +777,111 @@ class ProductLayer:
         store = CoregisteredSceneStore.open(self._product.path)
         return los_unit_vector(store, name)
 
-    def _read(self, name: str) -> np.ndarray:
-        if name in self._product.assets:
-            values = self._product.read(name)
+    def _read(self, name: str, window: Window | None = None) -> np.ndarray:
+        if self._merge_on_read and name in (
+            *SCENE_LAYER_NAMES,
+            "complex",
+            "wrapped_phase",
+            "amplitude",
+            "valid_mask",
+        ):
+            values = self._read_merged(name, window)
+        elif name in self._product.assets:
+            values = self._read_product_array(name, window)
         elif self._product.kind == "scene" and name in _SCENE_LOS_LAYERS:
             values = self._read_scene_los(name)
+            if window is not None:
+                values = values[window[0] : window[1], window[2] : window[3]]
         elif self._product.kind == "scene" and name in SCENE_LAYER_NAMES:
-            values = self._read_scene_layer(name)
+            values = self._read_scene_layer(name, window)
         elif name in _VIRTUAL_IFG_LAYERS:
-            values = self._read_virtual(name)
+            values = self._read_virtual(name, window)
         else:
             message = (
                 f"layer {name!r} is not stored in {self._product.path}; it is "
                 "neither a persisted asset nor a derivable virtual layer"
             )
             raise FileNotFoundError(message)
-        if values.shape != self.shape:
+        expected = self.shape if window is None else _window_shape(window)
+        if values.shape != expected:
             reject_invalid_state(f"layer {name!r} shape differs from its product")
         return values
 
-    def read(self) -> np.ndarray:
+    def _read_merged(self, name: str, window: Window | None) -> np.ndarray:
+        """Read one merged layer through the shared numerical kernel."""
+        local = window if window is not None else (0, self.shape[0], 0, self.shape[1])
+        kind: Literal["scene", "ifg"] = (
+            "scene" if self._product.kind == "scene" else "ifg"
+        )
+        store = self._scene_store() if kind == "scene" else None
+        merged = self._merge_window(store, local, kind=kind)
+        if merged is None:
+            return self._empty_merged_values(name, local)
+        mosaic = self._place_merged_array(
+            np.asarray(merged.complex), merged.window, local, fill=np.complex64(0)
+        )
+        values: np.ndarray | None
+        if name in {"slc", "complex"}:
+            values = mosaic
+        elif name == "amplitude":
+            values = np.abs(mosaic).astype(np.float32)
+        elif name == "intensity":
+            values = (np.abs(mosaic) ** 2).astype(np.float32)
+        elif name in {"phase", "wrapped_phase"}:
+            values = np.angle(mosaic).astype(np.float32)
+        elif name == "valid_mask":
+            values = self._place_merged_array(
+                np.asarray(merged.valid_mask, dtype=np.bool_),
+                merged.window,
+                local,
+                fill=False,
+            )
+        elif name == "coherence" and merged.coherence is not None:
+            values = self._place_merged_array(
+                np.asarray(merged.coherence),
+                merged.window,
+                local,
+                fill=np.float32(np.nan),
+            )
+        else:
+            values = None
+        if values is None:
+            message = f"unknown merged layer: {name!r}"
+            raise FileNotFoundError(message)
+        return values
+
+    def _empty_merged_values(self, name: str, local: Window) -> np.ndarray:
+        """Return an empty local canvas when no burst overlaps the window."""
+        shape = _window_shape(local)
+        if name == "valid_mask":
+            return np.zeros(shape, dtype=np.bool_)
+        if name in {"slc", "complex"}:
+            return np.zeros(shape, dtype=np.complex64)
+        return np.full(shape, np.nan, dtype=np.float32)
+
+    def read(self, window: Window | None = None) -> np.ndarray:
         """Read a detached array after checking the source commit and dtype.
+
+        Parameters
+        ----------
+        window : tuple of int, optional
+            Half-open source-grid window ``(r0, r1, c0, c1)``. Coordinates use
+            the same origin as :attr:`origin`; they are translated to local
+            array indices before the storage ``read(..., window=)`` seam.
+            ``None`` reads the full layer.
 
         Returns
         -------
         numpy.ndarray
             Newly loaded values that may be modified without changing this
             committed layer or its source identity. Virtual layers are
-            derived from their owning complex IFG commit.
+            derived from their owning complex IFG commit. A windowed read
+            materializes only the requested local rectangle.
 
         """
         self.validate_source()
-        values = self._read(self.name)
+        local = self._localize_window(window)
+        values = self._read(self.name, window=local)
         kind = self.geocode_kind
         valid_dtype = {
             "complex": values.dtype.kind == "c",
@@ -441,28 +1024,137 @@ class ProductLayer:
     def valid_mask(self) -> np.ndarray | None:
         """Read authoritative support, including excluded unwrap components.
 
-        Scene layers compute ``isfinite(real) & isfinite(imag) & (|slc| > 0)``
-        from the mosaic on demand; persisted ``valid_mask`` assets on IFG and
-        unwrap products are read through the usual branch.
+        Scene layers prefer persisted ``{tag}.valid`` assets; otherwise they
+        compute support from the mosaic. Persisted ``valid_mask`` assets on IFG
+        and unwrap products are read through the usual branch. Validity is
+        not inferred from amplitude, so a supported ``0j`` sample stays valid.
         """
         self.validate_source()
+        return self._support_mask()
+
+    def _support_mask(self, window: Window | None = None) -> np.ndarray | None:
+        """Read support, optionally windowed in local layer coordinates."""
         mask = None
+        local = self._localize_window(window) if window is not None else None
         if self._product.kind == "scene":
-            mask = self._read("valid_mask")
+            mask = self._read("valid_mask", window=local)
             if mask.dtype != np.bool_:
                 reject_invalid_state("layer valid_mask must have boolean dtype")
             return mask
         if "valid_mask" in self._product.assets:
-            mask = self._read("valid_mask")
+            mask = self._read("valid_mask", window=local)
             if mask.dtype != np.bool_:
                 reject_invalid_state("layer valid_mask must have boolean dtype")
         if self._product.kind == "unwrap":
-            components = self._read("connected_components")
+            components = self._read("connected_components", window=local)
             if components.dtype.kind not in "iu":
                 reject_invalid_state("connected components must have integer dtype")
             supported = components > 0
             mask = supported if mask is None else mask & supported
         return mask
+
+    def _candidate_window(self) -> Window:
+        """Return the coarse layout or footprint window for a cropped read.
+
+        A selected unmerged burst uses its full ROI-qualified footprint, not
+        an owner==burst midpoint trim. Merged polygon views may intersect
+        layout source windows when a layout is bound.
+        """
+        box = self._grid_box()
+        if self._is_selected_burst() or self._merge_layout is None:
+            return box
+        source_windows = getattr(self._merge_layout, "source_windows", None)
+        if not source_windows:
+            layout_window = getattr(self._merge_layout, "window", None)
+            if layout_window is None:
+                return box
+            overlap = _overlap_window(box, _as_window(tuple(layout_window)))
+            return box if overlap is None else overlap
+        union: Window | None = None
+        for item in source_windows:
+            candidate = getattr(item, "window", item)
+            overlap = _overlap_window(box, _as_window(tuple(candidate)))
+            if overlap is None:
+                continue
+            if union is None:
+                union = overlap
+            else:
+                union = (
+                    min(union[0], overlap[0]),
+                    max(union[1], overlap[1]),
+                    min(union[2], overlap[2]),
+                    max(union[3], overlap[3]),
+                )
+        return box if union is None else union
+
+    def _is_selected_burst(self) -> bool:
+        """Return whether this layer is a single selected unmerged burst."""
+        return self._scene_selection is not None and len(self._scene_selection) == 1
+
+    def _crop_window(self) -> Window | None:
+        """Return the tight valid-support window, or ``None`` when empty."""
+        candidate = self._candidate_window()
+        mask_window = None if candidate == self._grid_box() else candidate
+        mask = self._support_mask(window=mask_window)
+        if mask is None:
+            return candidate
+        origin = self._grid_box() if mask_window is None else mask_window
+        return _tight_support_window(mask, origin)
+
+    def _imshow_extent(
+        self, window: Window | None
+    ) -> tuple[float, float, float, float]:
+        """Return ``imshow`` extent ``(left, right, bottom, top)`` for a window."""
+        if window is None:
+            window = self._grid_box()
+        row0, row1, col0, col1 = window
+        transform = self._product.properties.get("proj:transform")
+        shifted = None if transform is None else _shift_affine(transform, row0, col0)
+        if shifted is not None:
+            a, b, c, d, e, f = shifted
+            left = c
+            top = f
+            right = c + a * (col1 - col0) + b * (row1 - row0)
+            bottom = f + d * (col1 - col0) + e * (row1 - row0)
+            return left, right, bottom, top
+        return (col0 - 0.5, col1 - 0.5, row1 - 0.5, row0 - 0.5)
+
+    def _plot_nodata(
+        self,
+        ax: Any,
+        *,
+        figsize: tuple[float, float] | None,
+        title: str | None,
+        iq: bool,
+    ) -> tuple[Any, Any, Any]:
+        """Draw a no-data panel instead of fabricating a zero image."""
+        import matplotlib.pyplot as plt
+
+        label = title if title is not None else self.name
+        if iq:
+            fig, axes = plt.subplots(
+                1, 2, figsize=figsize, sharex=True, sharey=True, squeeze=False
+            )
+            images: list[Any] = []
+            for axis, suffix in ((axes[0, 0], "I"), (axes[0, 1], "Q")):
+                axis.set_title(f"{label} ({suffix})")
+                axis.text(
+                    0.5,
+                    0.5,
+                    "no data",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
+                images.append(None)
+            return fig, (axes[0, 0], axes[0, 1]), (images[0], images[1])
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+        ax.set_title(label)
+        ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        return fig, ax, None
 
     def plot(
         self,
@@ -476,6 +1168,7 @@ class ProductLayer:
         figsize: tuple[float, float] | None = None,
         title: str | None = None,
         hist_colorbar: bool = True,
+        crop: bool = True,
         **imshow_kwargs: Any,
     ) -> tuple[Any, Any, Any]:
         """Plot this layer with colormap and limits chosen from its asset kind.
@@ -512,6 +1205,12 @@ class ProductLayer:
             Use FanInSAR :class:`~faninsar.plotting.HistColorbar` (histogram
             embedded beside the gradient) instead of a plain colorbar.
             Default True.
+        crop : bool, optional
+            Bound the read to actual product-valid support inside the layout
+            or footprint candidate window (default True for Polygon layers).
+            ``crop=False`` keeps the original scientific view extent. Empty
+            support reports no data rather than a fabricated zero image.
+            Interior holes and disjoint distances are preserved.
         **imshow_kwargs
             Forwarded to :meth:`matplotlib.axes.Axes.imshow`.
 
@@ -525,6 +1224,20 @@ class ProductLayer:
         """
         import matplotlib.pyplot as plt
 
+        plot_window = self._grid_box()
+        read_window: Window | None = None
+        if crop:
+            plot_window = self._crop_window()
+            if plot_window is None:
+                return self._plot_nodata(
+                    ax,
+                    figsize=figsize,
+                    title=title,
+                    iq=self.asset_kind
+                    in (AssetKind.COMPLEX_INTERFEROGRAM, AssetKind.SLC),
+                )
+            if plot_window != self._grid_box():
+                read_window = plot_window
         if self.asset_kind in (AssetKind.COMPLEX_INTERFEROGRAM, AssetKind.SLC):
             return self._plot_iq(
                 cmap=cmap,
@@ -535,12 +1248,14 @@ class ProductLayer:
                 figsize=figsize,
                 title=title,
                 hist_colorbar=hist_colorbar,
+                window=read_window,
                 **imshow_kwargs,
             )
 
-        values = np.asarray(self.values, dtype=np.result_type(self.values, np.float32))
+        raw = self.read(window=read_window)
+        values = np.asarray(raw, dtype=np.result_type(raw, np.float32))
         if masked:
-            mask = self.valid_mask
+            mask = self._support_mask(window=read_window)
             if mask is not None:
                 values = np.where(mask, values, np.nan)
 
@@ -558,7 +1273,13 @@ class ProductLayer:
                 AssetKind.WRAPPED_PHASE: (-np.pi, np.pi),
                 AssetKind.COHERENCE: (0.0, 1.0),
             }
-            lo, hi = default_limits.get(kind, (np.nanmin(values), np.nanmax(values)))
+            finite = values[np.isfinite(values)]
+            fallback = (
+                (float(np.nanmin(finite)), float(np.nanmax(finite)))
+                if finite.size
+                else (0.0, 1.0)
+            )
+            lo, hi = default_limits.get(kind, fallback)
             vmin = lo if vmin is None else vmin
             vmax = hi if vmax is None else vmax
 
@@ -566,7 +1287,14 @@ class ProductLayer:
             _, ax = plt.subplots(figsize=figsize)
             if title is None:
                 title = self.name
-        im = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kwargs)
+        im = ax.imshow(
+            values,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            extent=self._imshow_extent(plot_window),
+            **imshow_kwargs,
+        )
         ax.set_title(title if title is not None else "")
         if colorbar:
             self._add_colorbar(
@@ -590,13 +1318,14 @@ class ProductLayer:
         figsize: tuple[float, float] | None,
         title: str | None,
         hist_colorbar: bool,
+        window: Window | None = None,
         **imshow_kwargs: Any,
     ) -> tuple[Any, tuple[Any, Any], tuple[Any, Any]]:
         """Render a complex layer as side-by-side in-phase/quadrature panels."""
         import matplotlib.pyplot as plt
 
-        values = np.asarray(self.values, dtype=np.complex64)
-        mask = self.valid_mask if masked else None
+        values = np.asarray(self.read(window=window), dtype=np.complex64)
+        mask = self._support_mask(window=window) if masked else None
 
         if cmap is None:
             cmap = "gray"
@@ -620,6 +1349,7 @@ class ProductLayer:
             sharey=True,
             squeeze=False,
         )
+        extent = self._imshow_extent(window if window is not None else self._grid_box())
         ims = []
         for axis, component, suffix in (
             (axes[0, 0], values.real, "I"),
@@ -628,7 +1358,9 @@ class ProductLayer:
             data = np.asarray(component, dtype=np.float32)
             if mask is not None:
                 data = np.where(mask, data, np.nan)
-            im = axis.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kwargs)
+            im = axis.imshow(
+                data, cmap=cmap, vmin=vmin, vmax=vmax, extent=extent, **imshow_kwargs
+            )
             axis.set_title(f"{base} ({suffix})")
             ims.append(im)
             if colorbar:
@@ -663,6 +1395,79 @@ class ProductLayer:
 
 
 @dataclass(frozen=True, slots=True)
+class MergedBurstLayers:
+    """Lazy merged burst view of one scene or pair. Not a persisted product.
+
+    Collection ``merge_bursts()`` returns per-date or per-pair views of this
+    type's layer handles. Reads apply
+    :func:`faninsar.processing.mosaicking.merge_bursts` to bounded burst
+    windows and do not rewrite source products.
+    """
+
+    _product: Product = field(repr=False)
+    full_radar_shape: tuple[int, int]
+    multilook: tuple[int, int] = (1, 1)
+    origin: tuple[int, int] = (0, 0)
+    crs: str | None = None
+    extent: tuple[int, int] | None = None
+    _scene_selection: frozenset[str] | None = field(default=None, repr=False)
+    _upstream: tuple[Product, ...] = field(default=(), repr=False)
+    _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
+    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    def _layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
+        """Return one merged lazy layer bound to this view."""
+        return ProductLayer(
+            self._product,
+            name,
+            asset_kind,
+            self.full_radar_shape,
+            self.multilook,
+            origin=self.origin,
+            crs=self.crs,
+            extent=self.extent,
+            _scene_selection=self._scene_selection,
+            _upstream=self._upstream,
+            _session=self._session,
+            _merge_on_read=True,
+            _merge_layout=self._merge_layout,
+            _burst_products=self._burst_products,
+        )
+
+    @property
+    def slc(self) -> ProductLayer:
+        """Return the merged complex SLC layer."""
+        return self._layer("slc", AssetKind.SLC)
+
+    @property
+    def amplitude(self) -> ProductLayer:
+        """Return merged amplitude."""
+        return self._layer("amplitude", AssetKind.AMPLITUDE)
+
+    @property
+    def intensity(self) -> ProductLayer:
+        """Return merged intensity."""
+        return self._layer("intensity", AssetKind.AMPLITUDE)
+
+    @property
+    def phase(self) -> ProductLayer:
+        """Return merged wrapped phase."""
+        name = "phase" if self._product.kind == "scene" else "wrapped_phase"
+        return self._layer(name, AssetKind.WRAPPED_PHASE)
+
+    @property
+    def complex(self) -> ProductLayer:
+        """Return the merged complex interferogram layer."""
+        return self._layer("complex", AssetKind.COMPLEX_INTERFEROGRAM)
+
+    @property
+    def wrapped_phase(self) -> ProductLayer:
+        """Return merged wrapped phase of an IFG view."""
+        return self._layer("wrapped_phase", AssetKind.WRAPPED_PHASE)
+
+
+@dataclass(frozen=True, slots=True)
 class InterferogramLayers:
     """Flat per-Pair IFG view of lazy rasters and its bound unwrap product.
 
@@ -685,6 +1490,9 @@ class InterferogramLayers:
     crs: str | None = None
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
+    _merge_on_read: bool = field(default=False, repr=False, compare=False)
+    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def root(self) -> Path:
@@ -718,7 +1526,7 @@ class InterferogramLayers:
         *,
         virtual: bool = False,
     ) -> ProductLayer:
-        if not virtual and name not in self._product.assets:
+        if not virtual and not self._merge_on_read and name not in self._product.assets:
             message = (
                 f"IFG product {self._product.path} has no {name!r} layer; "
                 f"available layers: {sorted(self._product.assets)}"
@@ -730,9 +1538,14 @@ class InterferogramLayers:
             asset_kind,
             self.full_radar_shape,
             self.multilook,
+            origin=(0, 0),
             crs=self.crs,
+            extent=self.full_radar_shape if self._merge_on_read else None,
             _upstream=self._upstream,
             _session=self._session,
+            _merge_on_read=self._merge_on_read,
+            _merge_layout=self._merge_layout,
+            _burst_products=self._burst_products,
         )
 
     def _unwrap_layer(self, name: str, asset_kind: AssetKind | None) -> ProductLayer:

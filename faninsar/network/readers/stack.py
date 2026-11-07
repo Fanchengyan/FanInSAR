@@ -16,7 +16,7 @@ import shutil
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -69,6 +69,9 @@ class _Selection:
     polygon: int | None = None
     track: str | None = None
     pol: tuple[str, ...] | None = None
+    representation: Literal["merged", "burst"] = "merged"
+    burst_ids: tuple[str, ...] | None = None
+    merge_on_read: bool = False
 
     def __post_init__(self) -> None:
         """Validate looks shape; subset-of-plan is checked by ``sel``."""
@@ -148,6 +151,7 @@ class StackInterferogramCollection(InterferogramCollection):
         direction: str | None = None,
         pol: str | list[str] | tuple[str, ...] | None = None,
         burst: int | list[int] | tuple[int, ...] | None = None,
+        representation: Literal["merged", "burst"] | None = None,
     ) -> StackInterferogramCollection | InterferogramLayers:
         """Return a view bound to a committed multilook or Pair subset.
 
@@ -194,7 +198,14 @@ class StackInterferogramCollection(InterferogramCollection):
             is known the date axis is narrowed to acquisitions covering
             the requested ids; unknown metadata fails closed with
             :class:`ValueError` rather than silently ignoring the
-            selector.
+            selector. With ``representation="burst"`` the same values select
+            burst IFG products under ``ifg/bursts/``.
+        representation : {"merged", "burst"}, optional
+            Product representation to read. ``"merged"`` (the default) opens
+            ``ifg/ml_AxR/<pair>[/pN]``. ``"burst"`` opens
+            ``ifg/bursts/ml_AxR/<pair>/<burst_id>[/pN]`` and requires
+            ``burst=`` to name the burst product. ``None`` keeps the current
+            view's representation.
 
         Returns
         -------
@@ -214,8 +225,8 @@ class StackInterferogramCollection(InterferogramCollection):
             non-empty subset of the planned network, ``polygon`` is given
             for a single-polygon or absent ROI or names a polygon on
             another track, ``track``/``direction``/``pol``/``burst``
-            select nothing or cannot be resolved, or no dims select
-            anything.
+            select nothing or cannot be resolved, ``representation`` is
+            invalid, or no dims select anything.
 
         """
         if looks is not None and (
@@ -264,12 +275,14 @@ class StackInterferogramCollection(InterferogramCollection):
                     "selected date carries the requested channels"
                 )
                 raise ValueError(message)
-        if burst is not None:
-            resolved_pairs = self._resolve_burst_selector(burst, resolved_pairs)
         effective_track = (
             resolved_track if resolved_track is not None else self._selection.track
         )
         resolved_polygon = self._resolve_polygon(polygon, effective_track)
+        resolved_representation = self._resolve_representation(representation)
+        resolved_burst_ids = self._resolve_burst_ids(burst)
+        if burst is not None and resolved_representation != "burst":
+            resolved_pairs = self._resolve_burst_selector(burst, resolved_pairs)
 
         selection = _Selection(
             looks=self._selection.looks if looks is None else looks,
@@ -279,15 +292,26 @@ class StackInterferogramCollection(InterferogramCollection):
                 resolved_track if resolved_track is not None else self._selection.track
             ),
             pol=resolved_pol if resolved_pol is not None else self._selection.pol,
+            representation=resolved_representation,
+            burst_ids=resolved_burst_ids,
+            merge_on_read=self._selection.merge_on_read,
         )
         if pairs is None:
             if all(
                 value is None
-                for value in (looks, polygon, track, direction, pol, burst)
+                for value in (
+                    looks,
+                    polygon,
+                    track,
+                    direction,
+                    pol,
+                    burst,
+                    representation,
+                )
             ):
                 message = (
                     "sel requires at least one of looks=, pairs=, polygon=, "
-                    "track=, direction=, pol=, or burst="
+                    "track=, direction=, pol=, burst=, or representation="
                 )
                 raise ValueError(message)
             return StackInterferogramCollection(self._stack, selection)
@@ -319,6 +343,9 @@ class StackInterferogramCollection(InterferogramCollection):
                 polygon=selection.polygon,
                 track=selection.track,
                 pol=selection.pol,
+                representation=selection.representation,
+                burst_ids=selection.burst_ids,
+                merge_on_read=selection.merge_on_read,
             )
             return StackInterferogramCollection(self._stack, selection)
         if isinstance(pairs, Pair):
@@ -398,6 +425,55 @@ class StackInterferogramCollection(InterferogramCollection):
                 raise ValueError(message)
         return polygon
 
+    def _resolve_representation(
+        self, representation: Literal["merged", "burst"] | None
+    ) -> Literal["merged", "burst"]:
+        """Validate ``representation=`` against the allowed product kinds."""
+        if representation is None:
+            return self._selection.representation
+        if representation not in {"merged", "burst"}:
+            message = (
+                f"representation must be 'merged' or 'burst'; got {representation!r}"
+            )
+            raise ValueError(message)
+        return representation
+
+    def _resolve_burst_ids(
+        self, burst: int | list[int] | tuple[int, ...] | None
+    ) -> tuple[str, ...] | None:
+        """Record burst product identities selected by ``burst=``."""
+        if burst is None:
+            return self._selection.burst_ids
+        values = (burst,) if isinstance(burst, int) else tuple(burst)
+        return tuple(str(value) for value in values)
+
+    def merge_bursts(self) -> StackInterferogramCollection:
+        """Return a lazy per-pair merged view of burst IFG products.
+
+        Each pair is merged independently through the shared
+        :func:`~faninsar.processing.mosaicking.merge_bursts` kernel at read
+        time. Source burst products are not rewritten and pairs are never
+        merged together.
+
+        Returns
+        -------
+        StackInterferogramCollection
+            The same collection type, with ``merge_on_read`` set so layer
+            reads apply the bounded kernel.
+
+        """
+        selection = _Selection(
+            looks=self._selection.looks,
+            pairs=self._selection.pairs,
+            polygon=self._selection.polygon,
+            track=self._selection.track,
+            pol=self._selection.pol,
+            representation="merged",
+            burst_ids=self._selection.burst_ids,
+            merge_on_read=True,
+        )
+        return StackInterferogramCollection(self._stack, selection)
+
     def __getitem__(
         self, pair: str | Pair | Pairs
     ) -> InterferogramLayers | dict[str, InterferogramLayers]:
@@ -441,6 +517,8 @@ class StackInterferogramCollection(InterferogramCollection):
 
         if pair_id not in self.pairs.to_names().tolist():
             raise KeyError(pair_id)
+        if self._selection.merge_on_read:
+            return self._load_merged_layers(pair_id)
         store = InterferogramArtifactStore.open(self._pair_dir(pair_id))
         reference = self._stack._reference_scene_for(self._selection.polygon)
         if reference is None:
@@ -481,6 +559,49 @@ class StackInterferogramCollection(InterferogramCollection):
             _session=self._stack,
         )
 
+    def _load_merged_layers(self, pair_id: str) -> InterferogramLayers:
+        """Build a lazy merged view from burst IFG products of one pair."""
+        from faninsar.io.storage.ifg_store import IFG_KIND
+        from faninsar.io.storage.product import open_product
+        from faninsar.network.layers import InterferogramLayers
+        from faninsar.processing.errors import reject_invalid_state
+
+        burst_dirs = self._burst_product_dirs(pair_id)
+        if not burst_dirs:
+            message = (
+                f"pair {pair_id!r} has no burst IFG products under "
+                "ifg/bursts; form_interferograms(merge=False) first"
+            )
+            reject_invalid_state(message)
+        burst_products = tuple(open_product(path, kind=IFG_KIND) for path in burst_dirs)
+        for product in burst_products:
+            representation = product.properties.get("faninsar:representation", "burst")
+            if representation != "burst":
+                reject_invalid_state(
+                    f"burst IFG {product.path} is not representation='burst'"
+                )
+        handle = burst_products[0]
+        reference = self._stack._reference_scene_for(self._selection.polygon)
+        if reference is None:
+            reject_invalid_state(
+                "the Reference scene is missing; run coregister_scenes"
+            )
+        grid = handle.properties.get(
+            "faninsar:grid_shape", handle.properties["faninsar:shape"]
+        )
+        shape = (int(grid[0]), int(grid[1]))
+        return InterferogramLayers(
+            handle,
+            shape,
+            self.looks,
+            handle.properties.get("proj:code"),
+            (open_product(reference.root),),
+            _session=self._stack,
+            _merge_on_read=True,
+            _merge_layout=self._open_merge_layout(),
+            _burst_products=burst_products,
+        )
+
     @property
     def root(self) -> Path:
         """Return the IFG product directory of this view's multilook."""
@@ -489,10 +610,70 @@ class StackInterferogramCollection(InterferogramCollection):
 
     def _pair_dir(self, pair_id: str) -> Path:
         """Return the product directory of one Pair for this view's polygon."""
+        if self._selection.representation == "burst":
+            burst_ids = self._selection.burst_ids or ()
+            if len(burst_ids) != 1:
+                message = (
+                    "sel(representation='burst') requires burst= to name one "
+                    f"burst IFG product; got {burst_ids!r}"
+                )
+                raise ValueError(message)
+            return self._burst_pair_dir(pair_id, burst_ids[0])
         base = self.root / pair_id
         if self._selection.polygon is None:
             return base
         return base / f"p{self._selection.polygon}"
+
+    def _burst_pair_dir(self, pair_id: str, burst_id: str) -> Path:
+        """Return the burst IFG product directory of one pair and burst."""
+        looks = self.looks
+        base = (
+            self._stack.config.work_dir
+            / "ifg"
+            / "bursts"
+            / f"ml_{looks[0]}x{looks[1]}"
+            / pair_id
+            / str(burst_id)
+        )
+        if self._selection.polygon is None:
+            return base
+        return base / f"p{self._selection.polygon}"
+
+    def _burst_product_dirs(self, pair_id: str) -> list[Path]:
+        """Discover burst IFG product directories of one pair."""
+        if self._selection.burst_ids:
+            return [
+                self._burst_pair_dir(pair_id, burst_id)
+                for burst_id in self._selection.burst_ids
+            ]
+        looks = self.looks
+        parent = (
+            self._stack.config.work_dir
+            / "ifg"
+            / "bursts"
+            / f"ml_{looks[0]}x{looks[1]}"
+            / pair_id
+        )
+        if not parent.is_dir():
+            return []
+        paths: list[Path] = []
+        for child in sorted(parent.iterdir()):
+            if not child.is_dir():
+                continue
+            candidate = (
+                child
+                if self._selection.polygon is None
+                else child / f"p{self._selection.polygon}"
+            )
+            if (candidate / "item.json").is_file():
+                paths.append(candidate)
+        return paths
+
+    def _open_merge_layout(self) -> Any:
+        """Open the persisted Reference layout when formation has published it."""
+        return _open_committed_merge_layout(
+            self._stack, polygon=self._selection.polygon
+        )
 
     @property
     def index_metadata(self) -> dict[str, Any]:
@@ -876,6 +1057,67 @@ def _pair_id(store: InterferogramArtifactStore) -> str:
     return f"{store.pair[0]}_{store.pair[1]}"
 
 
+def _open_committed_merge_layout(stack: Stack, polygon: int | None = None) -> Any:
+    """Open ``work_dir/layout/<reference>[/pN]`` when that product exists.
+
+    Collection views never call :func:`build_merge_layout` to invent owner
+    labels from burst bounding boxes. Missing layouts stay ``None`` so
+    ``merge_bursts()`` can still return a lazy collection; the read path
+    rejects the missing layout.
+    """
+    from faninsar.io.storage.merge_layout import open_merge_layout
+
+    reference = getattr(stack, "reference", None)
+    work_dir = getattr(getattr(stack, "config", None), "work_dir", None)
+    if reference is None or work_dir is None:
+        return None
+    path = Path(work_dir) / "layout" / str(reference)
+    if polygon is not None:
+        path = path / f"p{polygon}"
+    if not (path / "item.json").is_file():
+        return None
+    return open_merge_layout(path)
+
+
+class _MergeBoundSceneStore:
+    """Scene store proxy whose ``.layers`` apply merge-on-read."""
+
+    def __init__(
+        self,
+        store: CoregisteredSceneStore,
+        layout: Any,
+        session: Stack,
+        upstream: tuple[Any, ...],
+    ) -> None:
+        self._store = store
+        self._layout = layout
+        self._session = session
+        self._upstream = upstream
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward store attributes that this proxy does not override."""
+        return getattr(self._store, name)
+
+    @property
+    def layers(self) -> Any:
+        """Return the lazy merged scene layer view."""
+        from faninsar.io.storage.product import open_product
+        from faninsar.io.storage.scene_store import SCENE_KIND
+        from faninsar.network.layers import MergedBurstLayers
+
+        product = open_product(self._store.root, kind=SCENE_KIND)
+        return MergedBurstLayers(
+            product,
+            self._store.grid_shape,
+            origin=(0, 0),
+            crs=self._store.crs,
+            extent=self._store.grid_shape,
+            _upstream=self._upstream,
+            _session=self._session,
+            _merge_layout=self._layout,
+        )
+
+
 class StackSceneCollection(dict):
     """Dict of committed scene products with session-bound layer views.
 
@@ -893,6 +1135,9 @@ class StackSceneCollection(dict):
         stack: Stack,
         stores: dict[str, CoregisteredSceneStore],
         selected: frozenset[str] | None = None,
+        *,
+        merge_on_read: bool = False,
+        merge_layout: Any = None,
     ) -> None:
         """Bind the collection to a Stack and its committed scene stores.
 
@@ -907,11 +1152,19 @@ class StackSceneCollection(dict):
             The date subset this view exposes. ``None`` selects all
             committed dates. Build constrained views with :meth:`sel`,
             never by mutating the collection in place.
+        merge_on_read : bool, optional
+            When True, scene layer reads merge selected bursts through the
+            shared mosaicking kernel instead of mosaicking in place.
+        merge_layout : object, optional
+            Persisted merge layout bound to this view, or ``None`` to
+            build a layout from the burst windows of each read.
 
         """
         super().__init__(stores)
         self._stack = stack
         self._selected = selected
+        self._merge_on_read = merge_on_read
+        self._merge_layout = merge_layout
 
     # ---- date axis -----------------------------------------------------
 
@@ -1029,6 +1282,29 @@ class StackSceneCollection(dict):
         """Return the virtual up LOS unit-vector component."""
         return self._los_layer("los_up")
 
+    def merge_bursts(self) -> StackSceneCollection:
+        """Return a lazy per-date merged view of burst scene units.
+
+        Each acquisition is merged independently through the shared
+        :func:`~faninsar.processing.mosaicking.merge_bursts` kernel at read
+        time. Persisted burst scenes are not rewritten and dates are never
+        merged together.
+
+        Returns
+        -------
+        StackSceneCollection
+            The same collection type, with merge-on-read layer views.
+
+        """
+        layout = _open_committed_merge_layout(self._stack)
+        return StackSceneCollection(
+            self._stack,
+            dict(self),
+            selected=self._selected,
+            merge_on_read=True,
+            merge_layout=layout,
+        )
+
     # ---- read views ----------------------------------------------------
 
     def _selected_stores(self) -> dict[str, CoregisteredSceneStore]:
@@ -1103,7 +1379,11 @@ class StackSceneCollection(dict):
                 )
                 raise ValueError(message)
             return StackSceneCollection(
-                self._stack, dict(self), selected=frozenset(track_subset)
+                self._stack,
+                dict(self),
+                selected=frozenset(track_subset),
+                merge_on_read=self._merge_on_read,
+                merge_layout=self._merge_layout,
             )
 
         scalar_id: str | None = None
@@ -1147,7 +1427,13 @@ class StackSceneCollection(dict):
         if not subset:
             message = "sel produced an empty date selection"
             raise ValueError(message)
-        return StackSceneCollection(self._stack, dict(self), selected=frozenset(subset))
+        return StackSceneCollection(
+            self._stack,
+            dict(self),
+            selected=frozenset(subset),
+            merge_on_read=self._merge_on_read,
+            merge_layout=self._merge_layout,
+        )
 
     def _track_selected_dates(
         self,
@@ -1207,7 +1493,10 @@ class StackSceneCollection(dict):
 
         reference = self._stack.reference_scene
         upstream = (open_product(reference.root),) if reference is not None else ()
-        return replace(store, _session=self._stack, _upstream=upstream)
+        bound = replace(store, _session=self._stack, _upstream=upstream)
+        if not self._merge_on_read:
+            return bound
+        return _MergeBoundSceneStore(bound, self._merge_layout, self._stack, upstream)
 
     def __getitem__(
         self, key: str | Acquisition
