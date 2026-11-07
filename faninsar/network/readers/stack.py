@@ -29,11 +29,13 @@ if TYPE_CHECKING:
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.baseline import Baselines
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+    from faninsar.io.storage.product import Product
     from faninsar.io.storage.scene_store import (
         CoregisteredSceneStore,
         SceneLayers,
     )
     from faninsar.network.layers import InterferogramLayers, ProductLayer
+    from faninsar.processing.mosaicking import MergeLayoutWindow
     from faninsar.stack.session import Stack
 
 _ASSETS = ("complex", "unw_phase", "wrapped_phase", "amplitude", "coherence")
@@ -590,6 +592,9 @@ class StackInterferogramCollection(InterferogramCollection):
             "faninsar:grid_shape", handle.properties["faninsar:shape"]
         )
         shape = (int(grid[0]), int(grid[1]))
+        layout, layout_product = _opened_merge_layout(
+            self._stack, polygon=self._selection.polygon
+        )
         return InterferogramLayers(
             handle,
             shape,
@@ -598,7 +603,8 @@ class StackInterferogramCollection(InterferogramCollection):
             (open_product(reference.root),),
             _session=self._stack,
             _merge_on_read=True,
-            _merge_layout=self._open_merge_layout(),
+            _merge_layout=layout,
+            _layout_product=layout_product,
             _burst_products=burst_products,
         )
 
@@ -668,12 +674,6 @@ class StackInterferogramCollection(InterferogramCollection):
             if (candidate / "item.json").is_file():
                 paths.append(candidate)
         return paths
-
-    def _open_merge_layout(self) -> Any:
-        """Open the persisted Reference layout when formation has published it."""
-        return _open_committed_merge_layout(
-            self._stack, polygon=self._selection.polygon
-        )
 
     @property
     def index_metadata(self) -> dict[str, Any]:
@@ -1057,7 +1057,9 @@ def _pair_id(store: InterferogramArtifactStore) -> str:
     return f"{store.pair[0]}_{store.pair[1]}"
 
 
-def _open_committed_merge_layout(stack: Stack, polygon: int | None = None) -> Any:
+def _opened_merge_layout(
+    stack: Stack, polygon: int | None = None
+) -> tuple[MergeLayoutWindow | None, Product | None]:
     """Open ``work_dir/layout/<reference>[/pN]`` when that product exists.
 
     Collection views never call :func:`build_merge_layout` to invent owner
@@ -1065,18 +1067,16 @@ def _open_committed_merge_layout(stack: Stack, polygon: int | None = None) -> An
     ``merge_bursts()`` can still return a lazy collection; the read path
     rejects the missing layout.
     """
-    from faninsar.io.storage.merge_layout import open_merge_layout
+    from faninsar.io.storage.merge_layout import LAYOUT_KIND, open_merge_layout
+    from faninsar.io.storage.product import open_product
 
-    reference = getattr(stack, "reference", None)
-    work_dir = getattr(getattr(stack, "config", None), "work_dir", None)
-    if reference is None or work_dir is None:
-        return None
-    path = Path(work_dir) / "layout" / str(reference)
+    path = stack.config.work_dir / "layout" / str(stack.reference)
     if polygon is not None:
         path = path / f"p{polygon}"
     if not (path / "item.json").is_file():
-        return None
-    return open_merge_layout(path)
+        return None, None
+    product = open_product(path, kind=LAYOUT_KIND)
+    return open_merge_layout(product), product
 
 
 class _MergeBoundSceneStore:
@@ -1085,12 +1085,14 @@ class _MergeBoundSceneStore:
     def __init__(
         self,
         store: CoregisteredSceneStore,
-        layout: Any,
+        layout: MergeLayoutWindow | None,
         session: Stack,
         upstream: tuple[Any, ...],
+        layout_product: Product | None = None,
     ) -> None:
         self._store = store
         self._layout = layout
+        self._layout_product = layout_product
         self._session = session
         self._upstream = upstream
 
@@ -1115,6 +1117,7 @@ class _MergeBoundSceneStore:
             _upstream=self._upstream,
             _session=self._session,
             _merge_layout=self._layout,
+            _layout_product=self._layout_product,
         )
 
 
@@ -1137,7 +1140,8 @@ class StackSceneCollection(dict):
         selected: frozenset[str] | None = None,
         *,
         merge_on_read: bool = False,
-        merge_layout: Any = None,
+        merge_layout: MergeLayoutWindow | None = None,
+        layout_product: Product | None = None,
     ) -> None:
         """Bind the collection to a Stack and its committed scene stores.
 
@@ -1155,9 +1159,13 @@ class StackSceneCollection(dict):
         merge_on_read : bool, optional
             When True, scene layer reads merge selected bursts through the
             shared mosaicking kernel instead of mosaicking in place.
-        merge_layout : object, optional
-            Persisted merge layout bound to this view, or ``None`` to
-            build a layout from the burst windows of each read.
+        merge_layout : MergeLayoutWindow, optional
+            Persisted merge layout bound to this view. ``None`` leaves
+            merge-on-read views lazy; a read without a committed layout is
+            rejected rather than assembled from burst windows.
+        layout_product : Product, optional
+            The ``merge_layout`` product whose ``write_id`` is re-checked
+            on each merged read.
 
         """
         super().__init__(stores)
@@ -1165,6 +1173,7 @@ class StackSceneCollection(dict):
         self._selected = selected
         self._merge_on_read = merge_on_read
         self._merge_layout = merge_layout
+        self._layout_product = layout_product
 
     # ---- date axis -----------------------------------------------------
 
@@ -1296,13 +1305,14 @@ class StackSceneCollection(dict):
             The same collection type, with merge-on-read layer views.
 
         """
-        layout = _open_committed_merge_layout(self._stack)
+        layout, layout_product = _opened_merge_layout(self._stack)
         return StackSceneCollection(
             self._stack,
             dict(self),
             selected=self._selected,
             merge_on_read=True,
             merge_layout=layout,
+            layout_product=layout_product,
         )
 
     # ---- read views ----------------------------------------------------
@@ -1384,6 +1394,7 @@ class StackSceneCollection(dict):
                 selected=frozenset(track_subset),
                 merge_on_read=self._merge_on_read,
                 merge_layout=self._merge_layout,
+                layout_product=self._layout_product,
             )
 
         scalar_id: str | None = None
@@ -1433,6 +1444,7 @@ class StackSceneCollection(dict):
             selected=frozenset(subset),
             merge_on_read=self._merge_on_read,
             merge_layout=self._merge_layout,
+            layout_product=self._layout_product,
         )
 
     def _track_selected_dates(
@@ -1496,7 +1508,13 @@ class StackSceneCollection(dict):
         bound = replace(store, _session=self._stack, _upstream=upstream)
         if not self._merge_on_read:
             return bound
-        return _MergeBoundSceneStore(bound, self._merge_layout, self._stack, upstream)
+        return _MergeBoundSceneStore(
+            bound,
+            self._merge_layout,
+            self._stack,
+            upstream,
+            layout_product=self._layout_product,
+        )
 
     def __getitem__(
         self, key: str | Acquisition

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
     from faninsar.processing.geocoding.product import GeocodeSession
     from faninsar.processing.geometry.grids import GridSpec
+    from faninsar.processing.mosaicking import MergeLayoutWindow
 
 __all__ = ["InterferogramLayers", "MergedBurstLayers", "ProductLayer"]
 
@@ -160,7 +161,7 @@ def _crop_committed_layout(layout: Any, grid_window: Window) -> Any:
             "work_dir/layout/<reference>; owner labels are not assembled "
             "from burst bounding boxes"
         )
-    layout_window = _as_window(tuple(layout.window))
+    layout_window = _as_window(layout.window)
     overlap = _overlap_window(layout_window, grid_window)
     if overlap is None:
         reject_invalid_state(
@@ -175,7 +176,7 @@ def _crop_committed_layout(layout: Any, grid_window: Window) -> Any:
     col1 = overlap[3] - layout_window[2]
     sources: list[Any] = []
     for source in layout.source_windows:
-        source_window = _as_window(tuple(source.window))
+        source_window = _as_window(source.window)
         source_overlap = _overlap_window(source_window, overlap)
         if source_overlap is None:
             continue
@@ -272,7 +273,10 @@ class ProductLayer:
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
     _merge_on_read: bool = field(default=False, repr=False, compare=False)
-    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _merge_layout: MergeLayoutWindow | None = field(
+        default=None, repr=False, compare=False
+    )
+    _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
 
     @property
@@ -355,8 +359,11 @@ class ProductLayer:
         return session.geocode(self, grid=grid, path=path, overwrite=overwrite)
 
     def validate_source(self) -> None:
-        """Reject a handle whose owning or upstream product was replaced."""
-        for recorded in (self._product, *self._upstream, *self._burst_products):
+        """Reject a handle whose owning, layout, or upstream product was replaced."""
+        recorded_products = (self._product, *self._upstream, *self._burst_products)
+        if self._layout_product is not None:
+            recorded_products = (*recorded_products, self._layout_product)
+        for recorded in recorded_products:
             current = open_product(recorded.path, kind=recorded.kind)
             if current.write_id != recorded.write_id:
                 reject_invalid_state(
@@ -903,14 +910,15 @@ class ProductLayer:
     def to_xarray(self) -> Any:
         """Return a lazy ``xarray.DataArray`` view of this layer.
 
-        ``dask.array.from_zarr`` opens each selected unit's persisted zarr
-        lazily and a ``map_blocks`` step mosaics them onto the layer's frame
-        (bounding-box when :attr:`extent` is set, the full common grid
-        otherwise); the ``slc`` mosaic then derives ``amplitude``,
-        ``intensity``, ``phase``, or ``valid_mask``. ``validate_source``
-        runs once at build time; the returned ``DataArray`` does not
-        re-validate on ``.compute()`` — callers needing a staleness re-check
-        use :attr:`values` or :meth:`validate_source`.
+        Merge-on-read layers compute through :meth:`read`, so they share the
+        committed midpoint selector. Other scene layers open each selected
+        unit's persisted zarr lazily and mosaic with the first-valid-sample
+        overlap rule (matching ``mosaic_slc``); the ``slc`` mosaic then
+        derives ``amplitude``, ``intensity``, ``phase``, or ``valid_mask``.
+        ``validate_source`` runs at build time. Merge-on-read ``.compute()``
+        re-validates through :meth:`read`; other lazy mosaics do not —
+        callers needing a staleness re-check use :attr:`values` or
+        :meth:`validate_source`.
 
         Returns
         -------
@@ -926,7 +934,15 @@ class ProductLayer:
         self.validate_source()
         product = self._product
         is_scene = self._product.kind == "scene"
-        if is_scene and self.name in _SCENE_LOS_LAYERS:
+        if self._merge_on_read:
+            from dask import delayed
+
+            data = da.from_delayed(
+                delayed(self.read)(),
+                shape=self.shape,
+                dtype=self._lazy_dtype(),
+            )
+        elif is_scene and self.name in _SCENE_LOS_LAYERS:
             # Virtual LOS: derive eagerly at build time from the stored
             # incidence/azimuth assets (which materialize lazily on demand).
             data = da.from_array(self._read_scene_los(self.name), chunks=self.shape)
@@ -1020,6 +1036,14 @@ class ProductLayer:
         }
         return xr.DataArray(data, dims=("y", "x"), name=self.name, attrs=attrs)
 
+    def _lazy_dtype(self) -> np.dtype[Any]:
+        """Return the dask dtype for a lazy full-layer read."""
+        if self.name == "valid_mask":
+            return np.dtype(np.bool_)
+        if self.name in {"slc", "complex"}:
+            return np.dtype(np.complex64)
+        return np.dtype(np.float32)
+
     @property
     def valid_mask(self) -> np.ndarray | None:
         """Read authoritative support, including excluded unwrap components.
@@ -1061,19 +1085,15 @@ class ProductLayer:
         layout source windows when a layout is bound.
         """
         box = self._grid_box()
-        if self._is_selected_burst() or self._merge_layout is None:
+        layout = self._merge_layout
+        if self._is_selected_burst() or layout is None:
             return box
-        source_windows = getattr(self._merge_layout, "source_windows", None)
-        if not source_windows:
-            layout_window = getattr(self._merge_layout, "window", None)
-            if layout_window is None:
-                return box
-            overlap = _overlap_window(box, _as_window(tuple(layout_window)))
+        if not layout.source_windows:
+            overlap = _overlap_window(box, layout.window)
             return box if overlap is None else overlap
         union: Window | None = None
-        for item in source_windows:
-            candidate = getattr(item, "window", item)
-            overlap = _overlap_window(box, _as_window(tuple(candidate)))
+        for source in layout.source_windows:
+            overlap = _overlap_window(box, source.window)
             if overlap is None:
                 continue
             if union is None:
@@ -1413,7 +1433,10 @@ class MergedBurstLayers:
     _scene_selection: frozenset[str] | None = field(default=None, repr=False)
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
-    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _merge_layout: MergeLayoutWindow | None = field(
+        default=None, repr=False, compare=False
+    )
+    _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
 
     def _layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
@@ -1432,6 +1455,7 @@ class MergedBurstLayers:
             _session=self._session,
             _merge_on_read=True,
             _merge_layout=self._merge_layout,
+            _layout_product=self._layout_product,
             _burst_products=self._burst_products,
         )
 
@@ -1491,7 +1515,10 @@ class InterferogramLayers:
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
     _merge_on_read: bool = field(default=False, repr=False, compare=False)
-    _merge_layout: Any = field(default=None, repr=False, compare=False)
+    _merge_layout: MergeLayoutWindow | None = field(
+        default=None, repr=False, compare=False
+    )
+    _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
 
     @property
@@ -1545,6 +1572,7 @@ class InterferogramLayers:
             _session=self._session,
             _merge_on_read=self._merge_on_read,
             _merge_layout=self._merge_layout,
+            _layout_product=self._layout_product,
             _burst_products=self._burst_products,
         )
 

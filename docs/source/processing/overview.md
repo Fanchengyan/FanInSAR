@@ -29,6 +29,21 @@ stack.unwrap()
 result = stack.network.invert()
 ```
 
+Burst products stay unmerged on disk. A committed `merge_layout` lets collection
+views select native samples at read time, independently per date or pair:
+
+```python
+merged = stack.scenes.merge_bursts()
+slc = merged["20240113"].layers.slc
+slc.read(window=(2, 6, 4, 12))  # source-grid window, sliced before load
+slc.plot()            # crop=True: tight valid bbox, holes kept
+slc.plot(crop=False)  # original scientific extent
+
+ifgs = stack.interferograms.merge_bursts()
+ifgs["20240101_20240113"].complex.read()
+unmerged = stack.interferograms.sel(representation="burst", burst=0)
+```
+
 All mission constructors (`S1Stack.from_safes`, `S1Stack.from_search`, and
 `NISARStack.from_rslc`) configure requests only. Call `prepare_data()` explicitly
 before raw-input scientific stages; those stages never download or auto-prepare.

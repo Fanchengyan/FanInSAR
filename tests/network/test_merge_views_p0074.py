@@ -262,16 +262,31 @@ def test_plot_crop_true_reads_tight_interior_window(tmp_path: Path) -> None:
     np.testing.assert_allclose(im.get_extent(), (2.5, 4.5, 3.5, 1.5))
 
 
-def _publish_stack_layout(stack: object, *, source_ids: tuple[str, str]) -> None:
-    """Publish a unique-coverage radar layout for one Stack Reference."""
-    from faninsar.io.storage.merge_layout import publish_merge_layout
-    from faninsar.processing.mosaicking import (
-        LayoutSourceWindow,
-        MergeScope,
-        build_merge_layout,
-    )
+def _merge_scope(stack: object) -> object:
+    """Return a radar MergeScope bound to the Stack Reference grid."""
+    from faninsar.processing.mosaicking import MergeScope
 
     store = stack.scenes[stack.reference]
+    return MergeScope(
+        domain="radar",
+        track_id="T000_A",
+        channel="vv",
+        reference_id=str(stack.reference),
+        grid_identity=str(store.grid_identity),
+        polygon_identity="poly-0",
+    )
+
+
+def _publish_stack_layout(
+    stack: object,
+    *,
+    source_ids: tuple[str, str],
+    window: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Publish a unique-coverage radar layout for one Stack Reference."""
+    from faninsar.io.storage.merge_layout import publish_merge_layout
+    from faninsar.processing.mosaicking import LayoutSourceWindow, build_merge_layout
+
     layout = build_merge_layout(
         (
             LayoutSourceWindow(
@@ -287,18 +302,75 @@ def _publish_stack_layout(stack: object, *, source_ids: tuple[str, str]) -> None
                 "IW2",
             ),
         ),
-        scope=MergeScope(
-            domain="radar",
-            track_id="T000_A",
-            channel="vv",
-            reference_id=str(stack.reference),
-            grid_identity=str(store.grid_identity),
-            polygon_identity="poly-0",
+        scope=_merge_scope(stack),
+        window=window,
+    )
+    publish_merge_layout(
+        stack.config.work_dir / "layout" / str(stack.reference),
+        layout,
+        overwrite=True,
+    )
+
+
+def _publish_overlap_layout(stack: object) -> None:
+    """Publish a range-overlap layout whose midpoint cut differs from first-valid."""
+    from faninsar.io.storage.merge_layout import publish_merge_layout
+    from faninsar.processing.mosaicking import (
+        LayoutSourceWindow,
+        MergeSeam,
+        build_merge_layout,
+    )
+
+    layout = build_merge_layout(
+        (
+            LayoutSourceWindow(
+                "f0_IW1_b0",
+                (0, 8, 0, 10),
+                np.ones((8, 10), dtype=bool),
+                "IW1",
+            ),
+            LayoutSourceWindow(
+                "f0_IW2_b0",
+                (0, 8, 6, 16),
+                np.ones((8, 10), dtype=bool),
+                "IW2",
+            ),
+        ),
+        scope=_merge_scope(stack),
+        seams=(
+            MergeSeam(
+                axis="range",
+                boundary=8,
+                earlier_id="f0_IW1_b0",
+                later_id="f0_IW2_b0",
+            ),
         ),
     )
     publish_merge_layout(
         stack.config.work_dir / "layout" / str(stack.reference),
         layout,
+        overwrite=True,
+    )
+
+
+def _write_date_units(
+    stack: object,
+    date_id: str,
+    units: list[dict[str, object]],
+) -> None:
+    """Overwrite one committed scene with *units* on the Reference grid."""
+    from faninsar.io.storage.scene_store import write_scene
+    from tests.support.scene_stores import coreg_dir
+
+    write_scene(
+        coreg_dir(stack.config.work_dir, date_id),
+        date_id=date_id,
+        reference_id=stack.reference,
+        domain="radar",
+        units=units,
+        grid_shape=(8, 16),
+        inputs={"reference": stack.scenes["20240101"].write_id},
+        overwrite=True,
     )
 
 
@@ -393,3 +465,145 @@ def test_interferograms_merge_bursts_reads_committed_layout(tmp_path: Path) -> N
     assert values.shape == (8, 16)
     np.testing.assert_allclose(values[:, :8], 1.0)
     np.testing.assert_allclose(values[:, 8:], 2.0)
+
+
+def test_merge_to_xarray_uses_shared_midpoint_selector(tmp_path: Path) -> None:
+    """Lazy xarray compute must match merge_bursts, not first-valid mosaicking."""
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 10), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 10), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 6,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+    )
+    _publish_overlap_layout(stack)
+    layer = stack.scenes.merge_bursts()["20240113"].layers.slc
+    eager = layer.read()
+    lazy = np.asarray(layer.to_xarray().compute())
+    np.testing.assert_array_equal(lazy, eager)
+    np.testing.assert_allclose(eager[:, :8], 1.0)
+    np.testing.assert_allclose(eager[:, 8:], 2.0)
+
+
+def test_merge_window_read_keeps_owner_labels_on_shifted_layout(
+    tmp_path: Path,
+) -> None:
+    """Cropped owner labels stay 1-based and aligned to a non-zero layout origin."""
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+    )
+    _publish_stack_layout(
+        stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"), window=(2, 6, 4, 12)
+    )
+    layer = stack.scenes.merge_bursts()["20240113"].layers.slc
+    roi = layer.read(window=(2, 6, 4, 12))
+    assert roi.shape == (4, 8)
+    np.testing.assert_allclose(roi[:, :4], 1.0)
+    np.testing.assert_allclose(roi[:, 4:], 2.0)
+    inner = layer.read(window=(3, 5, 6, 10))
+    assert inner.shape == (2, 4)
+    np.testing.assert_allclose(inner[:, :2], 1.0)
+    np.testing.assert_allclose(inner[:, 2:], 2.0)
+
+
+def test_merge_rejects_mismatched_phase_conventions(tmp_path: Path) -> None:
+    """Burst windows that disagree on phase convention fail closed at read."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+                "phase_state": {"convention": "reramped"},
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+                "phase_state": {"convention": "deramped"},
+            },
+        ],
+    )
+    _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
+    with pytest.raises(InvalidProcessingStateError, match="phase_convention"):
+        stack.scenes.merge_bursts()["20240113"].layers.slc.read()
+
+
+def test_merge_read_rejects_replaced_layout_product(tmp_path: Path) -> None:
+    """A layer bound to a replaced merge_layout product must not keep reading."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": "f0_IW1_b0",
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": "f0_IW2_b0",
+            },
+        ],
+    )
+    _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
+    layer = stack.scenes.merge_bursts()["20240113"].layers.slc
+    np.testing.assert_allclose(layer.read()[:, :8], 1.0)
+    _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
+    with pytest.raises(InvalidProcessingStateError, match="replaced"):
+        layer.read()
