@@ -142,6 +142,9 @@ class S1ReferenceContext:
         Apply-window ROI.
     dem : DEM
         Height sampler.
+    polarizations : tuple of str or None
+        The single channel published on this Reference layout. One
+        ``MergeScope.channel`` cannot carry two polarizations.
 
     """
 
@@ -153,11 +156,127 @@ class S1ReferenceContext:
     geo_grid: GeoGridSpec | None = None
     roi: BoundingBox | Polygons | None = None
     dem: DEM | None = None
+    polarizations: tuple[str, ...] | None = None
 
     @property
     def write_id(self) -> str:
         """Return the Reference product write id secondaries bind."""
         return self.product.write_id
+
+
+def _selected_polarizations(
+    polarizations: Sequence[str] | str | None,
+) -> tuple[str, ...] | None:
+    """Return requested channels, or ``None`` when the caller kept every channel."""
+    if polarizations is None:
+        return None
+    if isinstance(polarizations, str):
+        if polarizations.strip().lower() == "all":
+            return None
+        tokens: Sequence[str] = (polarizations,)
+    else:
+        tokens = polarizations
+    selected: list[str] = []
+    for value in tokens:
+        for part in str(value).replace(" ", "").split("+"):
+            token = part.strip().upper()
+            if token and token not in selected:
+                selected.append(token)
+    return tuple(selected) or None
+
+
+def _present_polarizations(products: Sequence[S1Product]) -> tuple[str, ...]:
+    """Return unique polarizations present on opened SAFE products."""
+    return tuple(
+        dict.fromkeys(
+            str(swath.polarization).upper()
+            for product in products
+            for swath in product.swaths
+        )
+    )
+
+
+def _restrict_product_polarizations(
+    product: S1Product, selected: tuple[str, ...]
+) -> S1Product:
+    """Return ``product`` carrying only ``selected`` measurement swaths."""
+    wanted = set(selected)
+    filtered = tuple(
+        swath for swath in product.swaths if str(swath.polarization).upper() in wanted
+    )
+    if not filtered:
+        reject_invalid_state(
+            f"requested polarization {selected[0]} is not present on "
+            f"{product.source_path}; available={product.polarizations}"
+        )
+    polarizations = tuple(
+        dict.fromkeys(str(swath.polarization).upper() for swath in filtered)
+    )
+    if filtered == product.swaths and product.polarizations == polarizations:
+        return product
+    return replace(product, swaths=filtered, polarizations=polarizations)
+
+
+def _require_single_coreg_polarization(
+    polarizations: Sequence[str] | str | None,
+    products: Sequence[S1Product],
+) -> tuple[str, ...]:
+    """Return the one channel this layout may publish.
+
+    Dual-pol SAFE annotations sort VH before VV. Opening every present
+    channel, or requesting several, would otherwise publish the first
+    annotation rather than the requested measurement.
+    """
+    present = _present_polarizations(products)
+    requested = _selected_polarizations(polarizations)
+    if requested is not None:
+        if len(requested) > 1:
+            reject_invalid_state(
+                "coregistration publishes one channel per layout; "
+                f"requested polarizations {requested} are ambiguous"
+            )
+        if requested[0] not in present:
+            reject_invalid_state(
+                f"requested polarization {requested[0]} is not present; "
+                f"available={present}"
+            )
+        return requested
+    if len(present) == 1:
+        return present
+    if not present:
+        reject_invalid_state("SAFE product has no polarizations")
+    return reject_invalid_state(
+        "coregistration publishes one channel per layout; "
+        f"SAFE polarizations {present} are ambiguous — request a single channel"
+    )
+
+
+def _coreg_open_filter(
+    polarizations: Sequence[str] | str | None,
+) -> tuple[str, ...] | None:
+    """Return the SAFE open filter, rejecting multi-channel requests first."""
+    requested = _selected_polarizations(polarizations)
+    if requested is not None and len(requested) > 1:
+        reject_invalid_state(
+            "coregistration publishes one channel per layout; "
+            f"requested polarizations {requested} are ambiguous"
+        )
+    return requested
+
+
+def _open_coreg_products(
+    paths: Sequence[Path],
+    polarizations: Sequence[str] | str | None,
+) -> tuple[list[S1Product], tuple[str, ...]]:
+    """Open SAFE products and restrict them to one coregistration channel."""
+    products = open_acquisition_products(
+        paths, polarizations=_coreg_open_filter(polarizations)
+    )
+    selected = _require_single_coreg_polarization(polarizations, products)
+    restricted = [
+        _restrict_product_polarizations(product, selected) for product in products
+    ]
+    return restricted, selected
 
 
 def prepare_s1_reference(
@@ -173,6 +292,7 @@ def prepare_s1_reference(
     geo_lut_cache_dir: Path | None = None,
     orbit_path: Path | None = None,
     aux_cal_path: Path | None = None,
+    polarizations: Sequence[str] | str | None = None,
     device: str = "auto",
     overwrite: bool = False,
 ) -> S1ReferenceContext:
@@ -206,6 +326,11 @@ def prepare_s1_reference(
         Precise orbit of the Reference.
     aux_cal_path : pathlib.Path, optional
         AUX_CAL file of the Reference; required for IPF 002.36 products.
+    polarizations : sequence of str or str, optional
+        The one channel this layout publishes. Dual-pol SAFEs list VH
+        before VV; ``None`` or ``"all"`` is allowed only when the product
+        already carries a single polarization. Requesting several channels
+        is rejected rather than processing the first annotation.
     device : str, optional
         Numerical device.
     overwrite : bool, optional
@@ -219,8 +344,9 @@ def prepare_s1_reference(
     Raises
     ------
     InvalidProcessingStateError
-        If the selection is empty, the configuration is invalid, or an
-        existing Reference product does not match the current selection.
+        If the selection is empty, the configuration is invalid, an
+        existing Reference product does not match the current selection,
+        or the requested polarizations are ambiguous for one layout.
 
     """
     if coregistration_grid not in {"radar", "geo"}:
@@ -228,7 +354,9 @@ def prepare_s1_reference(
     if coregistration_grid == "geo" and geo_grid is None:
         reject_invalid_state("geo coregistration requires geo_grid")
     primary_paths = _as_frame_paths(reference_path, "reference_path")
-    primary_products = open_acquisition_products(primary_paths)
+    primary_products, selected_polarizations = _open_coreg_products(
+        primary_paths, polarizations
+    )
     ref_orbits = [orbit_path] * len(primary_products)
     swath_tuple, resolved = _resolve_apply_selection(
         primary_products,
@@ -409,13 +537,12 @@ def prepare_s1_reference(
                 track_identity,
             )
 
-            first_swath = next(iter(units.values())).scene.swath
             layout = build_s1_reference_layout(
                 units,
                 domain=coregistration_grid,
                 reference_id=reference_id,
                 track_id=track_identity(primary_products[0]),
-                channel=str(first_swath.polarization).lower(),
+                channel=selected_polarizations[0].lower(),
                 grid_identity=writer.grid_identity,
                 roi=roi,
                 scene_offset=(scene_row0, scene_col0),
@@ -452,6 +579,7 @@ def prepare_s1_reference(
         geo_grid=geo_grid,
         roi=roi,
         dem=dem,
+        polarizations=selected_polarizations,
     )
 
 
@@ -758,6 +886,7 @@ def coregister_s1_secondary(
     misreg_rg_px: float,
     secondary_orbit_path: Path | None = None,
     secondary_aux_cal_path: Path | None = None,
+    polarizations: Sequence[str] | str | None = None,
     device: str = "auto",
     inputs: Mapping[str, Product | str] | None = None,
     properties: Mapping[str, object] | None = None,
@@ -783,6 +912,9 @@ def coregister_s1_secondary(
         Precise orbit of the secondary.
     secondary_aux_cal_path : pathlib.Path, optional
         AUX_CAL file of the secondary; required for IPF 002.36 products.
+    polarizations : sequence of str or str, optional
+        Channel to open. Defaults to the Reference context channel so the
+        secondary cannot silently load a different polarization.
     device : str, optional
         Numerical device.
     inputs : mapping, optional
@@ -811,7 +943,10 @@ def coregister_s1_secondary(
     date_id = _scene_id(secondary_paths[0])
     if date_id == context.reference_id:
         reject_invalid_state("coregister_s1_secondary requires a non-Reference date")
-    secondary_products = open_acquisition_products(secondary_paths)
+    secondary_products, _ = _open_coreg_products(
+        secondary_paths,
+        polarizations if polarizations is not None else context.polarizations,
+    )
     reference = context.product
     reference_units = reference.unit_map()
     domain = context.coregistration_grid
@@ -1205,6 +1340,7 @@ def coregister_s1_scene(
     secondary_orbit_path: Path | None = None,
     primary_aux_cal_path: Path | None = None,
     secondary_aux_cal_path: Path | None = None,
+    polarizations: Sequence[str] | str | None = None,
     device: str = "auto",
 ) -> CoregisteredSceneStore:
     """Coregister one secondary acquisition onto a Reference scene product.
@@ -1228,6 +1364,8 @@ def coregister_s1_scene(
         Precise orbits.
     primary_aux_cal_path, secondary_aux_cal_path : pathlib.Path, optional
         AUX_CAL files; required for IPF 002.36 products.
+    polarizations : sequence of str or str, optional
+        Single channel forwarded to Reference and secondary opens.
     device : str, optional
         Numerical device.
 
@@ -1251,6 +1389,7 @@ def coregister_s1_scene(
         geo_lut_cache_dir=geo_lut_cache_dir,
         orbit_path=primary_orbit_path,
         aux_cal_path=primary_aux_cal_path,
+        polarizations=polarizations,
         device=device,
     )
     return coregister_s1_secondary(
@@ -1261,6 +1400,7 @@ def coregister_s1_scene(
         misreg_rg_px=misreg_rg_px,
         secondary_orbit_path=secondary_orbit_path,
         secondary_aux_cal_path=secondary_aux_cal_path,
+        polarizations=polarizations,
         device=device,
     )
 

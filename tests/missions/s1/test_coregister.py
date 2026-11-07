@@ -67,6 +67,7 @@ def test_coregister_s1_scene_public_signature() -> None:
         "secondary_orbit_path",
         "primary_aux_cal_path",
         "secondary_aux_cal_path",
+        "polarizations",
         "device",
     ]
     for name in ("output_scene", "reference_scene", "dem", "misreg_az_px"):

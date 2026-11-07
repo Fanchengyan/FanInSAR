@@ -1377,6 +1377,7 @@ class S1Stack(Stack):
             geo_lut_cache_dir=self._geo_lut_cache_dir(),
             orbit_path=self._orbit_path_for(self.reference),
             aux_cal_path=self._aux_cal_path_for(self.reference),
+            polarizations=self.config.extra.get("polarizations"),
             device=self.config.device,
             overwrite=overwrite,
         )
@@ -1428,6 +1429,7 @@ class S1Stack(Stack):
             misreg_rg_px=misreg_rg_px,
             secondary_orbit_path=self._orbit_path_for(date_id),
             secondary_aux_cal_path=self._aux_cal_path_for(date_id),
+            polarizations=self.config.extra.get("polarizations"),
             device=self.config.device,
             inputs=inputs,
             properties=properties,

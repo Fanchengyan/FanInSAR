@@ -50,6 +50,15 @@ _COVERING_ROI = BoundingBox(9.99, 44.99, 10.08, 45.08)
 _SECOND_POLYGON = BoundingBox(10.02, 45.02, 10.08, 45.08)
 
 
+def _esa_measurement_path(swath: str, polarization: str) -> str:
+    """Return an ESA-like measurement name (``vh`` sorts before ``vv``)."""
+    pol = polarization.lower()
+    return (
+        f"memory://measurement/s1a-{swath.lower()}-slc-{pol}-"
+        "20200101t000000-20200101t000026-000001-xxxxxx-001.tiff"
+    )
+
+
 def _orbit() -> OrbitMetadata:
     """Return a short linear orbit covering the fake bursts."""
     return OrbitMetadata(
@@ -86,6 +95,7 @@ def _swath(
     *,
     name: str = "IW1",
     bursts: tuple[S1Burst, ...],
+    polarization: str = "VV",
     azimuth_time_interval_s: float = 1.0,
     slant_range_time_s: float = 0.005,
     range_sampling_rate_hz: float = 64_000_000.0,
@@ -94,9 +104,9 @@ def _swath(
     stop = bursts[-1].azimuth_time + timedelta(seconds=_LINES - 1)
     return S1Swath(
         swath=name,  # type: ignore[arg-type]
-        polarization="VV",
+        polarization=polarization,
         annotation_path="memory://annotation.xml",
-        measurement_path="memory://measurement.tiff",
+        measurement_path=_esa_measurement_path(name, polarization),
         lines=_LINES * len(bursts),
         samples=_SAMPLES,
         lines_per_burst=_LINES,
@@ -145,7 +155,7 @@ def _product(
         product_type="SLC",
         mode="IW",
         absolute_orbit=1,
-        polarizations=("VV",),
+        polarizations=tuple(dict.fromkeys(item.polarization for item in swaths)),
         swaths=swaths,
     )
 
@@ -682,3 +692,122 @@ def test_all_invalid_reference_bursts_reject_layout(
     monkeypatch.setattr(f"{coreg_module.__name__}.load_production_scene", fake_load)
     with pytest.raises(InvalidProcessingStateError, match="native validity"):
         _prepare_two_burst(tmp_path)
+
+
+def _dual_pol_product(path: Path) -> S1Product:
+    """Return a 1SDV-like product whose unfiltered IW1 swath is VH."""
+    product = _product(
+        path,
+        swaths=(
+            _two_burst_swath(polarization="VH"),
+            _two_burst_swath(polarization="VV"),
+        ),
+    )
+    first = product.swath("IW1")
+    assert first.polarization == "VH"
+    assert _measurement_channel(first.measurement_path) == "vh"
+    assert product.polarizations == ("VH", "VV")
+    return product
+
+
+def _measurement_channel(path: object) -> str:
+    """Return the ESA ``-slc-<pol>-`` token from a measurement path."""
+    text = str(path).lower()
+    assert "-slc-vv-" in text or "-slc-vh-" in text, (
+        f"measurement path has no vv/vh token: {path}"
+    )
+    return "vv" if "-slc-vv-" in text else "vh"
+
+
+def _patch_dual_pol_open(monkeypatch: pytest.MonkeyPatch, product: S1Product) -> None:
+    """Open/load the requested polarizations, not the VH-first annotation."""
+
+    def fake_open(paths: object, **kwargs: object) -> list[S1Product]:
+        selected = kwargs.get("polarizations")
+        if not selected or selected == "all":
+            opened = product
+        else:
+            wanted = {str(value).upper() for value in selected}  # type: ignore[union-attr]
+            filtered = tuple(
+                item for item in product.swaths if item.polarization in wanted
+            )
+            opened = replace(
+                product,
+                swaths=filtered,
+                polarizations=tuple(
+                    pol for pol in product.polarizations if pol in wanted
+                ),
+            )
+        return [opened for _ in paths]  # type: ignore[union-attr]
+
+    def fake_load(load_path: Path, **kwargs: object) -> MagicMock:
+        prod = kwargs.get("product")
+        swath_obj = (
+            prod.swath(str(kwargs.get("swath", "IW1")))  # type: ignore[union-attr]
+            if prod is not None
+            else product.swath("IW1")
+        )
+        return _fake_scene(
+            Path(load_path),
+            int(kwargs.get("burst_index", 0)),
+            swath=swath_obj,
+        )
+
+    monkeypatch.setattr(f"{coreg_module.__name__}.open_acquisition_products", fake_open)
+    monkeypatch.setattr(f"{coreg_module.__name__}.load_production_scene", fake_load)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (("VV",), "vv"),
+        (("VH",), "vh"),
+        ("VV", "vv"),
+        ("VH", "vh"),
+    ],
+)
+def test_requested_polarization_uses_that_measurement_path(
+    two_burst_s1: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: tuple[str, ...] | str,
+    expected: str,
+) -> None:
+    """Requested VV/VH must select that measurement TIFF, not the first annotation."""
+    tmp_path = two_burst_s1
+    path = tmp_path / REFERENCE
+    _patch_dual_pol_open(monkeypatch, _dual_pol_product(path))
+    context = prepare_s1_reference(
+        path,
+        output_scene=tmp_path / "coreg" / "20200101",
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0, 1]},
+        polarizations=requested,
+    )
+    layout = open_merge_layout(_layout_path(tmp_path))
+    unit = context.units["f0_IW1_b0"]
+    assert layout.scope.channel == expected
+    assert context.polarizations == (expected.upper(),)
+    assert unit.scene.swath.polarization == expected.upper()
+    assert _measurement_channel(unit.scene.swath.measurement_path) == expected
+
+
+@pytest.mark.parametrize("requested", [None, "all", ("VV", "VH"), "VV+VH"])
+def test_dual_pol_coregistration_rejects_ambiguous_channels(
+    two_burst_s1: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str | tuple[str, ...] | None,
+) -> None:
+    """One layout cannot silently process the first of several dual-pol channels."""
+    tmp_path = two_burst_s1
+    path = tmp_path / REFERENCE
+    _patch_dual_pol_open(monkeypatch, _dual_pol_product(path))
+    with pytest.raises(InvalidProcessingStateError, match="ambiguous"):
+        prepare_s1_reference(
+            path,
+            output_scene=tmp_path / "coreg" / "20200101",
+            dem=ConstantDEM(0.0),
+            swaths=("IW1",),
+            bursts={"IW1": [0, 1]},
+            polarizations=requested,
+        )
