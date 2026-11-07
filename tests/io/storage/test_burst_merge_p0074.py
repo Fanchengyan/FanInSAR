@@ -659,3 +659,92 @@ def test_bounded_tiles_match_full_frame_across_seam_and_roi_hole(
     assert small.valid_mask is not None
     assert not bool(small.valid_mask[4, 4])
     assert not bool(small.valid_mask[30, 4])
+
+
+def test_native_tiles_keep_selected_fields_inside_tile_plus_halo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``merge_bursts`` sees cropped native windows, not the parent canvas."""
+    import faninsar.io.storage.scene_store as scene_store
+
+    rows, cols = 384, 192
+    native_tile = 64
+    coherence_window = (5, 5)
+    halo = (coherence_window[0] // 2, coherence_window[1] // 2)
+    earlier = np.ones((240, cols), dtype=np.complex64)
+    later = np.ones((240, cols), dtype=np.complex64)
+    support = np.ones((240, cols), dtype=bool)
+    reference_store, secondary_store = _write_pair(
+        tmp_path,
+        earlier,
+        earlier,
+        reference_units=[
+            *_scene_units(
+                earlier, tag="IW1_b0", valid_mask=support, burst_id="IW1-anx0"
+            ),
+            *_scene_units(
+                later,
+                tag="IW1_b1",
+                row_origin=144,
+                valid_mask=support,
+                burst_id="IW1-anx1000000",
+            ),
+        ],
+        secondary_units=[
+            *_scene_units(
+                earlier, tag="IW1_b0", valid_mask=support, burst_id="IW1-anx0"
+            ),
+            *_scene_units(
+                later,
+                tag="IW1_b1",
+                row_origin=144,
+                valid_mask=support,
+                burst_id="IW1-anx1000000",
+            ),
+        ],
+        grid_shape=(rows, cols),
+    )
+    layout = build_scene_merge_layout(
+        reference_store,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=264,
+                earlier_id="IW1-anx0",
+                later_id="IW1-anx1000000",
+            ),
+        ),
+    )
+    observed: list[tuple[int, int, int]] = []
+    real_merge = scene_store.merge_bursts
+
+    def wrapped_merge(products, *, layout):
+        selected = real_merge(products, layout=layout)
+        observed.append(
+            (
+                int(layout.window[1] - layout.window[0]),
+                int(layout.window[3] - layout.window[2]),
+                int(selected.complex.nbytes),
+            )
+        )
+        return selected
+
+    monkeypatch.setattr(scene_store, "merge_bursts", wrapped_merge)
+    product = form_merged_scene_interferogram(
+        reference_store,
+        secondary_store,
+        multilook=(1, 1),
+        coherence_window=coherence_window,
+        layout=layout,
+        native_tile=native_tile,
+    )
+    assert product.complex.shape == (rows, cols)
+    assert observed
+    max_height = max(item[0] for item in observed)
+    max_width = max(item[1] for item in observed)
+    max_selected_bytes = max(item[2] for item in observed)
+    parent_bytes = rows * cols * np.dtype(np.complex64).itemsize
+    assert max_height <= native_tile + 2 * halo[0]
+    assert max_width <= native_tile + 2 * halo[1]
+    assert max_height * max_width < rows * cols
+    assert max_selected_bytes < parent_bytes

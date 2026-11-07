@@ -17,7 +17,13 @@ from faninsar.io.storage.ifg_store import (
     write_ifg_artifact,
     write_unwrapped_artifact,
 )
-from faninsar.io.storage.scene_store import write_scene
+from faninsar.io.storage.merge_layout import publish_merge_layout
+from faninsar.io.storage.scene_store import (
+    CoregisteredSceneStore,
+    build_scene_merge_layout,
+    write_scene,
+)
+from faninsar.processing.mosaicking import MergeSeam
 from faninsar.missions.s1 import S1Stack
 from faninsar.network.products import AssetKind
 from faninsar.processing.interferometry.pair import (
@@ -61,6 +67,34 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
     stack.prepare_data()
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     return stack
+
+
+def _publish_explicit_overlap_layout(
+    work_dir: Path,
+    reference_id: str,
+    *,
+    earlier_id: str = "IW1_b0",
+    later_id: str = "IW1_b1",
+    boundary: int = 1,
+) -> None:
+    """Publish a synthetic physical azimuth seam for overlapping test units.
+
+    The cut is an explicit fixture seam, not an inference from ROI-cropped
+    origins. The product path is canonical ``layout/{reference_id}``.
+    """
+    reference = CoregisteredSceneStore.open(work_dir / "coreg" / reference_id)
+    layout = build_scene_merge_layout(
+        reference,
+        seams=(
+            MergeSeam(
+                axis="azimuth",
+                boundary=boundary,
+                earlier_id=earlier_id,
+                later_id=later_id,
+            ),
+        ),
+    )
+    publish_merge_layout(work_dir / "layout" / reference_id, layout)
 
 
 def _write_pair_artifact(
@@ -534,6 +568,7 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
             row_origin=0,
             col_origin=0,
         )
+    _publish_explicit_overlap_layout(stack.config.work_dir, dates[0], boundary=1)
 
     stack.form_interferograms(multilook=(1, 1))
     assert stack.config.multilook == (1, 1)
