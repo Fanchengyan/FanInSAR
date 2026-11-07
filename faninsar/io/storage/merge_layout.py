@@ -9,7 +9,7 @@ import numpy as np
 from faninsar.io.storage._zarr_stac import write_zarr_array
 from faninsar.io.storage.product import Product, open_product, publish_product
 from faninsar.logging import setup_logger
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 from faninsar.processing.mosaicking.windows import (
     LayoutSourceWindow,
     MergeLayoutWindow,
@@ -48,7 +48,24 @@ def _compact_radar(layout: MergeLayoutWindow) -> bool:
         return False
     if len(layout.source_windows) != len(layout.source_ids):
         return False
-    return tuple(item.burst_id for item in layout.source_windows) == layout.source_ids
+    if tuple(item.burst_id for item in layout.source_windows) != layout.source_ids:
+        return False
+    from faninsar.processing.mosaicking.merge import build_merge_layout
+
+    try:
+        rebuilt = build_merge_layout(
+            layout.source_windows,
+            scope=layout.scope,
+            seams=layout.seams,
+            window=layout.window,
+        )
+    except InvalidProcessingStateError:
+        return False
+    return (
+        rebuilt.source_ids == layout.source_ids
+        and np.array_equal(rebuilt.owner, layout.owner)
+        and np.array_equal(rebuilt.scientific_support, layout.scientific_support)
+    )
 
 
 def _source_records(layout: MergeLayoutWindow) -> list[dict[str, object]]:
@@ -87,10 +104,12 @@ def publish_merge_layout(
 ) -> Product:
     """Publish one merge layout as a ``merge_layout`` product.
 
-    Radar layouts with precomputed seams and per-source support omit
-    ``owner.zarr`` and reconstruct labels on open. Geo layouts, and Radar
-    layouts that cannot reconstruct irregular holes from compact metadata,
-    persist ``owner.zarr``.
+    Radar layouts omit ``owner.zarr`` only when seams plus per-source
+    support reconstruct the supplied owner and union support exactly. Geo
+    layouts, and Radar layouts whose reconstructed labels disagree, persist
+    ``owner.zarr``. Per-source support assets are always written when
+    ``source_windows`` are present so reopen does not invent a bounding-box
+    footprint.
 
     Parameters
     ----------
@@ -134,12 +153,11 @@ def publish_merge_layout(
             "href": "scientific_support.zarr",
             "roles": ["data"],
         }
-        if compact:
-            for index, source in enumerate(layout.source_windows):
-                href = f"support-{index}.zarr"
-                write_zarr_array(staging / href, source.scientific_support)
-                assets[f"support-{index}"] = {"href": href, "roles": ["data"]}
-        else:
+        for index, source in enumerate(layout.source_windows):
+            href = f"support-{index}.zarr"
+            write_zarr_array(staging / href, source.scientific_support)
+            assets[f"support-{index}"] = {"href": href, "roles": ["data"]}
+        if not compact:
             write_zarr_array(staging / "owner.zarr", layout.owner)
             assets["owner"] = {"href": "owner.zarr", "roles": ["data"]}
         return assets
@@ -241,16 +259,9 @@ def open_merge_layout(path: str | Path | Product) -> MergeLayoutWindow:
                 source_window = _read_window(record["window"], name="source window")
                 swath = str(record.get("swath") or "unknown")
                 name = f"support-{index}"
-                if name in product.assets:
-                    source_support = np.asarray(product.read(name), dtype=bool)
-                else:
-                    source_support = np.ones(
-                        (
-                            source_window[1] - source_window[0],
-                            source_window[3] - source_window[2],
-                        ),
-                        dtype=bool,
-                    )
+                if name not in product.assets:
+                    continue
+                source_support = np.asarray(product.read(name), dtype=bool)
                 source_windows.append(
                     LayoutSourceWindow(burst_id, source_window, source_support, swath)
                 )

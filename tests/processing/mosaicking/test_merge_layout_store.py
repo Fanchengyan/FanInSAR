@@ -140,3 +140,86 @@ def test_open_rejects_missing_layout_kind(tmp_path: Path) -> None:
     )
     with pytest.raises(InvalidProcessingStateError, match="merge_layout"):
         open_merge_layout(other.path)
+
+
+def _seam_radar_layout() -> MergeLayoutWindow:
+    """Two-burst radar layout with an azimuth midpoint seam (verifier F1 geometry)."""
+    scope = MergeScope(
+        domain="radar",
+        track_id="T1",
+        channel="IW",
+        reference_id="ref",
+        grid_identity="a" * 64,
+        polygon_identity="pol",
+    )
+    support_a = np.ones((5, 4), dtype=bool)
+    support_a[0, 0] = False
+    support_b = np.ones((6, 4), dtype=bool)
+    sources = (
+        LayoutSourceWindow("b1", (0, 5, 0, 4), support_a, "iw1"),
+        LayoutSourceWindow("b2", (2, 8, 0, 4), support_b, "iw1"),
+    )
+    return build_merge_layout(
+        sources,
+        scope=scope,
+        seams=(MergeSeam("azimuth", 3, "b1", "b2"),),
+        window=(0, 8, 0, 4),
+    )
+
+
+def test_radar_supplied_owner_holes_roundtrip_exactly(tmp_path: Path) -> None:
+    """Unowned-but-supported owner holes must survive reopen, not refill."""
+    layout = _seam_radar_layout()
+    owner = layout.owner.copy()
+    owner[1, 2] = 0
+    owner[4, 3] = 0
+    holed = MergeLayoutWindow(
+        scope=layout.scope,
+        window=layout.window,
+        source_ids=layout.source_ids,
+        owner=owner,
+        scientific_support=layout.scientific_support,
+        seams=layout.seams,
+        source_windows=layout.source_windows,
+    )
+    product = publish_merge_layout(tmp_path / "radar-holed", holed)
+    assert product.properties["faninsar:compact"] is False
+    assert "owner" in product.assets
+    reopened = open_merge_layout(product.path)
+    np.testing.assert_array_equal(reopened.owner, holed.owner)
+    assert reopened.owner[1, 2] == 0
+    assert reopened.owner[4, 3] == 0
+    assert bool(reopened.scientific_support[1, 2])
+    assert bool(reopened.scientific_support[4, 3])
+
+
+def test_owner_asset_preserves_per_source_support(tmp_path: Path) -> None:
+    """Owner fallback must not replace source footprints with a bounding box."""
+    layout = _seam_radar_layout()
+    owner = layout.owner.copy()
+    owner[1, 2] = 0
+    holed = MergeLayoutWindow(
+        scope=layout.scope,
+        window=layout.window,
+        source_ids=layout.source_ids,
+        owner=owner,
+        scientific_support=layout.scientific_support,
+        seams=layout.seams,
+        source_windows=layout.source_windows,
+    )
+    product = publish_merge_layout(tmp_path / "radar-support", holed)
+    assert "owner" in product.assets
+    assert "support-0" in product.assets
+    assert "support-1" in product.assets
+    reopened = open_merge_layout(product.path)
+    assert len(reopened.source_windows) == 2
+    original = {
+        item.burst_id: item.scientific_support for item in layout.source_windows
+    }
+    for source in reopened.source_windows:
+        np.testing.assert_array_equal(
+            source.scientific_support, original[source.burst_id]
+        )
+    b1 = next(item for item in reopened.source_windows if item.burst_id == "b1")
+    assert not bool(b1.scientific_support[0, 0])
+    assert not bool(np.all(b1.scientific_support))
