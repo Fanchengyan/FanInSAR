@@ -566,8 +566,11 @@ def test_annotation_scale_azimuth_fraction_is_admitted(
 
 def test_absolute_orbit_is_not_a_track_key(tmp_path: Path) -> None:
     """MergeScope track_id must be the selection group key, not absolute orbit."""
-    product = _product(tmp_path / REFERENCE, swaths=(_two_burst_swath(),), track=None)
-    assert product.absolute_orbit == 1
+    product = replace(
+        _product(tmp_path / REFERENCE, swaths=(_two_burst_swath(),), track=None),
+        absolute_orbit=0,
+    )
+    assert product.absolute_orbit == 0
     with pytest.raises(InvalidProcessingStateError, match="relative orbit"):
         track_identity(product)
     staged = _product(tmp_path / REFERENCE, swaths=(_two_burst_swath(),))

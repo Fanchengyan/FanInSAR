@@ -19,17 +19,23 @@ The resolver never hits the network and reads no measurement pixels:
    direction of the *other* same-orbit group only when the catalog
    resolves exactly one direction for that orbit; a catalog mixing both
    directions keeps ``"?"`` rather than guessing.
-3. **Annotation/orbit fallback** — when the path gives nothing, the
-   orbit-state vectors of the first swath supply the direction (the mean
-   radial→velocity cross-track sense) and the relative orbit stays
-   ``None``; annotation parsing is the last resort because it reads the
-   XML payloads.
+3. **Manifest / S1A-B formula** — a standard ESA SAFE has no
+   ``<relOrbit><letter>`` field.  ``manifest.safe``
+   ``relativeOrbitNumber`` is authoritative when present.  Otherwise
+   S1A/S1B map absolute orbit through the ESA 175-orbit cycle
+   (S1A offset 73, S1B offset 27).  S1C/S1D have no formula here.
+4. **Annotation/orbit fallback** — when the path gives no pass letter,
+   the orbit-state vectors of the first swath supply the direction (the
+   mean radial→velocity cross-track sense).  Relative orbit is never
+   defaulted and never taken from the absolute-orbit id.
 """
 
 from __future__ import annotations
 
 import itertools
 import re
+import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +45,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.missions.s1.types import track_group_key, track_group_parts
+from faninsar.processing.errors import reject_invalid_state
 from faninsar.stack.selection import polygon_track_assignment
 
 if TYPE_CHECKING:
@@ -56,6 +63,8 @@ _TRACK_DIR_RE = re.compile(r"(?P<digits>\d{1,5})(?P<letter>[AD?]+)")
 _SAFE_TRACK_FIELD_RE = re.compile(
     r"_\d{8}T\d{6}_\d{8}T\d{6}_(?P<orbit>\d{5})(?P<letter>[AD?])_"
 )
+_S1_REPEAT_ORBITS = 175
+_S1_ABSOLUTE_TO_RELATIVE_OFFSET = {"A": 73, "B": 27}
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +123,126 @@ def _track_key_from_path(path: Path) -> tuple[int | None, str | None]:
         if candidate in {"A", "D"}:
             letter = candidate
     return orbit, letter
+
+
+def relative_orbit_from_absolute(
+    mission_id: str, absolute_orbit: int | str | None
+) -> int | None:
+    """Return the ESA relative orbit for an S1A/S1B absolute orbit.
+
+    The 175-orbit cycle offsets are the published ESA / ISCE mapping
+    (S1A: 73, S1B: 27).  Other units return ``None`` so the caller can
+    report missing metadata rather than invent a cycle.
+    """
+    text = str(mission_id or "").strip().upper().replace("-", "")
+    if text.startswith("SENTINEL"):
+        text = text[-1:]
+    letter = text.removeprefix("S1")
+    offset = _S1_ABSOLUTE_TO_RELATIVE_OFFSET.get(letter)
+    if offset is None:
+        return None
+    try:
+        absolute = int(str(absolute_orbit).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if absolute <= 0:
+        return None
+    return (absolute - offset) % _S1_REPEAT_ORBITS + 1
+
+
+def relative_orbit_from_manifest(manifest: bytes | str) -> int | None:
+    """Return ``relativeOrbitNumber`` from a ``manifest.safe`` document.
+
+    Prefers ``type="start"`` when both start and stop are present.
+    """
+    try:
+        root = ET.fromstring(manifest)
+    except ET.ParseError:
+        return None
+    fallback: int | None = None
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "relativeOrbitNumber":
+            continue
+        try:
+            value = int(str(element.text or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        kind = str(element.attrib.get("type", "")).strip().lower()
+        if kind == "start":
+            return value
+        if fallback is None:
+            fallback = value
+    return fallback
+
+
+def _read_manifest_bytes(source_path: Path) -> bytes | None:
+    """Return ``manifest.safe`` bytes from a SAFE directory or ZIP, if present."""
+    path = Path(source_path)
+    if path.is_dir():
+        manifest = path / "manifest.safe"
+        if manifest.is_file():
+            return manifest.read_bytes()
+        return None
+    if path.is_file() and path.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = [
+                    name
+                    for name in archive.namelist()
+                    if name.endswith("manifest.safe")
+                ]
+                if not names:
+                    return None
+                return archive.read(names[0])
+        except zipfile.BadZipFile:
+            return None
+    return None
+
+
+def _relative_orbit_for_product(product: S1Product) -> int | None:
+    """Return the relative orbit, rejecting path/manifest disagreement."""
+    path_orbit, _letter = _track_key_from_path(product.source_path)
+    payload = _read_manifest_bytes(product.source_path)
+    manifest_orbit = (
+        relative_orbit_from_manifest(payload) if payload is not None else None
+    )
+    if (
+        path_orbit is not None
+        and manifest_orbit is not None
+        and path_orbit != manifest_orbit
+    ):
+        reject_invalid_state(
+            "SAFE path track and manifest relativeOrbitNumber disagree: "
+            f"path={path_orbit} manifest={manifest_orbit}"
+        )
+    if manifest_orbit is not None:
+        return manifest_orbit
+    if path_orbit is not None:
+        return path_orbit
+    return relative_orbit_from_absolute(product.mission_id, product.absolute_orbit)
+
+
+def track_key_for_product(product: S1Product) -> str | None:
+    """Return the selection ``"<relOrbit><A|D>"`` key for one opened product.
+
+    Relative orbit prefers ``manifest.safe`` ``relativeOrbitNumber`` when
+    present.  A path-encoded track is used when the manifest omits that
+    field.  The two sources must agree when both are present.  S1A/S1B
+    fall back to the ESA absolute→relative cycle; other units stay
+    unresolved until metadata is present.
+    """
+    _, letter = _track_key_from_path(product.source_path)
+    orbit = _relative_orbit_for_product(product)
+    direction: str | None = None
+    if letter in {"A", "D"}:
+        direction = "ASCENDING" if letter == "A" else "DESCENDING"
+    if direction is None:
+        direction = _direction_from_orbit(product)
+    if direction not in {"ASCENDING", "DESCENDING"}:
+        return None
+    return track_group_key(product.mission_id, orbit, direction)
 
 
 def _direction_from_orbit(product: S1Product) -> str | None:
@@ -206,6 +335,8 @@ def resolve_track_acquisition(
     products: list[S1Product] = []
     if open_products and paths:
         products = _open_products(paths, polarizations=polarizations)
+        if products:
+            orbit = _relative_orbit_for_product(products[0])
 
     mission_id = next(
         (product.mission_id for product in products if product.mission_id), None
@@ -477,7 +608,10 @@ __all__ = [
     "footprints_for_date",
     "normalize_direction",
     "polygon_track_assignment",
+    "relative_orbit_from_absolute",
+    "relative_orbit_from_manifest",
     "resolve_track_acquisition",
     "select_dates",
+    "track_key_for_product",
     "unit_burst_map",
 ]

@@ -204,19 +204,9 @@ def track_identity(product: S1Product) -> str:
         If relative orbit and pass direction cannot be resolved.
 
     """
-    from faninsar.missions.s1.track_map import (
-        _direction_from_orbit,
-        _track_key_from_path,
-    )
-    from faninsar.missions.s1.types import track_group_key
+    from faninsar.missions.s1.track_map import track_key_for_product
 
-    orbit, letter = _track_key_from_path(product.source_path)
-    direction = None
-    if letter in {"A", "D"}:
-        direction = "ASCENDING" if letter == "A" else "DESCENDING"
-    if direction is None:
-        direction = _direction_from_orbit(product)
-    key = track_group_key(product.mission_id, orbit, str(direction or letter or ""))
+    key = track_key_for_product(product)
     if not key:
         reject_invalid_state(
             "Reference merge layout requires a resolved track key "
