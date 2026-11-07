@@ -138,6 +138,25 @@ def _phase_convention(value: object) -> str:
     return "primary_minus_secondary"
 
 
+def _scene_burst_id(unit: Any) -> str:
+    """Return the persisted physical burst id, never a local unit tag."""
+    burst_id = unit.burst_id
+    if not isinstance(burst_id, str) or not burst_id:
+        reject_invalid_state(
+            f"scene unit {unit.tag!r} requires faninsar:burst_id; "
+            "layout source_ids are physical identities, not local tags"
+        )
+    return burst_id
+
+
+def _ifg_burst_id(product: Product) -> str:
+    """Return the persisted IFG burst id, never a directory basename fallback."""
+    burst_id = product.properties.get("faninsar:burst_id")
+    if not isinstance(burst_id, str) or not burst_id:
+        reject_invalid_state(f"burst IFG {product.path} requires faninsar:burst_id")
+    return burst_id
+
+
 def _unwrap_payload(payload: object) -> np.ndarray:
     """Return the array from a store payload that may be ``(array, unit)``."""
     if isinstance(payload, tuple):
@@ -640,7 +659,7 @@ class ProductLayer:
         )
         return BurstWindow(
             scope=layout.scope,
-            burst_id=str(properties.get("faninsar:burst_id", product.path.name)),
+            burst_id=_ifg_burst_id(product),
             acquisitions=acquisitions,
             write_ids=(product.write_id,),
             phase_convention=_phase_convention(
@@ -670,7 +689,7 @@ class ProductLayer:
         mask = self._read_scene_unit_mask(store, unit, unit_window, payload)
         return BurstWindow(
             scope=layout.scope,
-            burst_id=str(getattr(unit, "burst_id", None) or unit.tag),
+            burst_id=_scene_burst_id(unit),
             acquisitions=(str(store.date_id),),
             write_ids=(store.write_id,),
             phase_convention=_phase_convention(

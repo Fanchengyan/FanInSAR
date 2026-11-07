@@ -1057,10 +1057,32 @@ def _pair_id(store: InterferogramArtifactStore) -> str:
     return f"{store.pair[0]}_{store.pair[1]}"
 
 
+def _merge_layout_dir(stack: Stack, polygon: int | None = None) -> Path:
+    """Return the layout directory published for this Reference.
+
+    Mission coregistration writes ``{work_dir}/layout/{reference}``. A
+    multi-polygon subtree may also place the product at ``.../pN`` or,
+    when the scene lives at ``coreg/<date>/pN``, beside that coreg tree
+    using the same walk-up as ``publish_reference_merge_layout``.
+    """
+    reference = str(stack.reference)
+    canonical = stack.config.work_dir / "layout" / reference
+    if polygon is None:
+        return canonical
+    nested = canonical / f"p{polygon}"
+    if (nested / "item.json").is_file():
+        return nested
+    if (canonical / "item.json").is_file():
+        return canonical
+    parent = stack._scene_dir(reference, polygon).parent
+    root = parent.parent if parent.name == "coreg" else parent
+    return root / "layout" / reference
+
+
 def _opened_merge_layout(
     stack: Stack, polygon: int | None = None
 ) -> tuple[MergeLayoutWindow | None, Product | None]:
-    """Open ``work_dir/layout/<reference>[/pN]`` when that product exists.
+    """Open ``work_dir/layout/<reference>`` when that product exists.
 
     Collection views never call :func:`build_merge_layout` to invent owner
     labels from burst bounding boxes. Missing layouts stay ``None`` so
@@ -1070,9 +1092,7 @@ def _opened_merge_layout(
     from faninsar.io.storage.merge_layout import LAYOUT_KIND, open_merge_layout
     from faninsar.io.storage.product import open_product
 
-    path = stack.config.work_dir / "layout" / str(stack.reference)
-    if polygon is not None:
-        path = path / f"p{polygon}"
+    path = _merge_layout_dir(stack, polygon)
     if not (path / "item.json").is_file():
         return None, None
     product = open_product(path, kind=LAYOUT_KIND)

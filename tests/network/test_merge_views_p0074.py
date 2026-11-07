@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _SOURCES = {"primary": "a" * 64, "secondary": "b" * 64}
+_PHYSICAL_IDS = ("IW1-anx1000000", "IW2-anx2000000")
 
 
 def _unique_complex(shape: tuple[int, int]) -> np.ndarray:
@@ -607,3 +608,107 @@ def test_merge_read_rejects_replaced_layout_product(tmp_path: Path) -> None:
     _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
     with pytest.raises(InvalidProcessingStateError, match="replaced"):
         layer.read()
+
+
+def test_scenes_merge_uses_physical_burst_id_not_unit_tag(tmp_path: Path) -> None:
+    """Layout source_ids are physical ANX ids; local tags must not be selected."""
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+                "burst_id": _PHYSICAL_IDS[0],
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+                "burst_id": _PHYSICAL_IDS[1],
+            },
+        ],
+    )
+    _publish_stack_layout(stack, source_ids=_PHYSICAL_IDS)
+    values = stack.scenes.merge_bursts()["20240113"].layers.slc.read()
+    np.testing.assert_allclose(values[:, :8], 1.0)
+    np.testing.assert_allclose(values[:, 8:], 2.0)
+
+
+def test_scenes_merge_rejects_tag_only_units_missing_burst_id(
+    tmp_path: Path,
+) -> None:
+    """A local tag is not a substitute for the persisted physical burst id."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _write_date_units(
+        stack,
+        "20240113",
+        [
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+            },
+            {
+                "tag": "f0_IW2_b0",
+                "payload": np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 8,
+            },
+        ],
+    )
+    _publish_stack_layout(stack, source_ids=_PHYSICAL_IDS)
+    with pytest.raises(InvalidProcessingStateError, match="burst_id"):
+        stack.scenes.merge_bursts()["20240113"].layers.slc.read()
+
+
+def test_interferograms_merge_uses_persisted_physical_burst_id(
+    tmp_path: Path,
+) -> None:
+    """Burst IFG merge keys on faninsar:burst_id, not a local path basename guess."""
+    from faninsar.io.storage.ifg_store import ifg_artifact_dir, write_ifg_artifact
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _publish_stack_layout(stack, source_ids=_PHYSICAL_IDS)
+    pair = ("20240101", "20240113")
+    primary = stack.scenes["20240101"].write_id
+    secondary = stack.scenes["20240113"].write_id
+    for burst_id, payload, col0 in (
+        (_PHYSICAL_IDS[0], np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64), 0),
+        (_PHYSICAL_IDS[1], np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64), 8),
+    ):
+        write_ifg_artifact(
+            ifg_artifact_dir(
+                stack.config.work_dir,
+                (1, 1),
+                pair,
+                representation="burst",
+                burst_id=burst_id,
+            ),
+            pair=pair,
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": primary, "secondary": secondary},
+            complex_ifg=payload,
+            valid_mask=np.ones((8, 8), dtype=bool),
+            representation="burst",
+            burst_id=burst_id,
+            row_origin=0,
+            col_origin=col0,
+            grid_shape=(8, 16),
+        )
+    values = stack.interferograms.merge_bursts()["20240101_20240113"].complex.read()
+    np.testing.assert_allclose(values[:, :8], 1.0)
+    np.testing.assert_allclose(values[:, 8:], 2.0)
