@@ -32,7 +32,7 @@ from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 from faninsar.processing.geometry import ConstantDEM, RadarGeometryModel
 from faninsar.processing.geometry.coordinates import RadarGrid
-from faninsar.processing.mosaicking.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec, build_geo_grid
 
 REFERENCE = "S1A_IW_SLC__1SDV_20200101T000000.SAFE"
 _ORIGIN = datetime(2020, 1, 1, tzinfo=UTC)
@@ -479,6 +479,89 @@ def test_geo_layout_cuts_on_lut_native_coords_not_geo_bbox(
     assert (tmp_path / "coreg" / "20200101-geo" / "item.json").is_file()
     item = _read_item(context.product.root)
     assert item["properties"]["faninsar:layout_id"]
+
+
+def test_geo_prepare_twice_reuses_projected_lut_window_not_native_shape(
+    two_burst_s1: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second geo prepare reuses the LUT window, not the native radar burst."""
+    tmp_path = two_burst_s1
+    roi = _COVERING_ROI
+    grid = build_geo_grid(
+        [((roi.left, roi.bottom), (roi.right, roi.top))],
+        resolution_m=(30.0, 30.0),
+    )
+    window_rows, window_cols = 6, 9
+    row0, col0 = 3, 2
+    assert tuple(grid.shape) != (_LINES, _SAMPLES)
+    assert (row0 + window_rows) <= int(grid.shape[0])
+    assert (col0 + window_cols) <= int(grid.shape[1])
+    lut = Geo2RdrLUT(
+        az_full=np.zeros((window_rows, window_cols), dtype=np.float64),
+        rg_full=np.zeros((window_rows, window_cols), dtype=np.float64),
+        valid=np.ones((window_rows, window_cols), dtype=bool),
+        full_radar_shape=(_LINES, _SAMPLES),
+        height_m=0.0,
+        row0=row0,
+        col0=col0,
+    )
+    geocode_calls = {"n": 0}
+
+    def fake_lut(_scene: MagicMock, **_kwargs: object) -> Geo2RdrLUT:
+        return lut
+
+    def fake_geocode(
+        *_args: object, reference_lut: Geo2RdrLUT, **_kwargs: object
+    ) -> tuple[np.ndarray, None]:
+        geocode_calls["n"] += 1
+        return np.ones(reference_lut.valid.shape, dtype=np.complex64), None
+
+    monkeypatch.setattr(coreg_module, "build_reference_geo_lut", fake_lut)
+    monkeypatch.setattr(
+        "faninsar.processing.geocoding.geo_modes.geocode_reference_slc_chunked",
+        fake_geocode,
+    )
+    options = {
+        "output_scene": tmp_path / "coreg" / "20200101",
+        "dem": ConstantDEM(0.0),
+        "swaths": ("IW1",),
+        "bursts": {"IW1": [0]},
+        "roi": roi,
+        "coregistration_grid": "geo",
+        "geo_grid": grid,
+    }
+    first = prepare_s1_reference(tmp_path / REFERENCE, **options)
+    assert geocode_calls["n"] == 1
+    unit = first.units["f0_IW1_b0"]
+    placed = first.product.unit_map()["f0_IW1_b0"]
+    assert unit.lut is not None
+    assert unit.native_shape == (_LINES, _SAMPLES)
+    assert tuple(unit.lut.shape) == (window_rows, window_cols)
+    assert tuple(placed.shape) == (window_rows, window_cols)
+    assert tuple(placed.shape) != tuple(unit.native_shape)
+    assert (placed.row_origin, placed.col_origin) == (row0, col0)
+    assert tuple(first.product.grid_shape) == tuple(grid.shape)
+    mask = first.product.read_valid_mask("f0_IW1_b0")
+    assert mask is not None
+    assert mask.shape == (window_rows, window_cols)
+    layout = open_merge_layout(_layout_path(tmp_path))
+    assert layout.scope.domain == "geo"
+
+    second = prepare_s1_reference(tmp_path / REFERENCE, **options)
+    assert geocode_calls["n"] == 1
+    assert second.write_id == first.write_id
+    reused = second.units["f0_IW1_b0"]
+    stored = second.product.unit_map()["f0_IW1_b0"]
+    assert reused.lut is not None
+    assert reused.native_shape == (_LINES, _SAMPLES)
+    assert tuple(reused.lut.shape) == (window_rows, window_cols)
+    assert tuple(stored.shape) == (window_rows, window_cols)
+    assert (reused.row_origin, reused.col_origin) == (row0, col0)
+    assert (stored.row_origin, stored.col_origin) == (row0, col0)
+    assert second.product.grid_identity == first.product.grid_identity
+    reopened = open_merge_layout(_layout_path(tmp_path))
+    assert reopened.scope.domain == "geo"
+    assert reopened.scope.reference_id == layout.scope.reference_id
 
 
 def test_incompatible_range_sampling_is_rejected(

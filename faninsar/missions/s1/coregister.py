@@ -557,7 +557,16 @@ def prepare_s1_reference(
             )
         else:
             product = CoregisteredSceneStore.open(output_scene)
-            _check_reused_reference(product, reference_id, units, coregistration_grid)
+            _check_reused_reference(
+                product,
+                reference_id,
+                units,
+                coregistration_grid,
+                grid_shape=grid_shape,
+                grid_identity=(
+                    str(header["grid_identity"]) if "grid_identity" in header else None
+                ),
+            )
     except BaseException:
         if writer is not None:
             writer.abort()
@@ -836,11 +845,38 @@ def _without_pixels(scene: ProductionScene) -> ProductionScene:
     return replace(scene, array=array)
 
 
+def _persisted_unit_shape(
+    unit: S1ReferenceUnit, coregistration_grid: str
+) -> tuple[int, int]:
+    """Return the published window shape for one Reference unit.
+
+    Radar units persist the native burst, or the ROI crop of that burst.
+    Geo units persist the LUT target window on the geographic grid, which
+    is not the native radar burst shape.
+    """
+    if coregistration_grid == "geo":
+        lut = unit.lut
+        if lut is None:
+            return reject_invalid_state(
+                f"{unit.tag}: geo Reference unit is missing LUT"
+            )
+        return (int(lut.shape[0]), int(lut.shape[1]))
+    if unit.crop is not None:
+        return (
+            int(unit.crop[1] - unit.crop[0]),
+            int(unit.crop[3] - unit.crop[2]),
+        )
+    return unit.native_shape
+
+
 def _check_reused_reference(
     product: CoregisteredSceneStore,
     reference_id: str,
     units: Mapping[str, S1ReferenceUnit],
     coregistration_grid: str,
+    *,
+    grid_shape: tuple[int, int],
+    grid_identity: str | None = None,
 ) -> None:
     """Reject a persisted Reference that no longer matches the selection."""
     if not product.is_reference or product.reference_id != reference_id:
@@ -851,6 +887,20 @@ def _check_reused_reference(
         reject_invalid_state(
             f"persisted Reference is {product.domain!r}, requested "
             f"{coregistration_grid!r}; recoregister with overwrite=True"
+        )
+    if coregistration_grid == "geo" and tuple(product.grid_shape) != tuple(grid_shape):
+        reject_invalid_state(
+            f"persisted Reference grid {tuple(product.grid_shape)} differs from "
+            f"requested {tuple(grid_shape)}; recoregister with overwrite=True"
+        )
+    if (
+        coregistration_grid == "geo"
+        and grid_identity is not None
+        and product.grid_identity != grid_identity
+    ):
+        reject_invalid_state(
+            "persisted Reference grid_identity differs from the current "
+            "selection; recoregister with overwrite=True"
         )
     stored = product.unit_map()
     if set(stored) != set(units):
@@ -865,15 +915,19 @@ def _check_reused_reference(
                 f"persisted Reference unit {tag!r} is placed differently from "
                 "the current selection; recoregister with overwrite=True"
             )
-        expected_shape = (
-            (unit.crop[1] - unit.crop[0], unit.crop[3] - unit.crop[2])
-            if unit.crop is not None
-            else unit.native_shape
-        )
+        expected_shape = _persisted_unit_shape(unit, coregistration_grid)
         if tuple(placed.shape) != tuple(expected_shape):
             reject_invalid_state(
                 f"persisted Reference unit {tag!r} has shape {tuple(placed.shape)}, "
                 f"expected {tuple(expected_shape)}; recoregister with overwrite=True"
+            )
+        if unit.scientific_support is not None and tuple(
+            unit.scientific_support.shape
+        ) != tuple(placed.shape):
+            reject_invalid_state(
+                f"persisted Reference unit {tag!r} support shape "
+                f"{tuple(unit.scientific_support.shape)} differs from payload "
+                f"{tuple(placed.shape)}; recoregister with overwrite=True"
             )
 
 
