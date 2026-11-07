@@ -856,7 +856,10 @@ def coregister_s1_secondary(
                         f"{tag}: secondary shape {payload.shape} differs from "
                         f"the Reference {placed.shape}"
                     )
-                from faninsar.missions.s1.merge_layout import physical_burst_id
+                if placed.burst_id is None:
+                    reject_invalid_state(
+                        f"{tag}: Reference unit is missing physical burst_id"
+                    )
 
                 _stage_scene_unit(
                     writer,
@@ -865,7 +868,7 @@ def coregister_s1_secondary(
                     row_origin=placed.row_origin,
                     col_origin=placed.col_origin,
                     valid_mask=unit.scientific_support,
-                    burst_id=physical_burst_id(unit),
+                    burst_id=placed.burst_id,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )

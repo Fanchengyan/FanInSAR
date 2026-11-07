@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 
+from faninsar.io.storage._zarr_stac import require_basename
 from faninsar.io.storage.merge_layout import publish_merge_layout
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
@@ -178,16 +179,57 @@ def polygon_identity(roi: BoundingBox | Polygons | None) -> str:
 
 
 def track_identity(product: S1Product) -> str:
-    """Return a non-empty track key from the Reference product."""
-    return f"{product.mission_id}-{int(product.absolute_orbit)}"
+    """Return the selection track key ``<relOrbit><A|D>`` for MergeScope.
+
+    Absolute orbit identifies one acquisition, not a track. The key is the
+    existing :func:`~faninsar.missions.s1.types.track_group_key` label used
+    by Stack selection (relative orbit and pass direction). Channel stays a
+    separate MergeScope field.
+
+    Parameters
+    ----------
+    product : S1Product
+        Reference SAFE product.
+
+    Returns
+    -------
+    str
+        Compact track label such as ``"88A"``.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If relative orbit and pass direction cannot be resolved.
+
+    """
+    from faninsar.missions.s1.track_map import (
+        _direction_from_orbit,
+        _track_key_from_path,
+    )
+    from faninsar.missions.s1.types import track_group_key
+
+    orbit, letter = _track_key_from_path(product.source_path)
+    direction = None
+    if letter in {"A", "D"}:
+        direction = "ASCENDING" if letter == "A" else "DESCENDING"
+    if direction is None:
+        direction = _direction_from_orbit(product)
+    key = track_group_key(product.mission_id, orbit, str(direction or letter or ""))
+    if not key:
+        reject_invalid_state(
+            "Reference merge layout requires a resolved track key "
+            "(relative orbit and pass direction); absolute orbit is not a track"
+        )
+    return key
 
 
 def physical_burst_id(unit: _ReferenceUnit) -> str:
     """Return a date-stable physical burst identity, not a local ``b0`` tag.
 
-    Prefers the ESA absolute burst id, then azimuth ANX time, then sensing
-    time. The value is a single path basename so it can be stored as
-    ``faninsar:burst_id``.
+    Prefers the ESA absolute burst id, then azimuth ANX time. Sensing-time
+    stamps are acquisition-dated and are not a stack-stable identity;
+    secondaries copy the Reference ``faninsar:burst_id`` instead of minting
+    a new one. The value is a single path basename.
     """
     swath = str(unit.swath)
     burst = getattr(unit.scene, "burst", None)
@@ -201,15 +243,6 @@ def physical_burst_id(unit: _ReferenceUnit) -> str:
         anx_value = None
     if anx_value is not None and np.isfinite(anx_value):
         return f"{swath}-anx{round(anx_value * 1_000_000.0)}"
-    time = getattr(burst, "azimuth_time", None)
-    stamp = getattr(time, "strftime", None)
-    if callable(stamp):
-        try:
-            rendered = stamp("%Y%m%dT%H%M%S")
-        except (TypeError, ValueError):
-            rendered = None
-        if rendered:
-            return f"{swath}-t{rendered}"
     message = f"{unit.tag}: burst is missing a physical identity"
     reject_invalid_state(message)
     raise RuntimeError(message)
@@ -251,6 +284,7 @@ def build_s1_reference_layout(
         reject_invalid_state("Reference layout requires at least one unit")
     if domain not in {"radar", "geo"}:
         reject_invalid_state("merge layout domain must be 'radar' or 'geo'")
+    units = _units_with_native_validity(units)
     parent_seams = _parent_seams(units)
     scope = MergeScope(
         domain=domain,
@@ -301,7 +335,10 @@ def publish_reference_merge_layout(
     output_scene : pathlib.Path
         Reference scene directory, typically ``<work_dir>/coreg/<date>``.
     layout : MergeLayoutWindow
-        Layout to persist.
+        Layout to persist. The product directory is
+        ``<work_dir>/layout/<reference_id>/<polygon_identity>`` so distinct
+        polygons of one Reference do not collide. MergeScope still records
+        the selection track key.
     overwrite : bool, optional
         Replace an existing layout product.
 
@@ -313,7 +350,11 @@ def publish_reference_merge_layout(
     """
     work_dir = Path(output_scene).parent
     root = work_dir.parent if work_dir.name == "coreg" else work_dir
-    target = root / "layout" / layout.scope.reference_id
+    reference_id = require_basename(layout.scope.reference_id, "layout reference_id")
+    polygon_id = require_basename(
+        layout.scope.polygon_identity, "layout polygon_identity"
+    )
+    target = root / "layout" / reference_id / polygon_id
     return publish_merge_layout(target, layout, overwrite=overwrite)
 
 
@@ -347,8 +388,33 @@ def _require_common_spacing(
     return float(reference)
 
 
-def _valid_native_window(unit: _ReferenceUnit) -> tuple[int, int, int, int]:
-    """Return the native valid rectangle, or the full burst when mask is absent."""
+def _units_with_native_validity(
+    units: Mapping[str, _ReferenceUnit],
+) -> dict[str, _ReferenceUnit]:
+    """Drop bursts whose annotation mask is explicitly empty."""
+    kept: dict[str, _ReferenceUnit] = {}
+    for tag, unit in units.items():
+        if _valid_native_window(unit) is None:
+            logger.info(
+                "%s: explicit empty native validity; excluded from merge layout",
+                tag,
+            )
+            continue
+        kept[tag] = unit
+    if not kept:
+        reject_invalid_state(
+            "Reference layout has no bursts with native validity; "
+            "an explicit all-invalid mask is not a full-burst owner"
+        )
+    return kept
+
+
+def _valid_native_window(unit: _ReferenceUnit) -> tuple[int, int, int, int] | None:
+    """Return the native valid rectangle, or ``None`` when explicitly empty.
+
+    A missing first/last-valid annotation is the legacy full-burst case. A
+    present mask with no valid row must not be promoted to all-ones coverage.
+    """
     height, width = (int(unit.native_shape[0]), int(unit.native_shape[1]))
     burst = getattr(unit.scene, "burst", None)
     first = getattr(burst, "first_valid_sample", None)
@@ -361,7 +427,7 @@ def _valid_native_window(unit: _ReferenceUnit) -> tuple[int, int, int, int]:
         if int(stop) >= int(start) >= 0
     ]
     if not rows:
-        return 0, height, 0, width
+        return None
     row0 = int(rows[0])
     row1 = int(rows[-1]) + 1
     col0 = min(
@@ -382,7 +448,10 @@ def _valid_native_window(unit: _ReferenceUnit) -> tuple[int, int, int, int]:
 
 def _parent_window(unit: _ReferenceUnit) -> MergeWindow:
     """Return the parent-native valid window of ``unit``."""
-    row0, row1, col0, col1 = _valid_native_window(unit)
+    window = _valid_native_window(unit)
+    if window is None:
+        reject_invalid_state(f"{unit.tag}: native validity window is empty")
+    row0, row1, col0, col1 = window
     return (
         int(unit.parent_row0) + row0,
         int(unit.parent_row0) + row1,

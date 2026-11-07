@@ -110,7 +110,7 @@ def _product(path: Path) -> S1Product:
     )
     return S1Product(
         product_id=path.stem,
-        source_path=path,
+        source_path=path.parent / "tracks" / "1A" / "acquisitions" / path.name,
         mission_id="S1A",
         product_type="SLC",
         mode="IW",

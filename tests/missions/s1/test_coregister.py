@@ -170,7 +170,7 @@ def _product(path: Path) -> S1Product:
     )
     return S1Product(
         product_id=path.stem,
-        source_path=path,
+        source_path=path.parent / "tracks" / "1A" / "acquisitions" / path.name,
         mission_id="S1A",
         product_type="SLC",
         mode="IW",
@@ -333,6 +333,10 @@ def test_reference_is_read_and_deramped_once_across_dates(
         reference.read("f0_IW1_b0")[0],
         np.full((_LINES, _SAMPLES), 2.0, dtype=np.complex64),
     )
+    ref_burst = json.loads((reference.root / "item.json").read_text())["assets"][
+        "f0_IW1_b0"
+    ]["faninsar:burst_id"]
+    assert ref_burst == "IW1-anx0"
     for product in products:
         assert product.inputs["reference"] == reference.write_id
         validate_reference_binding(reference, product)
@@ -340,6 +344,10 @@ def test_reference_is_read_and_deramped_once_across_dates(
             product.read("f0_IW1_b0")[0],
             np.full((_LINES, _SAMPLES), 1.0 + 1.0j, dtype=np.complex64),
         )
+        sec_burst = json.loads((product.root / "item.json").read_text())["assets"][
+            "f0_IW1_b0"
+        ]["faninsar:burst_id"]
+        assert sec_burst == ref_burst
     for kwargs in fake_s1.coregister_kwargs:
         assert kwargs["secondary_only"] is True
         assert kwargs["reference_shape"] == (_LINES, _SAMPLES)

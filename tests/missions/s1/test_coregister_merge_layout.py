@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from faninsar.missions.s1.coregister import (
     S1ReferenceUnit,
     prepare_s1_reference,
 )
+from faninsar.missions.s1.merge_layout import polygon_identity, track_identity
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
@@ -38,8 +40,10 @@ _REAL_AZIMUTH_INTERVAL_S = 2.055556299999998e-3
 # Measured IW1 burst-1 residual on annotation 2016-12-07 (~3.25e-4 px).
 _REAL_BURST1_DT_S = 2.762667
 _PHYSICAL_IDS = ("IW1-anx0", "IW1-anx1000000")
+_TRACK_KEY = "1A"
 # Linear rdr2geo: lon = 10 + 0.01 * range, lat = 45 + 0.01 * azimuth.
 _COVERING_ROI = BoundingBox(9.99, 44.99, 10.08, 45.08)
+_SECOND_POLYGON = BoundingBox(10.02, 45.02, 10.08, 45.08)
 
 
 def _orbit() -> OrbitMetadata:
@@ -115,15 +119,24 @@ def _swath(
     )
 
 
+def _source_path(path: Path, *, track: str | None = _TRACK_KEY) -> Path:
+    """Return a staged path that encodes the selection track key."""
+    resolved = Path(path)
+    if track is None or "tracks" in resolved.parts:
+        return resolved
+    return resolved.parent / "tracks" / track / "acquisitions" / resolved.name
+
+
 def _product(
     path: Path,
     *,
     swaths: tuple[S1Swath, ...],
+    track: str | None = _TRACK_KEY,
 ) -> S1Product:
     """Return a product whose date id is taken from ``path``."""
     return S1Product(
         product_id=path.stem,
-        source_path=path,
+        source_path=_source_path(path, track=track),
         mission_id="S1A",
         product_type="SLC",
         mode="IW",
@@ -251,9 +264,14 @@ def _parent_midpoint(unit_a: S1ReferenceUnit, unit_b: S1ReferenceUnit) -> int:
     return lo + (hi - lo) // 2
 
 
-def _layout_path(tmp_path: Path) -> Path:
+def _layout_path(
+    tmp_path: Path,
+    *,
+    reference_id: str = "20200101",
+    roi: BoundingBox | None = None,
+) -> Path:
     """Return the committed layout product directory for this Reference."""
-    return tmp_path / "layout" / "20200101"
+    return tmp_path / "layout" / reference_id / polygon_identity(roi)
 
 
 def _read_item(path: Path) -> dict[str, object]:
@@ -284,7 +302,10 @@ def test_radar_reference_publishes_parent_azimuth_midpoint_layout(
 
     layout = open_merge_layout(layout_dir)
     assert layout.scope.domain == "radar"
+    assert layout.scope.track_id == _TRACK_KEY
+    assert layout.scope.channel == "vv"
     assert layout.scope.reference_id == "20200101"
+    assert layout.scope.polygon_identity == "full-frame"
     assert layout.source_ids == _PHYSICAL_IDS
     assert item["assets"]["f0_IW1_b0"]["faninsar:burst_id"] == _PHYSICAL_IDS[0]
     assert item["assets"]["f0_IW1_b1"]["faninsar:burst_id"] == _PHYSICAL_IDS[1]
@@ -348,7 +369,7 @@ def test_radar_layout_parent_midpoint_is_invariant_to_roi_crop(
     def _seam_parent(context: S1ReferenceContext) -> int:
         item = _read_item(context.product.root)
         layout = open_merge_layout(
-            context.product.root.parent.parent / "layout" / "20200101"
+            _layout_path(context.product.root.parent.parent, roi=_COVERING_ROI)
         )
         assert item["properties"]["faninsar:layout_id"]
         assert layout.source_ids == _PHYSICAL_IDS
@@ -429,8 +450,9 @@ def test_geo_layout_cuts_on_lut_native_coords_not_geo_bbox(
         coregistration_grid="geo",
         geo_grid=grid,
     )
-    layout = open_merge_layout(tmp_path / "layout" / "20200101")
+    layout = open_merge_layout(_layout_path(tmp_path))
     assert layout.scope.domain == "geo"
+    assert layout.scope.track_id == _TRACK_KEY
     # Geo bbox midpoint of windows (0,6) and (2,8) would cut at row 4.
     # Parent overlap [4, 8) midpoints at 6, so geo row 4 stays earlier.
     assert layout.owner[4, 0] == 1
@@ -532,3 +554,101 @@ def test_annotation_scale_azimuth_fraction_is_admitted(
     raw = _REAL_BURST1_DT_S / _REAL_AZIMUTH_INTERVAL_S
     assert later.parent_row0 == round(raw)
     assert abs(raw - later.parent_row0) < 1.0e-3
+
+
+def test_absolute_orbit_is_not_a_track_key(tmp_path: Path) -> None:
+    """MergeScope track_id must be the selection group key, not absolute orbit."""
+    product = _product(tmp_path / REFERENCE, swaths=(_two_burst_swath(),), track=None)
+    assert product.absolute_orbit == 1
+    with pytest.raises(InvalidProcessingStateError, match="relative orbit"):
+        track_identity(product)
+    staged = _product(tmp_path / REFERENCE, swaths=(_two_burst_swath(),))
+    assert track_identity(staged) == _TRACK_KEY
+    assert track_identity(staged) != f"{staged.mission_id}-{staged.absolute_orbit}"
+
+
+def test_two_polygons_publish_independent_layouts(
+    two_burst_s1: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same Reference date must not share one layout directory across polygons."""
+    tmp_path = two_burst_s1
+    monkeypatch.setattr(
+        coreg_module, "_roi_burst_window", lambda *_a, **_k: (0, _LINES, 0, _SAMPLES)
+    )
+    monkeypatch.setattr(
+        coreg_module, "reference_window_crop", lambda window, _shape: window
+    )
+    first = prepare_s1_reference(
+        tmp_path / REFERENCE,
+        output_scene=tmp_path / "coreg" / "20200101-a",
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0, 1]},
+        roi=_COVERING_ROI,
+    )
+    second = prepare_s1_reference(
+        tmp_path / REFERENCE,
+        output_scene=tmp_path / "coreg" / "20200101-b",
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0, 1]},
+        roi=_SECOND_POLYGON,
+    )
+    path_a = _layout_path(tmp_path, roi=_COVERING_ROI)
+    path_b = _layout_path(tmp_path, roi=_SECOND_POLYGON)
+    assert path_a != path_b
+    assert (path_a / "item.json").is_file()
+    assert (path_b / "item.json").is_file()
+    layout_a = open_merge_layout(path_a)
+    layout_b = open_merge_layout(path_b)
+    assert layout_a.scope.track_id == layout_b.scope.track_id == _TRACK_KEY
+    assert layout_a.scope.polygon_identity != layout_b.scope.polygon_identity
+    assert layout_a.scope.polygon_identity == polygon_identity(_COVERING_ROI)
+    assert first.product.inputs["layout"] != second.product.inputs["layout"]
+
+
+def test_explicit_all_invalid_burst_is_excluded_from_layout(
+    two_burst_s1: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An annotation mask of all -1 is not a full-burst owner."""
+    tmp_path = two_burst_s1
+    invalid = tuple([-1] * _LINES)
+
+    def fake_load(load_path: Path, **kwargs: object) -> MagicMock:
+        scene = _fake_scene(Path(load_path), int(kwargs.get("burst_index", 0)))
+        if int(kwargs.get("burst_index", 0)) == 1:
+            scene.burst = replace(
+                scene.burst,
+                first_valid_sample=invalid,
+                last_valid_sample=invalid,
+            )
+        return scene
+
+    monkeypatch.setattr(f"{coreg_module.__name__}.load_production_scene", fake_load)
+    context = _prepare_two_burst(tmp_path)
+    layout = open_merge_layout(_layout_path(tmp_path))
+    assert layout.source_ids == (_PHYSICAL_IDS[0],)
+    assert layout.seams == ()
+    assert not np.any(layout.owner == 2)
+    assert context.units["f0_IW1_b1"].scene.burst.first_valid_sample == invalid
+
+
+def test_all_invalid_reference_bursts_reject_layout(
+    two_burst_s1: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Reference with only explicit empty masks cannot publish a layout."""
+    tmp_path = two_burst_s1
+    invalid = tuple([-1] * _LINES)
+
+    def fake_load(load_path: Path, **kwargs: object) -> MagicMock:
+        scene = _fake_scene(Path(load_path), int(kwargs.get("burst_index", 0)))
+        scene.burst = replace(
+            scene.burst,
+            first_valid_sample=invalid,
+            last_valid_sample=invalid,
+        )
+        return scene
+
+    monkeypatch.setattr(f"{coreg_module.__name__}.load_production_scene", fake_load)
+    with pytest.raises(InvalidProcessingStateError, match="native validity"):
+        _prepare_two_burst(tmp_path)
