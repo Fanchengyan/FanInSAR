@@ -1149,7 +1149,7 @@ def _scene_merge_scope(store: CoregisteredSceneStore) -> MergeScope:
 
 
 def _scene_units_overlap(units: Sequence[SceneUnit]) -> bool:
-    """Return whether any two scene units share parent-grid samples."""
+    """Return whether any two scene units share a parent-grid window."""
     ordered = tuple(units)
     for index, left in enumerate(ordered):
         left_window = _unit_parent_window(left)
@@ -1160,7 +1160,11 @@ def _scene_units_overlap(units: Sequence[SceneUnit]) -> bool:
 
 
 def scene_units_overlap(store: CoregisteredSceneStore) -> bool:
-    """Return whether any two units of ``store`` share parent-grid samples.
+    """Return whether any two units share qualified valid parent-grid samples.
+
+    Rectangular unit windows may overlap while their qualified valid support
+    remains disjoint, as with NISAR Geo tile extents. Only actual valid-sample
+    overlap requires a committed physical merge_layout.
 
     Parameters
     ----------
@@ -1170,10 +1174,21 @@ def scene_units_overlap(store: CoregisteredSceneStore) -> bool:
     Returns
     -------
     bool
-        ``True`` when any pair of units intersects on the parent grid.
+        ``True`` when any pair of units has overlapping qualified support.
 
     """
-    return _scene_units_overlap(store.units)
+    if not _scene_units_overlap(store.units):
+        return False
+    ordered = tuple(store.units)
+    for index, left in enumerate(ordered):
+        left_window = _unit_parent_window(left)
+        for right in ordered[index + 1 :]:
+            overlap = intersect_windows(left_window, _unit_parent_window(right))
+            if overlap is None:
+                continue
+            if _units_share_valid_support(store, left, right, overlap):
+                return True
+    return False
 
 
 def _crop_merge_layout(
@@ -1259,6 +1274,24 @@ def _store_unit_support(
     if mask is None:
         return np.asarray(valid_samples(payload) & finite, dtype=bool)
     return np.asarray(mask & finite, dtype=bool)
+
+
+def _units_share_valid_support(
+    store: CoregisteredSceneStore,
+    left: SceneUnit,
+    right: SceneUnit,
+    overlap: tuple[int, int, int, int],
+) -> bool:
+    """Return whether two units both claim qualified support on ``overlap``."""
+    left_local = _local_read_window(left, overlap)
+    right_local = _local_read_window(right, overlap)
+    if left_local is None or right_local is None:
+        return False
+    left_payload, _ = store.read(left.tag, window=left_local)
+    right_payload, _ = store.read(right.tag, window=right_local)
+    left_support = _store_unit_support(store, left.tag, left_payload, left_local)
+    right_support = _store_unit_support(store, right.tag, right_payload, right_local)
+    return bool(np.any(left_support & right_support))
 
 
 def _read_unit_on_layout(
@@ -1402,10 +1435,12 @@ def build_scene_merge_layout(
 ) -> MergeLayoutWindow:
     """Assemble a merge layout from scene support without inventing cuts.
 
-    Overlapping units require caller-supplied physical ``seams`` or a finished
-    ``owner`` raster. This helper never infers midpoints from ROI-cropped
-    ``row_origin``/``shape``. ``scope.reference_id`` is the acquisition key
-    and is not a product write id.
+    Overlapping qualified valid support requires caller-supplied physical
+    ``seams`` or a finished ``owner`` raster. Overlapping unit windows with
+    disjoint support remain unique coverage. This helper never infers
+    midpoints from ROI-cropped ``row_origin``/``shape``.
+    ``scope.reference_id`` is the acquisition key and is not a product write
+    id.
 
     Parameters
     ----------
@@ -1414,8 +1449,8 @@ def build_scene_merge_layout(
     window : tuple of int, optional
         Layout window. Default is the full parent scene grid.
     seams : sequence of MergeSeam, optional
-        Physical cuts from mission parent geometry. Required when units
-        overlap and ``owner`` is omitted.
+        Physical cuts from mission parent geometry. Required when units'
+        qualified valid support overlaps and ``owner`` is omitted.
     owner : numpy.ndarray, optional
         Finished preferred-owner labels on ``window``.
 
@@ -1427,14 +1462,14 @@ def build_scene_merge_layout(
     Raises
     ------
     InvalidProcessingStateError
-        If no unit intersects the window, or overlapping units are supplied
-        without physical seams or an owner raster.
+        If no unit intersects the window, or overlapping qualified valid
+        support is supplied without physical seams or an owner raster.
 
     """
     layout_window = (
         _as_merge_window(window) if window is not None else _scene_parent_window(store)
     )
-    if _scene_units_overlap(store.units) and not seams and owner is None:
+    if scene_units_overlap(store) and not seams and owner is None:
         reject_invalid_state(
             "overlapping scene units require a committed physical merge_layout; "
             "do not infer seams from ROI-cropped origins"

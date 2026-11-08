@@ -23,6 +23,7 @@ from faninsar.io.storage.scene_store import (
     build_scene_merge_layout,
     form_merged_scene_interferogram,
     merge_scene_slc,
+    scene_units_overlap,
     write_scene,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
@@ -432,10 +433,93 @@ def test_overlapping_units_reject_inferred_seams(tmp_path: Path) -> None:
         ],
         grid_shape=(4, 1),
     )
+    assert scene_units_overlap(store)
     with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
         build_scene_merge_layout(store)
     with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
         form_merged_scene_interferogram(store, secondary, multilook=(1, 1))
+
+
+def test_overlapping_payload_support_rejects_inferred_seams(tmp_path: Path) -> None:
+    """Generic overlapping valid samples still require a committed layout."""
+    payload = np.ones((3, 1), dtype=np.complex64)
+    store, secondary = _write_pair(
+        tmp_path,
+        payload,
+        payload,
+        reference_units=[
+            *_scene_units(payload, tag="IW1_b0"),
+            *_scene_units(payload, tag="IW1_b1", row_origin=1),
+        ],
+        secondary_units=[
+            *_scene_units(payload, tag="IW1_b0"),
+            *_scene_units(payload, tag="IW1_b1", row_origin=1),
+        ],
+        grid_shape=(4, 1),
+    )
+    assert scene_units_overlap(store)
+    with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
+        build_scene_merge_layout(store)
+    with pytest.raises(InvalidProcessingStateError, match="committed physical merge_layout"):
+        form_merged_scene_interferogram(store, secondary, multilook=(1, 1))
+
+
+def test_overlapping_windows_with_disjoint_valid_support_need_no_layout(
+    tmp_path: Path,
+) -> None:
+    """Overlapping rectangles with disjoint qualified support stay unique coverage."""
+    nan = np.complex64(np.nan + 1j * np.nan)
+    left = np.array([[1.0 + 0.0j], [1.0 + 0.0j], [nan]], dtype=np.complex64)
+    right = np.array([[nan], [2.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex64)
+    left_mask = np.array([[True], [True], [False]])
+    right_mask = np.array([[False], [True], [True]])
+    ones_left = np.ones((3, 1), dtype=np.complex64)
+    ones_right = np.full((3, 1), 2.0 + 0.0j, dtype=np.complex64)
+    expected = np.array(
+        [[1.0 + 0.0j], [1.0 + 0.0j], [2.0 + 0.0j], [2.0 + 0.0j]],
+        dtype=np.complex64,
+    )
+    for root, left_payload, right_payload, left_valid, right_valid in (
+        (tmp_path / "nan_payload", left, right, None, None),
+        (tmp_path / "explicit_mask", ones_left, ones_right, left_mask, right_mask),
+    ):
+        store, secondary = _write_pair(
+            root,
+            left_payload,
+            left_payload,
+            reference_units=[
+                *_scene_units(
+                    left_payload, tag="IW1_b0", valid_mask=left_valid
+                ),
+                *_scene_units(
+                    right_payload,
+                    tag="IW1_b1",
+                    row_origin=1,
+                    valid_mask=right_valid,
+                ),
+            ],
+            secondary_units=[
+                *_scene_units(
+                    np.ones_like(left_payload),
+                    tag="IW1_b0",
+                    valid_mask=left_valid,
+                ),
+                *_scene_units(
+                    np.ones_like(right_payload),
+                    tag="IW1_b1",
+                    row_origin=1,
+                    valid_mask=right_valid,
+                ),
+            ],
+            grid_shape=(4, 1),
+        )
+        assert not scene_units_overlap(store)
+        layout = build_scene_merge_layout(store)
+        assert np.all(layout.owner[layout.scientific_support] > 0)
+        product = form_merged_scene_interferogram(store, secondary, multilook=(1, 1))
+        np.testing.assert_allclose(product.complex, expected, atol=1e-6)
+        assert product.valid_mask is not None
+        assert bool(product.valid_mask.all())
 
 
 def test_radar_overlap_follows_explicit_azimuth_seam(tmp_path: Path) -> None:
