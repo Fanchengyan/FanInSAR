@@ -220,7 +220,13 @@ def _encode_geometry_or_dem(value: Any, *, identity_dir: Path | None = None) -> 
 
 
 def _encode_dem(value: Any, *, identity_dir: Path | None = None) -> dict[str, object]:
-    """Encode a DEM recipe (source selection, raster path, or constant)."""
+    """Encode a DEM recipe (source selection, raster path, or constant).
+
+    Raster and constant recipes persist the admitted vertical datum with the
+    existing path or height so reopen reconstructs the same request.  A
+    payload that omits the datum is restored through the public factory
+    without inventing one.
+    """
     from faninsar.processing.geometry.api import ConstantDEM, RasterDEM, SourceDEM
 
     def _path(recorded: Path) -> str:
@@ -242,9 +248,21 @@ def _encode_dem(value: Any, *, identity_dir: Path | None = None) -> dict[str, ob
     if isinstance(value, RasterDEM):
         if value.path is None:
             _fail_unserializable(value)
-        return {"faninsar:dem": {"kind": "raster", "path": _path(value.path)}}
+        return {
+            "faninsar:dem": {
+                "kind": "raster",
+                "path": _path(value.path),
+                "vertical_datum": value.vertical_datum,
+            }
+        }
     if isinstance(value, ConstantDEM):
-        return {"faninsar:dem": {"kind": "constant", "height": float(value.height)}}
+        return {
+            "faninsar:dem": {
+                "kind": "constant",
+                "height": float(value.height),
+                "vertical_datum": value.vertical_datum,
+            }
+        }
     _fail_unserializable(value)
 
 
@@ -354,9 +372,17 @@ def _decode_dem(payload: Mapping[str, object]) -> Any:
             cache_dir=None if cache_dir is None else Path(str(cache_dir)),
         )
     if kind == "raster":
-        return DEM.from_raster(Path(str(payload["path"])))
+        path = Path(str(payload["path"]))
+        datum = payload.get("vertical_datum")
+        if datum is None:
+            return DEM.from_raster(path)
+        return DEM.from_raster(path, vertical_datum=str(datum))
     if kind == "constant":
-        return DEM.from_constant(float(payload["height"]))
+        height = float(payload["height"])
+        datum = payload.get("vertical_datum")
+        if datum is None:
+            return DEM.from_constant(height)
+        return DEM.from_constant(height, vertical_datum=str(datum))
     message = f"stack.json DEM recipe is invalid: {kind!r}"
     return reject(message, InvalidProcessingStateError, logger=logger)
 

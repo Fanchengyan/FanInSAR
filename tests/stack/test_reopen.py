@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,12 +15,13 @@ from faninsar.processing.errors import (
     InvalidProcessingStateError,
 )
 from faninsar.processing.unwrapping.irls import SpatialIRLS
-from faninsar.stack.identity import STACK_JSON_NAME, save_stack_identity
+from faninsar.stack.identity import (
+    STACK_JSON_NAME,
+    encode_value,
+    save_stack_identity,
+)
 from faninsar.stack.session import Stack
 from tests.support.scene_stores import write_test_scene
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _stack(
@@ -490,3 +491,133 @@ def test_aux_cal_bindings_round_trip_through_stack_json(tmp_path: Path) -> None:
         date: str(path) for date, path in bound.items()
     }
     assert reopened._aux_cal_path_for(stack.catalog.dates[1]) == aux
+
+
+def _write_untagged_raster(path: Path) -> Path:
+    """Write a tiny GeoTIFF that has no FanInSAR vertical-datum tag."""
+    import rasterio
+    from affine import Affine
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=8,
+        width=8,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=Affine(0.01, 0.0, 10.0, 0.0, -0.01, 50.0),
+    ) as dataset:
+        dataset.write(np.full((8, 8), 12.0, dtype=np.float32), 1)
+    return path
+
+
+def _dem_recipe(document: dict[str, object]) -> dict[str, object]:
+    """Return the ``faninsar:dem`` payload from one identity or request document."""
+    science = document["science"]
+    assert isinstance(science, dict)
+    encoded = science["dem"]
+    assert isinstance(encoded, dict)
+    payload = encoded["faninsar:dem"]
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _prepare_dem_stack(tmp_path: Path, dem: object, *, name: str) -> LocalStack:
+    """Prepare a local Stack whose request and live config share one DEM."""
+    from dataclasses import replace
+
+    stack = _stack(tmp_path, name=name)
+    stack.config.dem = dem
+    stack._request_config = replace(stack.config, extra=dict(stack.config.extra))
+    stack.prepare_data()
+    return stack
+
+
+@pytest.mark.parametrize("vertical_datum", ["ellipsoidal", "egm96"])
+def test_explicit_raster_vertical_datum_survives_prepare_and_open(
+    tmp_path: Path,
+    vertical_datum: str,
+) -> None:
+    """A tagless raster DEM keeps the caller-supplied datum after Stack.open."""
+    from faninsar.processing.geometry import DEM
+
+    path = _write_untagged_raster(tmp_path / f"dem-{vertical_datum}.tif")
+    dem = DEM.from_raster(path, vertical_datum=vertical_datum)
+    stack = _prepare_dem_stack(tmp_path, dem, name=f"raster-{vertical_datum}")
+    work = stack.config.work_dir
+    identity = json.loads((work / STACK_JSON_NAME).read_text(encoding="utf-8"))
+    request = json.loads((work / "inputs" / "request.json").read_text(encoding="utf-8"))
+    assert _dem_recipe(identity)["vertical_datum"] == vertical_datum
+    assert _dem_recipe(request)["vertical_datum"] == vertical_datum
+
+    reopened = Stack.open(work)
+
+    assert type(reopened.config.dem).__name__ == "RasterDEM"
+    assert reopened.config.dem.vertical_datum == vertical_datum
+    assert Path(reopened.config.dem.path).resolve() == path.resolve()
+    assert reopened._request_config.dem.vertical_datum == vertical_datum
+    assert Path(reopened._request_config.dem.path).resolve() == path.resolve()
+
+
+def test_constant_dem_height_and_vertical_datum_survive_prepare_and_open(
+    tmp_path: Path,
+) -> None:
+    """Constant height recipes persist the declared datum with the height."""
+    from faninsar.processing.geometry import DEM
+
+    dem = DEM.from_constant(12.0, vertical_datum="egm96")
+    stack = _prepare_dem_stack(tmp_path, dem, name="constant-egm96")
+    work = stack.config.work_dir
+    identity = json.loads((work / STACK_JSON_NAME).read_text(encoding="utf-8"))
+    assert _dem_recipe(identity)["height"] == 12.0
+    assert _dem_recipe(identity)["vertical_datum"] == "egm96"
+
+    reopened = Stack.open(work)
+
+    assert type(reopened.config.dem).__name__ == "ConstantDEM"
+    assert float(reopened.config.dem.height) == 12.0
+    assert reopened.config.dem.vertical_datum == "egm96"
+    assert reopened._request_config.dem.vertical_datum == "egm96"
+
+
+def test_persisted_raster_dem_without_vertical_datum_still_rejects(
+    tmp_path: Path,
+) -> None:
+    """Legacy raster recipes with no datum stay fail-closed; nothing is guessed."""
+    from faninsar.processing.geometry import DEM
+
+    path = _write_untagged_raster(tmp_path / "dem-legacy.tif")
+    stack = _prepare_dem_stack(
+        tmp_path,
+        DEM.from_raster(path, vertical_datum="ellipsoidal"),
+        name="raster-legacy",
+    )
+    work = stack.config.work_dir
+    for relative in (STACK_JSON_NAME, Path("inputs") / "request.json"):
+        target = work / relative
+        document = json.loads(target.read_text(encoding="utf-8"))
+        _dem_recipe(document).pop("vertical_datum", None)
+        target.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        Stack.open(work)
+
+
+def test_raster_vertical_datum_change_changes_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    """The same raster path with a different datum is a different source identity."""
+    from faninsar.processing.geometry import DEM
+
+    path = _write_untagged_raster(tmp_path / "dem-identity.tif")
+    ellipsoidal = DEM.from_raster(path, vertical_datum="ellipsoidal")
+    orthometric = DEM.from_raster(path, vertical_datum="egm96")
+    first = encode_value(ellipsoidal)
+    second = encode_value(orthometric)
+    assert first != second
+    assert first["faninsar:dem"]["vertical_datum"] == "ellipsoidal"
+    assert second["faninsar:dem"]["vertical_datum"] == "egm96"
+    assert ellipsoidal.identity != orthometric.identity
