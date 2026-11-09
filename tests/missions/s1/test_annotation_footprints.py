@@ -37,10 +37,15 @@ def test_parse_burst_footprints_splits_by_lines_per_burst() -> None:
 
     assert footprints is not None
     assert len(footprints) == 2
-    # burst 0 -> gridline at line 0 (single point -> degenerate rectangle)
-    assert footprints[0] == ((101.0, 38.0), (101.0, 38.0), (101.0, 38.0), (101.0, 38.0))
-    # burst 1 -> gridline at line 1500
-    assert footprints[1] == ((101.8, 37.5), (101.8, 37.5), (101.8, 37.5), (101.8, 37.5))
+    # burst 0 = gridline 0 edge + gridline 1500 edge (single-point lines).
+    assert footprints[0] == (
+        (101.0, 38.0),
+        (101.0, 38.0),
+        (101.0, 38.0),
+        (101.8, 37.5),
+        (101.8, 37.5),
+        (101.8, 37.5),
+    )
 
 
 def test_parse_burst_footprints_returns_none_without_grid() -> None:
@@ -57,8 +62,8 @@ def test_real_annotation_fixture_corner_values() -> None:
     assert footprints is not None
     assert len(footprints) >= 9
     first = footprints[0]
-    # burst 0's footprint is the bounding box of the gridline at line 0:
-    # SW corner is that scan line's west end, NE corner its east end.
+    # burst 0 is the parallelogram from gridline 0 to the next gridline:
+    # first vertex is the top edge's west end, last the bottom edge's.
     assert first[0][0] == pytest.approx(98.448, abs=0.01)
     assert first[0][1] == pytest.approx(37.382, abs=0.01)
     assert first[2][0] == pytest.approx(99.435, abs=0.01)

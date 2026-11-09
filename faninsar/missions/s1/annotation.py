@@ -181,14 +181,15 @@ def _parse_burst_footprints(
 ) -> list[tuple[tuple[float, float], ...]] | None:
     """Return one polygon per burst from the geolocation grid.
 
-    Burst *i*'s footprint is the bounding box of the geolocation gridline
-    at its slot start ``i*lines_per_burst``.  Using each burst's own scan
-    line — instead of every gridline up to the product's final row — keeps
-    all footprints the same height and stops the last burst from absorbing
-    the slice's trailing TOPS-overlap rows (~2x inflation).
+    Burst *i*'s footprint is the parallelogram swept from its slot-start
+    gridline ``i*lines_per_burst`` to the gridline one burst period later,
+    matching ASF's ``processingLevel=BURST`` catalogue geometry: the top
+    edge is the burst's own scan line, the bottom edge the next burst's —
+    each sampled at its west/middle/east range points (3+3 vertices).
 
-    When a slot start has no sampled gridline, the nearest sampled line is
-    used so a burst still yields a finite rectangle.
+    The last burst has no following gridline inside its nominal window, so
+    its bottom edge is extrapolated from the previous burst's along-track
+    displacement instead of folding the slice's trailing TOPS tail in.
     """
     rows = _geolocation_grid_points(root)
     if not rows:
@@ -197,24 +198,43 @@ def _parse_burst_footprints(
     max_line = lines[-1]
     n_bursts = max_line // lines_per_burst + 1
 
+    def _edge(pts: list[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
+        """Return (west, middle, east) sample points of one gridline."""
+        pts = sorted(pts, key=lambda c: c[0])
+        return (pts[0], pts[len(pts) // 2], pts[-1])
+
     footprints: list[tuple[tuple[float, float], ...]] = []
     for index in range(n_bursts):
         slot_start = index * lines_per_burst
-        if slot_start in rows:
-            pts = rows[slot_start]
-        else:
-            nearest = min(lines, key=lambda ln: abs(ln - slot_start))
-            pts = rows[nearest]
-        lats = [c[1] for c in pts]
-        lons = [c[0] for c in pts]
-        footprints.append(
-            (
-                (min(lons), min(lats)),
-                (max(lons), min(lats)),
-                (max(lons), max(lats)),
-                (min(lons), max(lats)),
-            )
+        top_line = (
+            slot_start
+            if slot_start in rows
+            else min(lines, key=lambda ln: abs(ln - slot_start))
         )
+        top = _edge(rows[top_line])
+        nxt = slot_start + lines_per_burst
+        if nxt in rows:
+            bottom = _edge(rows[nxt])
+        else:
+            # Extrapolate the lower edge by the previous burst's
+            # along-track displacement so the un-numbered TOPS tail is not
+            # folded into the footprint.
+            prev = max((ln for ln in lines if ln < top_line), default=None)
+            if prev is None:
+                bottom = top
+            else:
+                scale = lines_per_burst / (top_line - prev)
+                pedge = _edge(rows[prev])
+                bottom = tuple(
+                    (
+                        tp[0] + (tp[0] - pp[0]) * scale,
+                        tp[1] + (tp[1] - pp[1]) * scale,
+                    )
+                    for tp, pp in zip(top, pedge, strict=True)
+                )
+        # west-top .. east-top, then east-bottom .. west-bottom: a
+        # parallelogram like ASF's 6-vertex burst polygons.
+        footprints.append((top[0], top[1], top[2], bottom[2], bottom[1], bottom[0]))
     return footprints
 
 
