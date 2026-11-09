@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from shapely.geometry import Point, Polygon
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.data.query import BoundingBox
 from faninsar.data.query.polygons import Polygons
+from faninsar.io.storage.scene_store import CoregisteredSceneStore
 from faninsar.missions.protocols import DopplerCentroidPolynomial
 from faninsar.missions.s1 import coregister as coreg_module
 from faninsar.missions.s1.coregister import (
@@ -237,7 +240,13 @@ def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         aligned = np.full((_LINES, _SAMPLES), 1.0 + 1.0j, dtype=np.complex64)
         aligned[_INTERIOR_ZERO] = np.complex64(0.0)
         aligned[_CANVAS_INVALID] = np.complex64(0.0)
+        native = np.asarray(state.secondary.array.valid_mask, dtype=bool)
+        aligned[~native] = np.complex64(0.0)
         state.secondary_aligned = aligned
+        if getattr(state, "coregistration_grid", "radar") == "geo":
+            state.secondary_aligned_valid = np.ones(aligned.shape, dtype=bool)
+        else:
+            state.secondary_aligned_valid = native
         state.radar_roi_origin = (0, 0)
         state.scientific_lineage = [{"stage": "fake"}]
         return state
@@ -521,3 +530,178 @@ def test_radar_scientific_support_rejects_unknown_geometry() -> None:
         roi=None,
     )
     np.testing.assert_array_equal(support, native)
+
+
+SECONDARY_C = "S1A_IW_SLC__1SDV_20200125T000000.SAFE"
+_B_HOLE = (3, 5)
+_C_HOLE = (6, 3)
+
+
+def test_reused_reference_keeps_write_id_and_persisted_mask(fake_s1: Path) -> None:
+    """Reopening an existing Reference must not rewrite its generation identity."""
+    tmp_path = fake_s1
+    output = tmp_path / "coreg" / "20200101"
+    context = _prepare_hole_reference(tmp_path)
+    write_id = context.product.write_id
+    mask = np.asarray(context.product.read_valid_mask("f0_IW1_b0"), dtype=bool)
+    reused = prepare_s1_reference(
+        tmp_path / REFERENCE,
+        output_scene=output,
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
+        roi=_hole_roi(),
+        overwrite=False,
+    )
+    assert reused.product.write_id == write_id
+    np.testing.assert_array_equal(
+        np.asarray(reused.product.read_valid_mask("f0_IW1_b0"), dtype=bool),
+        mask,
+    )
+    payload, _ = reused.product.read("f0_IW1_b0")
+    assert np.isnan(payload.real[~mask]).all()
+    assert bool(reused.units["f0_IW1_b0"].scientific_support[_CANVAS_INVALID])
+
+
+def test_legacy_reference_without_validity_revision_is_recomputed(
+    fake_s1: Path,
+) -> None:
+    """A committed Reference missing the validity token is recomputed, not stamped."""
+    from faninsar.missions.s1.coregister import S1_SLC_VALIDITY_REVISION
+
+    tmp_path = fake_s1
+    output = tmp_path / "coreg" / "20200101"
+    context = _prepare_hole_reference(tmp_path)
+    first_id = context.product.write_id
+    assert (
+        context.product.properties.get("faninsar:slc_validity_revision")
+        == S1_SLC_VALIDITY_REVISION
+    )
+
+    item_path = output / "item.json"
+    item = json.loads(item_path.read_text())
+    removed = item["properties"].pop("faninsar:slc_validity_revision")
+    assert removed == S1_SLC_VALIDITY_REVISION
+    item_path.write_text(json.dumps(item))
+
+    opened = CoregisteredSceneStore.open(output)
+    assert "faninsar:slc_validity_revision" not in opened.properties
+    assert opened.write_id == first_id
+
+    recomputed = prepare_s1_reference(
+        tmp_path / REFERENCE,
+        output_scene=output,
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
+        roi=_hole_roi(),
+        overwrite=False,
+    )
+    assert recomputed.product.write_id != first_id
+    assert (
+        recomputed.product.properties.get("faninsar:slc_validity_revision")
+        == S1_SLC_VALIDITY_REVISION
+    )
+    matching = prepare_s1_reference(
+        tmp_path / REFERENCE,
+        output_scene=output,
+        dem=ConstantDEM(0.0),
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
+        roi=_hole_roi(),
+        overwrite=False,
+    )
+    assert matching.product.write_id == recomputed.product.write_id
+
+
+def test_radar_secondaries_keep_independent_echo_holes(
+    fake_s1: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B and C publication masks follow their own echo, not Reference holes."""
+    tmp_path = fake_s1
+    extra = tmp_path / SECONDARY_C
+    extra.mkdir(parents=True, exist_ok=True)
+    (extra / "manifest.safe").write_text("acquired-support-canvas\n")
+    products = {
+        tmp_path / REFERENCE: _product(tmp_path / REFERENCE),
+        tmp_path / SECONDARY: _product(tmp_path / SECONDARY),
+        extra: _product(extra),
+    }
+    holes = {
+        "20200101": _CANVAS_INVALID,
+        "20200113": _B_HOLE,
+        "20200125": _C_HOLE,
+    }
+
+    def fake_load(path: Path, **_kwargs: object) -> MagicMock:
+        scene = _fake_scene(Path(path), Path(path).name.split("_")[5][:8])
+        native = np.ones((_LINES, _SAMPLES), dtype=bool)
+        native[holes[scene.scene_id]] = False
+        samples = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
+        samples[_INTERIOR_ZERO] = np.complex64(0.0)
+        samples[~native] = np.complex64(0.0)
+        scene.array.valid_mask = native
+        scene.array.samples = samples
+        return scene
+
+    monkeypatch.setattr(
+        f"{coreg_module.__name__}.open_acquisition_products",
+        lambda paths, **_k: [products[Path(item)] for item in paths],
+    )
+    monkeypatch.setattr(f"{coreg_module.__name__}.load_production_scene", fake_load)
+
+    context = _prepare_hole_reference(tmp_path)
+    geometry = np.asarray(context.units["f0_IW1_b0"].scientific_support, dtype=bool)
+    assert bool(geometry[_CANVAS_INVALID])
+    assert bool(geometry[_B_HOLE])
+    assert bool(geometry[_C_HOLE])
+    ref_mask = np.asarray(context.product.read_valid_mask("f0_IW1_b0"), dtype=bool)
+    assert not bool(ref_mask[_CANVAS_INVALID])
+    assert bool(ref_mask[_B_HOLE])
+    assert bool(ref_mask[_C_HOLE])
+
+    secondary_b = coregister_s1_secondary(
+        context,
+        tmp_path / SECONDARY,
+        output_scene=tmp_path / "coreg" / "20200113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    mask_b = np.asarray(secondary_b.read_valid_mask("f0_IW1_b0"), dtype=bool)
+    assert bool(mask_b[_CANVAS_INVALID])
+    assert not bool(mask_b[_B_HOLE])
+    assert bool(mask_b[_C_HOLE])
+    payload_b, _ = secondary_b.read("f0_IW1_b0")
+    assert np.isnan(payload_b.real[~mask_b]).all()
+    assert bool(context.units["f0_IW1_b0"].scientific_support[_CANVAS_INVALID])
+
+    secondary_c = coregister_s1_secondary(
+        context,
+        extra,
+        output_scene=tmp_path / "coreg" / "20200125",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    mask_c = np.asarray(secondary_c.read_valid_mask("f0_IW1_b0"), dtype=bool)
+    assert bool(mask_c[_CANVAS_INVALID])
+    assert bool(mask_c[_B_HOLE])
+    assert not bool(mask_c[_C_HOLE])
+    payload_c, _ = secondary_c.read("f0_IW1_b0")
+    assert np.isnan(payload_c.real[~mask_c]).all()
+
+
+def test_warns_once_for_unsupported_pixels_inside_roi(
+    fake_s1: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One warning is emitted for actual unsupported pixels inside requested support."""
+    caplog.set_level(logging.WARNING)
+    _prepare_hole_reference(fake_s1)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "lack interpolation support" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "f0_IW1_b0" in messages[0]

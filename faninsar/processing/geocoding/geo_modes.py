@@ -29,6 +29,19 @@ __all__ = [
 
 logger = setup_logger(__name__)
 
+_COMPLEX_NAN = np.complex64(np.nan + 1j * np.nan)
+
+
+def _finite_complex(values: np.ndarray) -> np.ndarray:
+    """Return True where both real and imaginary parts are finite."""
+    samples = np.asarray(values)
+    return np.isfinite(samples.real) & np.isfinite(samples.imag)
+
+
+def _mask_invalid_complex(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Write complex NaN outside ``valid``."""
+    return np.where(valid, values, _COMPLEX_NAN).astype(np.complex64, copy=False)
+
 
 def _apply_reramp(
     deramped: np.ndarray,
@@ -84,11 +97,27 @@ def geocode_reference_slc(
     reference_lut: Geo2RdrLUT,
     device: str = "auto",
     dask_client: Any | None = None,
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample the Reference SLC on the geographic grid.
 
     The Reference is masked only by its own LUT and sampling support, so the
     result is the same for every secondary of a Stack.
+
+    Parameters
+    ----------
+    reference_deramped : numpy.ndarray
+        Native-resolution deramped Reference SLC.
+    reference_carrier : TOPSCarrierModel
+        Reference TOPS carrier model.
+    reference_lut : Geo2RdrLUT
+        Reference radar coordinates on the geographic grid.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Torch device.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client for remote CUDA reramp tasks.
+    source_valid : numpy.ndarray, optional
+        Native Reference sample validity aligned with ``reference_deramped``.
 
     Returns
     -------
@@ -106,11 +135,7 @@ def geocode_reference_slc(
         coordinates,
         kind="complex",
         device=device,
-    )
-    reference_valid = (
-        reference_valid
-        & np.isfinite(reference_geo.real)
-        & np.isfinite(reference_geo.imag)
+        source_valid=source_valid,
     )
     reference_geo = _apply_reramp(
         reference_geo,
@@ -121,11 +146,8 @@ def geocode_reference_slc(
         device=device,
         dask_client=dask_client,
     )
-    invalid_value = np.complex64(np.nan + 1j * np.nan)
-    reference_geo = np.where(reference_valid, reference_geo, invalid_value).astype(
-        np.complex64
-    )
-    return reference_geo, reference_valid
+    reference_valid = reference_valid & _finite_complex(reference_geo)
+    return _mask_invalid_complex(reference_geo, reference_valid), reference_valid
 
 
 def geocode_secondary_slc(
@@ -137,6 +159,7 @@ def geocode_secondary_slc(
     offsets: OffsetFieldResult,
     device: str = "auto",
     dask_client: Any | None = None,
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample one secondary SLC on the geographic grid of the Reference.
 
@@ -149,23 +172,29 @@ def geocode_secondary_slc(
     reference_lut : Geo2RdrLUT
         Reference radar coordinates on the geographic grid.
     reference_valid : numpy.ndarray
-        Reference support on the same rows (from :func:`geocode_reference_slc`
-        or the persisted Reference). The pair validity is its intersection with
-        the secondary sampling support.
+        Destination geometric support on the same rows. Kept for API
+        compatibility and shape checking; Reference echo is not intersected
+        into the secondary payload. Pair intersection happens in
+        :func:`coregister_geocoded_slcs`.
     offsets : OffsetFieldResult
         Dense Reference-to-secondary radar offsets.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Torch device.
     dask_client : object or None, optional
         Explicitly trusted Dask client for remote CUDA reramp tasks.
+    source_valid : numpy.ndarray, optional
+        Native secondary sample validity aligned with ``secondary_deramped``.
 
     Returns
     -------
     secondary_geo, valid : tuple[numpy.ndarray, numpy.ndarray]
-        Reramped secondary samples (NaN outside the pair support) and the joint
-        pair validity mask.
+        Reramped secondary samples and that date's sampling validity.
 
     """
+    if tuple(np.shape(reference_valid)) != tuple(reference_lut.shape):
+        from faninsar.processing.errors import reject_invalid_state
+
+        reject_invalid_state("reference support does not match the geo LUT shape")
     reference_coordinates = RadarCoordinates(
         reference_lut.az_full,
         reference_lut.rg_full,
@@ -180,12 +209,7 @@ def geocode_secondary_slc(
         secondary_coordinates,
         kind="complex",
         device=device,
-    )
-    valid = (
-        np.asarray(reference_valid, dtype=bool)
-        & secondary_valid
-        & np.isfinite(secondary_geo.real)
-        & np.isfinite(secondary_geo.imag)
+        source_valid=source_valid,
     )
     secondary_geo = _apply_reramp(
         secondary_geo,
@@ -196,9 +220,8 @@ def geocode_secondary_slc(
         device=device,
         dask_client=dask_client,
     )
-    invalid_value = np.complex64(np.nan + 1j * np.nan)
-    secondary_geo = np.where(valid, secondary_geo, invalid_value).astype(np.complex64)
-    return secondary_geo, valid
+    valid = secondary_valid & _finite_complex(secondary_geo)
+    return _mask_invalid_complex(secondary_geo, valid), valid
 
 
 def coregister_geocoded_slcs(
@@ -211,6 +234,8 @@ def coregister_geocoded_slcs(
     offsets: OffsetFieldResult,
     device: str = "auto",
     dask_client: Any | None = None,
+    reference_source_valid: np.ndarray | None = None,
+    secondary_source_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Coregister two deramped SLCs directly on a geographic grid.
 
@@ -229,6 +254,8 @@ def coregister_geocoded_slcs(
         accelerated Lanczos implementation.
     dask_client : object or None, optional
         Explicitly trusted Dask client for remote CUDA reramp tasks.
+    reference_source_valid, secondary_source_valid : numpy.ndarray, optional
+        Native sample-validity masks aligned with each deramped SLC.
 
     Returns
     -------
@@ -250,17 +277,22 @@ def coregister_geocoded_slcs(
         reference_lut=reference_lut,
         device=device,
         dask_client=dask_client,
+        source_valid=reference_source_valid,
     )
-    secondary_geo, valid = geocode_secondary_slc(
+    secondary_geo, secondary_valid = geocode_secondary_slc(
         secondary_deramped,
         secondary_carrier=secondary_carrier,
         reference_lut=reference_lut,
-        reference_valid=reference_valid,
+        reference_valid=np.asarray(reference_lut.valid, dtype=bool),
         offsets=offsets,
         device=device,
         dask_client=dask_client,
+        source_valid=secondary_source_valid,
     )
-    return reference_geo, secondary_geo, valid
+    valid = np.asarray(reference_valid, dtype=bool) & np.asarray(
+        secondary_valid, dtype=bool
+    )
+    return reference_geo, _mask_invalid_complex(secondary_geo, valid), valid
 
 
 def _row_lut(lut: Geo2RdrLUT, rows: slice) -> Geo2RdrLUT:
@@ -292,6 +324,7 @@ def geocode_reference_slc_chunked(
     row_chunk: int = 256,
     device: str = "auto",
     dask_client: Any | None = None,
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.memmap, np.memmap]:
     """Sample the Reference SLC on the geographic grid into row tiles.
 
@@ -311,6 +344,8 @@ def geocode_reference_slc_chunked(
         Torch device.
     dask_client : object or None, optional
         Explicitly trusted Dask client for remote CUDA reramp tasks.
+    source_valid : numpy.ndarray, optional
+        Native Reference sample validity aligned with ``reference_deramped``.
 
     Returns
     -------
@@ -345,6 +380,7 @@ def geocode_reference_slc_chunked(
             reference_lut=_row_lut(reference_lut, rows),
             device=device,
             dask_client=dask_client,
+            source_valid=source_valid,
         )
         reference_output[rows] = tile
         reference_valid[rows] = tile_valid
@@ -369,6 +405,8 @@ def coregister_geocoded_slcs_chunked(
     device: str = "auto",
     dask_client: Any | None = None,
     watchdog: MemoryWatchdog | None = None,
+    reference_source_valid: np.ndarray | None = None,
+    secondary_source_valid: np.ndarray | None = None,
 ) -> tuple[np.memmap, np.memmap, np.memmap]:
     """Coregister geographic SLCs into disk-backed row tiles.
 
@@ -393,6 +431,8 @@ def coregister_geocoded_slcs_chunked(
         Explicitly trusted Dask client for remote CUDA reramp tasks.
     watchdog : MemoryWatchdog, optional
         Memory guard sampled after every completed tile.
+    reference_source_valid, secondary_source_valid : numpy.ndarray, optional
+        Native sample-validity masks aligned with each deramped SLC.
 
     Returns
     -------
@@ -408,20 +448,34 @@ def coregister_geocoded_slcs_chunked(
         row_chunk=row_chunk,
         device=device,
         dask_client=dask_client,
+        source_valid=reference_source_valid,
     )
     directory = Path(output_dir)
     secondary_output, valid_output = geocode_secondary_slc_chunked(
         secondary_deramped,
         secondary_carrier=secondary_carrier,
         reference_lut=reference_lut,
-        reference_valid=reference_valid,
+        reference_valid=np.asarray(reference_lut.valid, dtype=bool),
         offsets=offsets,
         output_dir=directory,
         row_chunk=row_chunk,
         device=device,
         dask_client=dask_client,
         watchdog=watchdog,
+        source_valid=secondary_source_valid,
     )
+    for row_start in range(0, reference_lut.shape[0], row_chunk):
+        rows = slice(row_start, min(row_start + row_chunk, reference_lut.shape[0]))
+        joint = np.asarray(reference_valid[rows], dtype=bool) & np.asarray(
+            valid_output[rows], dtype=bool
+        )
+        valid_output[rows] = joint
+        secondary_output[rows] = _mask_invalid_complex(secondary_output[rows], joint)
+        del joint
+        for array in (secondary_output, valid_output):
+            release_memmap_pages(array)
+    secondary_output.flush()
+    valid_output.flush()
     return reference_output, secondary_output, valid_output
 
 
@@ -437,13 +491,14 @@ def geocode_secondary_slc_chunked(
     device: str = "auto",
     dask_client: Any | None = None,
     watchdog: MemoryWatchdog | None = None,
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.memmap, np.memmap]:
     """Sample one secondary on the Reference geographic grid in row tiles.
 
     Returns
     -------
     secondary, valid : tuple[numpy.memmap, numpy.memmap]
-        Disk-backed geographic secondary SLC and joint pair validity.
+        Disk-backed geographic secondary SLC and that date's sampling validity.
 
     """
     from faninsar.processing.errors import reject_invalid_state
@@ -478,6 +533,7 @@ def geocode_secondary_slc_chunked(
             offsets=offsets,
             device=device,
             dask_client=dask_client,
+            source_valid=source_valid,
         )
         secondary_output[rows] = secondary_tile
         valid_output[rows] = valid_tile

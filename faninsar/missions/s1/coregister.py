@@ -64,7 +64,13 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+S1_SLC_VALIDITY_REVISION = "mask-aware-lanczos-v1"
+"""Scientific validity revision of S1 complex SLC resampling (P0078)."""
+
+_S1_SLC_VALIDITY_REVISION_KEY = "faninsar:slc_validity_revision"
+
 __all__ = [
+    "S1_SLC_VALIDITY_REVISION",
     "S1ReferenceContext",
     "S1ReferenceUnit",
     "coregister_s1_scene",
@@ -99,8 +105,9 @@ class S1ReferenceUnit:
     lut : Geo2RdrLUT or None
         Reference geo2rdr LUT (geo runs only).
     scientific_support : numpy.ndarray or None
-        Exact ROI support of the published window (geometry and native
-        validity). Stored independently of sample amplitude.
+        Destination geometry/ROI/LUT admissibility of the published window.
+        Per-date echo validity is combined only at publication and is never
+        written back onto this shared plan.
 
     """
 
@@ -375,7 +382,17 @@ def prepare_s1_reference(
     reference_id = _scene_id(primary_paths[0])
     output_scene = Path(output_scene)
     reuse = (output_scene / "item.json").is_file() and not overwrite
-    reused_store = CoregisteredSceneStore.open(output_scene) if reuse else None
+    replace_stale_validity = False
+    if reuse:
+        existing = CoregisteredSceneStore.open(output_scene)
+        if not _has_current_slc_validity_revision(existing):
+            logger.info(
+                "Reference %s lacks current SLC validity revision %s; recomputing",
+                reference_id,
+                S1_SLC_VALIDITY_REVISION,
+            )
+            reuse = False
+            replace_stale_validity = True
     scene_row0 = 0
     scene_col0 = 0
     if coregistration_grid == "geo":
@@ -436,7 +453,7 @@ def prepare_s1_reference(
                     domain=coregistration_grid,
                     grid_shape=grid_shape,
                     wavelength_m=float(scene.geometry.wavelength_m),
-                    overwrite=overwrite,
+                    overwrite=overwrite or replace_stale_validity,
                     **header,
                 )
             unit = units.get(tag)
@@ -467,13 +484,6 @@ def prepare_s1_reference(
             else:
                 unit.parent_row0 = parent_row0
                 unit.parent_col0 = parent_col0
-            if reused_store is not None:
-                persisted = reused_store.read_valid_mask(tag)
-                if persisted is None:
-                    reject_invalid_state(
-                        f"{tag}: reused Reference is missing persisted valid_mask"
-                    )
-                unit.scientific_support = np.asarray(persisted, dtype=bool)
             unit.scene = scene
             if coregistration_grid == "radar":
                 payload = _prepare_radar_unit(
@@ -498,13 +508,14 @@ def prepare_s1_reference(
             if writer is not None and payload is not None:
                 from faninsar.missions.s1.merge_layout import physical_burst_id
 
+                samples, published = payload
                 _stage_scene_unit(
                     writer,
                     tag=tag,
-                    payload=payload,
+                    payload=samples,
                     row_origin=unit.row_origin,
                     col_origin=unit.col_origin,
-                    valid_mask=unit.scientific_support,
+                    valid_mask=published,
                     burst_id=physical_burst_id(unit),
                     scientific_lineage=[
                         {
@@ -531,6 +542,7 @@ def prepare_s1_reference(
             # The Reference is its own baseline origin (PROPOSAL-0065).
             properties["faninsar:baseline_parallel_m"] = 0.0
             properties["faninsar:baseline_perpendicular_m"] = 0.0
+            properties[_S1_SLC_VALIDITY_REVISION_KEY] = S1_SLC_VALIDITY_REVISION
             from faninsar.missions.s1.merge_layout import (
                 build_s1_reference_layout,
                 publish_reference_merge_layout,
@@ -548,7 +560,7 @@ def prepare_s1_reference(
                 scene_offset=(scene_row0, scene_col0),
             )
             layout_product = publish_reference_merge_layout(
-                output_scene, layout, overwrite=overwrite
+                output_scene, layout, overwrite=overwrite or replace_stale_validity
             )
             properties["faninsar:layout_id"] = layout_product.write_id
             product = writer.commit(
@@ -680,7 +692,7 @@ def _prepare_radar_unit(
     dem: DEM,
     compute: bool,
     device: str,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, np.ndarray] | None:
     """Resolve the Reference ROI crop and return the radar Reference payload.
 
     The payload is ``reramp(deramp(reference))`` on the Reference crop, the
@@ -726,29 +738,28 @@ def _prepare_radar_unit(
     shape = (int(crop[1] - crop[0]), int(crop[3] - crop[2]))
     if unit.scientific_support is None:
         if roi is not None:
-            if not compute:
-                reject_invalid_state(
-                    f"{unit.tag}: reused Reference is missing persisted valid_mask"
-                )
             from faninsar.missions.s1.roi_support import radar_scientific_support
 
             unit.scientific_support = radar_scientific_support(
                 scene.geometry,
                 dem,
                 crop=crop,
-                native_valid=native_valid,
+                native_valid=None,
                 roi=roi,
                 device=device,
             )
-        elif native_valid is not None:
-            unit.scientific_support = np.asarray(native_valid, dtype=bool)
         else:
             unit.scientific_support = np.ones(shape, dtype=bool)
-    if payload is not None and roi is not None:
-        from faninsar.missions.s1.roi_support import apply_scientific_support
+    if payload is None:
+        return None
+    published = _published_unit_mask(
+        unit.scientific_support, native_valid, payload, tag=unit.tag
+    )
+    from faninsar.missions.s1.roi_support import apply_scientific_support
 
-        payload = apply_scientific_support(payload, unit.scientific_support)
-    return payload
+    payload = apply_scientific_support(payload, published)
+    _warn_unsupported_inside_support(unit.tag, unit.scientific_support, published)
+    return payload, published
 
 
 def _prepare_geo_unit(
@@ -761,7 +772,7 @@ def _prepare_geo_unit(
     roi: BoundingBox | Polygons | None,
     compute: bool,
     device: str,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, np.ndarray] | None:
     """Build the Reference LUT and (unless reusing) the geocoded Reference."""
     from faninsar.processing.geocoding.geo_modes import (
         geocode_reference_slc_chunked,
@@ -785,25 +796,30 @@ def _prepare_geo_unit(
     unit.row_origin = int(lut.row0)
     unit.col_origin = int(lut.col0)
     payload: np.ndarray | None = None
+    sampled_valid: np.ndarray | None = None
     if compute:
-        deramped = np.where(
-            scene.array.valid_mask, deramp(scene.array.samples, scene.carrier), 0
-        )
-        reference_geo, _ = geocode_reference_slc_chunked(
+        native_mask = scene.array.valid_mask
+        if native_mask is None:
+            native_mask = np.ones(scene.array.samples.shape, dtype=bool)
+        else:
+            native_mask = np.asarray(native_mask, dtype=bool)
+        deramped = np.where(native_mask, deramp(scene.array.samples, scene.carrier), 0)
+        reference_geo, sampled_valid = geocode_reference_slc_chunked(
             deramped,
             reference_carrier=scene.carrier,
             reference_lut=lut,
             output_dir=work_dir / "slc",
             device=device,
+            source_valid=native_mask,
         )
         payload = np.array(reference_geo, dtype=np.complex64)
+        if sampled_valid is None:
+            sampled_valid = np.ones(payload.shape, dtype=bool)
+        else:
+            sampled_valid = np.asarray(sampled_valid, dtype=bool)
     window = payload.shape if payload is not None else tuple(lut.valid.shape)
     if unit.scientific_support is None:
         if roi is not None:
-            if not compute:
-                reject_invalid_state(
-                    f"{unit.tag}: reused Reference is missing persisted valid_mask"
-                )
             from faninsar.missions.s1.roi_support import geo_scientific_support
 
             unit.scientific_support = geo_scientific_support(
@@ -816,11 +832,16 @@ def _prepare_geo_unit(
             )
         else:
             unit.scientific_support = np.asarray(lut.valid, dtype=bool)
-    if payload is not None and roi is not None:
-        from faninsar.missions.s1.roi_support import apply_scientific_support
+    if payload is None:
+        return None
+    published = _published_unit_mask(
+        unit.scientific_support, sampled_valid, payload, tag=unit.tag
+    )
+    from faninsar.missions.s1.roi_support import apply_scientific_support
 
-        payload = apply_scientific_support(payload, unit.scientific_support)
-    return payload
+    payload = apply_scientific_support(payload, published)
+    _warn_unsupported_inside_support(unit.tag, unit.scientific_support, published)
+    return payload, published
 
 
 def _materialize_lut(lut: Geo2RdrLUT) -> Geo2RdrLUT:
@@ -867,6 +888,12 @@ def _persisted_unit_shape(
             int(unit.crop[3] - unit.crop[2]),
         )
     return unit.native_shape
+
+
+def _has_current_slc_validity_revision(product: CoregisteredSceneStore) -> bool:
+    """Return whether ``product`` was written with the current validity revision."""
+    stored = product.properties.get(_S1_SLC_VALIDITY_REVISION_KEY)
+    return stored == S1_SLC_VALIDITY_REVISION
 
 
 def _check_reused_reference(
@@ -929,6 +956,11 @@ def _check_reused_reference(
                 f"{tuple(unit.scientific_support.shape)} differs from payload "
                 f"{tuple(placed.shape)}; recoregister with overwrite=True"
             )
+    if not _has_current_slc_validity_revision(product):
+        reject_invalid_state(
+            "persisted Reference lacks the current SLC validity revision; "
+            "recoregister with overwrite=True"
+        )
 
 
 def coregister_s1_secondary(
@@ -1025,7 +1057,7 @@ def coregister_s1_secondary(
                 if match is None:
                     continue
                 secondary_burst_index, secondary_product = match
-                payload, state = _coregister_unit(
+                payload, published, state = _coregister_unit(
                     context,
                     unit,
                     secondary_product.source_path,
@@ -1056,7 +1088,7 @@ def coregister_s1_secondary(
                     payload=payload,
                     row_origin=placed.row_origin,
                     col_origin=placed.col_origin,
-                    valid_mask=unit.scientific_support,
+                    valid_mask=published,
                     burst_id=placed.burst_id,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
@@ -1084,6 +1116,7 @@ def coregister_s1_secondary(
             )
             record["faninsar:baseline_parallel_m"] = float(parallel_m)
             record["faninsar:baseline_perpendicular_m"] = float(perpendicular_m)
+            record[_S1_SLC_VALIDITY_REVISION_KEY] = S1_SLC_VALIDITY_REVISION
             product = writer.commit(inputs=bindings, properties=record)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
@@ -1199,7 +1232,7 @@ def _coregister_unit(
     device: str,
     product: S1Product | None = None,
     secondary_aux_cal_path: Path | None = None,
-) -> tuple[np.ndarray, ProductionPairState]:
+) -> tuple[np.ndarray, np.ndarray, ProductionPairState]:
     """Resample one secondary burst onto its Reference unit."""
     domain = context.coregistration_grid
     secondary = load_production_scene(
@@ -1221,13 +1254,17 @@ def _coregister_unit(
         coregistration_grid=domain,
     )
     state = stage_deramp(state, device=device, secondary_only=True)
+    if not reference.is_reference:
+        reject_invalid_state(
+            f"{unit.tag}: secondary coregistration requires the Reference store"
+        )
     reference_geo_valid = None
     if domain == "geo":
-        reference_samples, _ = reference.read(unit.tag)
-        reference_geo_valid = np.isfinite(reference_samples.real) & np.isfinite(
-            reference_samples.imag
-        )
-        del reference_samples
+        if unit.lut is None:
+            reject_invalid_state(
+                f"{unit.tag}: geo coregistration requires a Reference LUT"
+            )
+        reference_geo_valid = np.asarray(unit.lut.valid, dtype=bool)
     state = stage_coregister(
         state,
         misreg_az_px=misreg_az_px,
@@ -1246,11 +1283,25 @@ def _coregister_unit(
     if state.secondary_aligned is None:
         reject_invalid_state(f"{unit.tag}: coregistration produced no aligned SLC")
     payload = np.array(state.secondary_aligned, dtype=np.complex64)
+    aligned_valid = state.secondary_aligned_valid
     if domain == "radar" and unit.crop is not None:
         payload = _crop_to_reference_window(state, unit.crop, payload, tag=unit.tag)
-    payload = _apply_unit_roi_support(context, unit, payload)
+        if aligned_valid is not None:
+            aligned_valid = _crop_to_reference_window(
+                state, unit.crop, np.asarray(aligned_valid, dtype=bool), tag=unit.tag
+            )
+    geometry = unit.scientific_support
+    if geometry is None:
+        geometry = _compute_unit_support(context, unit, payload.shape)
+        unit.scientific_support = geometry
+    from faninsar.missions.s1.roi_support import apply_scientific_support
+
+    published = _published_unit_mask(geometry, aligned_valid, payload, tag=unit.tag)
+    payload = apply_scientific_support(payload, published)
+    _warn_unsupported_inside_support(unit.tag, geometry, published)
     state.secondary_aligned = None
-    return payload, state
+    state.secondary_aligned_valid = None
+    return payload, published, state
 
 
 def _crop_to_reference_window(
@@ -1271,6 +1322,51 @@ def _crop_to_reference_window(
             f"{tag}: pair ROI crop does not contain the Reference ROI crop"
         )
     return np.ascontiguousarray(secondary[row0:row1, col0:col1])
+
+
+def _published_unit_mask(
+    geometry: np.ndarray,
+    sampled: np.ndarray | None,
+    payload: np.ndarray,
+    *,
+    tag: str,
+) -> np.ndarray:
+    """Combine geometry admissibility, sampled validity, and finite payload."""
+    published = np.asarray(geometry, dtype=bool)
+    if published.shape != payload.shape:
+        reject_invalid_state(
+            f"{tag}: geometry support {published.shape} does not match payload "
+            f"{payload.shape}"
+        )
+    if sampled is not None:
+        sampled_mask = np.asarray(sampled, dtype=bool)
+        if sampled_mask.shape != published.shape:
+            reject_invalid_state(
+                f"{tag}: sampled validity {sampled_mask.shape} does not match "
+                f"payload {payload.shape}"
+            )
+        published = published & sampled_mask
+    return published & np.isfinite(payload.real) & np.isfinite(payload.imag)
+
+
+def _warn_unsupported_inside_support(
+    tag: str,
+    geometry: np.ndarray,
+    published: np.ndarray,
+) -> None:
+    """Warn once when requested support contains incomplete interpolation."""
+    missing = np.asarray(geometry, dtype=bool) & ~np.asarray(published, dtype=bool)
+    count = int(np.count_nonzero(missing))
+    if count == 0:
+        return
+    support_count = int(np.count_nonzero(geometry))
+    logger.warning(
+        "%s: %d (%.4f of requested support) pixels lack interpolation support; "
+        "wrote complex NaN",
+        tag,
+        count,
+        count / max(support_count, 1),
+    )
 
 
 def _window_native_valid(
@@ -1340,10 +1436,7 @@ def _compute_unit_support(
         unit.scene.geometry,
         context.dem,
         crop=crop,
-        native_valid=_window_native_valid(
-            getattr(unit.scene.array, "valid_mask", None),
-            crop,
-        ),
+        native_valid=None,
         roi=context.roi,
         device="auto",
     )

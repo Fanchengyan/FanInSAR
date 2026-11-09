@@ -512,7 +512,7 @@ def test_sample_forwards_device_to_lanczos_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The sample device reaches the accelerated Lanczos backend unchanged."""
-    calls: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
 
     def fake_resample(
         _layer: np.ndarray,
@@ -520,11 +520,17 @@ def test_sample_forwards_device_to_lanczos_backend(
         _rg: np.ndarray,
         *,
         valid: np.ndarray | None = None,
+        source_valid: np.ndarray | None = None,
         executor: str = "torch",
         device: str = "auto",
     ) -> tuple[np.ndarray, np.ndarray]:
-        calls["device"] = device
-        calls["executor"] = executor
+        calls.append(
+            {
+                "device": device,
+                "executor": executor,
+                "source_valid": source_valid,
+            }
+        )
         values = np.full(az.shape, 1 + 0j, dtype=np.complex64)
         if valid is None:
             mask = np.ones(az.shape, dtype=bool)
@@ -554,4 +560,16 @@ def test_sample_forwards_device_to_lanczos_backend(
     )
     assert phase_values.shape == coords.shape
     assert phase_valid.all()
-    assert calls == {"device": "cuda", "executor": "torch"}
+    assert len(calls) == 2
+    assert calls[0] == {
+        "device": "cuda",
+        "executor": "torch",
+        "source_valid": None,
+    }
+    assert calls[1]["device"] == "cuda"
+    assert calls[1]["executor"] == "torch"
+    assert calls[1]["source_valid"] is not None
+    np.testing.assert_array_equal(
+        np.asarray(calls[1]["source_valid"], dtype=bool),
+        np.ones((8, 8), dtype=bool),
+    )

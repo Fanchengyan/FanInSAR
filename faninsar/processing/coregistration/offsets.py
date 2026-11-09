@@ -2307,6 +2307,182 @@ def estimate_patch_amplitude_shift(
     )
 
 
+def _resample_complex_lanczos_tiles(
+    samples: np.ndarray,
+    *,
+    range_offset_px: np.ndarray | float,
+    azimuth_offset_px: np.ndarray | float,
+    lanczos_a: int,
+    row_chunk: int,
+    device: str,
+    source_valid: np.ndarray | None = None,
+    return_valid: bool = False,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Resample complex samples with optional source-validity in row tiles."""
+    import torch
+
+    from faninsar.processing.coregistration.resampling_torch import (
+        DEFAULT_LANCZOS_CHUNK,
+        _cleanup_device,
+        _lanczos_resample_device_persistent,
+        _resolve_torch_device,
+    )
+
+    height, width = samples.shape
+    az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
+    rg_off = np.asarray(range_offset_px, dtype=np.float64)
+    scalar_az = az_off.ndim == 0
+    scalar_rg = rg_off.ndim == 0
+    if not scalar_az and az_off.shape != (height, width):
+        reject_invalid_state("azimuth_offset_px must be scalar or match samples shape")
+    if not scalar_rg and rg_off.shape != (height, width):
+        reject_invalid_state("range_offset_px must be scalar or match samples shape")
+    evaluate_validity = return_valid or source_valid is not None
+    valid_host: np.ndarray | None = None
+    if evaluate_validity:
+        if source_valid is None:
+            valid_host = np.ones((height, width), dtype=bool)
+        else:
+            valid_host = np.ascontiguousarray(np.asarray(source_valid), dtype=bool)
+            if valid_host.shape != (height, width):
+                reject_invalid_state("source validity mask must match samples shape")
+
+    resolved_chunk = (
+        int(DEFAULT_LANCZOS_CHUNK) if chunk_size is None else max(int(chunk_size), 1)
+    )
+    resolved_device = _resolve_torch_device(device)
+    if not isinstance(resolved_device, torch.device):
+        reject_invalid_state("resolved torch device has an invalid type")
+    source_tensor = torch.from_numpy(np.ascontiguousarray(samples)).to(
+        resolved_device,
+        non_blocking=True,
+    )
+    valid_tensor = None
+    if valid_host is not None:
+        valid_tensor = torch.from_numpy(valid_host).to(
+            resolved_device,
+            non_blocking=True,
+        )
+    if resolved_device.type == "cuda":
+        torch.cuda.synchronize()
+
+    out = np.empty((height, width), dtype=samples.dtype)
+    out_valid = np.empty((height, width), dtype=bool) if evaluate_validity else None
+    col_idx = np.arange(width, dtype=np.float64)
+    try:
+        for row0 in range(0, height, row_chunk):
+            row1 = min(row0 + row_chunk, height)
+            n_rows = row1 - row0
+            row_idx = np.arange(row0, row1, dtype=np.float64)[:, None]
+            cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
+            rows = np.broadcast_to(row_idx, (n_rows, width))
+            az_tile = az_off if scalar_az else az_off[row0:row1]
+            rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
+            src_row = rows - az_tile
+            src_col = cols - rg_tile
+            coords_row = np.ascontiguousarray(src_row.reshape(-1))
+            coords_col = np.ascontiguousarray(src_col.reshape(-1))
+            if evaluate_validity:
+                tile, tile_valid = _lanczos_resample_device_persistent(
+                    samples,
+                    coords_row,
+                    coords_col,
+                    a=lanczos_a,
+                    mode="constant",
+                    cval=0.0,
+                    device=resolved_device,
+                    chunk_size=resolved_chunk,
+                    source_tensor=source_tensor,
+                    valid_tensor=valid_tensor,
+                    return_valid=True,
+                )
+                out[row0:row1] = tile.reshape(n_rows, width)
+                assert out_valid is not None
+                out_valid[row0:row1] = tile_valid.reshape(n_rows, width)
+            else:
+                tile = _lanczos_resample_device_persistent(
+                    samples,
+                    coords_row,
+                    coords_col,
+                    a=lanczos_a,
+                    mode="constant",
+                    cval=0.0,
+                    device=resolved_device,
+                    chunk_size=resolved_chunk,
+                    source_tensor=source_tensor,
+                )
+                out[row0:row1] = tile.reshape(n_rows, width)
+    finally:
+        del source_tensor
+        if valid_tensor is not None:
+            del valid_tensor
+        _cleanup_device(resolved_device)
+    return out, out_valid
+
+
+def _resample_complex_with_validity(
+    samples: np.ndarray,
+    source_valid: np.ndarray,
+    *,
+    range_offset_px: np.ndarray | float,
+    azimuth_offset_px: np.ndarray | float,
+    lanczos_a: int = 4,
+    row_chunk: int = 64,
+    executor: Literal["torch"] = "torch",
+    device: str = "auto",
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample complex samples and the matching Boolean interpolation validity.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        Complex 2-D source, already zero-filled under ``source_valid`` when the
+        caller follows the SAFE-reader convention.
+    source_valid : numpy.ndarray
+        Boolean mask aligned with ``samples``. False marks unavailable taps.
+    range_offset_px, azimuth_offset_px : array or float
+        Offsets of the secondary relative to the reference grid.
+    lanczos_a : int, optional
+        Lanczos half-width.
+    row_chunk : int, optional
+        Azimuth rows processed per tile.
+    executor : {"torch"}, optional
+        Lanczos compute path. Only Torch is supported.
+    device : {"auto","cpu","cuda","mps"}, optional
+        Torch device.
+    chunk_size : int, optional
+        Device chunk length forwarded to the persistent kernel.
+
+    Returns
+    -------
+    samples, valid_mask : tuple[numpy.ndarray, numpy.ndarray]
+        Complex resampled array and per-pixel completeness. Invalid outputs are
+        complex NaN with ``valid_mask`` False.
+
+    """
+    if samples.ndim != 2 or not np.iscomplexobj(samples):
+        reject_invalid_state("complex resampling requires a 2-D complex array")
+    if executor != "torch":
+        reject_invalid_state(f"unsupported complex resampling executor: {executor}")
+    if row_chunk < 1:
+        reject_invalid_state("row_chunk must be >= 1")
+    output, valid = _resample_complex_lanczos_tiles(
+        samples,
+        range_offset_px=range_offset_px,
+        azimuth_offset_px=azimuth_offset_px,
+        lanczos_a=lanczos_a,
+        row_chunk=row_chunk,
+        device=device,
+        source_valid=source_valid,
+        return_valid=True,
+        chunk_size=chunk_size,
+    )
+    assert valid is not None
+    return output, valid
+
+
 def resample_complex(
     samples: np.ndarray,
     *,
@@ -2381,6 +2557,17 @@ def resample_complex(
         reject_invalid_state(f"unsupported complex resampling executor: {executor}")
     if row_chunk < 1:
         reject_invalid_state("row_chunk must be >= 1")
+    if order is None:
+        output, _ = _resample_complex_lanczos_tiles(
+            samples,
+            range_offset_px=range_offset_px,
+            azimuth_offset_px=azimuth_offset_px,
+            lanczos_a=lanczos_a,
+            row_chunk=row_chunk,
+            device=device,
+        )
+        return output
+
     height, width = samples.shape
     az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
     rg_off = np.asarray(range_offset_px, dtype=np.float64)
@@ -2391,82 +2578,155 @@ def resample_complex(
     if not scalar_rg and rg_off.shape != (height, width):
         reject_invalid_state("range_offset_px must be scalar or match samples shape")
 
-    source_tensor: object | None = None
-    resolved_device: object | None = None
-    chunk_size = 0
-    if order is None:
-        from faninsar.processing.coregistration.resampling_torch import (
-            DEFAULT_LANCZOS_CHUNK,
-            _cleanup_device,
-            _lanczos_resample_device_persistent,
-            _resolve_torch_device,
-        )
-
-        chunk_size = int(DEFAULT_LANCZOS_CHUNK)
-        resolved_device = _resolve_torch_device(device)
-        import torch
-
-        if not isinstance(resolved_device, torch.device):
-            reject_invalid_state("resolved torch device has an invalid type")
-        source_tensor = torch.from_numpy(np.ascontiguousarray(samples)).to(
-            resolved_device,
-            non_blocking=True,
-        )
-        if resolved_device.type == "cuda":
-            torch.cuda.synchronize()
-
     out = np.empty((height, width), dtype=samples.dtype)
     col_idx = np.arange(width, dtype=np.float64)
-
-    try:
-        for row0 in range(0, height, row_chunk):
-            row1 = min(row0 + row_chunk, height)
-            n_rows = row1 - row0
-            row_idx = np.arange(row0, row1, dtype=np.float64)[:, None]
-            cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
-            rows = np.broadcast_to(row_idx, (n_rows, width))
-
-            az_tile = az_off if scalar_az else az_off[row0:row1]
-            rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
-            src_row = rows - az_tile
-            src_col = cols - rg_tile
-
-            if order is None:
-                coords = np.vstack([src_row.ravel(), src_col.ravel()])
-                tile = _lanczos_resample_device_persistent(
-                    samples,
-                    coords[0],
-                    coords[1],
-                    a=lanczos_a,
-                    mode="constant",
-                    cval=0.0,
-                    device=resolved_device,
-                    chunk_size=chunk_size,
-                    source_tensor=source_tensor,
-                )
-                out[row0:row1] = tile.reshape(n_rows, width)
-            else:
-                real = map_coordinates(
-                    samples.real,
-                    [src_row, src_col],
-                    order=order,
-                    mode="constant",
-                    cval=0.0,
-                )
-                imag = map_coordinates(
-                    samples.imag,
-                    [src_row, src_col],
-                    order=order,
-                    mode="constant",
-                    cval=0.0,
-                )
-                out[row0:row1] = (real + 1j * imag).astype(samples.dtype, copy=False)
-    finally:
-        if source_tensor is not None:
-            del source_tensor
-            _cleanup_device(resolved_device)
-
+    for row0 in range(0, height, row_chunk):
+        row1 = min(row0 + row_chunk, height)
+        n_rows = row1 - row0
+        row_idx = np.arange(row0, row1, dtype=np.float64)[:, None]
+        cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
+        rows = np.broadcast_to(row_idx, (n_rows, width))
+        az_tile = az_off if scalar_az else az_off[row0:row1]
+        rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
+        src_row = rows - az_tile
+        src_col = cols - rg_tile
+        real = map_coordinates(
+            samples.real,
+            [src_row, src_col],
+            order=order,
+            mode="constant",
+            cval=0.0,
+        )
+        imag = map_coordinates(
+            samples.imag,
+            [src_row, src_col],
+            order=order,
+            mode="constant",
+            cval=0.0,
+        )
+        out[row0:row1] = (real + 1j * imag).astype(samples.dtype, copy=False)
     return out
+
+
+def _apply_analytical_reramp(
+    remapped_deramped: np.ndarray,
+    *,
+    secondary_carrier: TOPSCarrierModel,
+    range_offset_px: np.ndarray | float,
+    azimuth_offset_px: np.ndarray | float,
+    row_chunk: int,
+    device: str,
+    output_carrier: TOPSCarrierModel | None,
+    row0: int,
+    col0: int,
+    native_height: int | None,
+) -> np.ndarray:
+    """Multiply resampled deramped samples by the analytical TOPS carrier."""
+    height, width = remapped_deramped.shape
+    az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
+    rg_off = np.asarray(range_offset_px, dtype=np.float64)
+    scalar_az = az_off.ndim == 0
+    scalar_rg = rg_off.ndim == 0
+    centre_row = float(height // 2 if native_height is None else native_height // 2)
+    out = np.empty((height, width), dtype=remapped_deramped.dtype)
+    col_idx = np.arange(width, dtype=np.float64)
+    from faninsar.processing.runtime.torch_kernels import (
+        carrier_multiply_torch,
+        carrier_phase_at_points_torch,
+    )
+
+    for row_start in range(0, height, row_chunk):
+        row_stop = min(row_start + row_chunk, height)
+        n_rows = row_stop - row_start
+        row_idx = np.arange(row_start, row_stop, dtype=np.float64)[:, None]
+        cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
+        rows = np.broadcast_to(row_idx, (n_rows, width))
+        az_tile = az_off if scalar_az else az_off[row_start:row_stop]
+        rg_tile = rg_off if scalar_rg else rg_off[row_start:row_stop]
+        src_row = rows - az_tile
+        src_col = cols - rg_tile
+        tile = remapped_deramped[row_start:row_stop]
+        carrier_model = secondary_carrier if output_carrier is None else output_carrier
+        carrier_row = (src_row if output_carrier is None else rows) + float(row0)
+        carrier_col = (src_col if output_carrier is None else cols) + float(col0)
+        phi_src = carrier_phase_at_points_torch(
+            carrier_model,
+            carrier_row,
+            carrier_col,
+            centre_row=centre_row,
+            dtype=np.float64,
+            device=device,
+        )
+        out[row_start:row_stop] = carrier_multiply_torch(
+            tile,
+            phi_src,
+            sign=1.0,
+            device=device,
+        )
+    return out
+
+
+def _resample_complex_deramped_reramp_with_validity(
+    sec_deramped: np.ndarray,
+    source_valid: np.ndarray,
+    *,
+    secondary_carrier: TOPSCarrierModel,
+    range_offset_px: np.ndarray | float,
+    azimuth_offset_px: np.ndarray | float,
+    lanczos_a: int = 4,
+    row_chunk: int = 64,
+    executor: Literal["torch"] = "torch",
+    device: str = "auto",
+    output_carrier: TOPSCarrierModel | None = None,
+    row0: int = 0,
+    col0: int = 0,
+    native_height: int | None = None,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a deramped secondary with source validity, then analytical reramp.
+
+    Finiteness is required of the deramped interpolation inputs (via
+    ``source_valid`` intersected with finite samples) and of the reramped
+    output. Invalid pixels are complex NaN.
+    """
+    if sec_deramped.ndim != 2 or not np.iscomplexobj(sec_deramped):
+        reject_invalid_state("deramped resample requires a 2-D complex array")
+    if row_chunk < 1:
+        reject_invalid_state("row_chunk must be >= 1")
+    source_mask = np.ascontiguousarray(np.asarray(source_valid), dtype=bool)
+    if source_mask.shape != sec_deramped.shape:
+        reject_invalid_state("source validity mask must match samples shape")
+    finite_source = np.isfinite(sec_deramped.real) & np.isfinite(sec_deramped.imag)
+    source_mask = source_mask & finite_source
+    remapped, valid = _resample_complex_with_validity(
+        sec_deramped,
+        source_mask,
+        range_offset_px=range_offset_px,
+        azimuth_offset_px=azimuth_offset_px,
+        lanczos_a=lanczos_a,
+        row_chunk=row_chunk,
+        executor=executor,
+        device=device,
+        chunk_size=chunk_size,
+    )
+    out = _apply_analytical_reramp(
+        remapped,
+        secondary_carrier=secondary_carrier,
+        range_offset_px=range_offset_px,
+        azimuth_offset_px=azimuth_offset_px,
+        row_chunk=row_chunk,
+        device=device,
+        output_carrier=output_carrier,
+        row0=row0,
+        col0=col0,
+        native_height=native_height,
+    )
+    finite_reramp = np.isfinite(out.real) & np.isfinite(out.imag)
+    valid = valid & finite_reramp
+    out = np.where(valid, out, np.complex64(np.nan + 1j * np.nan)).astype(
+        sec_deramped.dtype, copy=False
+    )
+    return out, valid
 
 
 def resample_complex_deramped_reramp(
@@ -2537,19 +2797,6 @@ def resample_complex_deramped_reramp(
         reject_invalid_state("deramped resample requires a 2-D complex array")
     if row_chunk < 1:
         reject_invalid_state("row_chunk must be >= 1")
-    height, width = sec_deramped.shape
-    az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
-    rg_off = np.asarray(range_offset_px, dtype=np.float64)
-    scalar_az = az_off.ndim == 0
-    scalar_rg = rg_off.ndim == 0
-    if not scalar_az and az_off.shape != (height, width):
-        reject_invalid_state("azimuth_offset_px must be scalar or match samples shape")
-    if not scalar_rg and rg_off.shape != (height, width):
-        reject_invalid_state("range_offset_px must be scalar or match samples shape")
-
-    centre_row = float(height // 2 if native_height is None else native_height // 2)
-    out = np.empty((height, width), dtype=sec_deramped.dtype)
-    col_idx = np.arange(width, dtype=np.float64)
     remapped_deramped = resample_complex(
         sec_deramped,
         range_offset_px=range_offset_px,
@@ -2559,39 +2806,15 @@ def resample_complex_deramped_reramp(
         executor=executor,
         device=device,
     )
-
-    for row_start in range(0, height, row_chunk):
-        row_stop = min(row_start + row_chunk, height)
-        n_rows = row_stop - row_start
-        row_idx = np.arange(row_start, row_stop, dtype=np.float64)[:, None]
-        cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
-        rows = np.broadcast_to(row_idx, (n_rows, width))
-        az_tile = az_off if scalar_az else az_off[row_start:row_stop]
-        rg_tile = rg_off if scalar_rg else rg_off[row_start:row_stop]
-        src_row = rows - az_tile
-        src_col = cols - rg_tile
-        tile = remapped_deramped[row_start:row_stop]
-        carrier_model = secondary_carrier if output_carrier is None else output_carrier
-        carrier_row = (src_row if output_carrier is None else rows) + float(row0)
-        carrier_col = (src_col if output_carrier is None else cols) + float(col0)
-        from faninsar.processing.runtime.torch_kernels import (
-            carrier_multiply_torch,
-            carrier_phase_at_points_torch,
-        )
-
-        phi_src = carrier_phase_at_points_torch(
-            carrier_model,
-            carrier_row,
-            carrier_col,
-            centre_row=centre_row,
-            dtype=np.float64,
-            device=device,
-        )
-        out[row_start:row_stop] = carrier_multiply_torch(
-            tile,
-            phi_src,
-            sign=1.0,
-            device=device,
-        )
-
-    return out
+    return _apply_analytical_reramp(
+        remapped_deramped,
+        secondary_carrier=secondary_carrier,
+        range_offset_px=range_offset_px,
+        azimuth_offset_px=azimuth_offset_px,
+        row_chunk=row_chunk,
+        device=device,
+        output_carrier=output_carrier,
+        row0=row0,
+        col0=col0,
+        native_height=native_height,
+    )

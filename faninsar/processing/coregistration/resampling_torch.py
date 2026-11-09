@@ -40,6 +40,20 @@ def _cleanup_device(device: torch.device) -> None:
     del device
 
 
+def _exact_cardinal_weights(
+    weights: torch.Tensor,
+    fraction: torch.Tensor,
+    *,
+    center: int,
+) -> torch.Tensor:
+    """Replace an axis with a one-hot cardinal kernel at an exact integer."""
+    import torch
+
+    cardinal = torch.zeros_like(weights)
+    cardinal[:, center] = 1.0
+    return torch.where((fraction == 0)[:, None], cardinal, weights)
+
+
 def _lanczos_resample_device_persistent(
     data: np.ndarray,
     rows: np.ndarray,
@@ -51,13 +65,28 @@ def _lanczos_resample_device_persistent(
     device: torch.device,
     chunk_size: int,
     source_tensor: torch.Tensor | None = None,
-) -> np.ndarray:
-    """Run the bounded Lanczos kernel while keeping the source device-resident."""
+    source_valid: np.ndarray | None = None,
+    valid_tensor: torch.Tensor | None = None,
+    return_valid: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Run the bounded Lanczos kernel while keeping the source device-resident.
+
+    When ``return_valid`` is true or a source mask is supplied, values and
+    Boolean completeness share the same coordinates, taps, and weights. Public
+    unmasked callers omit those arguments and still receive only the sample
+    array.
+    """
     import torch
 
     sample_count = int(rows.size)
+    evaluate_validity = (
+        return_valid or source_valid is not None or valid_tensor is not None
+    )
     if sample_count == 0:
-        return np.empty(0, dtype=data.dtype)
+        empty = np.empty(0, dtype=data.dtype)
+        if evaluate_validity:
+            return empty, np.empty(0, dtype=bool)
+        return empty
 
     height, width = data.shape
     owns_source = source_tensor is None
@@ -67,6 +96,20 @@ def _lanczos_resample_device_persistent(
             non_blocking=device.type == "cuda",
         )
     assert source_tensor is not None
+    owns_valid = False
+    if evaluate_validity and valid_tensor is None:
+        if source_valid is None:
+            valid_host = np.ones(data.shape, dtype=bool)
+        else:
+            valid_host = np.ascontiguousarray(np.asarray(source_valid), dtype=bool)
+            if valid_host.shape != data.shape:
+                message = "source validity mask must match the resampling source"
+                reject(message, ValueError)
+        valid_tensor = torch.from_numpy(valid_host).to(
+            device,
+            non_blocking=device.type == "cuda",
+        )
+        owns_valid = True
 
     coordinate_dtype = torch.float32 if device.type == "mps" else torch.float64
     numpy_coordinate_dtype = np.float32 if device.type == "mps" else np.float64
@@ -83,10 +126,16 @@ def _lanczos_resample_device_persistent(
     ) - float(a - 1)
     integer_tap_offsets = tap_offsets.to(dtype=torch.int64)
     half_width = float(a)
+    center = int(a - 1)
     output_tensor = torch.empty(
         sample_count,
         dtype=source_tensor.dtype,
         device=device,
+    )
+    output_valid_tensor = (
+        torch.empty(sample_count, dtype=torch.bool, device=device)
+        if evaluate_validity
+        else None
     )
     fill_value = cval + 0j if np.iscomplexobj(data) else cval
     fill_tensor = torch.tensor(
@@ -94,13 +143,40 @@ def _lanczos_resample_device_persistent(
         dtype=source_tensor.dtype,
         device=device,
     )
+    zero_tensor = torch.zeros((), dtype=source_tensor.dtype, device=device)
+    if source_tensor.is_complex():
+        invalid_fill = torch.tensor(
+            complex(float("nan"), float("nan")),
+            dtype=source_tensor.dtype,
+            device=device,
+        )
+    else:
+        invalid_fill = torch.tensor(
+            float("nan"),
+            dtype=source_tensor.dtype,
+            device=device,
+        )
 
     for start in range(0, sample_count, chunk_size):
         stop = min(start + chunk_size, sample_count)
         row_coordinates = rows_tensor[start:stop]
         column_coordinates = columns_tensor[start:stop]
-        row_base = torch.floor(row_coordinates)
-        column_base = torch.floor(column_coordinates)
+        if evaluate_validity:
+            coord_finite = torch.isfinite(row_coordinates) & torch.isfinite(
+                column_coordinates
+            )
+            work_rows = torch.where(
+                coord_finite, row_coordinates, torch.zeros_like(row_coordinates)
+            )
+            work_cols = torch.where(
+                coord_finite, column_coordinates, torch.zeros_like(column_coordinates)
+            )
+        else:
+            coord_finite = None
+            work_rows = row_coordinates
+            work_cols = column_coordinates
+        row_base = torch.floor(work_rows)
+        column_base = torch.floor(work_cols)
         row_taps = row_base[:, None].to(torch.int64) + integer_tap_offsets[None, :]
         column_taps = (
             column_base[:, None].to(torch.int64) + integer_tap_offsets[None, :]
@@ -108,8 +184,8 @@ def _lanczos_resample_device_persistent(
         clipped_rows = torch.clamp(row_taps, 0, height - 1)
         clipped_columns = torch.clamp(column_taps, 0, width - 1)
 
-        row_fraction = row_coordinates - row_base
-        column_fraction = column_coordinates - column_base
+        row_fraction = work_rows - row_base
+        column_fraction = work_cols - column_base
         row_distance = row_fraction[:, None] - tap_offsets[None, :]
         column_distance = column_fraction[:, None] - tap_offsets[None, :]
         row_weights = torch.sinc(row_distance) * torch.sinc(row_distance / half_width)
@@ -122,19 +198,57 @@ def _lanczos_resample_device_persistent(
         column_weights = (
             column_weights / column_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         ).to(torch.float32)
+        row_weights = _exact_cardinal_weights(row_weights, row_fraction, center=center)
+        column_weights = _exact_cardinal_weights(
+            column_weights, column_fraction, center=center
+        )
 
         patch = source_tensor[
             clipped_rows[:, :, None],
             clipped_columns[:, None, :],
         ]
-        if mode == "constant":
-            valid_rows = (row_taps >= 0) & (row_taps < height)
-            valid_columns = (column_taps >= 0) & (column_taps < width)
-            valid_taps = valid_rows[:, :, None] & valid_columns[:, None, :]
-            if not bool(torch.all(valid_taps).item()):
-                patch = torch.where(valid_taps, patch, fill_tensor)
-        column_reduced = (patch * column_weights[:, None, :]).sum(dim=2)
-        output_tensor[start:stop] = (column_reduced * row_weights).sum(dim=1)
+        valid_rows = (row_taps >= 0) & (row_taps < height)
+        valid_columns = (column_taps >= 0) & (column_taps < width)
+        in_bounds = valid_rows[:, :, None] & valid_columns[:, None, :]
+        if evaluate_validity:
+            assert valid_tensor is not None
+            gathered_valid = valid_tensor[
+                clipped_rows[:, :, None],
+                clipped_columns[:, None, :],
+            ]
+            if patch.is_complex():
+                finite_samples = torch.isfinite(patch.real) & torch.isfinite(patch.imag)
+            else:
+                finite_samples = torch.isfinite(patch)
+            sample_ok = in_bounds & gathered_valid & finite_samples
+            contributing = (row_weights != 0)[:, :, None] & (column_weights != 0)[
+                :, None, :
+            ]
+            safe_patch = torch.where(sample_ok, patch, zero_tensor)
+            column_reduced = (safe_patch * column_weights[:, None, :]).sum(dim=2)
+            accumulated = (column_reduced * row_weights).sum(dim=1)
+            tap_complete = ~(contributing & ~sample_ok).any(dim=(1, 2))
+            output_valid = coord_finite & tap_complete
+            output_tensor[start:stop] = torch.where(
+                output_valid, accumulated, invalid_fill
+            )
+            assert output_valid_tensor is not None
+            output_valid_tensor[start:stop] = output_valid
+            del (
+                safe_patch,
+                accumulated,
+                sample_ok,
+                gathered_valid,
+                finite_samples,
+                contributing,
+                tap_complete,
+                output_valid,
+            )
+        else:
+            if mode == "constant" and not bool(torch.all(in_bounds).item()):
+                patch = torch.where(in_bounds, patch, fill_tensor)
+            column_reduced = (patch * column_weights[:, None, :]).sum(dim=2)
+            output_tensor[start:stop] = (column_reduced * row_weights).sum(dim=1)
         del (
             patch,
             column_reduced,
@@ -144,6 +258,7 @@ def _lanczos_resample_device_persistent(
             column_taps,
             clipped_rows,
             clipped_columns,
+            in_bounds,
         )
 
     if device.type == "cuda":
@@ -151,10 +266,19 @@ def _lanczos_resample_device_persistent(
     elif device.type == "mps":
         torch.mps.synchronize()
     output = output_tensor.detach().cpu().numpy().astype(data.dtype, copy=False)
+    valid_output = None
+    if output_valid_tensor is not None:
+        valid_output = output_valid_tensor.detach().cpu().numpy()
+        del output_valid_tensor
     del rows_tensor, columns_tensor, output_tensor
+    if owns_valid:
+        del valid_tensor
     if owns_source:
         del source_tensor
         _cleanup_device(device)
+    if evaluate_validity:
+        assert valid_output is not None
+        return output, valid_output
     return output
 
 

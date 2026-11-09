@@ -23,7 +23,6 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import reject
-from faninsar.processing.coregistration.resampling import lanczos_resample
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
@@ -85,6 +84,7 @@ def resample_complex_at_coordinates(
     range_index: np.ndarray,
     *,
     valid: np.ndarray | None = None,
+    source_valid: np.ndarray | None = None,
     executor: Literal["torch", "opencv"] = "torch",
     device: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -98,8 +98,13 @@ def resample_complex_at_coordinates(
         Zero-based fractional source coordinates on the destination grid.
     valid : numpy.ndarray, optional
         Additional destination validity mask.
+    source_valid : numpy.ndarray, optional
+        Source-sample validity aligned with ``complex_radar``. When omitted,
+        stencil completeness still requires in-bounds finite contributing taps.
+        Mask-aware stencil completeness is a Torch capability; see Notes.
     executor : {"torch", "opencv"}, optional
-        Lanczos implementation.
+        Lanczos implementation. ``"torch"`` is the mask-aware production
+        executor. ``"opencv"`` is the historical unmasked path.
     device : {"auto", "cpu", "cuda"}, optional
         Torch device for the accelerated implementation.
 
@@ -107,6 +112,27 @@ def resample_complex_at_coordinates(
     -------
     output, valid : tuple[numpy.ndarray, numpy.ndarray]
         Resampled complex image and final validity mask.
+
+    Raises
+    ------
+    NotImplementedError
+        If ``executor='opencv'`` and ``source_valid`` is provided, including an
+        all-true mask. Use ``executor='torch'`` for contributor-stencil
+        completeness.
+    InvalidProcessingStateError
+        If coordinate or mask shapes are inconsistent, or ``executor`` is
+        unknown.
+    ImportError
+        If ``executor='opencv'`` is selected without ``source_valid`` and
+        OpenCV is not installed.
+
+    Notes
+    -----
+    Mask-aware production sampling (``source_valid``) is implemented only for
+    ``executor='torch'``. Explicit ``executor='opencv'`` without
+    ``source_valid`` keeps the historical optional-dependency path and uses
+    coordinate plus output-finiteness validity only. The executor is never
+    overridden automatically.
 
     """
     source = np.asarray(complex_radar, dtype=np.complex64)
@@ -127,37 +153,64 @@ def resample_complex_at_coordinates(
         if np.asarray(valid).shape != azimuth.shape:
             reject_invalid_state("valid mask must match coordinate shape")
         coordinate_valid &= np.asarray(valid, dtype=bool)
+    source_mask = None
+    if source_valid is not None:
+        source_mask = np.ascontiguousarray(np.asarray(source_valid), dtype=bool)
+        if source_mask.shape != source.shape:
+            reject_invalid_state("source validity mask must match the radar image")
+    if executor == "opencv" and source_mask is not None:
+        reject(
+            "executor='opencv' does not implement mask-aware complex "
+            "resampling (source_valid). Use executor='torch', which evaluates "
+            "contributor-stencil completeness. Omitting source_valid preserves "
+            "OpenCV coordinate and output-finiteness validity.",
+            NotImplementedError,
+        )
 
     output = np.full(azimuth.shape, np.nan + 1j * np.nan, dtype=np.complex64)
+    output_valid = np.zeros(azimuth.shape, dtype=bool)
     if not np.any(coordinate_valid):
-        return output, coordinate_valid
+        return output, output_valid
     if executor == "opencv":
-        return (
-            _resample_complex_opencv(
-                source,
-                azimuth,
-                range_index,
-                coordinate_valid,
-            ),
+        resampled = _resample_complex_opencv(
+            source,
+            azimuth,
+            range_index,
             coordinate_valid,
         )
+        output_valid = (
+            coordinate_valid & np.isfinite(resampled.real) & np.isfinite(resampled.imag)
+        )
+        output[output_valid] = resampled[output_valid]
+        return output, output_valid
     coordinates = np.array(
         [azimuth[coordinate_valid], range_index[coordinate_valid]],
         dtype=np.float64,
     )
-    if executor == "torch":
-        values = lanczos_resample(
-            source,
-            coordinates,
-            a=4,
-            mode="constant",
-            cval=0.0,
-            device=device,
-        )
-    else:
+    if executor != "torch":
         reject_invalid_state(f"unknown geocode executor: {executor}")
-    output[coordinate_valid] = np.asarray(values, dtype=np.complex64)
-    return output, coordinate_valid
+    from faninsar.processing.coregistration.resampling import DEFAULT_LANCZOS_CHUNK
+    from faninsar.processing.coregistration.resampling_torch import (
+        _lanczos_resample_device_persistent,
+        _resolve_torch_device,
+    )
+
+    values, sampled_valid = _lanczos_resample_device_persistent(
+        source,
+        coordinates[0],
+        coordinates[1],
+        a=4,
+        mode="constant",
+        cval=0.0,
+        device=_resolve_torch_device(device),
+        chunk_size=int(DEFAULT_LANCZOS_CHUNK),
+        source_valid=source_mask,
+        return_valid=True,
+    )
+    output_valid[coordinate_valid] = np.asarray(sampled_valid, dtype=bool)
+    output[output_valid] = np.asarray(values, dtype=np.complex64)[sampled_valid]
+    output[~output_valid] = np.complex64(np.nan + 1j * np.nan)
+    return output, output_valid
 
 
 def sample(
@@ -166,6 +219,7 @@ def sample(
     *,
     kind: GeocodeKind,
     device: str = "auto",
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample one radar layer at radar coordinates with the kernel for ``kind``.
 
@@ -189,6 +243,11 @@ def sample(
         Torch device for the accelerated Lanczos kernels (``complex`` and
         ``phase``). The SciPy bilinear/nearest backends (``continuous`` and
         ``label``) execute on CPU.
+    source_valid : numpy.ndarray, optional
+        Source-sample validity aligned with ``layer``. Used by the Torch
+        ``complex`` and ``phase`` kernels so stencil completeness matches the
+        radar mask. This entry point always uses the Torch Lanczos executor
+        for those kinds; mask-aware OpenCV sampling is not provided.
 
     Returns
     -------
@@ -206,6 +265,10 @@ def sample(
     Unwrapped phase sampled as ``continuous`` is locally unreliable across
     connectivity-component boundaries, where the field jumps by ``2*pi``.
 
+    Mask-aware complex/phase sampling is a Torch capability. The OpenCV
+    Lanczos executor is available only through
+    :func:`resample_complex_at_coordinates` and rejects ``source_valid``.
+
     """
     layer = np.asarray(layer)
     if kind == "complex":
@@ -215,11 +278,12 @@ def sample(
             coords.az,
             coords.rg,
             valid=coords.valid,
+            source_valid=source_valid,
             device=device,
         )
     if kind == "phase":
         _validate_dtype(layer, kind)
-        return _sample_phase(layer, coords, device=device)
+        return _sample_phase(layer, coords, device=device, source_valid=source_valid)
     if kind == "continuous":
         _validate_dtype(layer, kind)
         return _sample_bilinear(layer, coords)
@@ -254,6 +318,7 @@ def _sample_phase(
     coords: RadarCoordinates,
     *,
     device: str,
+    source_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resample cyclic wrapped phase through its complex representation.
 
@@ -263,6 +328,8 @@ def _sample_phase(
     """
     phase = np.asarray(layer, dtype=np.float32)
     finite = np.isfinite(phase)
+    if source_valid is not None:
+        finite = finite & np.asarray(source_valid, dtype=bool)
     complex_source = np.where(
         finite,
         np.exp(1j * phase.astype(np.float64)),
@@ -273,6 +340,7 @@ def _sample_phase(
         coords.az,
         coords.rg,
         valid=coords.valid,
+        source_valid=finite,
         device=device,
     )
     valid = valid & (np.abs(complex_values) > _PHASE_MAGNITUDE_EPSILON)

@@ -88,6 +88,27 @@ def _make_mock_scene(shape: tuple[int, int]) -> MagicMock:
     return scene
 
 
+def _passthrough_mask_aware_resample(
+    samples: np.ndarray,
+    source_valid: np.ndarray,
+    **kwargs: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep samples and propagate source validity for production monkeypatches."""
+    del kwargs
+    return np.asarray(samples).copy(), np.asarray(source_valid, dtype=bool)
+
+
+def _patch_mask_aware_resample(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: object | None = None,
+) -> None:
+    """Patch the private deramp/resample/reramp worker used by stage_coregister."""
+    monkeypatch.setattr(
+        "faninsar.processing.coregistration.offsets._resample_complex_deramped_reramp_with_validity",
+        fake if fake is not None else _passthrough_mask_aware_resample,
+    )
+
+
 def test_production_pair_state_note() -> None:
     """note() appends messages and logs them."""
     ref = _make_mock_scene((8, 8))
@@ -224,11 +245,9 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
         "combine_offset_fields",
         lambda geometry_field, **_kwargs: geometry_field,
     )
-    monkeypatch.setattr(
-        production_mod,
-        "resample_complex_deramped_reramp",
-        lambda samples, **_kwargs: samples.copy(),
-    )
+    hole = (4, 8)
+    sec.array.valid_mask[hole] = False
+    _patch_mask_aware_resample(monkeypatch)
 
     result = stage_coregister(
         state,
@@ -241,6 +260,10 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     assert result.range_shift_px == 0.0
     assert result.azimuth_shift_px == 0.25
     assert geometry_call["stride"] == 8
+    assert result.secondary_aligned_valid is not None
+    assert not bool(result.secondary_aligned_valid[hole])
+    assert np.isnan(result.secondary_aligned.real[hole])
+    assert np.isnan(result.secondary_aligned.imag[hole])
 
 
 @pytest.mark.parametrize("requested_device", ["gpu", "auto"])
@@ -282,11 +305,14 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
         "refine_shift_with_correlation",
         lambda *_args, **kwargs: captured.update(kwargs) or (0.25, -0.125),
     )
-    monkeypatch.setattr(
-        production_mod,
-        "resample_complex_deramped_reramp",
-        lambda samples, **kwargs: resample_kwargs.update(kwargs) or samples.copy(),
-    )
+    def fake_resample(
+        samples: np.ndarray, source_valid: np.ndarray, **kwargs: object
+    ) -> tuple[np.ndarray, np.ndarray]:
+        resample_kwargs.update(kwargs)
+        resample_kwargs["source_valid"] = np.asarray(source_valid, dtype=bool)
+        return samples.copy(), np.asarray(source_valid, dtype=bool)
+
+    _patch_mask_aware_resample(monkeypatch, fake_resample)
     monkeypatch.setattr(
         "faninsar.processing.runtime.dask_gpu.should_accelerate",
         lambda *_args, **_kwargs: False,
@@ -310,6 +336,11 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     assert captured["device"] == expected_ampcor_device
     assert resample_kwargs["executor"] == "torch"
     assert resample_kwargs["device"] == expected_resample_device
+    np.testing.assert_array_equal(
+        resample_kwargs["source_valid"], np.ones(shape, dtype=bool)
+    )
+    assert result.secondary_aligned_valid is not None
+    assert np.asarray(result.secondary_aligned_valid).all()
 
 
 def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
@@ -344,11 +375,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
         "dense_geometry_offsets",
         fake_dense_geometry_offsets,
     )
-    monkeypatch.setattr(
-        production_mod,
-        "resample_complex_deramped_reramp",
-        lambda samples, **_: samples.copy(),
-    )
+    _patch_mask_aware_resample(monkeypatch)
 
     measure = ProductionPairState(
         pair_id="prepared-measure",
@@ -388,6 +415,8 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
     assert product.range_shift_px == pytest.approx(0.25)
     assert product.azimuth_shift_px == pytest.approx(-0.125)
     assert product.coregistration_timings_s["dense_geometry_offsets_reused"] == 0.0
+    assert product.secondary_aligned_valid is not None
+    assert np.asarray(product.secondary_aligned_valid).all()
 
 
 def test_read_prepared_geometry_field_adapts_provider_payload() -> None:
@@ -599,11 +628,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
     monkeypatch.setattr(
         production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
     )
-    monkeypatch.setattr(
-        production_mod,
-        "resample_complex_deramped_reramp",
-        lambda samples, **_: samples.copy(),
-    )
+    _patch_mask_aware_resample(monkeypatch)
 
     measure = ProductionPairState(
         pair_id="prepared-roi-measure",
@@ -644,6 +669,9 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
         prepared.crop_bounds[1] - prepared.crop_bounds[0],
         prepared.crop_bounds[3] - prepared.crop_bounds[2],
     )
+    assert product.secondary_aligned_valid is not None
+    assert product.secondary_aligned_valid.shape == product.secondary_aligned.shape
+    assert np.asarray(product.secondary_aligned_valid).all()
 
 
 def test_stage_coregister_grows_roi_halo_for_large_offsets(
@@ -692,17 +720,18 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
             uncertainty_px=np.zeros(shape, dtype=np.float32),
         )
 
-    def fake_resample(samples: np.ndarray, **kwargs: object) -> np.ndarray:
+    def fake_resample(
+        samples: np.ndarray, source_valid: np.ndarray, **kwargs: object
+    ) -> tuple[np.ndarray, np.ndarray]:
         resample_kwargs.update(kwargs)
-        return samples.copy()
+        resample_kwargs["source_valid"] = np.asarray(source_valid, dtype=bool)
+        return samples.copy(), np.asarray(source_valid, dtype=bool)
 
     monkeypatch.setattr(production_mod, "geometry_offset_window_extent", fake_extent)
     monkeypatch.setattr(
         production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
     )
-    monkeypatch.setattr(
-        production_mod, "resample_complex_deramped_reramp", fake_resample
-    )
+    _patch_mask_aware_resample(monkeypatch, fake_resample)
 
     result = stage_coregister(
         state,
@@ -725,6 +754,12 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
     assert result.radar_roi_origin == (second_row0, second_col0)
     assert result.secondary_aligned is not None
     assert result.secondary_aligned.shape == second_shape
+    assert result.secondary_aligned_valid is not None
+    assert result.secondary_aligned_valid.shape == second_shape
+    np.testing.assert_array_equal(
+        resample_kwargs["source_valid"].shape, second_shape
+    )
+    assert np.asarray(result.secondary_aligned_valid).all()
 
 
 def test_stage_interferogram_with_synthetic() -> None:
@@ -1255,16 +1290,18 @@ def test_stage_coregister_conforms_short_secondary_to_reference_shape(
             uncertainty_px=np.zeros(shape, dtype=np.float32),
         )
 
-    def fake_resample(samples: np.ndarray, **_kwargs: object) -> np.ndarray:
+    def fake_resample(
+        samples: np.ndarray, source_valid: np.ndarray, **_kwargs: object
+    ) -> tuple[np.ndarray, np.ndarray]:
         observed["secondary_shape"] = samples.shape
-        return samples.copy()
+        observed["source_valid_shape"] = np.asarray(source_valid).shape
+        observed["source_valid"] = np.asarray(source_valid, dtype=bool)
+        return samples.copy(), np.asarray(source_valid, dtype=bool)
 
     monkeypatch.setattr(
         production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
     )
-    monkeypatch.setattr(
-        production_mod, "resample_complex_deramped_reramp", fake_resample
-    )
+    _patch_mask_aware_resample(monkeypatch, fake_resample)
     state = ProductionPairState(
         pair_id="short-secondary",
         primary=ref,
@@ -1276,12 +1313,18 @@ def test_stage_coregister_conforms_short_secondary_to_reference_shape(
 
     result = stage_coregister(state, device="cpu")
 
-    assert observed == {"geometry_shape": shape, "secondary_shape": shape}
+    assert observed["geometry_shape"] == shape
+    assert observed["secondary_shape"] == shape
+    assert observed["source_valid_shape"] == shape
+    assert not observed["source_valid"][60:].any()
     assert result.primary_deramped is not None
     assert result.primary_deramped.shape == shape
     assert result.secondary_aligned is not None
     assert result.secondary_aligned.shape == shape
-    assert np.all(result.secondary_aligned[60:] == 0)
+    assert result.secondary_aligned_valid is not None
+    assert not result.secondary_aligned_valid[60:].any()
+    assert np.isnan(result.secondary_aligned.real[60:]).all()
+    assert np.isnan(result.secondary_aligned.imag[60:]).all()
 
 
 def test_reference_window_crop_is_contained_in_every_pair_crop() -> None:

@@ -244,6 +244,67 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
     assert first == second
 
 
+def test_s1_slc_validity_revision_differentiates_dates_and_rejects_legacy(
+    tmp_path: Path,
+) -> None:
+    """B/C request identities include the S1 validity token; legacy scenes recompute."""
+    from types import MethodType
+
+    from faninsar.missions.s1.coregister import S1_SLC_VALIDITY_REVISION
+    from faninsar.stack.session import Stack
+
+    stack = _stack_with_three_date_network(tmp_path)
+    assert (
+        stack._source_processing_identity("20240113")["slc_validity_revision"]
+        == S1_SLC_VALIDITY_REVISION
+    )
+    current_b = stack._coreg_resume_identity(
+        "20240113", misreg_az_px=0.0, misreg_rg_px=0.0
+    )
+    current_c = stack._coreg_resume_identity(
+        "20240125", misreg_az_px=0.0, misreg_rg_px=0.0
+    )
+    assert current_b != current_c
+
+    stack._source_processing_identity = MethodType(  # type: ignore[method-assign]
+        Stack._source_processing_identity, stack
+    )
+    legacy_b = stack._coreg_resume_identity(
+        "20240113", misreg_az_px=0.0, misreg_rg_px=0.0
+    )
+    legacy_c = stack._coreg_resume_identity(
+        "20240125", misreg_az_px=0.0, misreg_rg_px=0.0
+    )
+    assert legacy_b != legacy_c
+    assert legacy_b != current_b
+    assert legacy_c != current_c
+    del stack._source_processing_identity
+
+    payload = np.ones((2, 2), dtype=np.complex64)
+    write_test_scene(
+        stack.config.work_dir,
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        payload=payload,
+    )
+    write_test_scene(
+        stack.config.work_dir,
+        date_id="20240113",
+        reference_id=stack.reference,
+        payload=payload,
+        properties={"faninsar:coreg_identity": legacy_b},
+    )
+    write_test_scene(
+        stack.config.work_dir,
+        date_id="20240125",
+        reference_id=stack.reference,
+        payload=payload,
+        properties={"faninsar:coreg_identity": current_c},
+    )
+    assert not stack._reuse_scene("20240113", current_b)
+    assert stack._reuse_scene("20240125", current_c)
+
+
 def test_coreg_reuse_redoes_scene_after_science_config_change(
     tmp_path: Path,
 ) -> None:
