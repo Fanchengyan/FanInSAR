@@ -55,10 +55,13 @@ def test_real_annotation_fixture_corner_values() -> None:
     assert footprints is not None
     assert len(footprints) >= 9
     first = footprints[0]
+    # SW corner sits on the first scan line's west end.
     assert first[0][0] == pytest.approx(98.448, abs=0.01)
     assert first[0][1] == pytest.approx(37.382, abs=0.01)
-    assert first[2][0] == pytest.approx(99.435, abs=0.01)
-    assert first[2][1] == pytest.approx(37.528, abs=0.01)
+    # NE corner is the burst's azimuth-window east edge, interpolated along
+    # track to the burst's nominal-period end — not a raw gridline end.
+    assert first[2][0] == pytest.approx(99.402, abs=0.01)
+    assert first[2][1] == pytest.approx(37.694, abs=0.01)
     assert footprints[8][0][1] > footprints[0][2][1]
 
 
