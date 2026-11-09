@@ -220,6 +220,74 @@ def test_pair_phase_attributes_retain_wrapped_and_unwrapped_semantics(
     assert (store.unwrap_root / "geocoded" / "unwrapped_phase" / "item.json").is_file()
 
 
+def test_geocode_unwrapped_ion_uses_selected_branch_product(stack: Stack) -> None:
+    """Geocoding unwrapped_ion writes under unwrap_ion, not ordinary unwrap."""
+    from faninsar.io.storage.ifg_store import (
+        write_complex_ion_artifact,
+        write_unwrapped_artifact,
+    )
+    from faninsar.io.storage.ion_store import ion_dir, write_ionosphere_artifact
+
+    store = _write_ifg(stack, value=0.3)
+    ion = write_ionosphere_artifact(
+        ion_dir(stack.config.work_dir, "20240101_20240113", (1, 1)),
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        domain="radar",
+        wavelength_m=0.0555,
+        grid_identity=store.grid_identity,
+        method_name="ionosphere_split_spectrum",
+        method_parameters={"looks": [1, 1]},
+        degraded=False,
+        degradation_reason=None,
+        runtime_fingerprint="a" * 64,
+        devices=("cpu",),
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
+        ionosphere_phase=np.full(RADAR_SHAPE, 0.1, dtype=np.float32),
+        nondispersive_phase=np.zeros(RADAR_SHAPE, dtype=np.float32),
+        weight=np.ones(RADAR_SHAPE, dtype=np.float32),
+        native_origin=(0, 0),
+    )
+    write_complex_ion_artifact(
+        store.root,
+        complex_ifg=np.full(RADAR_SHAPE, np.exp(1j * 0.2), dtype=np.complex64),
+        valid_mask=np.ones(RADAR_SHAPE, dtype=bool),
+        ion_write_id=ion.write_id,
+        ion_looks=(1, 1),
+        interpolation="masked_bilinear_unwrapped",
+        source_anchor=ion.sample_center_anchor,
+        source_spacing=ion.sample_spacing,
+        target_anchor=(0.0, 0.0),
+        target_spacing=(1.0, 1.0),
+    )
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 1.0, dtype=np.float32),
+        connected_components=np.ones(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+        source="complex",
+    )
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
+        connected_components=np.full(RADAR_SHAPE, 2, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+        source="complex_ion",
+    )
+    ifg = stack.interferograms["20240101_20240113"]
+    ordinary = stack.geocode(ifg.unwrapped_phase)
+    corrected = stack.geocode(ifg.unwrapped_ion)
+    np.testing.assert_allclose(ordinary.values[ordinary.valid], 1.0, atol=1e-5)
+    np.testing.assert_allclose(corrected.values[corrected.valid], 9.0, atol=1e-5)
+    assert (store.unwrap_root / "geocoded" / "unwrapped_phase" / "item.json").is_file()
+    assert (store.root / "unwrap_ion" / "geocoded" / "unwrapped_phase" / "item.json").is_file()
+    assert not (store.unwrap_root / "geocoded" / "unwrapped_ion").exists()
+
+
 def test_flat_layer_surface_lists_names_and_keeps_virtual_paths_none(
     stack: Stack,
 ) -> None:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from tests.support.local_stack import LocalStack
 
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -14,9 +16,11 @@ from faninsar import Pairs
 from faninsar.io.storage.ifg_store import write_ifg_artifact, write_unwrapped_artifact
 from faninsar.io.storage.ion_store import ion_dir, write_ionosphere_artifact
 from faninsar.io.storage.product import open_product
+from faninsar.network import Network
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
 from faninsar.stack import Stack
+from faninsar.timeseries.models import LinearModel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,6 +29,8 @@ _DIGEST_A = "a" * 64
 _DIGEST_B = "b" * 64
 _PAIR = ("20240101", "20240113")
 _PAIR_ID = "20240101_20240113"
+_PAIR_B = ("20240113", "20240125")
+_PAIR_B_ID = "20240113_20240125"
 
 
 class _IdentityUnwrapper(SpatialUnwrapper):
@@ -96,6 +102,43 @@ def _stack_with_ifg(
     return stack
 
 
+def _stack_with_named_pairs(
+    tmp_path: Path,
+    pair_ids: list[str],
+    *,
+    looks: tuple[int, int] = (1, 1),
+    shape: tuple[int, int] = (2, 2),
+) -> Stack:
+    """Create a prepared Stack with one synthetic IFG per named pair."""
+    dates = sorted({part for pair_id in pair_ids for part in pair_id.split("_")})
+    safe_paths = []
+    for date in dates:
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{date}T000000.SAFE"
+        path.mkdir()
+        safe_paths.append(path)
+    stack = LocalStack.from_paths(
+        safe_paths,
+        work_dir=tmp_path / "out",
+        pairs=Pairs.from_names(pair_ids),
+        multilook=looks,
+    )
+    stack.prepare_data()
+    for pair_id in pair_ids:
+        write_ifg_artifact(
+            stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}" / pair_id,
+            pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
+            looks=looks,
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": _DIGEST_A, "secondary": _DIGEST_B},
+            complex_ifg=np.ones(shape, dtype=np.complex64),
+            coherence=np.ones(shape, dtype=np.float32),
+            valid_mask=np.ones(shape, dtype=bool),
+            grid_identity=_DIGEST_A,
+        )
+    return stack
+
+
 def _write_ion(
     stack: Stack,
     *,
@@ -103,10 +146,12 @@ def _write_ion(
     shape: tuple[int, int],
     screen: float = 0.1,
     native_origin: tuple[int, int] = (0, 0),
+    pair: tuple[str, str] = _PAIR,
 ) -> None:
+    pair_id = f"{pair[0]}_{pair[1]}"
     write_ionosphere_artifact(
-        ion_dir(stack.config.work_dir, _PAIR_ID, looks),
-        pair=_PAIR,
+        ion_dir(stack.config.work_dir, pair_id, looks),
+        pair=pair,
         looks=looks,
         domain="radar",
         wavelength_m=0.236,
@@ -236,3 +281,177 @@ def test_status_reports_pair_owned_ion_branches(tmp_path: Path) -> None:
     assert _PAIR_ID in report["unwrap_ion"]["committed"]
     assert _PAIR_ID in report["ionosphere"]["committed"]
     assert _PAIR_ID in report["unwrap"]["missing"]
+
+
+def test_collection_item_omits_absent_ion_assets_on_ordinary_only(
+    tmp_path: Path,
+) -> None:
+    """Ordinary item() metadata omits missing ion siblings without raising."""
+    stack = _stack_with_ifg(tmp_path)
+    stack.unwrap(_IdentityUnwrapper())
+    item = stack.interferograms.item(_PAIR_ID)
+    assert "complex" in item["assets"]
+    assert "complex_ion" not in item["assets"]
+    assert "unwrapped_ion" not in item["assets"]
+    assert "wrapped_ion" not in item["assets"]
+    with pytest.raises(InvalidProcessingStateError, match="complex_ion"):
+        stack.interferograms.path(_PAIR_ID, "complex_ion")
+    with pytest.raises(InvalidProcessingStateError, match="complex_ion"):
+        stack.interferograms.open(_PAIR_ID, "complex_ion")
+
+
+def test_collection_item_still_rejects_corrupt_original_ifg(tmp_path: Path) -> None:
+    """item() must not swallow original IFG corruption while omitting ion assets."""
+    stack = _stack_with_ifg(tmp_path)
+    broken = stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID / "item.json"
+    broken.write_text("{ not valid json", encoding="utf-8")
+    with pytest.raises(InvalidProcessingStateError):
+        stack.interferograms.item(_PAIR_ID)
+
+
+def test_corrected_only_network_admits_explicit_unwrapped_ion(tmp_path: Path) -> None:
+    """Corrected-only workspaces expose Network.invert(phase='unwrapped_ion')."""
+    stack = _stack_with_ifg(tmp_path)
+    _write_ion(stack, looks=(1, 1), shape=(2, 2))
+    stack.apply_ionosphere_correction(ion_multilook=(1, 1))
+    stack.unwrap(_IdentityUnwrapper(), source="complex_ion")
+    assert stack.analysis_ready
+    assert stack.network is not None
+    network = Network(stack.config.work_dir)
+    result = network.invert(phase="unwrapped_ion")
+    item = open_product(stack.config.work_dir / "timeseries")
+    unwrap_ion = open_product(
+        stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID / "unwrap_ion"
+    )
+    assert item.properties["faninsar:phase_source"] == "unwrapped_ion"
+    assert item.inputs[_PAIR_ID] == unwrap_ion.write_id
+    assert result is not None
+    with pytest.raises(RuntimeError, match="cannot be opened for inversion"):
+        network.invert()
+
+
+def test_mixed_pair_unwrap_branches_do_not_admit_or_mix(tmp_path: Path) -> None:
+    """A network that mixes ordinary and ion unwraps is not analysis-ready."""
+    stack = _stack_with_named_pairs(tmp_path, [_PAIR_ID, _PAIR_B_ID])
+    _write_ion(stack, looks=(1, 1), shape=(2, 2), pair=_PAIR)
+    _write_ion(stack, looks=(1, 1), shape=(2, 2), pair=_PAIR_B)
+    stack.apply_ionosphere_correction(ion_multilook=(1, 1))
+    write_unwrapped_artifact(
+        stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID,
+        unwrapped_phase=np.full((2, 2), 1.0, dtype=np.float32),
+        connected_components=np.ones((2, 2), dtype=np.int64),
+        method="identity",
+        method_parameters={},
+        ifg_manifest_digest=open_product(
+            stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID
+        ).write_id,
+        source="complex",
+    )
+    write_unwrapped_artifact(
+        stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_B_ID,
+        unwrapped_phase=np.full((2, 2), 2.0, dtype=np.float32),
+        connected_components=np.ones((2, 2), dtype=np.int64),
+        method="identity",
+        method_parameters={},
+        ifg_manifest_digest=open_product(
+            stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_B_ID
+        ).write_id,
+        source="complex_ion",
+    )
+    stack._refresh_network()
+    assert not stack.analysis_ready
+    assert stack.network is None
+    np.testing.assert_allclose(
+        stack.interferograms.open(_PAIR_ID, "unwrapped").values, 1.0
+    )
+    np.testing.assert_allclose(
+        stack.interferograms.open(_PAIR_B_ID, "unwrapped_ion").values, 2.0
+    )
+    with pytest.raises(InvalidProcessingStateError):
+        stack.interferograms.open(_PAIR_ID, "unwrapped_ion")
+    with pytest.raises(FileNotFoundError):
+        stack.interferograms.open(_PAIR_B_ID, "unwrapped")
+
+
+def test_network_nsbas_routes_selected_unwrapped_ion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NSBAS invert consumes the selected unwrap_ion matrix and provenance."""
+    stack = _stack_with_ifg(tmp_path)
+    _write_ion(stack, looks=(1, 1), shape=(2, 2))
+    stack.apply_ionosphere_correction(ion_multilook=(1, 1))
+    pair_root = stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID
+    ifg_id = open_product(pair_root).write_id
+    write_unwrapped_artifact(
+        pair_root,
+        unwrapped_phase=np.full((2, 2), 11.0, dtype=np.float32),
+        connected_components=np.zeros((2, 2), dtype=np.int64),
+        method="identity",
+        method_parameters={},
+        ifg_manifest_digest=ifg_id,
+        source="complex",
+    )
+    write_unwrapped_artifact(
+        pair_root,
+        unwrapped_phase=np.full((2, 2), 22.0, dtype=np.float32),
+        connected_components=np.zeros((2, 2), dtype=np.int64),
+        method="identity",
+        method_parameters={},
+        ifg_manifest_digest=ifg_id,
+        source="complex_ion",
+    )
+    stack._refresh_network()
+    captured: dict[str, object] = {}
+
+    def fake_nsbas(received: object, *, model: object, **_kwargs: object) -> tuple:
+        captured["matrix"] = np.asarray(received.unwrapped_matrix())  # type: ignore[attr-defined]
+        captured["model"] = model
+        n_pixels = int(captured["matrix"].shape[1])  # type: ignore[union-attr]
+        n_pairs = len(received.pairs)  # type: ignore[attr-defined]
+        n_dates = len(received.pairs.dates)  # type: ignore[attr-defined]
+        return (
+            np.zeros((n_dates - 1, n_pixels), dtype=np.float64),
+            None,
+            np.zeros((n_pairs, n_pixels), dtype=np.float64),
+            None,
+        )
+
+    monkeypatch.setattr(import_module("faninsar.timeseries.invert"), "invert", fake_nsbas)
+    model = LinearModel(pd.DatetimeIndex(stack.pairs.dates.astype("datetime64[ns]")))
+    result = stack.network.invert(phase="unwrapped_ion", model=model)
+    np.testing.assert_allclose(captured["matrix"], 22.0)
+    assert isinstance(captured["model"], LinearModel)
+    item = open_product(stack.config.work_dir / "timeseries")
+    unwrap_ion = open_product(pair_root / "unwrap_ion")
+    assert item.properties["faninsar:phase_source"] == "unwrapped_ion"
+    assert item.inputs[_PAIR_ID] == unwrap_ion.write_id
+    assert result.metadata["method"] == "nsbas"
+
+    captured.clear()
+    ordinary = stack.network.invert(phase="unwrapped", model=model)
+    np.testing.assert_allclose(captured["matrix"], 11.0)
+    ordinary_item = open_product(stack.config.work_dir / "timeseries")
+    unwrap = open_product(pair_root / "unwrap")
+    assert ordinary_item.properties["faninsar:phase_source"] == "unwrapped"
+    assert ordinary_item.inputs[_PAIR_ID] == unwrap.write_id
+    assert ordinary.metadata["method"] == "nsbas"
+
+
+def test_network_nsbas_unwrapped_ion_uses_existing_linear_model(
+    tmp_path: Path,
+) -> None:
+    """Corrected NSBAS input selection reaches the existing LinearModel solver."""
+    stack = _stack_with_ifg(tmp_path)
+    _write_ion(stack, looks=(1, 1), shape=(2, 2))
+    stack.apply_ionosphere_correction(ion_multilook=(1, 1))
+    stack.unwrap(_IdentityUnwrapper(), source="complex_ion")
+    model = LinearModel(pd.DatetimeIndex(stack.pairs.dates.astype("datetime64[ns]")))
+    result = stack.network.invert(phase="unwrapped_ion", model=model)
+    item = open_product(stack.config.work_dir / "timeseries")
+    unwrap_ion = open_product(
+        stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID / "unwrap_ion"
+    )
+    assert item.properties["faninsar:phase_source"] == "unwrapped_ion"
+    assert item.inputs[_PAIR_ID] == unwrap_ion.write_id
+    assert result.metadata["method"] == "nsbas"
+    assert result.phase_cumulative_rad.shape[0] == 2

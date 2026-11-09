@@ -36,7 +36,10 @@ from faninsar.io.storage.product import (
     publish_product,
 )
 from faninsar.logging import setup_logger
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import (
+    InvalidProcessingStateError,
+    reject_invalid_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -866,6 +869,22 @@ class InterferogramArtifactStore:
             return False
         product = open_product(self.unwrap_root, kind=UNWRAP_KIND)
         return product.inputs.get("ifg") == self.write_id
+
+    def has_unwrap_ion(self) -> bool:
+        """Return whether a current unwrap_ion product is bound to this IFG.
+
+        Stale siblings bound to a replaced IFG, complex_ion, or ion estimate
+        count as absent so Network admission cannot mix branches.
+        """
+        if self.representation == BURST_REPRESENTATION:
+            return False
+        if not (unwrap_ion_root(self.root) / "item.json").is_file():
+            return False
+        try:
+            self._require_unwrap_ion()
+        except InvalidProcessingStateError:
+            return False
+        return True
 
     def unwrap_product(self) -> Product:
         """Open the unwrap product bound to this IFG without reading layers.

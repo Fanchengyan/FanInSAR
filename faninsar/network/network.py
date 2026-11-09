@@ -275,13 +275,16 @@ class Network(NetworkContract):
         """Return the time series of this Network, if one exists."""
         return self._timeseries
 
-    def to_ifg_stack(self, *, pairs: Any = None) -> Any:
+    def to_ifg_stack(self, *, pairs: Any = None, phase: str = "unwrapped") -> Any:
         """Build the analysis stack by reading products through Dataset.
 
         Parameters
         ----------
         pairs : Pairs, optional
             Subset of Pair products; defaults to all products in the Network.
+        phase : {"unwrapped", "unwrapped_ion"}, optional
+            Ordinary unwrap products (default) or the unwrap of
+            ``complex_ion``. A missing named branch raises.
 
         Returns
         -------
@@ -292,16 +295,21 @@ class Network(NetworkContract):
         Raises
         ------
         ValueError
-            If the Network has no readable unwrapped phase products.
+            If the Network has no readable unwrapped phase products of the
+            selected branch.
 
         """
         from faninsar.processing.interferometry.contracts import InterferogramStack
 
+        if phase not in {"unwrapped", "unwrapped_ion"}:
+            message = "phase must be 'unwrapped' or 'unwrapped_ion'"
+            reject(message, ValueError, logger=logger)
         pair_obj = pairs if pairs is not None else self.interferograms.pairs
         unwrapped: np.ndarray | None = None
         coherence: np.ndarray | None = None
+        asset = "unw_phase" if phase == "unwrapped" else "unwrapped_ion"
         try:
-            unwrapped_data = self.interferograms.open_stack("unw_phase", pairs=pair_obj)
+            unwrapped_data = self.interferograms.open_stack(asset, pairs=pair_obj)
             unwrapped = np.asarray(unwrapped_data.values, dtype=np.float64)
             if unwrapped.ndim == 3:
                 unwrapped = unwrapped.reshape(unwrapped.shape[0], -1)
@@ -442,7 +450,7 @@ class Network(NetworkContract):
             message = "Network has no interferogram products to invert"
             reject(message, RuntimeError, logger=logger)
         try:
-            stack = self.to_ifg_stack(pairs=pairs)
+            stack = self.to_ifg_stack(pairs=pairs, phase=phase)
         except Exception as exc:
             message = f"Network products cannot be opened for inversion: {exc}"
             reject(message, RuntimeError, cause=exc, logger=logger)
@@ -464,19 +472,14 @@ class Network(NetworkContract):
             )
             return self._persist_result(result, phase=phase)
 
-        if phase != "unwrapped":
-            message = (
-                "Network NSBAS invert consumes ordinary unwrapped phase; "
-                "use phase='unwrapped' or Stack.invert_timeseries(phase=...)"
-            )
-            reject(message, ValueError, logger=logger)
-        return self._run_nsbas(stack, model=normalized_model, **kwargs)
+        return self._run_nsbas(stack, model=normalized_model, phase=phase, **kwargs)
 
     def _run_nsbas(
         self,
         stack: Any,
         *,
         model: TimeSeriesModels | None,
+        phase: str = "unwrapped",
         **kwargs: Any,
     ) -> Any:
         """Run NSBAS and adapt its result to a ``TimeSeries``."""
@@ -521,7 +524,7 @@ class Network(NetworkContract):
             phase_cumulative_rad=cumulative_array,
             metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
         )
-        return self._persist_result(result)
+        return self._persist_result(result, phase=phase)
 
     @staticmethod
     def _normalize_inversion_model(

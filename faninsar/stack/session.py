@@ -797,10 +797,11 @@ def _validate_geocode_output(
         item_path = parent / "item.json"
         if item_path.is_file():
             owner = open_product(parent)
+            source_path = None if layer is None else layer.source.path.resolve()
             allowed = (
-                layer is not None
-                and parent == layer.source.path.resolve()
-                and resolved == parent / "geocoded" / layer.name
+                source_path is not None
+                and resolved == source_path / "geocoded" / layer.name
+                and (parent == source_path or source_path.is_relative_to(parent))
             )
             if not allowed:
                 message = f"geocode output would alter source product {owner.path}"
@@ -1617,7 +1618,9 @@ class Stack(NetworkContract, ABC):
         """Return the Network view over this Stack's committed products.
 
         The Stack and Network share one product index; until every planned
-        Pair has a current IFG and unwrap product the view is unavailable.
+        Pair has a current IFG and a complete unwrap branch (ordinary
+        ``unwrap/`` or ``unwrap_ion/``) the view is unavailable. Default
+        inversion still requires the ordinary branch.
         """
         if not self.analysis_ready:
             return None
@@ -5102,19 +5105,30 @@ class Stack(NetworkContract, ABC):
         """Rebuild the Network index from the committed products.
 
         The index exists only when every planned Pair has a current IFG and a
-        current unwrap product (bound to that IFG's ``write_id``), all from
-        one unwrap method. Otherwise the index is cleared: a missing, stale,
-        or mixed Pair blocks analysis instead of shrinking the network.
+        complete unwrap branch: ordinary ``unwrap/`` for all pairs, or
+        ``unwrap_ion/`` for all pairs, each of one unwrap method. Mixed
+        per-pair branches do not admit a view. Default inversion still
+        requires the ordinary branch; ``phase='unwrapped_ion'`` is explicit.
         """
+        from faninsar.io.storage.ifg_store import unwrap_ion_root
+
         try:
             stores = self._pair_artifact_stores(looks=self.config.multilook)
         except InvalidProcessingStateError:
             self._clear_network()
             return
-        if not stores or not all(store.has_unwrapped() for store in stores):
+        if not stores:
             self._clear_network()
             return
-        unwraps = [store.unwrap_product() for store in stores]
+        ordinary_complete = all(store.has_unwrapped() for store in stores)
+        ion_complete = all(store.has_unwrap_ion() for store in stores)
+        if not ordinary_complete and not ion_complete:
+            self._clear_network()
+            return
+        if ordinary_complete:
+            unwraps = [store.unwrap_product() for store in stores]
+        else:
+            unwraps = [store.unwrap_ion_product() for store in stores]
         methods = {
             json.dumps(product.properties.get("faninsar:method"), sort_keys=True)
             for product in unwraps
@@ -5133,6 +5147,11 @@ class Stack(NetworkContract, ABC):
         products: list[NetworkProduct] = []
         for store, unwrap in zip(stores, unwraps, strict=True):
             primary, secondary = _canonical_pair_strings(store.pair)
+            unwrap_location = (
+                store.unwrap_root / "unwrapped_phase.zarr"
+                if ordinary_complete
+                else unwrap_ion_root(store.root) / "unwrapped_phase.zarr"
+            )
             for kind, location, digest, lineage in (
                 (
                     AssetKind.COMPLEX_INTERFEROGRAM,
@@ -5142,7 +5161,7 @@ class Stack(NetworkContract, ABC):
                 ),
                 (
                     AssetKind.UNWRAPPED_PHASE,
-                    store.unwrap_root / "unwrapped_phase.zarr",
+                    unwrap_location,
                     unwrap.write_id,
                     (store.write_id, unwrap.write_id),
                 ),
@@ -5189,7 +5208,7 @@ class Stack(NetworkContract, ABC):
 
     @property
     def analysis_ready(self) -> bool:
-        """Whether every planned Pair has current IFG and unwrap products."""
+        """Whether every planned Pair has a current IFG and complete unwrap branch."""
         return (
             self._network_generation_id is not None
             and self._network_product_index is not None
@@ -6027,10 +6046,12 @@ def _pair_phase_sources(
 
 def _network_snapshot_id(stores: Sequence[InterferogramArtifactStore]) -> str:
     """Return the identity of one IFG-plus-unwrap product snapshot."""
-    components = [
-        *(f"ifg:{store.write_id}" for store in stores),
-        *(f"unwrap:{store.unwrap_product().write_id}" for store in stores),
-    ]
+    components = [*(f"ifg:{store.write_id}" for store in stores)]
+    for store in stores:
+        if store.has_unwrapped():
+            components.append(f"unwrap:{store.unwrap_product().write_id}")
+        if store.has_unwrap_ion():
+            components.append(f"unwrap_ion:{store.unwrap_ion_product().write_id}")
     return hashlib.sha256("|".join(sorted(components)).encode("utf-8")).hexdigest()
 
 

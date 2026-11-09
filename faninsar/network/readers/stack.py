@@ -60,6 +60,8 @@ _SHORT_ASSET_NAMES = {
 #: Layers derived at read time from a complex asset; no file exists for them.
 _VIRTUAL_ASSETS = ("wrapped_phase", "amplitude", "wrapped_ion", "amplitude_ion")
 _ION_VIRTUAL_ASSETS = ("wrapped_ion", "amplitude_ion")
+#: Optional corrected assets omitted from item() when the sibling is absent.
+_OPTIONAL_ION_ASSETS = frozenset({"complex_ion", "unwrapped_ion", *_ION_VIRTUAL_ASSETS})
 
 
 def _canonical_asset_name(name: str) -> str:
@@ -1013,9 +1015,13 @@ class StackInterferogramCollection(InterferogramCollection):
     def item(self, pair: str) -> dict[str, Any]:
         """Return an item-like record for one Stack Pair.
 
-        Assets enumerate real payloads only: virtual derived layers are
-        omitted rather than given a fabricated href.
+        Assets enumerate real payloads only: virtual derived layers and
+        absent optional ion siblings are omitted rather than given a
+        fabricated href. Explicit ``path``/``open`` of a named corrected
+        layer still raises. Original IFG corruption is not swallowed.
         """
+        from faninsar.processing.errors import InvalidProcessingStateError
+
         if str(pair) not in self.pairs.to_names().tolist():
             raise KeyError(pair)
         assets: dict[str, Any] = {}
@@ -1024,6 +1030,10 @@ class StackInterferogramCollection(InterferogramCollection):
                 assets[name] = {"href": str(self.path(str(pair), name))}
             except FileNotFoundError:
                 continue
+            except InvalidProcessingStateError:
+                if name in _OPTIONAL_ION_ASSETS:
+                    continue
+                raise
         return {
             "id": str(pair),
             "pair": str(pair),
