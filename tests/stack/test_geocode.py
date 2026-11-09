@@ -702,15 +702,15 @@ def test_alternate_grid_and_layer_outputs_do_not_replace_each_other(
     assert open_product(store.root).write_id == store.write_id
 
 
-def test_unwrapped_support_and_labels_follow_the_source(stack: Stack) -> None:
-    """Finite phase in excluded components must never become valid output."""
+def test_unwrapped_support_follows_persisted_valid_mask(stack: Stack) -> None:
+    """Geocode support is the stored valid_mask, not phase or component labels."""
     from faninsar.io.storage.ifg_store import write_unwrapped_artifact
 
     store = _write_ifg(stack)
     write_unwrapped_artifact(
         store.root,
         unwrapped_phase=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
-        connected_components=np.zeros(RADAR_SHAPE, dtype=np.uint32),
+        connected_components=np.full(RADAR_SHAPE, 5, dtype=np.int32),
         method="test",
         method_parameters={},
         ifg_manifest_digest=store.write_id,
@@ -723,8 +723,30 @@ def test_unwrapped_support_and_labels_follow_the_source(stack: Stack) -> None:
     labels = stack.geocode(
         stack.interferograms["20240101_20240113"].connected_components
     )
-    assert labels.values.dtype == np.uint32
+    assert labels.values.dtype == np.int32
     assert not labels.valid.any()
+
+
+def test_unwrapped_valid_mask_true_geocodes_regardless_of_labels(
+    stack: Stack,
+) -> None:
+    """A True valid_mask pixel geocodes even when the component label is -1."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
+        connected_components=np.full(RADAR_SHAPE, -1, dtype=np.int32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+        extra_layers={"valid_mask": np.ones(RADAR_SHAPE, dtype=bool)},
+    )
+    unwrapped = stack.interferograms["20240101_20240113"].unwrapped_phase
+    raster = stack.geocode(unwrapped)
+    assert raster.valid.any()
+    np.testing.assert_allclose(raster.values[raster.valid], 9.0, atol=1e-5)
 
 
 def test_layer_values_are_detached_from_committed_provenance(stack: Stack) -> None:

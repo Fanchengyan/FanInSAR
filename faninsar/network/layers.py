@@ -1051,12 +1051,14 @@ class ProductLayer:
 
     @property
     def valid_mask(self) -> np.ndarray | None:
-        """Read authoritative support, including excluded unwrap components.
+        """Read the persisted finite/invalid support mask.
 
         Scene layers prefer persisted ``{tag}.valid`` assets; otherwise they
-        compute support from the mosaic. Persisted ``valid_mask`` assets on IFG
-        and unwrap products are read through the usual branch. Validity is
-        not inferred from amplitude, so a supported ``0j`` sample stays valid.
+        compute support from the mosaic. IFG and unwrap products read the
+        stored ``valid_mask`` asset. Support is never inferred from sample
+        values (phase, amplitude, or connected-component labels); a supported
+        ``0j`` or label-``0`` sample stays valid, and an unsupported pixel
+        stays invalid even if a label is non-negative.
         """
         self.validate_source()
         return self._support_mask()
@@ -1074,12 +1076,6 @@ class ProductLayer:
             mask = self._read("valid_mask", window=local)
             if mask.dtype != np.bool_:
                 reject_invalid_state("layer valid_mask must have boolean dtype")
-        if self._product.kind == "unwrap":
-            components = self._read("connected_components", window=local)
-            if components.dtype.kind not in "iu":
-                reject_invalid_state("connected components must have integer dtype")
-            supported = components > 0
-            mask = supported if mask is None else mask & supported
         return mask
 
     def _candidate_window(self) -> Window:
