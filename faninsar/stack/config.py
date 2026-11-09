@@ -16,6 +16,7 @@ from faninsar.processing.runtime.resources import ResourceBudget
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
+    from faninsar.data.query.points import Points
     from faninsar.missions.protocols import BurstSelection, CoregistrationGrid
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.mosaicking.grid import GeoGridSpec
@@ -49,7 +50,10 @@ class StackConfig:
     ``nlooks_divisor`` is an inheritance sentinel: ``None`` means the
     concrete Stack class default is installed at construction. The live
     ``stack.config.nlooks_divisor`` is always a finite number greater
-    than zero. ``record_scientific_lineage`` (default ``False``) records
+    than zero. ``ref_points`` and ``ref_policy`` are the persisted
+    geographic reference-point defaults used by inversion and plotting;
+    they are not part of coregistration or IFG generation identity.
+    ``record_scientific_lineage`` (default ``False``) records
     lightweight operation, parameter, and phase-state metadata when
     enabled. It does not hash scientific array payloads or bind products
     to content checksums. See :doc:`/user_guide/scientific_lineage`.
@@ -63,6 +67,8 @@ class StackConfig:
     ampcor_snr_threshold: float = 6.0
     multilook: tuple[int, int] = (5, 2)
     nlooks_divisor: float | None = None
+    ref_points: Points | None = None
+    ref_policy: Literal["common", "per_image"] = "common"
     goldstein_alpha: float = 0.5
     executor: str = "torch"
     device: str = "auto"
@@ -145,6 +151,16 @@ class StackConfig:
                 message = "nlooks_divisor must be a finite number greater than zero"
                 reject(message, ValueError)
             self.nlooks_divisor = divisor
+        if not isinstance(self.ref_policy, str) or self.ref_policy not in {
+            "common",
+            "per_image",
+        }:
+            message = "ref_policy must be 'common' or 'per_image'"
+            reject(message, ValueError)
+        if self.ref_points is not None:
+            from faninsar.data.reference import normalize_stored_points
+
+            self.ref_points = normalize_stored_points(self.ref_points)
 
 
 def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:

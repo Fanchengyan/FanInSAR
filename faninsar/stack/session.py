@@ -1613,6 +1613,122 @@ class Stack(NetworkContract, ABC):
             return None
         return current
 
+    def set_ref_points(
+        self,
+        points: Points | None,
+        *,
+        policy: Literal["common", "per_image"] = "common",
+    ) -> None:
+        """Set or clear the geographic reference points used by inversion and plotting.
+
+        Calling with points alone always resets ``policy`` to ``"common"``.
+        ``points=None`` clears the stored points; the policy is still replaced
+        by this call. Both values are validated before the live config is
+        mutated. Persistence is one ``stack.json`` write; a failed save rolls
+        the in-memory settings back.
+
+        Parameters
+        ----------
+        points : Points or None
+            Geographic reference locations. CRS-less input is stored as WGS84
+            longitude, latitude. Projected CRS is kept as given and converted
+            to WGS84 only when sampling radar products. Empty or non-finite
+            coordinates are rejected. The input object is copied.
+        policy : {"common", "per_image"}, optional
+            Valid-point subset used when subtracting arithmetic means.
+            ``"common"`` (default, including when omitted) uses the nonempty
+            intersection across every image. ``"per_image"`` uses each image's
+            own nonempty subset. Subtracting a mean does not independently
+            align disconnected unwrap components.
+
+        Raises
+        ------
+        TypeError
+            If ``points`` is not ``None`` or :class:`~faninsar.data.query.Points`.
+        ValueError
+            If ``points`` is empty or non-finite, or ``policy`` is invalid.
+
+        Examples
+        --------
+        Set two WGS84 points and the default common subset::
+
+            from faninsar.data.query import Points
+
+            stack.set_ref_points(Points([[100.12, 31.45], [100.18, 31.50]]))
+
+        Switch to per-image subsets without changing the points::
+
+            stack.set_ref_points(stack.ref_points, policy="per_image")
+
+        Clear stored points (later invert/plot inherit nothing)::
+
+            stack.set_ref_points(None)
+
+        """
+        from faninsar.data.reference import copy_points, normalize_stored_points
+        from faninsar.stack.identity import save_stack_identity
+
+        if not isinstance(policy, str) or policy not in {"common", "per_image"}:
+            message = "ref_policy must be 'common' or 'per_image'"
+            reject(message, ValueError, logger=logger)
+        stored = None if points is None else normalize_stored_points(points)
+        previous_points = copy_points(self.config.ref_points)
+        previous_policy = self.config.ref_policy
+        self.config.ref_points = stored
+        self.config.ref_policy = policy
+        try:
+            save_stack_identity(self)
+        except Exception:
+            self.config.ref_points = previous_points
+            self.config.ref_policy = previous_policy
+            raise
+
+    @property
+    def ref_points(self) -> Points | None:
+        """Return a copy of the persisted reference points, or ``None``.
+
+        The returned object is independent of the saved configuration. Missing
+        fields on older workspaces behave as ``None``.
+        """
+        from faninsar.data.reference import copy_points
+
+        return copy_points(self.config.ref_points)
+
+    @property
+    def ref_policy(self) -> Literal["common", "per_image"]:
+        """Return the persisted reference-point subset policy.
+
+        Missing fields on older workspaces behave as ``"common"``.
+        """
+        policy = self.config.ref_policy
+        if policy not in {"common", "per_image"}:
+            return "common"
+        return policy
+
+    def map_reference_points_to_radar(
+        self,
+        points: Points,
+        *,
+        origin: tuple[int, int],
+        looks: tuple[int, int],
+        shape: tuple[int, int],
+        device: str | None = None,
+    ) -> object:
+        """Map geographic points onto a cropped, multilooked radar layer."""
+        from faninsar.data.reference import normalize_stored_points
+        from faninsar.stack.reference import map_radar_points
+
+        geometry, _grid_shape = self._reference_radar_geometry()
+        return map_radar_points(
+            normalize_stored_points(points),
+            geometry=geometry,
+            dem=self._geometry_dem(),
+            origin=origin,
+            looks=looks,
+            shape=shape,
+            device=str(self.config.device if device is None else device),
+        )
+
     @property
     def network(self) -> Network | None:
         """Return the Network view over this Stack's committed products.
@@ -5611,14 +5727,21 @@ class Stack(NetworkContract, ABC):
         phase: Literal["unwrapped", "unwrapped_ion"] = "unwrapped",
         pairs: Pairs | None = None,
         overwrite: bool = False,
+        ref_points: object = "inherit",
         **kwargs: Any,
     ) -> TimeSeries:
         """Invert the persisted unwrapped Pair network with SBAS.
+
+        Reference-point means are subtracted from copies of each pair before
+        the solver. Stored unwrap rasters are not modified. The arithmetic
+        mean does not independently align disconnected unwrap components.
 
         Parameters
         ----------
         pair_phases : dict[str, numpy.ndarray], optional
             In-memory Pair phases to invert directly; nothing is persisted.
+            Referencing still uses the resolved points when they are not
+            disabled.
         device : str, optional
             Solver device. Defaults to :attr:`StackConfig.invert_device`.
         multilook : tuple[int, int], optional
@@ -5630,7 +5753,13 @@ class Stack(NetworkContract, ABC):
             Pair subset to invert. Defaults to every planned Pair. The
             canonical time-series product always reflects the latest call.
         overwrite : bool, default=False
-            Replace an existing time-series product bound to other inputs.
+            Replace an existing time-series product bound to other inputs or
+            a different reference-point definition.
+        ref_points : Points, None, ``"inherit"``, or Parameter.INHERIT, optional
+            ``"inherit"`` (default) uses :meth:`set_ref_points` values.
+            ``None`` disables referencing for this call. Explicit
+            :class:`~faninsar.data.query.Points` override the locations and
+            keep the current Stack policy.
         **kwargs : Any
             Must be empty. The retired ``ionosphere_corrected`` flag raises
             ``TypeError``.
@@ -5639,16 +5768,25 @@ class Stack(NetworkContract, ABC):
         -------
         TimeSeries
             The result, committed as ``work_dir/timeseries`` whose Item
-            records the ``write_id`` of every consumed unwrap product.
+            records the ``write_id`` of every consumed unwrap product. Applied
+            reference provenance is stored in ``result.metadata["reference"]``.
 
         Raises
         ------
         InvalidProcessingStateError
             If a planned Pair has no current (or corrected) unwrap, or the
-            existing time-series product is bound to other inputs and
-            ``overwrite`` is false.
+            existing time-series product is bound to other inputs or a
+            different reference definition and ``overwrite`` is false.
+        ValueError
+            If requested reference points cannot be sampled.
 
         """
+        from faninsar.data.reference import (
+            definitions_match,
+            reference_definition,
+            resolve_ref_points_argument,
+            stored_definition_from_record,
+        )
         from faninsar.timeseries.io import read_timeseries, write_timeseries_product
         from faninsar.timeseries.results import SpatialMetadata, invert_unwrapped_pairs
 
@@ -5666,8 +5804,27 @@ class Stack(NetworkContract, ABC):
         if phase not in {"unwrapped", "unwrapped_ion"}:
             reject_invalid_state("phase must be 'unwrapped' or 'unwrapped_ion'")
         solver_device = device or self.config.invert_device
+        resolved_points, resolved_policy = resolve_ref_points_argument(
+            ref_points,
+            self.ref_points,
+            self.ref_policy,
+        )
+        requested_definition = reference_definition(resolved_points, resolved_policy)
         if pair_phases is not None:
-            self.timeseries = invert_unwrapped_pairs(pair_phases, device=solver_device)
+            phases = pair_phases
+            record = None
+            if resolved_points is not None:
+                phases, record = self._apply_reference_points(
+                    pair_phases,
+                    points=resolved_points,
+                    policy=resolved_policy,
+                )
+            result = invert_unwrapped_pairs(phases, device=solver_device)
+            if record is not None:
+                metadata = dict(result.metadata)
+                metadata["reference"] = record
+                result = replace(result, metadata=metadata)
+            self.timeseries = result
             return self.timeseries
         looks = multilook or self.config.multilook
         stores = self._pair_artifact_stores(looks=looks)
@@ -5683,27 +5840,53 @@ class Stack(NetworkContract, ABC):
         complete_network = pairs is None
         if complete_network and (target / "item.json").is_file() and not overwrite:
             existing = open_product(target)
+            existing_meta = existing.properties.get("faninsar:metadata")
+            stored_record = (
+                existing_meta.get("reference")
+                if isinstance(existing_meta, dict)
+                else None
+            )
             if (
                 existing.inputs == inputs
                 and existing.properties.get("faninsar:phase_source") == phase_source
+                and definitions_match(
+                    stored_definition_from_record(stored_record),
+                    requested_definition,
+                )
             ):
                 self.timeseries = read_timeseries(target)
                 return self.timeseries
             reject_invalid_state(
-                "the time-series product is bound to other unwrap products; "
-                "pass overwrite=True to recompute it"
+                "the time-series product is bound to other unwrap products or a "
+                "different reference-point definition; pass overwrite=True to "
+                "recompute it"
             )
         wavelengths = {store.wavelength_m for store in stores}
         if len(wavelengths) != 1:
             reject_invalid_state("Stack IFG products use mixed wavelengths")
+        raw_phases = {
+            pair_id: source.read("unwrapped_phase")
+            for pair_id, source in sources.items()
+        }
+        phases = raw_phases
+        record = None
+        if resolved_points is not None:
+            phases, record = self._apply_reference_points(
+                raw_phases,
+                points=resolved_points,
+                policy=resolved_policy,
+                stores=stores,
+                sources=sources,
+            )
         result = invert_unwrapped_pairs(
-            {
-                pair_id: source.read("unwrapped_phase")
-                for pair_id, source in sources.items()
-            },
+            phases,
             device=solver_device,
             wavelength_m=next(iter(wavelengths)),
         )
+        if record is not None:
+            metadata = dict(result.metadata)
+            metadata["reference"] = record
+            result = replace(result, metadata=metadata)
         first = stores[0]
         result = replace(
             result,
@@ -5729,6 +5912,72 @@ class Stack(NetworkContract, ABC):
         if self._network_view is not None:
             self._network_view._timeseries = self.timeseries
         return self.timeseries
+
+    def _apply_reference_points(
+        self,
+        pair_phases: Mapping[str, np.ndarray],
+        *,
+        points: Points,
+        policy: str,
+        stores: Sequence[InterferogramArtifactStore] | None = None,
+        sources: Mapping[str, Product] | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Subtract reference means from copies of ``pair_phases``."""
+        from faninsar.stack.reference import (
+            grid_payload_from_store,
+            map_points_for_store,
+            map_radar_points,
+            reference_phase_arrays,
+            support_mask_from_product,
+        )
+
+        shape = next(iter(pair_phases.values())).shape
+        if stores is None:
+            try:
+                candidate = self._pair_artifact_stores(looks=self.config.multilook)
+            except InvalidProcessingStateError:
+                candidate = None
+            if candidate and candidate[0].shape == shape:
+                stores = candidate
+        if stores:
+            mapping = map_points_for_store(self, points, stores[0])
+            grid = grid_payload_from_store(stores[0])
+        else:
+            geometry, _grid_shape = self._reference_radar_geometry()
+            looks = tuple(self.config.multilook)
+            mapping = map_radar_points(
+                points,
+                geometry=geometry,
+                dem=self._geometry_dem(),
+                origin=(0, 0),
+                looks=looks,
+                shape=shape,
+                device=str(self.config.device),
+            )
+            grid = {
+                "domain": "radar",
+                "shape": [int(shape[0]), int(shape[1])],
+                "looks": [int(looks[0]), int(looks[1])],
+                "origin": [0, 0],
+                "crs": None,
+                "transform": None,
+                "grid_identity": None,
+            }
+        support_masks: dict[str, np.ndarray | None]
+        if sources is None:
+            support_masks = dict.fromkeys(pair_phases)
+        else:
+            support_masks = {
+                key: support_mask_from_product(sources[key]) for key in pair_phases
+            }
+        return reference_phase_arrays(
+            pair_phases,
+            mapping=mapping,
+            support_masks=support_masks,
+            points=points,
+            policy=policy,
+            grid=grid,
+        )
 
     def analyze_time_series(
         self,

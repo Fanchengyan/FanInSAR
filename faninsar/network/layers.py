@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 from faninsar.io.storage.product import Product, open_product
-from faninsar.logging import setup_logger
+from faninsar.logging import reject, setup_logger
 from faninsar.network.products import ASSET_KIND_GEOCODE_KERNELS, AssetKind
 from faninsar.processing.errors import reject_invalid_state
 
@@ -55,6 +55,10 @@ _SCENE_GEOMETRY_ASSETS = (
     "incidence",
     "azimuth",
     "geom_flags",
+)
+
+_REFERENCE_SUBTRACT_KINDS = frozenset(
+    {AssetKind.UNWRAPPED_PHASE, AssetKind.DISPLACEMENT}
 )
 
 
@@ -224,6 +228,207 @@ def _crop_committed_layout(layout: Any, grid_window: Window) -> Any:
         seams=tuple(layout.seams),
         source_windows=tuple(sources),
     )
+
+
+def _layer_placement_properties(layer: ProductLayer) -> dict[str, Any]:
+    """Return IFG placement metadata, falling back to an upstream IFG product.
+
+    Unwrap siblings do not copy ``row_origin``/``look_origin``. Those fields
+    live on the parent IFG and combine as in
+    :func:`faninsar.io.storage.ifg_store.ifg_sample_placement`.
+    """
+    properties = dict(layer.source.properties)
+    if "faninsar:row_origin" in properties or "faninsar:look_origin" in properties:
+        return properties
+    for parent in layer._upstream:
+        parent_props = getattr(parent, "properties", None)
+        if isinstance(parent_props, dict) and (
+            "faninsar:row_origin" in parent_props
+            or "faninsar:look_origin" in parent_props
+        ):
+            return dict(parent_props)
+    return properties
+
+
+def _layer_native_origin(layer: ProductLayer) -> tuple[int, int]:
+    """Return the native index of layer pixel ``(0, 0)``'s first sample."""
+    properties = _layer_placement_properties(layer)
+    looks = tuple(layer.multilook)
+    raw_looks = properties.get("faninsar:looks")
+    if isinstance(raw_looks, (list, tuple)) and len(raw_looks) == 2:
+        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    raw_look_origin = properties.get("faninsar:look_origin", (0, 0))
+    look_origin = (int(raw_look_origin[0]), int(raw_look_origin[1]))
+    row_origin = int(properties.get("faninsar:row_origin", layer.origin[0]))
+    col_origin = int(properties.get("faninsar:col_origin", layer.origin[1]))
+    return (
+        row_origin + look_origin[0] * looks[0],
+        col_origin + look_origin[1] * looks[1],
+    )
+
+
+def _resolve_plot_ref_points(
+    layer: ProductLayer, ref_points: object
+) -> tuple[object, str]:
+    """Resolve inherit / None / explicit points for one plot call."""
+    from faninsar.data.reference import is_inherit, resolve_ref_points_argument
+
+    session = layer._session
+    if is_inherit(ref_points) and session is None:
+        return None, "common"
+    inherited_points = (
+        getattr(session, "ref_points", None) if session is not None else None
+    )
+    inherited_policy = (
+        getattr(session, "ref_policy", "common") if session is not None else "common"
+    )
+    return resolve_ref_points_argument(ref_points, inherited_points, inherited_policy)
+
+
+def _map_layer_reference_points(
+    layer: ProductLayer, points: object
+) -> tuple[object, str]:
+    """Map points onto this layer's scientific grid."""
+    from faninsar.data.query.points import Points
+    from faninsar.data.reference import map_geographic_points
+
+    if not isinstance(points, Points):
+        message = "ref_points must be a faninsar.data.query.Points instance"
+        reject(message, TypeError, logger=logger)
+    properties = layer.source.properties
+    domain = properties.get("faninsar:domain")
+    if domain is None:
+        domain = "geo" if layer.crs is not None else "radar"
+    if domain == "geo":
+        transform = properties.get("proj:transform")
+        if transform is None:
+            message = "geographic reference-point mapping requires a layer transform"
+            reject(message, ValueError, logger=logger)
+        return (
+            map_geographic_points(
+                points,
+                transform=transform,
+                shape=layer.shape,
+                crs=layer.crs or properties.get("proj:code"),
+            ),
+            "geo",
+        )
+    mapper = getattr(layer._session, "map_reference_points_to_radar", None)
+    if layer._session is None or mapper is None:
+        message = (
+            "radar reference-point mapping requires geometry context; "
+            "use a Stack-bound layer or pass geographic points on a "
+            "geographic layer"
+        )
+        reject(message, ValueError, logger=logger)
+    looks = tuple(layer.multilook)
+    raw_looks = properties.get("faninsar:looks")
+    if isinstance(raw_looks, (list, tuple)) and len(raw_looks) == 2:
+        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    return (
+        mapper(
+            points,
+            origin=_layer_native_origin(layer),
+            looks=looks,
+            shape=layer.shape,
+        ),
+        "radar",
+    )
+
+
+def _reference_display_xy(
+    layer: ProductLayer,
+    points: object,
+    mapping: object,
+    domain: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return marker coordinates in the plotted extent's coordinate system."""
+    if domain == "geo":
+        from faninsar.data.reference import coordinates_in_crs
+
+        crs = layer.crs or layer.source.properties.get("proj:code")
+        if crs is not None and getattr(points, "crs", None) is not None:
+            return coordinates_in_crs(points, crs)
+        return (
+            np.asarray(points.x, dtype=np.float64),
+            np.asarray(points.y, dtype=np.float64),
+        )
+    return (
+        np.asarray(mapping.col_frac, dtype=np.float64),
+        np.asarray(mapping.row_frac, dtype=np.float64),
+    )
+
+
+def _apply_plot_reference(
+    layer: ProductLayer,
+    display_values: np.ndarray,
+    ref_points: object,
+    *,
+    subtract: bool,
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
+    """Subtract a reference mean from a display copy of the full layer."""
+    from faninsar.data.reference import (
+        mean_offsets,
+        sample_at_pixels,
+        select_valid_subsets,
+        subtract_offsets,
+    )
+
+    points, policy = _resolve_plot_ref_points(layer, ref_points)
+    if points is None:
+        return display_values, None
+    mapping, domain = _map_layer_reference_points(layer, points)
+    raw = np.asarray(layer.read())
+    if np.iscomplexobj(raw):
+        raw = np.asarray(raw.real)
+    sampled = sample_at_pixels(raw, mapping, layer._support_mask())
+    valid = np.isfinite(sampled)
+    xs, ys = _reference_display_xy(layer, points, mapping, domain)
+    markers = (xs, ys, valid)
+    if not subtract:
+        return display_values, markers
+    selected = select_valid_subsets({"layer": valid}, policy)
+    offsets = mean_offsets({"layer": sampled}, selected)
+    referenced = subtract_offsets({"layer": display_values}, offsets)
+    return referenced["layer"], markers
+
+
+def _scatter_reference_markers(
+    ax: Any,
+    markers: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    extent: tuple[float, float, float, float],
+) -> None:
+    """Draw requested points that fall inside the displayed extent."""
+    if markers is None:
+        return
+    xs, ys, valid = markers
+    left, right, bottom, top = extent
+    x_lo, x_hi = (left, right) if left <= right else (right, left)
+    y_lo, y_hi = (bottom, top) if bottom <= top else (top, bottom)
+    inside = (xs >= x_lo) & (xs <= x_hi) & (ys >= y_lo) & (ys <= y_hi)
+    shown_valid = valid & inside
+    shown_invalid = (~valid) & inside
+    if np.any(shown_valid):
+        ax.scatter(
+            xs[shown_valid],
+            ys[shown_valid],
+            marker="+",
+            c="k",
+            s=40,
+            zorder=5,
+        )
+    if np.any(shown_invalid):
+        ax.scatter(
+            xs[shown_invalid],
+            ys[shown_invalid],
+            marker="x",
+            c="0.5",
+            s=30,
+            zorder=5,
+        )
+    n_outside = int(np.count_nonzero(~inside))
+    if n_outside:
+        logger.info("%s reference points lie outside the displayed extent", n_outside)
 
 
 def _shift_affine(
@@ -1206,6 +1411,7 @@ class ProductLayer:
         title: str | None = None,
         hist_colorbar: bool = True,
         crop: bool = True,
+        ref_points: object = "inherit",
         **imshow_kwargs: Any,
     ) -> tuple[Any, Any, Any]:
         """Plot this layer with colormap and limits chosen from its asset kind.
@@ -1218,6 +1424,18 @@ class ProductLayer:
         ``wrapped_phase`` and ``amplitude`` layers. Any default can be overridden
         per call.
 
+        ``ref_points="inherit"`` uses the parent Stack defaults when this
+        layer carries a session. Inherit without a session is a no-op.
+        ``None`` disables markers and display referencing. Explicit
+        :class:`~faninsar.data.query.Points` override locations and keep the
+        Stack policy, or ``"common"`` when there is no Stack. Unwrapped phase
+        and displacement subtract the valid-point arithmetic mean from a
+        temporary copy before automatic ``vmin``/``vmax``; wrapped phase,
+        coherence, labels, and amplitude only overlay markers. Sampling uses
+        the full scientific layer even when ``crop`` or ``masked`` changes
+        the displayed buffer. Layer ``read`` results are not modified.
+        Subtracting a mean does not independently align unwrap components.
+
         Parameters
         ----------
         ax : matplotlib.axes.Axes, optional
@@ -1228,11 +1446,13 @@ class ProductLayer:
             Colormap name overriding the kind default.
         vmin, vmax : float, optional
             Data limits overriding the kind default. For a complex layer the
-            same limits apply to both panels.
+            same limits apply to both panels. Automatic limits for unwrapped
+            phase and displacement are computed after reference subtraction.
         colorbar : bool, optional
             Add a colorbar. Default True.
         masked : bool, optional
             Mask pixels outside :attr:`valid_mask` to NaN. Default True.
+            Reference-point validity always consults the support mask.
         figsize : tuple[float, float], optional
             Figure size when creating a new figure.
         title : str, optional
@@ -1247,7 +1467,13 @@ class ProductLayer:
             or footprint candidate window (default True for Polygon layers).
             ``crop=False`` keeps the original scientific view extent. Empty
             support reports no data rather than a fabricated zero image.
-            Interior holes and disjoint distances are preserved.
+            Interior holes and disjoint distances are preserved. Reference
+            offsets do not change with crop.
+        ref_points : Points, None, ``"inherit"``, or Parameter.INHERIT, optional
+            Inherited Stack points, an explicit override, or ``None`` to
+            disable. Standalone geographic layers may resolve explicit
+            geographic points without a Stack; standalone radar layers
+            need geometry context.
         **imshow_kwargs
             Forwarded to :meth:`matplotlib.axes.Axes.imshow`.
 
@@ -1286,6 +1512,8 @@ class ProductLayer:
                 title=title,
                 hist_colorbar=hist_colorbar,
                 window=read_window,
+                plot_window=plot_window,
+                ref_points=ref_points,
                 **imshow_kwargs,
             )
 
@@ -1295,6 +1523,10 @@ class ProductLayer:
             mask = self._support_mask(window=read_window)
             if mask is not None:
                 values = np.where(mask, values, np.nan)
+        subtract = self.asset_kind in _REFERENCE_SUBTRACT_KINDS
+        values, markers = _apply_plot_reference(
+            self, values, ref_points, subtract=subtract
+        )
 
         kind = self.asset_kind
         if cmap is None:
@@ -1324,15 +1556,17 @@ class ProductLayer:
             _, ax = plt.subplots(figsize=figsize)
             if title is None:
                 title = self.name
+        extent = self._imshow_extent(plot_window)
         im = ax.imshow(
             values,
             cmap=cmap,
             vmin=vmin,
             vmax=vmax,
-            extent=self._imshow_extent(plot_window),
+            extent=extent,
             **imshow_kwargs,
         )
         ax.set_title(title if title is not None else "")
+        _scatter_reference_markers(ax, markers, extent)
         if colorbar:
             self._add_colorbar(
                 ax.figure,
@@ -1356,6 +1590,8 @@ class ProductLayer:
         title: str | None,
         hist_colorbar: bool,
         window: Window | None = None,
+        plot_window: Window | None = None,
+        ref_points: object = "inherit",
         **imshow_kwargs: Any,
     ) -> tuple[Any, tuple[Any, Any], tuple[Any, Any]]:
         """Render a complex layer as side-by-side in-phase/quadrature panels."""
@@ -1363,6 +1599,9 @@ class ProductLayer:
 
         values = np.asarray(self.read(window=window), dtype=np.complex64)
         mask = self._support_mask(window=window) if masked else None
+        _, markers = _apply_plot_reference(
+            self, np.asarray(values.real), ref_points, subtract=False
+        )
 
         if cmap is None:
             cmap = "gray"
@@ -1386,7 +1625,11 @@ class ProductLayer:
             sharey=True,
             squeeze=False,
         )
-        extent = self._imshow_extent(window if window is not None else self._grid_box())
+        extent = self._imshow_extent(
+            plot_window
+            if plot_window is not None
+            else (window if window is not None else self._grid_box())
+        )
         ims = []
         for axis, component, suffix in (
             (axes[0, 0], values.real, "I"),
@@ -1399,6 +1642,7 @@ class ProductLayer:
                 data, cmap=cmap, vmin=vmin, vmax=vmax, extent=extent, **imshow_kwargs
             )
             axis.set_title(f"{base} ({suffix})")
+            _scatter_reference_markers(axis, markers, extent)
             ims.append(im)
             if colorbar:
                 self._add_colorbar(fig, axis, im, data, hist=hist_colorbar)

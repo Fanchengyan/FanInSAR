@@ -233,6 +233,8 @@ def request_document(stack: Stack) -> dict[str, Any]:
     snapshot = replace(
         stack._request_config,
         nlooks_divisor=stack.config.nlooks_divisor,
+        ref_points=stack.config.ref_points,
+        ref_policy=stack.config.ref_policy,
     )
     science = {
         item.name: encode_value(getattr(snapshot, item.name))
@@ -424,6 +426,8 @@ def _prepare_stack_data(
         candidate.config = replace(
             stack._request_config,
             nlooks_divisor=stack.config.nlooks_divisor,
+            ref_points=stack.config.ref_points,
+            ref_policy=stack.config.ref_policy,
             extra=thaw(freeze(stack._request_config.extra)),
         )
         candidate.config.extra.update(thaw(inputs.extra))

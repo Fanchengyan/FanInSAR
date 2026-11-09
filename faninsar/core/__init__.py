@@ -16,6 +16,7 @@ from faninsar.core.constants import SAR, Frequency, Wavelength
 from faninsar.core.dates import DateManager, DaySpan
 from faninsar.core.loops import Loop, Loops, TripletLoop, TripletLoops
 from faninsar.core.pair import Pair, Pairs, PairsFactory
+from faninsar.core.parameters import Parameter
 from faninsar.core.physical import (
     PHYSICAL_TYPE_MEMBERS,
     SEQ_TRANSITIONS,
@@ -41,6 +42,7 @@ __all__ = [
     "Pair",
     "Pairs",
     "PairsFactory",
+    "Parameter",
     "PhaseDeformationConverter",
     "PhysicalType",
     "Sentinel1",

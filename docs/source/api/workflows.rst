@@ -41,6 +41,26 @@ persisted elsewhere:
 constructor. ``Interferogram`` is available from ``faninsar.network`` and
 ``TimeSeries`` from ``faninsar.timeseries``.
 
+Reference points
+----------------
+
+Configure geographic reference points once on the Stack. SBAS subtracts each
+pair's valid-point arithmetic mean from a copy before inversion; plots of
+unwrapped phase and displacement do the same for display. Original rasters are
+unchanged. The mean does not independently align unwrap components.
+
+::
+
+   from faninsar.data.query import Points
+
+   stack.set_ref_points(Points([[100.12, 31.45], [100.18, 31.50]]))
+   time_series = stack.invert_timeseries()
+   stack.interferograms["20240101_20240113"].unwrapped_phase.plot()
+
+   stack.set_ref_points(None)
+
+See :doc:`/user_guide/reference_points`.
+
 API
 ---
 

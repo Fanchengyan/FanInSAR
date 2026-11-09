@@ -85,7 +85,9 @@ TRACK_OWNED_SCIENCE_FIELDS = frozenset({"multilook"})
 # comparison. Changing these must not reject a workspace whose
 # ``inputs/request.json`` predates the field, or invalidate source
 # readiness after a live config mutation.
-PREPARATION_EXCLUDED_SCIENCE_FIELDS = frozenset({"nlooks_divisor"})
+PREPARATION_EXCLUDED_SCIENCE_FIELDS = frozenset(
+    {"nlooks_divisor", "ref_points", "ref_policy"}
+)
 
 SAVED_EXTRA_KEYS = frozenset(
     {
@@ -162,6 +164,7 @@ def encode_value(value: Any, *, identity_dir: Path | None = None) -> object:
 def _encode_geometry_or_dem(value: Any, *, identity_dir: Path | None = None) -> object:
     """Encode an ROI geometry, a mask plan, a grid, or a DEM recipe."""
     from faninsar.data.query.bbox import BoundingBox
+    from faninsar.data.query.points import Points
     from faninsar.processing.geometry.api import (
         ConstantDEM,
         RasterDEM,
@@ -170,12 +173,22 @@ def _encode_geometry_or_dem(value: Any, *, identity_dir: Path | None = None) -> 
     from faninsar.processing.geometry.grids import GridSpec
     from faninsar.stack.mask_plan import MaskPlan
 
-    if isinstance(value, BoundingBox):
-        from pyproj import CRS
+    if isinstance(value, (Points, BoundingBox)):
+        if isinstance(value, Points):
+            from faninsar.data.reference import encode_points_payload
 
-        bounds = [value.left, value.bottom, value.right, value.top]
-        crs = None if value.crs is None else CRS.from_user_input(value.crs).to_string()
-        return {"faninsar:bbox": {"bounds": bounds, "crs": crs}}
+            encoded: object = {"faninsar:points": encode_points_payload(value)}
+        else:
+            from pyproj import CRS
+
+            bounds = [value.left, value.bottom, value.right, value.top]
+            crs = (
+                None
+                if value.crs is None
+                else CRS.from_user_input(value.crs).to_string()
+            )
+            encoded = {"faninsar:bbox": {"bounds": bounds, "crs": crs}}
+        return encoded
     if isinstance(value, GridSpec):
         return {
             "faninsar:grid": {
@@ -312,8 +325,14 @@ def _decode_typed(value: Mapping[str, object]) -> Any:
 
         return MaskPlan.from_mapping(value["faninsar:mask_plan"])
     if "faninsar:dem" in value:
-        return _decode_dem(value["faninsar:dem"])
-    return _UNTYPED
+        decoded: Any = _decode_dem(value["faninsar:dem"])
+    elif "faninsar:points" in value:
+        from faninsar.data.reference import decode_points_payload
+
+        decoded = decode_points_payload(value["faninsar:points"])
+    else:
+        decoded = _UNTYPED
+    return decoded
 
 
 def _decode_polygons(payload: Mapping[str, object]) -> Any:
