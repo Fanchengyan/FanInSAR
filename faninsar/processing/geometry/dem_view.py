@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 import numpy as np
 from affine import Affine
@@ -33,8 +34,8 @@ _NATIVE_SPACING_DEG = {
     "srtm-skadi": _GLO30_SPACING_DEG,
     "glo90": _GLO90_SPACING_DEG,
 }
-_VIEW_TABLE: dict[str, LonLatDEMView] = {}
-_VIEW_TABLE_LIMIT = 8
+_VIEW_TABLE: WeakKeyDictionary[object, LonLatDEMView] = WeakKeyDictionary()
+_NONE_VIEW_OWNER = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,8 +165,15 @@ def geodetic_crop_grid(
     )
 
 
+def _view_owner(dem: DEM | None) -> object:
+    """Return the live object that owns one execution view."""
+    if dem is not None:
+        return dem
+    return _NONE_VIEW_OWNER
+
+
 def lonlat_dem_view(dem: DEM | None) -> LonLatDEMView:
-    """Return the cached lon/lat execution view for ``dem``.
+    """Return the owner-scoped lon/lat execution view for ``dem``.
 
     Parameters
     ----------
@@ -178,6 +186,7 @@ def lonlat_dem_view(dem: DEM | None) -> LonLatDEMView:
         Kernel-facing geographic raster.  Projected public rasters are
         sampled at lon/lat centres; cells outside the projected footprint
         are filled with 0 m so native kernels keep a finite bucket.
+        Independent DEM objects with equal bounds do not share this view.
 
     Raises
     ------
@@ -189,39 +198,29 @@ def lonlat_dem_view(dem: DEM | None) -> LonLatDEMView:
     """
     from faninsar.processing.geometry.api import ConstantDEM, RasterDEM
 
-    sampler = ConstantDEM(0.0) if dem is None else dem
-    key = _view_key(sampler)
-    cached = _VIEW_TABLE.get(key)
+    owner = _view_owner(dem)
+    cached = _VIEW_TABLE.get(owner)
     if cached is not None:
         return cached
-    if isinstance(sampler, ConstantDEM):
-        view = _constant_view(float(sampler.height))
-    elif isinstance(sampler, RasterDEM):
-        view = _raster_view(sampler)
+    if isinstance(owner, ConstantDEM):
+        view = _constant_view(float(owner.height))
+    elif isinstance(owner, RasterDEM):
+        view = _raster_view(owner)
     else:
-        message = f"unsupported DEM type for rdr2geo: {type(sampler).__name__}"
+        message = f"unsupported DEM type for rdr2geo: {type(owner).__name__}"
         reject(message, TypeError)
-    if len(_VIEW_TABLE) >= _VIEW_TABLE_LIMIT:
-        oldest = next(iter(_VIEW_TABLE))
-        _VIEW_TABLE.pop(oldest, None)
-    _VIEW_TABLE[key] = view
+    _VIEW_TABLE[owner] = view
     return view
+
+
+def drop_lonlat_dem_view(dem: DEM | None) -> None:
+    """Drop the execution view owned by ``dem`` after a managed replacement."""
+    _VIEW_TABLE.pop(_view_owner(dem), None)
 
 
 def clear_lonlat_dem_views() -> None:
     """Drop cached execution views.  Intended for tests."""
     _VIEW_TABLE.clear()
-
-
-def _view_key(dem: object) -> str:
-    """Return a stable cache key for one public DEM."""
-    identity = getattr(dem, "identity", None)
-    if isinstance(identity, str) and identity:
-        return identity
-    kind = type(dem).__name__
-    height = getattr(dem, "height", 0.0)
-    datum = getattr(dem, "vertical_datum", "ellipsoidal")
-    return f"{kind}:{height}:{datum}"
 
 
 def _geodetic_bounds(

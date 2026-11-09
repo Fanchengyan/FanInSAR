@@ -1543,8 +1543,9 @@ class Stack(NetworkContract, ABC):
     def dem(self) -> RasterDEM | object | None:
         """Return the live DEM after preparation.
 
-        A source recipe stays private until it is materialized onto the Stack
-        grid. Constant and raster DEMs are returned as given.
+        The default managed raster is geographic (EPSG:4326, ellipsoidal) and
+        independent of the Stack output grid. A source recipe stays private
+        until it is materialized. Constant DEMs are returned as given.
         """
         current = self.config.dem
         if current is None or isinstance(current, SourceDEM):
@@ -1764,26 +1765,26 @@ class Stack(NetworkContract, ABC):
         return unary_union(sorted(geometries, key=lambda geometry: geometry.wkb))
 
     def materialize_dem(self, dem: DEM | None = None) -> RasterDEM:
-        """Materialize one DEM directly on the authoritative Stack grid.
+        """Materialize the canonical WGS84 ellipsoidal workspace DEM.
 
-        The source recipe remains inert until this method is called.  Stack
-        supplies its work-directory cache when a source recipe needs it.
+        The source recipe remains inert until this method is called.  The
+        raster is stored at ``work_dir/dem.tif`` on a source-native geographic
+        grid, not on :attr:`grid`.  Stack supplies its work-directory cache
+        when a source recipe needs it.
         """
         from faninsar.processing.geometry import api as dem_api
 
         selected = dem or self.config.dem
         if selected is None:
             selected = dem_api.DEM.from_source("auto")
-        if isinstance(selected, dem_api.RasterDEM):
-            dem_api.ensure_dem_covers_grid(selected, self.grid)
-        cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
-        if hasattr(selected, "cache_dir") and selected.cache_dir is None:
-            selected.cache_dir = cache_dir  # type: ignore[attr-defined]
-        return selected.to_raster(
-            self.grid,
-            vertical_datum="ellipsoidal",
-            budget=self.config.resource_budget,
-        )
+        self._capture_dem_source(selected)
+        if isinstance(selected, dem_api.SourceDEM):
+            cache_dir = self.config.dem_cache_dir or (
+                self.config.work_dir / "dem-cache"
+            )
+            if selected.cache_dir is None:
+                selected.cache_dir = cache_dir
+        return self._resolve_managed_dem(selected)
 
     def geocode(
         self,
@@ -1992,7 +1993,20 @@ class Stack(NetworkContract, ABC):
         if support is not None and resolved_kind != "label":
             values[~support] = np.nan
         from faninsar.processing.geocoding import Geocoder
+        from faninsar.processing.geometry.dem_view import native_spacing_deg
+        from faninsar.processing.geometry.managed_dem import (
+            expand_bounds,
+            interpolation_margin_deg,
+            wgs84_bounds,
+        )
 
+        product = None if self._dem_source is None else self._dem_source.product
+        self._ensure_dem_covers_request(
+            expand_bounds(
+                wgs84_bounds(destination),
+                interpolation_margin_deg(native_spacing_deg(product)),
+            )
+        )
         engine = Geocoder(
             geometry,
             destination,
@@ -2069,18 +2083,8 @@ class Stack(NetworkContract, ABC):
         return self.config.roi is not None or self._selected_footprint_roi() is not None
 
     def _dem_artifact_root(self) -> Path:
-        """Resolve an immutable prepared artifact scope within the workspace."""
-        scope = self.config.extra.get("preparation_dem_scope")
-        if scope is None:
-            return self.config.work_dir
-        path = Path(str(scope))
-        if (
-            path.is_absolute()
-            or ".." in path.parts
-            or path.parts[:2] != ("inputs", "dem")
-        ):
-            reject_invalid_state("invalid prepared DEM artifact scope")
-        return self.config.work_dir / path
+        """Return the workspace root that owns the canonical ``dem.tif``."""
+        return self.config.work_dir
 
     def _stack_dem_raster_path(self) -> Path:
         """Return the durable raster path owned by this Stack.
@@ -2099,7 +2103,11 @@ class Stack(NetworkContract, ABC):
         return dem_sidecar_path(self._dem_artifact_root())
 
     def _stack_wgs84_raster_path(self) -> Path:
-        """Return the geographic DEM used by rdr2geo."""
+        """Return the legacy geographic sibling path if one already exists.
+
+        New workspaces do not create ``dem_wgs84.tif``. The canonical DEM is
+        :meth:`_stack_dem_raster_path`.
+        """
         from faninsar.stack.layout import dem_wgs84_path
 
         return dem_wgs84_path(self._dem_artifact_root())
@@ -2107,13 +2115,70 @@ class Stack(NetworkContract, ABC):
     def _geometry_dem(self) -> RasterDEM | object | None:
         """Return the DEM passed to radar geometry.
 
-        A native EPSG:4326 crop is preferred when Stack materialized one from
-        the source tiles.  Otherwise the public product raster is returned and
-        geometry backends build a private lon/lat view.
+        Acquisition, preparation, and geometry share the canonical managed
+        raster. A geographic ``_dem_wgs84`` alias, when present, is that same
+        object rather than a second persistent file.
         """
         if self._dem_wgs84 is not None:
             return self._dem_wgs84
         return self.config.dem
+
+    def _explicit_roi_bounds(self) -> tuple[float, float, float, float] | None:
+        """Return WGS84 bounds of an explicit ROI, if the user supplied one."""
+        roi = self.config.roi
+        if roi is None:
+            return None
+        bounds = getattr(roi, "bounds", None)
+        if bounds is None:
+            geometry = getattr(roi, "geometry", roi)
+            bounds = getattr(geometry, "bounds", None)
+        if bounds is None:
+            return None
+        try:
+            west, south, east, north = (float(value) for value in bounds)
+        except (TypeError, ValueError):
+            return None
+        if west >= east or south >= north:
+            return None
+        crs = getattr(roi, "crs", None)
+        if crs is not None:
+            from faninsar.processing.geometry.dem_view import is_geodetic_crs
+
+            if not is_geodetic_crs(crs):
+                from pyproj import Transformer
+
+                transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                longitudes, latitudes = transformer.transform(
+                    [west, east, west, east],
+                    [south, south, north, north],
+                )
+                west, east = min(longitudes), max(longitudes)
+                south, north = min(latitudes), max(latitudes)
+        return west, south, east, north
+
+    def _initial_dem_bounds(self) -> tuple[float, float, float, float] | None:
+        """Return an extent used only to create a missing managed DEM."""
+        explicit = self._explicit_roi_bounds()
+        if explicit is not None:
+            return explicit
+        grid = self.config.grid
+        from faninsar.processing.geometry.grids import GridSpec
+
+        if isinstance(grid, GridSpec):
+            from faninsar.processing.geometry.managed_dem import wgs84_bounds
+
+            return wgs84_bounds(grid)
+        return None
+
+    def _dem_cache_dir(self) -> Path:
+        """Return the source tile/geoid cache for this workspace."""
+        return self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
+
+    def _dem_scratch_dir(self) -> Path:
+        """Return workspace scratch used for atomic managed-DEM replacement."""
+        from faninsar.stack.layout import TMP_DIRNAME
+
+        return self.config.work_dir / TMP_DIRNAME
 
     def _source_record(self) -> dict[str, object] | None:
         """Return the serializable source recipe, if one was captured."""
@@ -2127,7 +2192,7 @@ class Stack(NetworkContract, ABC):
         }
 
     def _persist_raster_dem(self, raster: RasterDEM) -> Path:
-        """Write the live raster when this Stack owns a source recipe."""
+        """Write the sidecar for the canonical managed DEM."""
         path = self._stack_dem_raster_path()
         sidecar = self._stack_dem_sidecar_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2137,62 +2202,15 @@ class Stack(NetworkContract, ABC):
             "vertical_datum": raster.vertical_datum,
             "path": str(path),
         }
-        if path.exists():
-            try:
-                existing = json.loads(sidecar.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                existing = {}
-            if existing.get("identity") != raster.identity:
-                if getattr(self, "_preparation_preserve_artifacts", False):
-                    from faninsar.stack.preparation import InputUnavailableError
-
-                    message = (
-                        "candidate DEM conflicts with a durable artifact; "
-                        "retain prior data"
-                    )
-                    reject(message, InputUnavailableError, logger=logger)
-                path.unlink()
+        source_path = getattr(raster, "path", None)
         if not path.is_file():
             raster.save(path)
-        self._persist_wgs84_dem()
-        if self._dem_wgs84 is not None and self._dem_wgs84 is not raster:
-            record["wgs84_path"] = str(self._stack_wgs84_raster_path())
-            record["wgs84_identity"] = self._dem_wgs84.identity
+        elif source_path is None or Path(source_path).resolve() != path.resolve():
+            from faninsar.processing.geometry.managed_dem import _replace_managed_raster
+
+            raster = _replace_managed_raster(raster, path, self._dem_scratch_dir())
         sidecar.write_text(json.dumps(record, indent=2) + chr(10), encoding="utf-8")
         return path
-
-    def _persist_wgs84_dem(self) -> None:
-        """Write the geographic crop when it is distinct from the product DEM."""
-        wgs84 = self._dem_wgs84
-        if wgs84 is None or wgs84 is self.config.dem:
-            return
-        path = self._stack_wgs84_raster_path()
-        sidecar = self._stack_dem_sidecar_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = getattr(wgs84, "path", None)
-        if (
-            path.is_file()
-            and source_path is not None
-            and Path(source_path).resolve() == path.resolve()
-        ):
-            return
-        if path.exists():
-            try:
-                existing = json.loads(sidecar.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                existing = {}
-            if existing.get("wgs84_identity") == wgs84.identity and path.is_file():
-                return
-            if getattr(self, "_preparation_preserve_artifacts", False):
-                from faninsar.stack.preparation import InputUnavailableError
-
-                message = (
-                    "recovered coverage needs a new geographic DEM; "
-                    "prior artifact retained"
-                )
-                reject(message, InputUnavailableError, logger=logger)
-            path.unlink()
-        wgs84.save(path)
 
     def _load_persisted_raster_dem(self) -> RasterDEM | None:
         """Reload a previously materialized Stack raster, if it still matches."""
@@ -2213,160 +2231,150 @@ class Stack(NetworkContract, ABC):
         datum = recorded.get("vertical_datum") or "ellipsoidal"
         if not isinstance(datum, str):
             datum = "ellipsoidal"
-        return RasterDEM(path=path, vertical_datum=datum)
-
-    def _load_persisted_wgs84_dem(self) -> RasterDEM | None:
-        """Reload the geographic crop when the source recipe still matches.
-
-        Content identity is not compared.  RasterDEM identity includes
-        path provenance, so a saved crop never hashes to the in-memory
-        identity recorded at materialization.
-        """
-        path = self._stack_wgs84_raster_path()
-        sidecar = self._stack_dem_sidecar_path()
-        if not path.is_file():
-            return None
         try:
-            recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+            return RasterDEM(path=path, vertical_datum=datum)
         except (OSError, ValueError):
-            recorded = {}
-        source = self._source_record()
-        if source is not None and (
-            recorded.get("product") != source["product"]
-            or recorded.get("provider") != source["provider"]
-        ):
+            logger.warning("Persisted DEM %s is unreadable; rematerializing", path)
             return None
-        datum = recorded.get("vertical_datum") or "ellipsoidal"
-        if not isinstance(datum, str):
-            datum = "ellipsoidal"
-        raster = RasterDEM(path=path, vertical_datum=datum)
-        from faninsar.processing.geometry.dem_view import is_geodetic_crs
 
-        if not is_geodetic_crs(raster.crs):
-            logger.warning(
-                "Persisted geographic DEM %s is not lon/lat (crs=%s); ignoring",
-                path,
-                raster.crs,
-            )
-            return None
+    def _bind_live_dem(self, raster: RasterDEM) -> RasterDEM:
+        """Publish ``raster`` as the live managed DEM and drop stale views."""
+        from faninsar.processing.geometry.dem_view import is_geodetic_crs
+        from faninsar.processing.geometry.prepare_production import (
+            drop_prepared_dem_state,
+        )
+
+        previous = self.config.dem
+        if previous is not None and previous is not raster:
+            drop_prepared_dem_state(previous)
+        self.config.dem = raster
+        self._dem_wgs84 = raster if is_geodetic_crs(raster.crs) else None
+        drop_prepared_dem_state(raster)
         return raster
 
-    def _align_raster_dem(self, raster: RasterDEM) -> RasterDEM:
-        """Regrid a raster onto the Stack grid when one exists."""
-        if self.config.grid == "utm_ups" and not self._has_stack_extent():
-            self.config.dem = raster
-            return raster
-        from faninsar.processing.geometry import api as dem_api
+    def _resolve_managed_dem(self, selected: object | None = None) -> RasterDEM:
+        """Create, reuse, or grow the canonical ``work_dir/dem.tif`` raster."""
+        from faninsar.processing.geometry.api import RasterDEM as LiveRaster
+        from faninsar.processing.geometry.managed_dem import resolve_managed_wgs84_dem
 
-        if raster.grid != self.grid or raster.vertical_datum != "ellipsoidal":
-            dem_api.ensure_dem_covers_grid(raster, self.grid)
-            raster = raster.to_raster(
-                self.grid,
+        current = self.config.dem if selected is None else selected
+        self._capture_dem_source(current)
+        if type(current).__name__ == "ConstantDEM":
+            bounds = self._initial_dem_bounds()
+            if bounds is None:
+                message = "shared DEM has no usable extent"
+                reject(message, FileNotFoundError, logger=logger)
+            from faninsar.processing.geometry.dem_view import native_spacing_deg
+            from faninsar.processing.geometry.managed_dem import (
+                geographic_source_grid,
+            )
+
+            grid = geographic_source_grid(bounds, native_spacing_deg("glo30"))
+            raster = current.to_raster(
+                grid,
                 vertical_datum="ellipsoidal",
                 budget=self.config.resource_budget,
             )
-        self.config.dem = raster
-        self._ensure_wgs84_dem(raster)
-        if self._dem_source is not None:
             self._persist_raster_dem(raster)
-        return raster
-
-    def _working_frame_bounds(self) -> tuple[float, float, float, float] | None:
-        """Return WGS84 bounds of selected acquisition footprints, if any."""
-        geometry = self._selected_footprint_roi()
-        if geometry is None:
-            return None
-        bounds = getattr(geometry, "bounds", None)
-        if bounds is None:
-            return None
-        try:
-            west, south, east, north = (float(value) for value in bounds)
-        except (TypeError, ValueError):
-            return None
-        if (
-            west >= east
-            or south >= north
-            or not np.all(np.isfinite((west, south, east, north)))
-        ):
-            return None
-        return west, south, east, north
-
-    @staticmethod
-    def _geodetic_covers(
-        actual: tuple[float, float, float, float],
-        required: tuple[float, float, float, float],
-    ) -> bool:
-        """Return whether ``actual`` WGS84 bounds cover ``required``."""
-        tolerance = 1.0e-8
-        return (
-            actual[0] <= required[0] + tolerance
-            and actual[1] <= required[1] + tolerance
-            and actual[2] >= required[2] - tolerance
-            and actual[3] >= required[3] - tolerance
-        )
-
-    def _ensure_wgs84_dem(self, raster: RasterDEM) -> None:
-        """Materialize a native-spacing geographic crop for rdr2geo.
-
-        The public product raster stays on the Stack grid.  The geometry crop
-        unions that grid with selected acquisition footprints so burst-corner
-        rdr2geo stays on DEM even when the user-visible extent is a smaller
-        ROI.
-        """
-        from faninsar.processing.geometry.dem_view import (
-            geodetic_crop_grid,
-            is_geodetic_crs,
-            native_spacing_deg,
-        )
-
-        extra = self._working_frame_bounds()
-        loaded = self._load_persisted_wgs84_dem()
-        if loaded is not None and (
-            extra is None or self._geodetic_covers(loaded.grid.bounds, extra)
-        ):
-            self._dem_wgs84 = loaded
-            logger.info("Reusing geographic DEM %s", self._stack_wgs84_raster_path())
-            return
-        if is_geodetic_crs(raster.crs) and (
-            extra is None or self._geodetic_covers(raster.grid.bounds, extra)
-        ):
-            self._dem_wgs84 = raster
-            return
+            return self._bind_live_dem(raster)
+        roi_bounds = self._explicit_roi_bounds()
+        loaded = self._load_persisted_raster_dem()
+        existing = current if isinstance(current, LiveRaster) else loaded
+        if existing is None and loaded is not None:
+            existing = loaded
+        required = roi_bounds
+        if existing is None and required is None:
+            required = self._initial_dem_bounds()
         source = self._dem_source
-        if source is None:
-            self._dem_wgs84 = raster if is_geodetic_crs(raster.crs) else None
-            if extra is not None and not (
-                is_geodetic_crs(raster.crs)
-                and self._geodetic_covers(raster.grid.bounds, extra)
-            ):
-                logger.warning(
-                    "Working-frame DEM needs coverage %s but no source recipe "
-                    "is available; geometry uses the public raster",
-                    extra,
-                )
-            return
-        cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
-        if source.cache_dir is None:
-            source.cache_dir = cache_dir
-        product = raster.provenance.get("product") or source.product
-        coverage = raster.grid if is_geodetic_crs(raster.crs) else self.grid
-        grid = geodetic_crop_grid(
-            coverage,
-            native_spacing_deg(product),
-            extra,
-        )
-        logger.info("Materializing geographic DEM from source tiles onto %s", grid.crs)
-        self._dem_wgs84 = source.to_raster(
-            grid,
-            vertical_datum="ellipsoidal",
+        product = None
+        if isinstance(existing, LiveRaster):
+            product = existing.provenance.get("product")
+        if source is not None:
+            product = product or source.product
+        raster = resolve_managed_wgs84_dem(
+            managed_path=self._stack_dem_raster_path(),
+            source=source,
+            existing=existing if isinstance(existing, LiveRaster) else None,
+            required_bounds=required,
+            check_coverage=roi_bounds is not None,
+            cache_dir=self._dem_cache_dir(),
             budget=self.config.resource_budget,
+            scratch_dir=self._dem_scratch_dir(),
+            product=product,
         )
+        self._persist_raster_dem(raster)
+        return self._bind_live_dem(raster)
+
+    def _expand_managed_dem(
+        self, required_bounds: tuple[float, float, float, float]
+    ) -> RasterDEM:
+        """Grow the managed DEM to ``required_bounds`` and refresh live state."""
+        from faninsar.processing.geometry.api import RasterDEM as LiveRaster
+        from faninsar.processing.geometry.managed_dem import resolve_managed_wgs84_dem
+
+        existing = self.config.dem if isinstance(self.config.dem, LiveRaster) else None
+        raster = resolve_managed_wgs84_dem(
+            managed_path=self._stack_dem_raster_path(),
+            source=self._dem_source,
+            existing=existing,
+            required_bounds=required_bounds,
+            check_coverage=True,
+            cache_dir=self._dem_cache_dir(),
+            budget=self.config.resource_budget,
+            scratch_dir=self._dem_scratch_dir(),
+            product=None if self._dem_source is None else self._dem_source.product,
+        )
+        self._persist_raster_dem(raster)
+        return self._bind_live_dem(raster)
+
+    def _call_with_dem_coverage(
+        self,
+        required_bounds: tuple[float, float, float, float],
+        operation: Any,
+    ) -> Any:
+        """Run ``operation``, expanding the managed DEM once if coverage is short."""
+        from faninsar.processing.geometry.api import RasterDEM as LiveRaster
+        from faninsar.processing.geometry.managed_dem import (
+            DEMCoverageInsufficientError,
+            require_dem_coverage,
+        )
+
+        current = self.config.dem
+        retried = False
+        if isinstance(current, LiveRaster):
+            try:
+                require_dem_coverage(current, required_bounds)
+            except DEMCoverageInsufficientError:
+                self._expand_managed_dem(required_bounds)
+                retried = True
+        try:
+            return operation()
+        except DEMCoverageInsufficientError as error:
+            if retried:
+                raise
+            self._expand_managed_dem(error.required_bounds)
+            current = self.config.dem
+            if isinstance(current, LiveRaster):
+                require_dem_coverage(current, error.required_bounds)
+            return operation()
+
+    def _ensure_dem_covers_request(
+        self, required_bounds: tuple[float, float, float, float] | None
+    ) -> None:
+        """Expand the managed DEM once when a current request is uncovered."""
+        if required_bounds is None:
+            return
+
+        def _noop() -> None:
+            return None
+
+        self._call_with_dem_coverage(required_bounds, _noop)
 
     def _ensure_raster_dem(self) -> RasterDEM | object | None:
         """Make the live Stack DEM a raster or leave a constant sampler.
 
-        Source recipes are materialized onto the authoritative grid and
-        persisted under ``work_dir/dem``.  ``ConstantDEM`` stays a sampler so
+        Source recipes are materialized onto a geographic ellipsoidal grid and
+        persisted as ``work_dir/dem.tif``.  ``ConstantDEM`` stays a sampler so
         tests and flat-geometry campaigns do not allocate a scene-sized
         raster.  Pair production may still promote a constant when it has an
         extent.
@@ -2375,33 +2383,31 @@ class Stack(NetworkContract, ABC):
         current = self.config.dem
         if type(current).__name__ == "ConstantDEM":
             return current
-        if isinstance(current, RasterDEM):
-            return self._align_raster_dem(current)
         loaded = self._load_persisted_raster_dem()
-        if loaded is not None:
-            return self._align_raster_dem(loaded)
         if (
             current is None
+            and loaded is None
             and self.config.grid == "utm_ups"
             and not self._has_stack_extent()
         ):
             return None
+        if (
+            loaded is None
+            and not isinstance(current, RasterDEM)
+            and self._dem_source is None
+            and self._initial_dem_bounds() is None
+        ):
+            return None
         raster = self.materialize_dem(current)
-        self._ensure_wgs84_dem(raster)
-        # Persist any Stack-materialized raster so ``config.dem`` is a
-        # path-bound RasterDEM that ``stack.json`` identity can serialize.
-        # ``current`` may be a SourceDEM recipe, or ``None`` when the
-        # materializer used ``DEM.from_source("auto")``; both are owned by
-        # this Stack.  Reload through the persisted path so ``path`` is set.
-        self._capture_dem_source(current)
-        self._persist_raster_dem(raster)
-        persisted = self._load_persisted_raster_dem()
-        self.config.dem = persisted if persisted is not None else raster
-        return self.config.dem
+        if isinstance(raster, RasterDEM):
+            self._persist_raster_dem(raster)
+            return self._bind_live_dem(raster)
+        return raster
 
     def _restore_local_inputs(self) -> None:
         """Restore persisted local DEMs without preparing missing inputs."""
         self._capture_dem_source()
+        from faninsar.processing.geometry.dem_view import is_geodetic_crs
         from faninsar.stack.preparation import unavailable_local_inputs
 
         if any(
@@ -2416,7 +2422,7 @@ class Stack(NetworkContract, ABC):
         raster = self._load_persisted_raster_dem()
         if raster is not None:
             self.config.dem = raster
-        self._dem_wgs84 = self._load_persisted_wgs84_dem()
+            self._dem_wgs84 = raster if is_geodetic_crs(raster.crs) else None
 
     @classmethod
     def _search_profile(cls) -> MissionSearchProfile:
@@ -3713,8 +3719,8 @@ class Stack(NetworkContract, ABC):
                 reason,
             )
         options = dict(options)
-        # One live DEM on the Stack grid. Source recipes are materialized
-        # by _ensure_raster_dem; a constant sampler is promoted only when
+        # One live geographic DEM. Source recipes are materialized by
+        # _ensure_raster_dem; a constant sampler is promoted only when
         # this production callback has a geographic extent.
         self._ensure_raster_dem()
         has_extent = self._has_stack_extent()

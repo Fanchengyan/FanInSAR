@@ -10,6 +10,7 @@ from tests.support.local_stack import LocalStack
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 from affine import Affine
 
 if TYPE_CHECKING:
@@ -95,7 +96,7 @@ def _utm_grid() -> GridSpec:
 def test_prepare_writes_native_wgs84_from_source(
     tmp_path: Path, monkeypatch: object
 ) -> None:
-    """Projected Stack grids persist a native 1 arc-second geographic crop."""
+    """Projected Stack grids persist one geographic root DEM, not a UTM raster."""
     utm = _utm_grid()
     cache = tmp_path / "dem-cache"
     cache.mkdir()
@@ -127,15 +128,12 @@ def test_prepare_writes_native_wgs84_from_source(
     )
     stack.prepare_data()
 
-    assert str(stack.dem.crs) == "EPSG:32633"
+    assert str(stack.dem.crs) == "EPSG:4326"
     assert (work / "dem.tif").is_file()
-    assert (work / "dem_wgs84.tif").is_file()
-    wgs84 = stack._dem_wgs84
-    assert wgs84 is not None
-    assert str(wgs84.crs) == "EPSG:4326"
-    assert abs(wgs84.grid.transform[0] - 1.0 / 3600.0) < 1.0e-12
-    assert "EPSG:32633" in grids
-    assert "EPSG:4326" in grids
+    assert not (work / "dem_wgs84.tif").exists()
+    assert not (work / "dem" / "rgv_stack.tif").exists()
+    assert abs(stack.dem.grid.transform[0] - 1.0 / 3600.0) < 1.0e-12
+    assert grids == ["EPSG:4326"]
     n_materialize = len(grids)
 
     reopened = LocalStack.from_paths(
@@ -146,9 +144,8 @@ def test_prepare_writes_native_wgs84_from_source(
         dem_cache_dir=cache,
     )
     reopened.prepare_data()
-    assert str(reopened.dem.crs) == "EPSG:32633"
-    assert reopened._dem_wgs84 is not None
-    assert str(reopened._dem_wgs84.crs) == "EPSG:4326"
+    assert str(reopened.dem.crs) == "EPSG:4326"
+    assert reopened.dem.grid == stack.dem.grid
     assert len(grids) == n_materialize
 
 
@@ -176,7 +173,7 @@ def _fake_source_to_raster(
 def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
     tmp_path: Path, monkeypatch: object
 ) -> None:
-    """Processing-domain DEM covers selected footprints; public DEM stays on the ROI."""
+    """Prepare covers the explicit ROI only; selected footprints are not prefetched."""
     from faninsar.data.query.bbox import BoundingBox
 
     roi = BoundingBox(10.0, 40.0, 10.05, 40.05, crs="EPSG:4326")
@@ -200,36 +197,25 @@ def test_prepare_wgs84_dem_covers_working_frame_not_just_roi(
 
     public = stack.dem
     assert isinstance(public, RasterDEM)
-    public_west, public_south, public_east, public_north = public.grid.bounds
-    if str(public.grid.crs) != "EPSG:4326":
-        from pyproj import Transformer
-
-        transformer = Transformer.from_crs(public.grid.crs, "EPSG:4326", always_xy=True)
-        lons, lats = transformer.transform(
-            [public_west, public_east, public_west, public_east],
-            [public_south, public_south, public_north, public_north],
-        )
-        public_west, public_east = min(lons), max(lons)
-        public_south, public_north = min(lats), max(lats)
-    assert public_east - public_west < 0.2
-    assert public_north - public_south < 0.2
-
-    wgs84 = stack._dem_wgs84
-    assert wgs84 is not None
-    west, south, east, north = wgs84.grid.bounds
-    assert west <= 9.5
-    assert south <= 39.5
-    assert east >= 11.0
-    assert north >= 41.0
+    assert str(public.grid.crs) == "EPSG:4326"
+    west, south, east, north = public.grid.bounds
+    assert west <= 10.0
+    assert south <= 40.0
+    assert east >= 10.05
+    assert north >= 40.05
+    assert east - west < 0.5
+    assert north - south < 0.5
+    assert west > 9.5
+    assert east < 11.0
     assert (work / "dem.tif").is_file()
-    assert (work / "dem_wgs84.tif").is_file()
-    assert any(str(grid.crs) == "EPSG:4326" and grid.bounds[0] <= 9.5 for grid in grids)
+    assert not (work / "dem_wgs84.tif").exists()
+    assert all(str(grid.crs) == "EPSG:4326" for grid in grids)
 
 
 def test_geographic_roi_grid_builds_larger_processing_dem(
     tmp_path: Path, monkeypatch: object
 ) -> None:
-    """An EPSG:4326 ROI product grid still gets a working-frame geometry DEM."""
+    """An EPSG:4326 product grid does not force a second DEM or footprint prefetch."""
     roi_grid = GridSpec(
         crs="EPSG:4326",
         transform=Affine(0.001, 0.0, 10.0, 0.0, -0.001, 40.05),
@@ -256,15 +242,16 @@ def test_geographic_roi_grid_builds_larger_processing_dem(
 
     public = stack.dem
     assert isinstance(public, RasterDEM)
-    assert public.grid == roi_grid
-    wgs84 = stack._dem_wgs84
-    assert wgs84 is not None
-    west, south, east, north = wgs84.grid.bounds
-    assert west <= 9.5
-    assert south <= 39.5
-    assert east >= 11.0
-    assert north >= 41.0
-    assert wgs84.grid != roi_grid
+    assert str(public.grid.crs) == "EPSG:4326"
+    assert public.grid != roi_grid
+    west, south, east, north = public.grid.bounds
+    assert west <= roi_grid.bounds[0]
+    assert south <= roi_grid.bounds[1]
+    assert east >= roi_grid.bounds[2]
+    assert north >= roi_grid.bounds[3]
+    assert west > 9.5
+    assert east < 11.0
+    assert not (work / "dem_wgs84.tif").exists()
     n_materialize = len(grids)
 
     reopened = LocalStack.from_paths(
@@ -275,12 +262,55 @@ def test_geographic_roi_grid_builds_larger_processing_dem(
         dem_cache_dir=cache,
     )
     reopened.prepare_data()
-    restored = reopened._dem_wgs84
-    assert restored is not None
-    west, south, east, north = restored.grid.bounds
+    assert str(reopened.dem.crs) == "EPSG:4326"
+    assert reopened.dem.grid == public.grid
+    assert reopened.config.grid == roi_grid
+    assert len(grids) == n_materialize
+
+
+def test_use_time_shortage_grows_same_file_and_failed_expand_preserves_bytes(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A later uncovered request rewrites dem.tif in place; a failed fetch keeps it."""
+    from faninsar.data.query.bbox import BoundingBox
+
+    roi = BoundingBox(10.0, 40.0, 10.05, 40.05, crs="EPSG:4326")
+    cache = tmp_path / "dem-cache"
+    cache.mkdir()
+    source = DEM.from_source("auto", cache_dir=cache)
+    grids: list[GridSpec] = []
+    monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
+    work = tmp_path / "work-expand"
+    stack = LocalStack.from_paths(
+        _dummy_safes(tmp_path),
+        work_dir=work,
+        dem=source,
+        roi=roi,
+        dem_cache_dir=cache,
+    )
+    stack.prepare_data()
+    managed = work / "dem.tif"
+    assert managed.is_file()
+    before = managed.read_bytes()
+    first_grid = stack.dem.grid
+    n_materialize = len(grids)
+
+    def _boom(_self: SourceDEM, _grid: GridSpec, **_kwargs: object) -> RasterDEM:
+        raise OSError("injected source outage")
+
+    monkeypatch.setattr(SourceDEM, "to_raster", _boom)
+    with pytest.raises(OSError, match="injected source outage"):
+        stack._ensure_dem_covers_request((9.5, 39.5, 11.0, 41.0))
+    assert managed.read_bytes() == before
+    assert stack.dem.grid == first_grid
+
+    monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
+    stack._ensure_dem_covers_request((9.5, 39.5, 11.0, 41.0))
+    assert managed.is_file()
+    assert not (work / "dem_wgs84.tif").exists()
+    west, south, east, north = stack.dem.grid.bounds
     assert west <= 9.5
     assert south <= 39.5
     assert east >= 11.0
     assert north >= 41.0
-    assert reopened.dem.grid == roi_grid
-    assert len(grids) == n_materialize
+    assert len(grids) == n_materialize + 1

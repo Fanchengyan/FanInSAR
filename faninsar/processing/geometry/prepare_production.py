@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
@@ -50,9 +51,14 @@ logger = setup_logger(__name__)
 
 _NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent / "native"
 _CUDA_MODULES: dict[str, object] = {}
-_PREPARED_CACHE: dict[tuple[object, ...], object] = {}
+_PREPARED_CACHE: WeakKeyDictionary[object, dict[tuple[object, ...], object]] = (
+    WeakKeyDictionary()
+)
 _PREPARED_CACHE_LIMIT = 12
-_GPU_DEM_TABLE: dict[tuple[str, str], dict[str, object]] = {}
+_GPU_DEM_TABLE: WeakKeyDictionary[object, dict[str, dict[str, object]]] = (
+    WeakKeyDictionary()
+)
+_NONE_DEM_OWNER = ConstantDEM(0.0)
 _RDR2GEO_DEM_FIELDS = ("dem_values", "dem_metadata", "dem_height_bounds")
 
 
@@ -97,21 +103,66 @@ def _native_dem_context_bound(context: object) -> bool:
     return all(context.get(name) is not None for name in _RDR2GEO_DEM_FIELDS)
 
 
+def _gpu_dem_owner(dem: DEM | None) -> object:
+    """Return the live object that owns GPU DEM tensors."""
+    return _NONE_DEM_OWNER if dem is None else dem
+
+
+def _prepared_cache_size() -> int:
+    """Return the number of prepared entries across live DEM owners."""
+    return sum(len(table) for table in _PREPARED_CACHE.values())
+
+
+def _prepared_lookup(dem: DEM | None, cache_key: tuple[object, ...]) -> object | None:
+    """Return the prepared handle owned by ``dem``, if it is still alive."""
+    table = _PREPARED_CACHE.get(_gpu_dem_owner(dem))
+    if table is None:
+        return None
+    return table.get(cache_key)
+
+
+def _prepared_store(
+    dem: DEM | None, cache_key: tuple[object, ...], prepared: object
+) -> None:
+    """Store one prepared handle on the live DEM owner."""
+    owner = _gpu_dem_owner(dem)
+    table = _PREPARED_CACHE.get(owner)
+    if table is None:
+        table = {}
+        _PREPARED_CACHE[owner] = table
+    if _prepared_cache_size() >= _PREPARED_CACHE_LIMIT and cache_key not in table:
+        oldest_owner = next(iter(_PREPARED_CACHE))
+        if oldest_owner is owner and len(table) > 0:
+            table.pop(next(iter(table)), None)
+        else:
+            _PREPARED_CACHE.pop(oldest_owner, None)
+            table = _PREPARED_CACHE.get(owner)
+            if table is None:
+                table = {}
+                _PREPARED_CACHE[owner] = table
+    table[cache_key] = prepared
+
+
 def _resident_gpu_dem(
     dem_digest: str,
     device_identity: str,
     torch_device: object,
     dem: DEM | None,
 ) -> dict[str, object]:
-    """Return device DEM tensors, uploading once per digest and device.
+    """Return device DEM tensors, uploading once per live DEM and device.
 
-    Distinct prepared shapes share this table (PROPOSAL-0034). A digest
-    miss re-uploads; a hit aliases the resident tensors.
+    Distinct prepared shapes of the same owner share this table. Independent
+    DEM objects with equal range descriptors do not alias tensors.
     """
     import torch
 
-    key = (dem_digest, device_identity)
-    cached = _GPU_DEM_TABLE.get(key)
+    del dem_digest
+    owner = _gpu_dem_owner(dem)
+    per_device = _GPU_DEM_TABLE.get(owner)
+    if per_device is None:
+        per_device = {}
+        _GPU_DEM_TABLE[owner] = per_device
+    cached = per_device.get(device_identity)
     if cached is not None:
         return cached
     dem_values, dem_metadata, dem_bounds = _dem_native_arrays(dem)
@@ -126,7 +177,7 @@ def _resident_gpu_dem(
             dem_bounds, dtype=torch.float64, device=torch_device
         ),
     }
-    _GPU_DEM_TABLE[key] = resident
+    per_device[device_identity] = resident
     return resident
 
 
@@ -141,11 +192,12 @@ def _prepared_cache_key(
     physical_uuid: str | None,
     mig_uuid: str | None,
 ) -> tuple[object, ...]:
-    """Operational prepared identity (PROPOSAL-0034).
+    """Operational prepared identity (PROPOSAL-0034, amended by PROPOSAL-0079).
 
-    Keyed by operation, model_digest, orbit digest, DEM digest, shape,
-    solver.for_operation, and device UUID. Excludes toolchain/runtime and
-    ``id(model)``.
+    Keyed by operation, model_digest, orbit digest, DEM range descriptor,
+    shape, solver.for_operation, and device UUID. The live DEM object owns
+    the table that stores this key, so equal-range independent DEMs do not
+    share prepared array state and dead owners cannot leak numeric ids.
     """
     from faninsar.processing.geometry.torch_backends import (
         _dem_digest,
@@ -163,6 +215,16 @@ def _prepared_cache_key(
         solver_items,
         _device_cache_identity(resolved, physical_uuid, mig_uuid),
     )
+
+
+def drop_prepared_dem_state(dem: DEM | None) -> None:
+    """Drop owner-scoped prepared handles and GPU DEM tensors for ``dem``."""
+    from faninsar.processing.geometry.dem_view import drop_lonlat_dem_view
+
+    owner = _gpu_dem_owner(dem)
+    _PREPARED_CACHE.pop(owner, None)
+    _GPU_DEM_TABLE.pop(owner, None)
+    drop_lonlat_dem_view(dem)
 
 
 def _cuda_uuids(resolved: object) -> tuple[str, str | None]:
@@ -584,7 +646,7 @@ def prepare_production_geometry(
     normalized_shape = tuple(int(value) for value in shape)
     dem_arg = dem
     if op is Operation.RDR2GEO and dem_arg is None:
-        dem_arg = ConstantDEM(0.0)
+        dem_arg = _NONE_DEM_OWNER
     cache_key = _prepared_cache_key(
         op,
         model,
@@ -595,7 +657,7 @@ def prepare_production_geometry(
         physical_uuid=physical_uuid,
         mig_uuid=mig_uuid,
     )
-    cached = _PREPARED_CACHE.get(cache_key)
+    cached = _prepared_lookup(dem_arg, cache_key)
     if cached is not None:
         return cached
     native_op = (
@@ -707,10 +769,7 @@ def prepare_production_geometry(
             mig_uuid=mig_uuid,
             use_compile=False,
         )
-    if len(_PREPARED_CACHE) >= _PREPARED_CACHE_LIMIT:
-        oldest = next(iter(_PREPARED_CACHE))
-        _PREPARED_CACHE.pop(oldest, None)
-    _PREPARED_CACHE[cache_key] = prepared
+    _prepared_store(dem_arg, cache_key, prepared)
     return prepared
 
 

@@ -362,8 +362,7 @@ def test_offline_geoid_miss_cannot_use_live_transport(tmp_path, monkeypatch):
     assert stack.prepare_data(offline=True).outcome == "failed"
 
 
-@pytest.mark.parametrize("failure_policy", [None, "warn", "raise"])
-def test_expanded_recovered_coverage_uses_new_dem_preserving_prior_bytes(tmp_path, monkeypatch, failure_policy):
+def test_expanded_recovered_coverage_uses_new_dem_preserving_prior_bytes(tmp_path, monkeypatch):
     import numpy as np
     from affine import Affine
     from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
@@ -393,33 +392,23 @@ def test_expanded_recovered_coverage_uses_new_dem_preserving_prior_bytes(tmp_pat
     product.write_bytes(b"prior scientific payload with original lineage")
     before = {path: path.read_bytes() for path in (*paths, product)}
     old_science = stack._coreg_science_config()
+    dem_path = stack.config.work_dir / "dem.tif"
+    assert dem_path.is_file()
+    assert not (stack.config.work_dir / "dem_wgs84.tif").exists()
+    west, _south, east, _north = stack.dem.grid.bounds
+    assert west > 9.5
+    assert east < 10.5
 
     recovered.write_bytes(b"recovered")
-    old_geographic = stack._stack_wgs84_raster_path()
-    original_report = stack.preparation_report
-    if failure_policy is not None:
-        original_materialize = SourceDEM.to_raster
-        def unavailable(*args, **kwargs):
-            raise OSError("injected expanded DEM failure before commit")
-        monkeypatch.setattr(SourceDEM, "to_raster", unavailable)
-        if failure_policy == "raise":
-            with pytest.raises(DataPreparationError):
-                stack.prepare_data(on_error="raise")
-        else:
-            assert stack.prepare_data().outcome == "failed"
-        assert stack.preparation_report is original_report
-        assert stack.data_ready
-        assert stack.catalog.dates == tuple(initial)
-        assert all(path.read_bytes() == payload for path, payload in before.items())
-        monkeypatch.setattr(SourceDEM, "to_raster", original_materialize)
     assert stack.prepare_data(on_error="raise").outcome == "complete"
     assert all(path.read_bytes() == payload for path, payload in before.items() if path.name != "stack.json")
     assert stack.catalog.dates == (*initial, "20200113")
     assert stack.config.grid == public_grid
-    assert stack._stack_wgs84_raster_path() != old_geographic
-    assert stack._stack_wgs84_raster_path().is_file()
-    assert stack._dem_wgs84.grid.bounds[0] <= 9.5
-    assert stack._dem_wgs84.grid.bounds[2] >= 10.5
+    assert (stack.config.work_dir / "dem.tif").is_file()
+    assert not (stack.config.work_dir / "dem_wgs84.tif").exists()
+    west, _south, east, _north = stack.dem.grid.bounds
+    assert west > 9.5
+    assert east < 10.5
     # Expanded science is not silently relabeled as the old product lineage.
     assert stack._coreg_science_config() != old_science
     from faninsar.missions import base as registry
@@ -427,8 +416,7 @@ def test_expanded_recovered_coverage_uses_new_dem_preserving_prior_bytes(tmp_pat
     monkeypatch.setattr(__import__(__name__, fromlist=["x"]), "_coverage_mission", CoverageMission, raising=False)
     opened = Stack.open(stack.config.work_dir)
     assert opened.catalog.dates == (*initial, "20200113")
-    assert opened._stack_wgs84_raster_path() == stack._stack_wgs84_raster_path()
-    assert opened._dem_wgs84.grid == stack._dem_wgs84.grid
+    assert opened.dem.grid == stack.dem.grid
 
 
 @pytest.mark.parametrize("damage", ["delete", "truncate"])

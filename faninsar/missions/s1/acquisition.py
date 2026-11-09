@@ -74,7 +74,6 @@ from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.canvas import BurstFetchedWindow
 from faninsar.missions.s1.overlap import burst_overlap_windows
 from faninsar.missions.s1.types import track_group_key
-from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.remote.errors import RemoteAccessError
 from faninsar.remote.fetch import RangeFetcher, RangeSpan, fetch_ranges_async
 from faninsar.remote.fetch.span_cache import (
@@ -90,6 +89,7 @@ if TYPE_CHECKING:
     from faninsar.missions.s1.io.canvas import RoiSafeCanvas
     from faninsar.missions.s1.overlap import BurstOverlapWindow
     from faninsar.missions.s1.types import S1Swath
+    from faninsar.processing.geometry.dem import RasterDEM
 
 logger = setup_logger(__name__)
 
@@ -1307,33 +1307,31 @@ def _fetch_dem_for_roi(
     roi: BoundingBox | Points | Polygons,
     work_dir: str | Path,
 ) -> RasterDEM:
-    """Fetch a Copernicus DEM mosaic covering the whole ROI.
+    """Fetch the canonical workspace DEM covering the whole ROI.
 
-    Downloads GLO-30 tiles for the ROI union bounding box and writes a
-    merged GeoTIFF under ``work_dir/dem/``.  The result is persisted so a
-    later ``prepare`` pass can reuse it without re-downloading.  Bounds are
-    inflated by a small margin so biquintic DEM sampling along the ROI
-    edge has the kernel support it needs — required by the shared
-    ``run_geo2rdr`` envelope path every ROI kind uses.
+    Downloads source tiles for the ROI envelope and writes
+    ``work_dir/dem.tif`` as EPSG:4326 ellipsoidal heights.  A later Stack
+    ``prepare_data`` pass reuses that file instead of downloading a second
+    copy.  Bounds include the ordinary interpolation margin so biquintic
+    DEM sampling along the ROI edge has the kernel support it needs.
     """
-    from faninsar.processing.geometry.dem_manager import DEMManager
+    from faninsar.processing.geometry.api import DEM
+    from faninsar.processing.geometry.managed_dem import resolve_managed_wgs84_dem
+    from faninsar.stack.layout import DEM_RASTER_NAME, TMP_DIRNAME, dem_cache_dir
 
-    minx, miny, maxx, maxy = inversion_envelope(roi)
-    # ~2 km margin keeps the 6x6 biquintic kernel fully inside the raster
-    # for every ROI-edge sample.
-    margin_deg = 2.0 / 111.0
-    bounds = (
-        minx - margin_deg,
-        miny - margin_deg,
-        maxx + margin_deg,
-        maxy + margin_deg,
+    bounds = inversion_envelope(roi)
+    root = Path(work_dir)
+    cache_dir = dem_cache_dir(root)
+    source = DEM.from_source("auto", cache_dir=cache_dir)
+    return resolve_managed_wgs84_dem(
+        managed_path=root / DEM_RASTER_NAME,
+        source=source,
+        required_bounds=bounds,
+        check_coverage=True,
+        cache_dir=cache_dir,
+        scratch_dir=root / TMP_DIRNAME,
+        product=source.product,
     )
-    out_dir = Path(work_dir) / "dem"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "rgv_stack.tif"
-    mgr = DEMManager(cache_dir=Path(work_dir) / "dem-cache")
-    mgr.fetch_dem(bounds=bounds, output_path=out_path)
-    return RasterDEM(path=out_path)
 
 
 def _fetch_dem_for_polygons(

@@ -52,6 +52,10 @@ from .fetch import (
 from .geoid import GeoidSampler, load_geoid
 from .grids import GeoGrid, GeoGridMixin, GridSpec, format_bounds_and_crs
 from .lut_cache import TransformCacheKey, read_transform_cache, write_transform_cache
+from .managed_dem import (
+    DEMCoverageInsufficientError,
+    resolve_managed_wgs84_dem,
+)
 from .orbit import (
     OrbitInterpolator,
     OrbitState,
@@ -157,6 +161,7 @@ __all__ = [
     "BoundaryDecision",
     "CandidateKey",
     "ConstantDEM",
+    "DEMCoverageInsufficientError",
     "DEMProduct",
     "DeviceKey",
     "ExecutionProfile",
@@ -219,6 +224,7 @@ __all__ = [
     "prepare_production_geometry",
     "read_transform_cache",
     "requires_fetch",
+    "resolve_managed_wgs84_dem",
     "run_geo2rdr",
     "run_rdr2geo",
     "run_rdr2geo_chunked",

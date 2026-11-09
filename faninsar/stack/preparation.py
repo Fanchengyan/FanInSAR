@@ -506,35 +506,6 @@ def _prepare_stack_data(
                     inputs.mission.selected_footprints
                 )
             if stack._prepared and stack._inputs_state is not None:
-                from faninsar.stack.identity import encode_value
-
-                scope_identity = {
-                    "request": document,
-                    "sources": {
-                        key: [
-                            {
-                                "path": str(path),
-                                "size": path.stat().st_size,
-                                "mtime_ns": path.stat().st_mtime_ns,
-                            }
-                            for path in paths
-                        ]
-                        for key, paths in sorted(sources.items())
-                    },
-                    "footprints": encode_value(inputs.mission.selected_footprints),
-                    "grid": encode_value(candidate.config.grid),
-                    "repair_of": {
-                        path: entry.get("stat")
-                        for path, entry in unavailable.items()
-                        if entry["kind"] == "dem"
-                    },
-                }
-                fingerprint = hashlib.sha256(
-                    json.dumps(scope_identity, sort_keys=True).encode()
-                ).hexdigest()
-                candidate.config.extra["preparation_dem_scope"] = (
-                    f"inputs/dem/{fingerprint}"
-                )
                 candidate._preparation_preserve_artifacts = False
                 candidate._dem_wgs84 = None
             candidate._validate_mission_prepared(mission)

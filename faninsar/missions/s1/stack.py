@@ -1188,6 +1188,25 @@ class S1Stack(Stack):
         info = infos.get(date_id)
         return None if info is None else getattr(info, "track_key", None)
 
+    def _s1_roi_coverage_bounds(
+        self, roi: object | None
+    ) -> tuple[float, float, float, float] | None:
+        """Return WGS84 DEM coverage required by one S1 ROI query."""
+        if roi is None:
+            return None
+        from faninsar.missions.s1.acquisition import inversion_envelope
+        from faninsar.processing.geometry.dem_view import native_spacing_deg
+        from faninsar.processing.geometry.managed_dem import (
+            expand_bounds,
+            interpolation_margin_deg,
+        )
+
+        product = None if self._dem_source is None else self._dem_source.product
+        return expand_bounds(
+            inversion_envelope(roi),
+            interpolation_margin_deg(native_spacing_deg(product)),
+        )
+
     def _resolve_s1_roi_burst_selection(
         self,
         *,
@@ -1223,6 +1242,7 @@ class S1Stack(Stack):
         from faninsar.missions.s1.safe import open_acquisition_products
 
         logger.info("ROI provided; explicit swaths/bursts selection ignored")
+        self._ensure_dem_covers_request(self._s1_roi_coverage_bounds(roi))
         ref_paths = list(self.catalog.paths_for(self.reference))
         polarizations = self.config.extra.get("polarizations")
         selected_polarizations = (
@@ -1304,6 +1324,9 @@ class S1Stack(Stack):
         from faninsar.missions.s1.measure import measure_s1_pair_misreg
 
         swaths, bursts = self._resolve_s1_nesd_selection()
+        self._ensure_dem_covers_request(
+            self._s1_roi_coverage_bounds(self._effective_roi_with_mask().roi)
+        )
         return measure_s1_pair_misreg(
             _source_input(self.catalog.paths_for(primary)),
             _source_input(self.catalog.paths_for(secondary)),
@@ -1374,6 +1397,7 @@ class S1Stack(Stack):
         else:
             roi = self._effective_roi_with_mask().roi
         swaths, bursts = self._resolve_s1_roi_burst_selection(polygon=polygon)
+        self._ensure_dem_covers_request(self._s1_roi_coverage_bounds(roi))
         return prepare_s1_reference(
             _source_input(self.catalog.paths_for(self.reference)),
             output_scene=self._scene_dir(self.reference, polygon),

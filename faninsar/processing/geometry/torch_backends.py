@@ -146,17 +146,20 @@ def _dem_payload(dem: object, seen: set[int]) -> dict[str, object]:
             "values",
             "data",
         }:
-            values[name] = _array_digest(np.asarray(value))
+            array = np.asarray(value)
+            values[name] = {
+                "dtype": str(array.dtype),
+                "shape": tuple(int(dim) for dim in array.shape),
+            }
         elif isinstance(value, (str, int, float, bool)) or value is None:
             values[name] = str(value) if name in {"path", "source"} else value
     materialized = getattr(dem, "_height_array", None)
-    if materialized is None and hasattr(dem, "_open"):
-        try:
-            materialized = dem._open().read(1)  # type: ignore[attr-defined]
-        except (ImportError, OSError, RuntimeError, AttributeError):
-            materialized = None
     if materialized is not None:
-        values["materialized_height"] = _array_digest(np.asarray(materialized))
+        array = np.asarray(materialized)
+        values["materialized_height"] = {
+            "dtype": str(array.dtype),
+            "shape": tuple(int(dim) for dim in array.shape),
+        }
     dataset = getattr(dem, "_dataset", None)
     transform = getattr(dataset, "transform", None)
     bounds = getattr(dataset, "bounds", None)
@@ -168,9 +171,17 @@ def _dem_payload(dem: object, seen: set[int]) -> dict[str, object]:
 
 
 def _dem_digest(dem: object | None) -> str:
-    """Digest nested DEM metadata and materialized samples."""
+    """Digest DEM range/grid metadata without reading pixel bytes."""
     if dem is None:
         return _digest("none")
+    from faninsar.processing.geometry.api import (
+        ConstantDEM,
+        RasterDEM,
+        dem_content_identity,
+    )
+
+    if isinstance(dem, (ConstantDEM, RasterDEM)):
+        return _digest(dem_content_identity(dem))
     return _digest(_dem_payload(dem, set()))
 
 

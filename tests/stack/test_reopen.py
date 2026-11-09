@@ -541,23 +541,28 @@ def test_explicit_raster_vertical_datum_survives_prepare_and_open(
     tmp_path: Path,
     vertical_datum: str,
 ) -> None:
-    """A tagless raster DEM keeps the caller-supplied datum after Stack.open."""
+    """A supplied raster is ingested once into canonical work_dir/dem.tif."""
     from faninsar.processing.geometry import DEM
 
     path = _write_untagged_raster(tmp_path / f"dem-{vertical_datum}.tif")
     dem = DEM.from_raster(path, vertical_datum=vertical_datum)
     stack = _prepare_dem_stack(tmp_path, dem, name=f"raster-{vertical_datum}")
     work = stack.config.work_dir
+    managed = work / "dem.tif"
     identity = json.loads((work / STACK_JSON_NAME).read_text(encoding="utf-8"))
     request = json.loads((work / "inputs" / "request.json").read_text(encoding="utf-8"))
-    assert _dem_recipe(identity)["vertical_datum"] == vertical_datum
+    assert managed.is_file()
+    assert path.is_file()
+    assert stack.dem.vertical_datum == "ellipsoidal"
+    assert Path(stack.dem.path).resolve() == managed.resolve()
+    assert _dem_recipe(identity)["vertical_datum"] == "ellipsoidal"
     assert _dem_recipe(request)["vertical_datum"] == vertical_datum
 
     reopened = Stack.open(work)
 
     assert type(reopened.config.dem).__name__ == "RasterDEM"
-    assert reopened.config.dem.vertical_datum == vertical_datum
-    assert Path(reopened.config.dem.path).resolve() == path.resolve()
+    assert reopened.config.dem.vertical_datum == "ellipsoidal"
+    assert Path(reopened.config.dem.path).resolve() == managed.resolve()
     assert reopened._request_config.dem.vertical_datum == vertical_datum
     assert Path(reopened._request_config.dem.path).resolve() == path.resolve()
 

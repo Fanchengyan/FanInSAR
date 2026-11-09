@@ -10,9 +10,8 @@ shared inputs flatten to the work-directory root:
         tmp/s1-transfer/<canvasStem>/<fingerprint>/  CDSE range scratch
         orbits/                                     precise orbit files
         aux_cal/                                    Sentinel-1 AUX_CAL files
-        dem.tif                                     Stack-grid DEM raster
+        dem.tif                                     WGS84 ellipsoidal DEM
         dem.json                                    DEM sidecar identity
-        dem_wgs84.tif                               geographic DEM crop
         dem-cache/                                  source DEM tile cache
         inputs/                                     legacy staging root
 
@@ -61,13 +60,13 @@ AUX_CAL_DIRNAME = "aux_cal"
 """Top-level Sentinel-1 AUX_CAL directory (EAP phase correction)."""
 
 DEM_RASTER_NAME = "dem.tif"
-"""Top-level Stack-grid DEM raster (was ``dem/stack.tif``)."""
+"""Top-level WGS84 ellipsoidal DEM raster (was ``dem/stack.tif``)."""
 
 DEM_SIDECAR_NAME = "dem.json"
 """Top-level DEM sidecar record (was ``dem/stack.json``)."""
 
 DEM_WGS84_NAME = "dem_wgs84.tif"
-"""Top-level geographic DEM crop (was ``dem/stack_wgs84.tif``)."""
+"""Legacy geographic sibling; new workspaces do not create this file."""
 
 DEM_CACHE_DIRNAME = "dem-cache"
 """Top-level source DEM tile cache."""
@@ -553,10 +552,11 @@ def legacy_orbits_dir(work_dir: str | Path) -> Path:
 
 
 def dem_raster_path(work_dir: str | Path) -> Path:
-    """Return the durable Stack-grid DEM raster path.
+    """Return the durable WGS84 ellipsoidal DEM raster path.
 
     Prefers the flat ``dem.tif``; falls back to ``dem/stack.tif`` when a
-    legacy workspace holds only the nested file.
+    legacy workspace holds only the nested file. The canonical raster is
+    geographic and independent of the Stack product grid.
     """
     root = Path(work_dir)
     flat = root / DEM_RASTER_NAME
@@ -577,7 +577,11 @@ def dem_sidecar_path(work_dir: str | Path) -> Path:
 
 
 def dem_wgs84_path(work_dir: str | Path) -> Path:
-    """Return the geographic DEM raster (``dem_wgs84.tif`` or legacy path)."""
+    """Return a legacy geographic sibling path if one already exists.
+
+    New workspaces persist only ``dem.tif``. This helper locates an older
+    ``dem_wgs84.tif`` or ``dem/stack_wgs84.tif`` without creating it.
+    """
     root = Path(work_dir)
     flat = root / DEM_WGS84_NAME
     legacy = root.joinpath(*_LEGACY_DEM_WGS84)

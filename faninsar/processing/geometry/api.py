@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Self
@@ -196,63 +195,27 @@ def _grid_centres_wgs84(grid: GridSpec) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _identity(
-    array: np.ndarray,
     grid: GridSpec,
     datum: VerticalDatum,
-    provenance: Mapping[str, str],
 ) -> str:
-    """Build a stable content identity for a materialized DEM."""
-    digest = hashlib.sha256()
-    digest.update(np.ascontiguousarray(array).tobytes())
+    """Build a cheap range/grid/datum descriptor for a materialized DEM.
+
+    The descriptor hashes CRS, affine, shape, bounds, and vertical datum.  It
+    does not read pixel values, file size, mtime, or path provenance.
+    Equal descriptors are not a claim of equal terrain.
+    """
     payload = {
-        "grid": (grid.crs, grid.transform, grid.shape, grid.bounds),
+        "bounds": tuple(float(value) for value in grid.bounds),
+        "crs": str(grid.crs),
         "datum": datum,
-        "provenance": dict(provenance),
-        "resampling": "isce-p0032-biquintic-6x6-v1",
-        "pyproj": _pyproj_runtime_identity(),
+        "shape": (int(grid.height), int(grid.width)),
+        "transform": tuple(float(value) for value in grid.transform),
     }
-    digest.update(json.dumps(payload, sort_keys=True, default=str).encode())
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
     return digest.hexdigest()
-
-
-@lru_cache(maxsize=1)
-def _pyproj_runtime_identity() -> str:
-    """Return a stable projection runtime/data identity without host paths."""
-    try:
-        import pyproj
-        from pyproj import datadir
-
-        data_root = Path(datadir.get_data_dir())
-        data_digest = hashlib.sha256()
-        candidates = sorted(path for path in data_root.rglob("*") if path.is_file())
-        for candidate in candidates:
-            relative = candidate.relative_to(data_root).as_posix()
-            data_digest.update(relative.encode("utf-8"))
-            try:
-                with candidate.open("rb") as stream:
-                    for block in iter(lambda: stream.read(1 << 20), b""):
-                        data_digest.update(block)
-            except OSError as error:
-                logger.warning(
-                    "unable to fingerprint PROJ data file %s: %s",
-                    relative,
-                    type(error).__name__,
-                )
-                return (
-                    f"pyproj={pyproj.__version__};proj={pyproj.proj_version_str};"
-                    "data=unavailable"
-                )
-        return (
-            f"pyproj={pyproj.__version__};proj={pyproj.proj_version_str};"
-            f"data-sha256={data_digest.hexdigest()}"
-        )
-    except ImportError:
-        return "pyproj-unavailable"
-    except OSError as error:
-        logger.warning(
-            "unable to inspect PROJ data directory: %s", type(error).__name__
-        )
-        return "pyproj-data-unavailable"
 
 
 class DEM(ABC):
@@ -517,14 +480,15 @@ class ConstantDEM(DEM):
 
 
 class RasterDEM(DEM):
-    """Materialized georeferenced elevation raster with complete identity.
+    """Materialized georeferenced elevation raster with a range/grid descriptor.
 
     The internal float32 array is defensive-copied and read-only.  NumPy
     conversion exposes that array directly; ``1``/finite heights remain
     values while nodata is represented by NaN.  ``to_raster`` uses the fixed
     P0032 biquintic 6x6 rule for a changed grid and pointwise datum conversion
     for a changed datum.  ``save`` writes one strict GeoTIFF and refuses to
-    overwrite an existing path.
+    overwrite an existing path.  :attr:`identity` is a bounds/grid/datum
+    descriptor, not a pixel checksum.
     """
 
     def __init__(
@@ -593,7 +557,7 @@ class RasterDEM(DEM):
         self._provenance = _freeze_mapping(metadata)
         source_path = self._provenance.get("source_path")
         self._path = None if source_path is None else Path(source_path)
-        self._identity = _identity(self._array, grid, datum, self._provenance)
+        self._identity = _identity(grid, datum)
 
     def sample(
         self,
@@ -674,7 +638,10 @@ class RasterDEM(DEM):
 
     @property
     def identity(self) -> str:
-        """Return the stable content identity."""
+        """Return the cheap range/grid/datum descriptor.
+
+        Equal descriptors do not prove equal terrain values.
+        """
         return self._identity
 
     @property
@@ -857,29 +824,29 @@ class RasterDEM(DEM):
 
 
 def dem_content_identity(dem: DEM | None) -> str:
-    """Return a stable content identity for a DEM instance.
+    """Return a lightweight DEM descriptor for cache keys.
 
-    Cache identities must depend on DEM *content*, never on a class name:
-    two rasters or two constant heights must not share cache entries. The
-    identity covers materialized rasters through :attr:`RasterDEM.identity`,
-    constant DEMs through their height and vertical datum, and the absent
-    DEM as ``"none"``. Any other DEM type has no content contract yet and is
-    rejected instead of degrading to a type name.
+    Raster descriptors use :attr:`RasterDEM.identity` (bounds, CRS, transform,
+    shape, and datum) and are not pixel checksums. Constant DEMs use height
+    and vertical datum. The absent DEM is ``"none"``. Any other DEM type has
+    no descriptor rule yet and is rejected instead of degrading to a type
+    name. Equal raster descriptors do not prove equal terrain; live array
+    caches must stay owner-scoped.
 
     Parameters
     ----------
     dem : DEM or None
-        DEM instance whose content is identified.
+        DEM instance whose descriptor is requested.
 
     Returns
     -------
     str
-        Stable content-identity string suitable for cache keys.
+        Stable range/grid or constant-height descriptor for cache keys.
 
     Raises
     ------
     InvalidProcessingStateError
-        If the DEM type has no content-identity rule.
+        If the DEM type has no descriptor rule.
 
     """
     if dem is None:
