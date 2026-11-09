@@ -48,7 +48,7 @@ def test_burst_ready_canvas_resumes_without_losing_samples_or_overlap_mask(
         n_lines=3,
         n_samples=25,
     )
-    digest = writer.write_burst(4, [roi], [(overlap, "top", data[46:49, 30:55])])
+    writer.write_burst(4, [roi], [(overlap, "top", data[46:49, 30:55])])
     with rasterio.open(canvas.measurement_path) as src:
         assert src.shape == (2 * LINES_PER_BURST, SAMPLES_PER_BURST)
         assert src.profile["tiled"]
@@ -91,9 +91,7 @@ def test_burst_ready_canvas_resumes_without_losing_samples_or_overlap_mask(
     assert parsed.bursts[1].first_valid_sample == (-1,) * LINES_PER_BURST
 
     resumed = _RoiCanvasWriter(swath, tmp_path, resume=True, **kwargs)
-    assert resumed.burst_digest(4) == digest
     resumed.write_burst(5, [], [(overlap, "bottom", data[51:54, 30:55])])
-    assert resumed.burst_digest(4) == digest
     with rasterio.open(canvas.measurement_path) as src:
         actual = src.read(1)
     np.testing.assert_array_equal(actual[:10], first[:10])
@@ -150,14 +148,14 @@ def test_rewrite_is_idempotent_and_resets_only_target_burst(tmp_path: Path) -> N
     writer = _make_writer(tmp_path)
     data = _parent_raster()
     untouched = BurstFetchedWindow(5, 0, 10, data[50:55, 10:50])
-    digest5 = writer.write_burst(5, [untouched], [])
+    writer.write_burst(5, [untouched], [])
     writer.write_burst(4, [BurstFetchedWindow(4, 0, 0, data[40:50])], [])
     roi = BurstFetchedWindow(4, 3, 20, data[43:48, 20:60])
-    first_digest = writer.write_burst(4, [roi], [])
-    assert writer.write_burst(4, [roi], []) == first_digest
-    assert writer.burst_digest(5) == digest5
+    writer.write_burst(4, [roi], [])
+    writer.write_burst(4, [roi], [])
     with rasterio.open(writer.canvas.measurement_path) as src:
         raster = src.read(1)
+    np.testing.assert_array_equal(raster[10:15, 10:50], data[50:55, 10:50])
     assert not np.any(raster[:3])
     assert not np.any(raster[8:10])
     assert not np.any(raster[3:8, :20])
@@ -205,23 +203,19 @@ def test_roi_masks_union_and_exclude_unsupported_line_valid_rows(
     )
 
 
-def test_burst_digest_detects_changed_samples_and_mask_independently(
+def test_same_size_sample_mutation_does_not_block_structural_resume(
     tmp_path: Path,
 ) -> None:
-    """The progress digest protects both data bytes and the target XML validity."""
+    """Same-size raster edits after a successful write are intentionally undetected."""
     writer = _make_writer(tmp_path)
-    digest = writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
+    writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
     with rasterio.open(writer.canvas.measurement_path, "r+") as dst:
         dst.write(
             np.asarray([[2 + 3j]], dtype=np.complex64), 1, window=Window(20, 1, 1, 1)
         )
-    changed_samples = writer.burst_digest(4)
-    assert changed_samples != digest
-    annotation = writer.canvas.annotation_path
-    annotation.write_text(
-        annotation.read_text().replace("-1 20 20 -1", "-1 21 20 -1", 1)
-    )
-    assert writer.burst_digest(4) != changed_samples
+    resumed = _make_writer(tmp_path, resume=True)
+    with rasterio.open(resumed.canvas.measurement_path) as src:
+        assert src.read(1)[1, 20] == np.complex64(2 + 3j)
 
 
 @pytest.mark.parametrize("damage", ["shape", "annotation", "missing", "mask"])
@@ -265,11 +259,11 @@ def test_reject_bad_burst_payload_invalidates_target(
     """A rejected payload invalidates the target without a success receipt.
 
     Incremental writing clears the target before streaming blocks, so a
-    bad payload can never leave the previous durable digest advertised;
-    the next identical write rebuilds the same burst deterministically.
+    bad payload cannot leave the previous samples advertised; the next
+    identical write rebuilds the same burst deterministically.
     """
     writer = _make_writer(tmp_path)
-    digest = writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
+    writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
     overlap = BurstOverlapWindow(
         swath="IW1",
         top_index=4,
@@ -290,6 +284,8 @@ def test_reject_bad_burst_payload_invalidates_target(
         overlaps = [(overlap, "top", np.ones((2, 25)))]
     with pytest.raises(Sentinel1ProductError):
         writer.write_burst(4, windows, overlaps)
-    assert writer.burst_digest(4) != digest
-    retry = writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
-    assert retry == digest
+    with rasterio.open(writer.canvas.measurement_path) as src:
+        assert not np.any(src.read(1)[:10])
+    writer.write_burst(4, [BurstFetchedWindow(4, 1, 20, np.ones((2, 3)))], [])
+    with rasterio.open(writer.canvas.measurement_path) as src:
+        np.testing.assert_array_equal(src.read(1)[1:3, 20:23], np.ones((2, 3)))

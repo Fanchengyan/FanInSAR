@@ -1490,17 +1490,18 @@ class Stack(NetworkContract, ABC):
         return report
 
     def verify(self) -> list[str]:
-        """Re-hash every committed product payload in this work directory.
+        """Check committed product structure in this work directory.
 
-        Normal reads skip hashing; this method checks every ``file:checksum``
-        recorded in every ``item.json`` below the work directory (``cache/``
-        is skipped).
+        Each ``item.json`` below the work directory (``cache/`` and hidden
+        names are skipped) is checked for required assets, path safety, and
+        declared array shape/dtype metadata. Payload bytes and legacy
+        ``file:checksum`` fields are not compared.
 
         Returns
         -------
         list of str
-            One entry per damaged asset, ``"<product>: <asset>"``; empty
-            means every payload matches its write-time checksum.
+            One entry per failing asset, ``"<product>: <asset>"``; empty
+            means every product passed the structural contract.
 
         """
         from faninsar.io.storage.product import verify_product

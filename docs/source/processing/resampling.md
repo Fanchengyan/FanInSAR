@@ -222,9 +222,11 @@ coarser = stack.geocode(ifg.wrapped_phase, grid=stack.resolve_grid(resolution_m=
 and `valid.tif`; relative paths resolve from the current working directory.
 No input-array content digest is computed. An in-memory product never reuses
 an old output by pathname: an existing directory raises `FileExistsError`
-unless `overwrite=True` requests recomputation and replacement. Stored output
-checksums remain available to `stack.verify()`. All computations return the
-geocoded raster even when it is also saved.
+unless `overwrite=True` requests recomputation and replacement. `stack.verify()`
+checks product structure and declared array metadata, not payload checksums.
+A deliberate rerun uses `overwrite=True` on the geocode call and publishes a
+fresh write id. All computations return the geocoded raster even when it is
+also saved.
 
 Already georeferenced products pass through with a warning when no output or
 resampling options are given. Explicit output or grid changes on those

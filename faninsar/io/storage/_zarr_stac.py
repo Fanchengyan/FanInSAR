@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import operator
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,33 +15,35 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
-def digest_path(path: Path) -> str:
-    """Return a deterministic SHA-256 digest for a file or directory tree."""
-    digest = hashlib.sha256()
-    if path.is_file():
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+def inspect_zarr_array_metadata(path: Path) -> tuple[tuple[int, ...], np.dtype]:
+    """Return ``(shape, dtype)`` from Zarr metadata without reading samples.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Canonical Zarr array directory.
+
+    Returns
+    -------
+    tuple of tuple of int and numpy.dtype
+        Declared array shape and dtype.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the asset is missing, unsafe, or its array metadata cannot be read.
+
+    """
+    import zarr
+
     if not path.is_dir() or path.is_symlink():
-        reject_invalid_state(f"Zarr asset is missing or unsafe: {path}")
-    # Generation leases expose a descriptor-backed Path whose filesystem
-    # spelling is ``/dev/fd/...``.  Use its stable display path for recursive
-    # Zarr traversal; the lease still pins the immutable generation lifetime.
-    root = os.fspath(getattr(path, "_display_path", path))
-    for directory, directories, filenames in os.walk(root, followlinks=False):
-        directories.sort()
-        for filename in sorted(filenames):
-            child = Path(directory) / filename
-            if child.is_symlink():
-                reject_invalid_state(f"Zarr asset contains a symbolic link: {child}")
-            relative = os.path.relpath(child, root).replace(os.sep, "/").encode()
-            digest.update(len(relative).to_bytes(8, "big"))
-            digest.update(relative)
-            with child.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    return digest.hexdigest()
+        reject_invalid_state(f"Zarr payload is missing or unsafe: {path}")
+    try:
+        array = zarr.open_array(store=str(path), mode="r")
+        shape = tuple(int(size) for size in array.shape)
+        return shape, np.dtype(array.dtype)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        reject_invalid_state(f"Zarr payload cannot be read: {error}")
 
 
 def require_basename(value: object, field: str) -> str:
@@ -284,7 +284,7 @@ def validate_stac_item(
 
 
 __all__ = [
-    "digest_path",
+    "inspect_zarr_array_metadata",
     "normalize_read_window",
     "read_zarr_array",
     "require_basename",

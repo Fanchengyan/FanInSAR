@@ -50,22 +50,9 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
-def _source_digest(path: Path) -> tuple[str, str]:
-    """Return canonical source id and content SHA-256 for one RSLC path."""
-    source_id = str(path.expanduser().resolve(strict=False))
-    digest = hashlib.sha256()
-    try:
-        with Path(source_id).open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except (FileNotFoundError, NotADirectoryError):
-        digest.update(f"missing:{source_id}".encode())
-    except OSError as error:
-        logger.exception("NISAR source cannot be snapshotted: %s", source_id)
-        reject_invalid_state(
-            f"NISAR source cannot be snapshotted: {source_id}: {error}"
-        )
-    return source_id, digest.hexdigest()
+def _source_id(path: Path) -> str:
+    """Return a canonical local path identity without reading file bytes."""
+    return str(path.expanduser().resolve(strict=False))
 
 
 def _dem_identity(dem: object) -> str:
@@ -1112,8 +1099,9 @@ def make_nisar_scene_provider(
     flatten_stage : {"coregistration", "interferogram"}, optional
         Stage at which the NISAR range-offset phase screen is applied.
     admission_lineage : mapping, optional
-        Date-keyed trusted pre-open metadata.  It is copied into the scene
-        manifest so source identity and policy survive stack publication.
+        Date-keyed source identity and optional inventory metadata.  It is
+        copied into the scene manifest so canonical source id, channel, and
+        policy survive stack publication.  It is not a content snapshot.
     **legacy : object
         Removed keyword arguments. The old ``master`` keyword is rejected with
         a migration error.
@@ -1140,7 +1128,7 @@ def make_nisar_scene_provider(
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
     admission_lineage = dict(admission_lineage or {})
     admitted_sources = {
-        date_id: _source_digest(Path(path)) for date_id, path in lineage.items()
+        date_id: _source_id(Path(path)) for date_id, path in lineage.items()
     }
 
     def produce_pair(
@@ -1180,15 +1168,6 @@ def make_nisar_scene_provider(
             configured_dem=configured_dem,
             configured_height=configured_height,
         )
-        for date_id, source_path in (
-            (primary_date, primary_source),
-            (secondary_date, secondary_source),
-        ):
-            current = _source_digest(Path(source_path))
-            if current != admitted_sources[date_id]:
-                reject_invalid_state(
-                    "NISAR RSLC source path or content changed after admission"
-                )
         if not isinstance(primary_product.grid, RadarGrid) or not isinstance(
             secondary_product.grid, RadarGrid
         ):
@@ -1646,8 +1625,7 @@ def make_nisar_scene_provider(
                 {
                     "stage": "nisar_rslc_tile" if full_scene else "nisar_rslc_window",
                     "source": str(primary_source),
-                    "source_id": admitted_sources[primary_date][0],
-                    "source_digest": admitted_sources[primary_date][1],
+                    "source_id": admitted_sources[primary_date],
                     "admission_policy": admission_lineage.get(primary_date, {}).get(
                         "policy"
                     ),
@@ -1692,8 +1670,7 @@ def make_nisar_scene_provider(
                         if full_scene
                         else "nisar_rslc_window",
                         "source": str(secondary_source),
-                        "source_id": admitted_sources[secondary_date][0],
-                        "source_digest": admitted_sources[secondary_date][1],
+                        "source_id": admitted_sources[secondary_date],
                         "admission_policy": admission_lineage.get(
                             secondary_date, {}
                         ).get("policy"),
@@ -1732,11 +1709,6 @@ def make_nisar_scene_provider(
                     "range_offset_phase_model": (
                         "phase=4*pi*range_spacing/wavelength*(secondary-reference)"
                     ),
-                    "range_offset_phase_array_digest": hashlib.sha256(
-                        np.ascontiguousarray(
-                            range_offset_phase, dtype=np.float32
-                        ).tobytes()
-                    ).hexdigest(),
                     "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
                     "valid_pixels": int(np.sum(valid_samples(secondary_array))),
                     "pair_valid_pixels": int(

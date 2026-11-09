@@ -23,7 +23,6 @@ from pathlib import Path
 import numpy as np
 
 from faninsar.io.storage._zarr_stac import (
-    digest_path,
     read_zarr_array,
     write_zarr_array,
 )
@@ -142,8 +141,8 @@ def commit_scene_geometry(
     The rdr2geo solve runs once over the full Reference grid; the six zarr
     payloads are written into the product directory and ``item.json`` is
     rewritten atomically, preserving the scene ``write_id`` and properties
-    while adding the new asset entries (with ``file:checksum`` and
-    ``roles: ["data"]``). Keeping the ``write_id`` intact is required by the
+    while adding the new asset entries (with ``roles: ["data"]``). Keeping
+    the ``write_id`` intact is required by the
     flat layout: secondaries bound to this Reference must not go stale when
     its geometry fields are materialized.
 
@@ -194,7 +193,6 @@ def commit_scene_geometry(
         assets[name] = {
             "href": href,
             "roles": ["data"],
-            "file:checksum": digest_path(root / href),
         }
     item["assets"] = assets
     text = json.dumps(item, sort_keys=True, separators=(",", ":"))

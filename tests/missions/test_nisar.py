@@ -6,22 +6,18 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-import faninsar.missions.nisar as nisar_module
 from faninsar.missions.nisar import (
     NisarAdmissionPolicy,
     NisarSensor,
     admit_nisar_source,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class FakeComplexDataset:
@@ -52,12 +48,34 @@ def install_fake_reader(
     monkeypatch.setitem(sys.modules, "nisar.products.readers", readers)
 
 
+def _spy_source_reads(monkeypatch: pytest.MonkeyPatch, source: Path) -> list[str]:
+    """Record read-binary opens of ``source`` used for full-file hashing."""
+    target = source.expanduser().resolve(strict=False)
+    opens: list[str] = []
+    real_open = Path.open
+
+    def wrapped(
+        self: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        path = Path(self).expanduser().resolve(strict=False)
+        text = str(mode)
+        if path == target and "b" in text and "r" in text and "w" not in text:
+            opens.append(text)
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", wrapped)
+    return opens
+
+
 def admit_fake_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     handle: object,
 ) -> object:
-    """Attach an explicit trusted admission snapshot to a reader fake."""
+    """Attach optional source-identity metadata to a reader fake."""
     source = tmp_path / f"fake-rslc-{id(handle)}.h5"
     source.write_bytes(b"reader-fake")
     if getattr(handle, "filename", None) is None:
@@ -186,19 +204,24 @@ def test_nisar_window_read_rejects_out_of_bounds_window(
     assert dataset.selections == []
 
 
-def test_nisar_admission_rejects_content_mutation_before_window_read(
+def test_nisar_admission_does_not_reject_content_mutation_before_window_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An admitted handle cannot read bytes from a changed RSLC source."""
+    """Same-path source byte edits are no longer a processing reject.
+
+    PROPOSAL-0082 withdraws full-file snapshot drift checks. Local inputs are
+    treated as stable for the run; a matching inventory digest is metadata,
+    not an open/read gate.
+    """
     source = tmp_path / "scene.h5"
     source.write_bytes(b"rslc-v1")
-    dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
+    samples = np.ones((4, 4), dtype=np.complex64)
+    dataset = FakeComplexDataset(samples)
     handle = SimpleNamespace(
         filename=str(source),
         getSlcDatasetAsNativeComplex=lambda *_args: dataset,
     )
-    calls: list[str] = []
-    install_fake_reader(monkeypatch, handle, calls)
+    install_fake_reader(monkeypatch, handle, [])
     admitted = NisarSensor().open_product(
         str(source),
         admission={
@@ -208,9 +231,9 @@ def test_nisar_admission_rejects_content_mutation_before_window_read(
     )
     source.write_bytes(b"rslc-v2")
 
-    with pytest.raises(InvalidProcessingStateError, match="content changed"):
-        NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
-    assert dataset.selections == []
+    result = NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
+    np.testing.assert_array_equal(result, samples[:2, :2])
+    assert dataset.selections == [(slice(0, 2), slice(0, 2))]
 
 
 @pytest.mark.parametrize(
@@ -267,3 +290,75 @@ def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
 
     with pytest.raises(ValueError, match="different channels"):
         NisarSensor().to_slc_product(handle, frequency="A", freq="B")
+
+
+def test_repeated_window_reads_do_not_hash_entire_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Public adapter window reads never scan the whole RSLC for identity."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"rslc-payload" * 4096)
+    samples = (
+        np.arange(48, dtype=np.float32).reshape(6, 8)
+        + 1j * np.arange(48, dtype=np.float32).reshape(6, 8)
+    ).astype(np.complex64)
+    dataset = FakeComplexDataset(samples)
+    handle = SimpleNamespace(
+        filename=str(source),
+        getSlcDatasetAsNativeComplex=lambda *_args: dataset,
+    )
+    install_fake_reader(monkeypatch, handle, [])
+    opens = _spy_source_reads(monkeypatch, source)
+    digest = hashlib.sha256(b"declared-inventory").hexdigest()
+    sensor = NisarSensor()
+    admitted = sensor.open_product(
+        str(source),
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {str(source): digest},
+        },
+    )
+    first = sensor.read_slc_window(admitted, (slice(1, 4), slice(2, 6)))
+    second = sensor.read_slc_window(admitted, (slice(1, 4), slice(2, 6)))
+
+    np.testing.assert_array_equal(first, samples[1:4, 2:6])
+    np.testing.assert_array_equal(second, first)
+    assert dataset.selections == [
+        (slice(1, 4), slice(2, 6)),
+        (slice(1, 4), slice(2, 6)),
+    ]
+    assert opens == []
+    metadata = sensor.admission_metadata(admitted)
+    assert metadata is not None
+    assert metadata["source_id"] == str(source.resolve())
+    assert "source_digest" not in metadata
+    assert metadata["policy"]["expected_sha256"][str(source)] == digest
+
+
+def test_admit_nisar_source_records_inventory_without_hashing_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """admit_nisar_source keeps expected SHA-256 inventory as metadata only."""
+    source = tmp_path / "scene.h5"
+    payload = b"rslc-v1" * 2048
+    source.write_bytes(payload)
+    digest = hashlib.sha256(b"not-the-file-bytes").hexdigest()
+    opens = _spy_source_reads(monkeypatch, source)
+
+    record = admit_nisar_source(
+        source,
+        expected_sha256={str(source): digest},
+        trusted_roots=[tmp_path],
+    )
+
+    assert record["source_id"] == str(source.resolve())
+    assert "source_digest" not in record
+    assert "source_size_bytes" not in record
+    assert record["policy"]["expected_sha256"][str(source)] == digest
+    assert opens == []
+
+
+def test_nisar_expected_sha256_inventory_rejects_malformed_digest() -> None:
+    """Inventory metadata must stay well-formed even though it is not enforced."""
+    with pytest.raises(InvalidProcessingStateError, match="64 hex digits"):
+        NisarAdmissionPolicy(expected_sha256={"scene.h5": "abcd"}).as_metadata()

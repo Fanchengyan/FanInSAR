@@ -12,13 +12,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from faninsar.missions.nisar import NisarSensor
-from faninsar.processing.geometry.coordinates import GeoGrid
-from faninsar.processing.geometry import ConstantDEM
-from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.mosaicking.grid import GeoGridSpec
-from faninsar.processing.slc import GeoSLC, RadarSLC
-from faninsar.missions.nisar import NISARStack
+from faninsar.io.storage.scene_store import CoregisteredSceneStore
+from faninsar.missions.nisar import NisarSensor, NISARStack
 from faninsar.missions.nisar.provider import (
     _apply_range_offset_flatten,
     _dense_secondary_mapping,
@@ -30,7 +25,11 @@ from faninsar.missions.nisar.provider import (
     _tile_resume_identity,
     make_nisar_scene_provider,
 )
-from faninsar.io.storage.scene_store import CoregisteredSceneStore
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.geometry import ConstantDEM
+from faninsar.processing.geometry.coordinates import GeoGrid
+from faninsar.processing.mosaicking.grid import GeoGridSpec
+from faninsar.processing.slc import GeoSLC, RadarSLC
 
 from .test_stack import _result
 
@@ -335,10 +334,14 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
     np.testing.assert_array_equal(secondary_crop.samples, secondary_array[3:6, 3:7])
 
     item = (tmp_path / "pair" / "item.json").read_text()
-    assert "source_digest" in item
     assert "source_id" in item
+    assert "source_digest" not in item
+    assert "range_offset_phase_array_digest" not in item
     assert "dem_identity" in item
     assert "B/HH" in item
+    assert "range_offset_phase_rms_rad" in item
+    assert "tile_identity" in item
+    assert "range_offset_phase_sign" in item
     reference = CoregisteredSceneStore.open(tmp_path / "20240101")
     secondary = CoregisteredSceneStore.open(tmp_path / "pair")
     assert reference.is_reference
@@ -1008,9 +1011,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         extra={"nisar_tile_shape": (2, 3)},
     )
     radar_stack.prepare_data()
-    radar_stack.coregister_scenes().form_interferograms(
-        multilook=(1, 1)
-    )
+    radar_stack.coregister_scenes().form_interferograms(multilook=(1, 1))
     assert len(radar_stack.ifg_dirs) == 3
     reference_write_id = radar_stack.reference_scene.write_id
     for date_id in dates:
@@ -1143,10 +1144,37 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
     }
 
 
-def test_nisar_provider_rejects_source_content_mutation_after_admission(
+def _spy_source_reads(monkeypatch: pytest.MonkeyPatch, *sources: Path) -> list[str]:
+    """Record read-binary opens of the given RSLC paths."""
+    targets = {path.expanduser().resolve(strict=False) for path in sources}
+    opens: list[str] = []
+    real_open = Path.open
+
+    def wrapped(
+        self: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        path = Path(self).expanduser().resolve(strict=False)
+        text = str(mode)
+        if path in targets and "b" in text and "r" in text and "w" not in text:
+            opens.append(f"{path.name}:{text}")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", wrapped)
+    return opens
+
+
+def test_nisar_provider_does_not_reject_source_content_mutation_after_admission(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider snapshot prevents stale scene reuse after source mutation."""
+    """Same-path source edits no longer reject pair execution after admission.
+
+    PROPOSAL-0082 withdraws full-file provider snapshots and pair rechecks.
+    Unadmitted paths still fail; explicit overwrite remains the rerun control.
+    """
     reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
     secondary_path = tmp_path / "NISAR_RSLC_20240113.h5"
     reference_path.write_bytes(b"reference-v1")
@@ -1169,6 +1197,11 @@ def test_nisar_provider_rejects_source_content_mutation_after_admission(
                 dtype=np.complex64,
             )
 
+    opens = _spy_source_reads(monkeypatch, reference_path, secondary_path)
+    monkeypatch.setattr(
+        "faninsar.missions.nisar.provider._geometry_shared_radar_window",
+        lambda *_args, **_kwargs: (0, 2, 0, 2),
+    )
     callback = make_nisar_scene_provider(
         sensor=Sensor(),
         handles=handles,
@@ -1183,12 +1216,70 @@ def test_nisar_provider_rejects_source_content_mutation_after_admission(
         reference="20240101",
         channel=("B", "HH"),
         configured_window=(0, 2, 0, 2),
+        configured_dem=ConstantDEM(0.0),
     )
     secondary_path.write_bytes(b"secondary-v2")
-    with pytest.raises(InvalidProcessingStateError, match="changed after admission"):
+    callback(
+        reference_path,
+        secondary_path,
+        output_dir=tmp_path / "pair",
+        options={"coregistration_grid": "radar"},
+    )
+    store = CoregisteredSceneStore.open(tmp_path / "pair")
+    payload, unit = store.read("NISAR_b0")
+    np.testing.assert_array_equal(payload, np.ones((2, 2), dtype=np.complex64))
+    assert unit.phase_state is not None
+    assert "range_offset_phase_array_digest" not in unit.phase_state
+    assert "tile_identity" in unit.phase_state
+    assert "source_digest" not in (tmp_path / "pair" / "item.json").read_text()
+    assert opens == []
+
+
+def test_nisar_provider_still_rejects_unadmitted_source_path(
+    tmp_path: Path,
+) -> None:
+    """Path identity remains; only content snapshots are withdrawn."""
+    reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
+    secondary_path = tmp_path / "NISAR_RSLC_20240113.h5"
+    other_path = tmp_path / "NISAR_RSLC_other.h5"
+    for path in (reference_path, secondary_path, other_path):
+        path.write_bytes(path.name.encode())
+    reference_result = _result(reference_path, "20240101")
+    secondary_result = _result(secondary_path, "20240113")
+
+    class Sensor:
+        """Fake normalized NISAR window reader."""
+
+        def read_slc_window(
+            self,
+            _handle: object,
+            window: tuple[slice, slice],
+            **_kwargs: object,
+        ) -> np.ndarray:
+            return np.ones(
+                (window[0].stop - window[0].start, window[1].stop - window[1].start),
+                dtype=np.complex64,
+            )
+
+    callback = make_nisar_scene_provider(
+        sensor=Sensor(),
+        handles={reference_path: object(), secondary_path: object()},
+        products={
+            "20240101": reference_result.product,
+            "20240113": secondary_result.product,
+        },
+        lineage={
+            "20240101": str(reference_path),
+            "20240113": str(secondary_path),
+        },
+        reference="20240101",
+        channel=("B", "HH"),
+        configured_window=(0, 2, 0, 2),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="unadmitted source path"):
         callback(
             reference_path,
-            secondary_path,
+            other_path,
             output_dir=tmp_path / "pair",
             options={"coregistration_grid": "radar", "height": 0.0},
         )

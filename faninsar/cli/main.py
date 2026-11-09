@@ -58,7 +58,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the RepairReport without writing stack.json",
     )
     stack_verify = stack_sub.add_parser(
-        "verify", help="Check committed product payloads against checksums"
+        "verify",
+        help=(
+            "Check committed product structure, required assets, paths, "
+            "and declared array metadata"
+        ),
+        description=(
+            "Check committed product structure, required assets, paths, "
+            "and declared array metadata"
+        ),
     )
     stack_verify.add_argument("work_dir", help="Stack work directory")
 

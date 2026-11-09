@@ -2,7 +2,7 @@
 
 # The adapter preserves actionable domain messages at the mission boundary;
 # these exception-style rules are intentionally handled locally.
-# ruff: noqa: E501, EM101, EM102, TRY003, TRY400
+# ruff: noqa: E501, EM101, EM102, TRY003
 
 from __future__ import annotations
 
@@ -44,12 +44,10 @@ logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class _AdmissionSnapshot:
-    """Immutable identity captured before opening one RSLC source."""
+class _SourceIdentity:
+    """Canonical path identity captured when opening one RSLC source."""
 
     source_id: str
-    source_digest: str
-    source_size_bytes: int = 0
     policy: NisarAdmissionPolicy | None = None
 
 
@@ -66,9 +64,11 @@ class NisarAdmissionPolicy:
     trusted_roots : sequence of path-like, optional
         Legacy metadata retained for callers that record a source policy.
     expected_sha256 : mapping, optional
-        Source inventory.  Keys may be the source path (or its canonical
-        spelling), and values are hexadecimal SHA-256 digests.  A value may
-        also be a mapping containing ``sha256``.
+        Declared source inventory.  Keys may be the source path (or its
+        canonical spelling), and values are hexadecimal SHA-256 digests.
+        A value may also be a mapping containing ``sha256``.  The inventory
+        is recorded as metadata and is not compared with local file bytes
+        at open, window read, or pair execution.
     policy_id : str, default="nisar-source-metadata-v1"
         Stable metadata identity recorded in lineage and scene manifests.
 
@@ -230,92 +230,51 @@ def _coerce_admission_policy(
     )
 
 
-def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
-    """Return a reproducible path/content identity for one source.
-
-    This is provenance bookkeeping, not an admission gate.  Missing paths
-    retain a deterministic sentinel so in-memory reader fakes can exercise
-    the adapter; native readers remain responsible for opening real files.
-    """
-    resolved = Path(path).expanduser().resolve(strict=False)
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        with resolved.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-                size += len(chunk)
-    except (FileNotFoundError, NotADirectoryError):
-        digest.update(f"missing:{resolved}".encode())
-    except OSError as error:
-        logger.error("NISAR RSLC source cannot be snapshotted: %s", resolved)
-        raise InvalidProcessingStateError(
-            f"NISAR RSLC source cannot be snapshotted: {resolved}: {error}"
-        ) from error
-    return _AdmissionSnapshot(str(resolved), digest.hexdigest(), size)
+def _canonical_source_id(path: str | Path) -> str:
+    """Return a canonical local path identity without reading file bytes."""
+    return str(Path(path).expanduser().resolve(strict=False))
 
 
-def _handle_source_identity(handle: Any) -> str | None:
-    """Return a canonical source identity exposed by a native handle."""
-    try:
-        source = _value(handle, "filename", "file_name", "source_path")
-    except Exception:
-        logger.exception("Unable to inspect NISAR handle source identity")
-        return None
-    if source is None:
-        return None
-    try:
-        return str(Path(source).expanduser().resolve(strict=False))
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-def _remember_admission(handle: Any, snapshot: _AdmissionSnapshot) -> None:
-    """Attach an optional baseline snapshot to a native handle.
+def _remember_source_identity(handle: Any, identity: _SourceIdentity) -> None:
+    """Attach canonical source identity to a native handle.
 
     Native handles normally allow attributes.  Handles that do not are still
-    usable; their current source is snapshotted at each public read boundary.
-    No process-wide identity or integer-id cache is used.
+    usable; their path is resolved from handle metadata without reading
+    payload bytes.  No process-wide identity or integer-id cache is used.
     """
     try:
-        handle._faninsar_nisar_source_snapshot = snapshot
+        handle._faninsar_nisar_source_identity = identity
     except (AttributeError, TypeError):
         return
 
 
-def _handle_admission(handle: Any) -> _AdmissionSnapshot | None:
-    """Return an optional baseline snapshot attached by :meth:`open_product`."""
-    snapshot = getattr(handle, "_faninsar_nisar_source_snapshot", None)
-    return snapshot if isinstance(snapshot, _AdmissionSnapshot) else None
+def _handle_source_record(handle: Any) -> _SourceIdentity | None:
+    """Return the optional identity attached by :meth:`open_product`."""
+    identity = getattr(handle, "_faninsar_nisar_source_identity", None)
+    return identity if isinstance(identity, _SourceIdentity) else None
 
 
-def _validate_admission(
+def _source_identity(
     handle: Any, *, expected_source: str | Path | None = None
-) -> _AdmissionSnapshot:
-    """Check optional source lineage and detect changes since opening.
+) -> _SourceIdentity:
+    """Return canonical source identity without reading payload bytes.
 
-    The check provides reproducibility for Stack resume and provenance.  It
-    does not authorize or reject a reader handle based on a trust policy.
+    Path identity is provenance, not a content claim.  Local inputs are
+    treated as stable for the run; same-path byte edits are not rejected.
     """
-    snapshot = _handle_admission(handle)
-    if snapshot is None:
+    identity = _handle_source_record(handle)
+    if identity is None:
         handle_source = _value(handle, "filename", "file_name", "source_path")
         source = expected_source if expected_source is not None else handle_source
         if source is None:
-            return _AdmissionSnapshot("", "", 0)
-        snapshot = _source_snapshot(source)
+            return _SourceIdentity("")
+        identity = _SourceIdentity(_canonical_source_id(source))
     elif expected_source is not None:
-        expected_id = str(Path(expected_source).expanduser().resolve(strict=False))
-        if expected_id != snapshot.source_id:
+        expected_id = _canonical_source_id(expected_source)
+        if expected_id != identity.source_id:
             logger.error("NISAR RSLC source lineage changed: %s", expected_source)
             raise InvalidProcessingStateError("NISAR RSLC source lineage changed")
-
-    if snapshot.source_id:
-        current = _source_snapshot(snapshot.source_id)
-        if current.source_digest != snapshot.source_digest:
-            logger.error("NISAR RSLC source content changed: %s", snapshot.source_id)
-            raise InvalidProcessingStateError("NISAR RSLC source content changed")
-    return snapshot
+    return identity
 
 
 def _value(value: Any, *names: str) -> Any:
@@ -540,47 +499,40 @@ class NisarSensor(Sensor):
         *,
         admission: NisarAdmissionPolicy | Mapping[str, object] | None = None,
         **policy_options: Any,
-    ) -> _AdmissionSnapshot:
-        """Capture optional source identity and content digest.
+    ) -> _SourceIdentity:
+        """Capture canonical source path identity and optional inventory metadata.
 
         Parameters
         ----------
         uri : path-like
             RSLC path or reader URI.
         admission : NisarAdmissionPolicy or mapping, optional
-            Optional metadata retained in the returned snapshot.
+            Optional metadata retained in the returned identity.
         **policy_options : Any
             Convenience scalar policy options accepted by the policy object.
 
         Returns
         -------
-        _AdmissionSnapshot
-            Source id, SHA-256, size, and the effective policy.
+        _SourceIdentity
+            Canonical source id and the effective policy.  No payload digest
+            is computed or claimed.
 
         """
         policy = _coerce_admission_policy(admission, **policy_options)
-        snapshot = _source_snapshot(uri)
-        return _AdmissionSnapshot(
-            snapshot.source_id,
-            snapshot.source_digest,
-            snapshot.source_size_bytes,
-            policy,
-        )
+        return _SourceIdentity(_canonical_source_id(uri), policy)
 
     def admission_metadata(self, handle: Any) -> dict[str, object] | None:
         """Return optional source identity metadata for one reader handle."""
-        snapshot = _handle_admission(handle)
-        if snapshot is None:
+        identity = _handle_source_record(handle)
+        if identity is None:
             source = _value(handle, "filename", "file_name", "source_path")
             if source is None:
                 return None
-            snapshot = _source_snapshot(source)
+            identity = _SourceIdentity(_canonical_source_id(source))
         return {
-            "source_id": snapshot.source_id,
-            "source_digest": snapshot.source_digest,
-            "source_size_bytes": snapshot.source_size_bytes,
+            "source_id": identity.source_id,
             "policy": (
-                snapshot.policy.as_metadata() if snapshot.policy is not None else None
+                identity.policy.as_metadata() if identity.policy is not None else None
             ),
         }
 
@@ -647,9 +599,7 @@ class NisarSensor(Sensor):
                     "NISAR policy object cannot mix scalar metadata options"
                 )
         policy = _coerce_admission_policy(configured_policy)
-        # Snapshot the bytes for provenance and later source-change detection.
-        # This is deliberately independent of the optional metadata policy.
-        snapshot = _source_snapshot(uri)
+        identity = _SourceIdentity(_canonical_source_id(uri), policy)
         try:
             readers = import_module("nisar.products.readers")
         except ImportError as error:
@@ -678,15 +628,7 @@ class NisarSensor(Sensor):
                 "expected an RSLC reader handle"
             )
             reject(message, ValueError, logger=logger)
-        _remember_admission(
-            handle,
-            _AdmissionSnapshot(
-                snapshot.source_id,
-                snapshot.source_digest,
-                snapshot.source_size_bytes,
-                policy,
-            ),
-        )
+        _remember_source_identity(handle, identity)
         return handle
 
     def to_slc_product(
@@ -700,10 +642,7 @@ class NisarSensor(Sensor):
         **kwargs: Any,
     ) -> SLCReadResult:
         """Normalize one admitted NISAR RSLC channel without reading its raster."""
-        # Validate identity and content before selecting channels: native
-        # metadata accessors are executable reader boundaries and must never
-        # run for a compatible-but-unadmitted handle.
-        snapshot = _validate_admission(handle, expected_source=source_path)
+        identity = _source_identity(handle, expected_source=source_path)
         if "freq" in kwargs:
             alias = normalize_channel(kwargs.pop("freq"), field="frequency")
             direct = normalize_channel(frequency, field="frequency")
@@ -738,7 +677,7 @@ class NisarSensor(Sensor):
         resolved_source = str(
             source_path
             or _value(handle, "filename", "file_name", "source_path")
-            or snapshot.source_id
+            or identity.source_id
         )
         if not resolved_source:
             raise InvalidProcessingStateError("NISAR RSLC handle has no source path")
@@ -767,15 +706,13 @@ class NisarSensor(Sensor):
                 "product": "RSLC",
                 "frequency": frequency,
                 "polarization": polarization,
-                "source_id": snapshot.source_id,
-                "source_digest": snapshot.source_digest,
-                "source_size_bytes": snapshot.source_size_bytes,
+                "source_id": identity.source_id,
                 "admission_policy": (
-                    snapshot.policy.as_metadata()
-                    if snapshot.policy is not None
+                    identity.policy.as_metadata()
+                    if identity.policy is not None
                     else None
                 ),
-                "lineage": snapshot.source_id,
+                "lineage": identity.source_id,
             },
         )
 
@@ -822,7 +759,6 @@ class NisarSensor(Sensor):
         if kwargs:
             message = f"Unsupported NISAR window-read options: {tuple(kwargs)}"
             reject(message, TypeError, logger=logger)
-        _validate_admission(handle)
         getter = getattr(handle, "getSlcDatasetAsNativeComplex", None)
         if not callable(getter):
             message = "NISAR handle has no getSlcDatasetAsNativeComplex method"
@@ -856,14 +792,12 @@ def admit_nisar_source(
     admission: NisarAdmissionPolicy | Mapping[str, object] | None = None,
     **policy_options: Any,
 ) -> dict[str, object]:
-    """Admit one NISAR source without importing the optional reader package."""
-    snapshot = NisarSensor().admit_source(uri, admission=admission, **policy_options)
+    """Record one NISAR source identity without importing the optional reader."""
+    identity = NisarSensor().admit_source(uri, admission=admission, **policy_options)
     return {
-        "source_id": snapshot.source_id,
-        "source_digest": snapshot.source_digest,
-        "source_size_bytes": snapshot.source_size_bytes,
+        "source_id": identity.source_id,
         "policy": (
-            snapshot.policy.as_metadata() if snapshot.policy is not None else None
+            identity.policy.as_metadata() if identity.policy is not None else None
         ),
     }
 

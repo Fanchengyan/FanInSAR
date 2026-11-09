@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from faninsar.io.storage.product import (
+    ITEM_NAME,
     Product,
-    publish_product,
+    ProductWriter,
     discover_products,
     open_product,
+    publish_product,
     verify_product,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
@@ -31,6 +34,21 @@ def _write_arrays(arrays: dict[str, np.ndarray]):
         return assets
 
     return writer
+
+
+def _omit_asset(root: Path, name: str) -> None:
+    """Drop one asset from ``item.json`` and delete its payload."""
+    item_path = root / ITEM_NAME
+    item = json.loads(item_path.read_text(encoding="utf-8"))
+    href = item["assets"].pop(name)["href"]
+    item_path.write_text(
+        json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    payload = root / href
+    if payload.is_dir():
+        shutil.rmtree(payload)
+    elif payload.exists():
+        payload.unlink()
 
 
 def test_commit_and_open_roundtrip(tmp_path: Path) -> None:
@@ -63,8 +81,11 @@ def test_every_commit_gets_a_fresh_write_id(tmp_path: Path) -> None:
     second = publish_product(
         target, kind="x", properties={}, write_payloads=writer, overwrite=True
     )
-    assert second.write_id != first.write_id
-    assert open_product(target).write_id == second.write_id
+    third = publish_product(
+        target, kind="x", properties={}, write_payloads=writer, overwrite=True
+    )
+    assert len({first.write_id, second.write_id, third.write_id}) == 3
+    assert open_product(target).write_id == third.write_id
 
 
 def test_crash_before_item_leaves_no_product(tmp_path: Path) -> None:
@@ -90,16 +111,20 @@ def test_crash_before_item_leaves_no_product(tmp_path: Path) -> None:
 
 
 def test_crash_after_aside_keeps_old_product_discoverable(tmp_path: Path) -> None:
-    """A crash between the aside rename and rename-in loses only the new data."""
+    """A leftover aside is restored; the next writer does not delete the only copy."""
     target = tmp_path / "p"
     writer = _write_arrays({"a": np.zeros((1, 1), dtype=np.float32)})
     first = publish_product(target, kind="x", properties={}, write_payloads=writer)
     aside = tmp_path / f".p.aside-{first.write_id}"
     os.rename(target, aside)
     assert discover_products(tmp_path, kind="x") == []
-    with pytest.raises(InvalidProcessingStateError, match="missing"):
-        open_product(target)
-    publish_product(target, kind="x", properties={}, write_payloads=writer)
+    with pytest.raises(InvalidProcessingStateError, match="exists"):
+        publish_product(target, kind="x", properties={}, write_payloads=writer)
+    restored = open_product(target)
+    assert restored.write_id == first.write_id
+    np.testing.assert_array_equal(
+        restored.read("a"), np.zeros((1, 1), dtype=np.float32)
+    )
     assert not aside.exists()
 
 
@@ -186,8 +211,109 @@ def test_inputs_record_upstream_write_ids(tmp_path: Path) -> None:
     assert down.stale_inputs({"reference": replaced}) == ["reference"]
 
 
-def test_verify_detects_modified_payload(tmp_path: Path) -> None:
-    """``verify_product`` re-hashes payloads against write-time checksums."""
+def test_new_products_omit_file_checksum(tmp_path: Path) -> None:
+    """New commits keep write ids and omit a self-computed payload checksum."""
+    target = tmp_path / "p"
+    product = publish_product(
+        target,
+        kind="x",
+        properties={},
+        write_payloads=_write_arrays({"a": np.ones((1, 1), dtype=np.float32)}),
+    )
+    item = json.loads((target / ITEM_NAME).read_text(encoding="utf-8"))
+    assert "file:checksum" not in item["assets"]["a"]
+    assert product.write_id == item["properties"]["faninsar:write_id"]
+    assert open_product(target).write_id == product.write_id
+
+
+def test_verify_reports_missing_and_malformed_assets(tmp_path: Path) -> None:
+    """Structural verify names missing and unreadable required assets."""
+    target = tmp_path / "p"
+    publish_product(
+        target,
+        kind="x",
+        properties={},
+        write_payloads=_write_arrays(
+            {
+                "a": np.ones((2, 2), dtype=np.float32),
+                "b": np.zeros((2, 2), dtype=np.float32),
+            }
+        ),
+    )
+    assert verify_product(target) == []
+    shutil.rmtree(target / "a.zarr")
+    (target / "b.zarr" / "zarr.json").write_bytes(b"not zarr metadata")
+    assert verify_product(target) == ["a", "b"]
+
+
+def test_verify_reports_required_mask_asset_omitted_from_manifest(
+    tmp_path: Path,
+) -> None:
+    """A mask product must name ``mask`` when that required asset is dropped."""
+    target = tmp_path / "masks" / "water" / "geo"
+    publish_product(
+        target,
+        kind="mask",
+        properties={},
+        write_payloads=_write_arrays({"mask": np.ones((2, 2), dtype=np.uint8)}),
+    )
+    assert verify_product(target) == []
+    _omit_asset(target, "mask")
+    assert verify_product(target) == ["mask"]
+
+
+def test_verify_reports_omitted_geometry_asset_when_set_is_declared(
+    tmp_path: Path,
+) -> None:
+    """Once a scene declares the geometry set, an omitted field is reported."""
+    from faninsar.io.storage.scene_geometry import SCENE_GEOMETRY_ASSETS
+
+    arrays = {
+        name: np.zeros((2, 2), dtype=np.float32) for name in SCENE_GEOMETRY_ASSETS
+    }
+    arrays["geom_flags"] = np.zeros((2, 2), dtype=np.uint8)
+    target = tmp_path / "coreg" / "20240101"
+    publish_product(
+        target,
+        kind="scene",
+        properties={},
+        write_payloads=_write_arrays(arrays),
+    )
+    assert verify_product(target) == []
+    _omit_asset(target, "incidence")
+    assert verify_product(target) == ["incidence"]
+
+
+def test_verify_allows_scene_without_geometry_assets(tmp_path: Path) -> None:
+    """Geometry is lazy; a scene that never published it stays structurally healthy."""
+    target = tmp_path / "coreg" / "20240101"
+    publish_product(
+        target,
+        kind="scene",
+        properties={},
+        write_payloads=_write_arrays({"slc": np.ones((2, 2), dtype=np.complex64)}),
+    )
+    assert verify_product(target) == []
+
+
+def test_verify_reports_declared_shape_and_dtype_mismatch(tmp_path: Path) -> None:
+    """Declared array metadata is checked without requiring a payload hash."""
+    from faninsar.io.storage._zarr_stac import write_zarr_array
+
+    target = tmp_path / "p"
+    publish_product(
+        target,
+        kind="x",
+        properties={"faninsar:shape": [2, 2]},
+        write_payloads=_write_arrays({"a": np.ones((2, 2), dtype=np.float32)}),
+    )
+    assert verify_product(target) == []
+    write_zarr_array(target / "a.zarr", np.ones((3, 1), dtype=np.float64))
+    assert verify_product(target) == ["a"]
+
+
+def test_verify_ignores_legacy_checksum_and_payload_bytes(tmp_path: Path) -> None:
+    """Legacy ``file:checksum`` is inert; same-size byte edits are not scanned."""
     target = tmp_path / "p"
     publish_product(
         target,
@@ -195,14 +321,61 @@ def test_verify_detects_modified_payload(tmp_path: Path) -> None:
         properties={},
         write_payloads=_write_arrays({"a": np.ones((4, 4), dtype=np.float32)}),
     )
-    assert verify_product(target) == []
+    item_path = target / ITEM_NAME
+    item = json.loads(item_path.read_text(encoding="utf-8"))
+    item["assets"]["a"]["file:checksum"] = "0" * 64
+    item_path.write_text(
+        json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
     chunk = next(
         path
         for path in (target / "a.zarr").rglob("*")
         if path.is_file() and path.name not in {"zarr.json", ".zarray", ".zattrs"}
     )
-    chunk.write_bytes(chunk.read_bytes() + b"x")
-    assert verify_product(target) == ["a"]
+    payload = chunk.read_bytes()
+    chunk.write_bytes(bytes((payload[0] ^ 0xFF,)) + payload[1:])
+    assert verify_product(target) == []
+
+
+def test_failed_overwrite_rename_restores_the_old_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed staging rename after aside must put the last usable product back."""
+    from faninsar.io.storage._zarr_stac import write_zarr_array
+
+    target = tmp_path / "p"
+    first = publish_product(
+        target,
+        kind="x",
+        properties={},
+        write_payloads=_write_arrays({"a": np.zeros((1, 1), dtype=np.float32)}),
+    )
+    original = Path.rename
+    rename_error = "simulated staging rename failure"
+
+    def flaky_rename(self: Path, dst: str | Path) -> Path:
+        destination = Path(dst)
+        if self.name == f".{target.name}.tmp" and destination == target:
+            raise OSError(rename_error)
+        return original(self, destination)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
+
+    def overwrite() -> None:
+        with ProductWriter(target, kind="x", overwrite=True) as writer:
+            write_zarr_array(
+                writer.add_asset("a", "a.zarr"), np.ones((1, 1), dtype=np.float32)
+            )
+            writer.commit({})
+
+    with pytest.raises(OSError, match="staging rename"):
+        overwrite()
+    restored = open_product(target)
+    assert restored.write_id == first.write_id
+    np.testing.assert_array_equal(
+        restored.read("a"), np.zeros((1, 1), dtype=np.float32)
+    )
+    assert list(tmp_path.glob(".p.aside-*")) == []
 
 
 def test_item_is_stac_feature(tmp_path: Path) -> None:
@@ -219,7 +392,7 @@ def test_item_is_stac_feature(tmp_path: Path) -> None:
     assert item["stac_version"] == "1.0.0"
     assert item["properties"]["faninsar:kind"] == "scene"
     assert item["assets"]["a"]["href"] == "a.zarr"
-    assert "file:checksum" in item["assets"]["a"]
+    assert "file:checksum" not in item["assets"]["a"]
 
 
 def test_discover_lists_committed_products_by_kind(tmp_path: Path) -> None:

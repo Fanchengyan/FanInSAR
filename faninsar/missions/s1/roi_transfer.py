@@ -31,6 +31,7 @@ logger = setup_logger(__name__)
 _MAX_ACTIVE_BURSTS = 20
 _MAX_TRANSFER_TASKS = 20
 _PROGRESS_NAME = "progress.json"
+_PROGRESS_SCHEMA = "p0082-completion-v1"
 _DECODE_WORKING_BYTES = 4 * 1024 * 1024
 _WRITER_FIXED_BYTES = 32 * 1024 * 1024
 _CHECKPOINT_HEADROOM = 2 * 1024 * 1024
@@ -91,7 +92,7 @@ class _OwnerPlan:
     bursts: list[_BurstPlan]
     granularity: str = "roi"
     writer: _RoiCanvasWriter | None = None
-    completed: dict[str, str] = field(default_factory=dict)
+    completed: dict[str, bool] = field(default_factory=dict)
     abort: threading.Event = field(default_factory=threading.Event)
     skipped: bool = False
 
@@ -374,13 +375,29 @@ def _plan_owner_spans(owner: _OwnerPlan) -> None:
     _restore_progress(owner)
 
 
+def _progress_record(owner: _OwnerPlan) -> dict[str, Any]:
+    """Return the durable burst-completion record for ``owner``."""
+    return {
+        "schema": _PROGRESS_SCHEMA,
+        "fingerprint": owner.fingerprint,
+        "bursts": dict.fromkeys(owner.completed, True),
+    }
+
+
 def _restore_progress(owner: _OwnerPlan) -> None:
-    """Honor only burst checkpoints whose written pixels and mask still match."""
+    """Honor completed burst indices after the canvas structure still parses.
+
+    Legacy digest maps are accepted as completion only when the plan fingerprint
+    and canvas structure match. Payload bytes are not rehashed.
+    """
     try:
         raw = json.loads(owner.progress_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
     if not isinstance(raw, dict) or raw.get("fingerprint") != owner.fingerprint:
+        return
+    schema = raw.get("schema")
+    if schema is not None and schema != _PROGRESS_SCHEMA:
         return
     completed = raw.get("bursts")
     if not isinstance(completed, dict):
@@ -389,18 +406,14 @@ def _restore_progress(owner: _OwnerPlan) -> None:
         owner.writer = owner.open_writer(resume=True)
     except (OSError, ValueError, RuntimeError):
         return
+    legacy = schema is None
     for index in owner.listed:
-        digest = completed.get(str(index))
-        if not isinstance(digest, str):
-            continue
-        try:
-            if owner.writer.burst_digest(index) == digest:
-                owner.completed[str(index)] = digest
-        except (OSError, ValueError, RuntimeError):
-            continue
+        marker = completed.get(str(index))
+        if marker is True or (legacy and isinstance(marker, str) and marker):
+            owner.completed[str(index)] = True
 
 
-def _write_burst(owner: _OwnerPlan, burst: _BurstPlan) -> str:
+def _write_burst(owner: _OwnerPlan, burst: _BurstPlan) -> None:
     """Decode verified local blocks incrementally on the sole writer thread."""
     import rasterio
 
@@ -457,11 +470,11 @@ def _write_burst(owner: _OwnerPlan, burst: _BurstPlan) -> str:
                 )
                 yield subwindow, role, block.samples
 
-    # Reserve fixed GDAL/tile/digest buffers separately from the decoder budget.
+    # Reserve fixed GDAL/tile buffers separately from the decoder budget.
     with rasterio.Env(GDAL_CACHEMAX=_WRITER_FIXED_BYTES // 4):
         if owner.writer is None:
             owner.writer = owner.open_writer()
-        return owner.writer.write_burst(burst.index, windows(), rectangles())
+        owner.writer.write_burst(burst.index, windows(), rectangles())
 
 
 async def _write_ready_burst(owner: _OwnerPlan, burst: _BurstPlan) -> None:
@@ -471,15 +484,12 @@ async def _write_ready_burst(owner: _OwnerPlan, burst: _BurstPlan) -> None:
     # Invalidate any stale receipt before modifying this target's pixels.
     owner.completed.pop(str(burst.index), None)
     if owner.progress_path.exists():
-        source._atomic_write_json(
-            owner.progress_path,
-            {"fingerprint": owner.fingerprint, "bursts": owner.completed},
-        )
+        source._atomic_write_json(owner.progress_path, _progress_record(owner))
     task = asyncio.create_task(asyncio.to_thread(_write_burst, owner, burst))
     cancelled = False
     while True:
         try:
-            digest = await asyncio.shield(task)
+            await asyncio.shield(task)
             break
         except asyncio.CancelledError:
             cancelled = True
@@ -495,11 +505,8 @@ async def _write_ready_burst(owner: _OwnerPlan, burst: _BurstPlan) -> None:
             raise
     if cancelled:
         raise asyncio.CancelledError
-    owner.completed[str(burst.index)] = digest
-    source._atomic_write_json(
-        owner.progress_path,
-        {"fingerprint": owner.fingerprint, "bursts": owner.completed},
-    )
+    owner.completed[str(burst.index)] = True
+    source._atomic_write_json(owner.progress_path, _progress_record(owner))
     cache = owner.context.span_cache
     assert cache is not None
     # The coordinator's admitted consumers define last use, never download order.

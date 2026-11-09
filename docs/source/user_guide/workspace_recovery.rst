@@ -69,7 +69,31 @@ The ``faninsar stack`` subcommands mirror the Python entry points::
    faninsar stack status work/      # status() report, or a rescan report
    faninsar stack repair work/      # rewrite stack.json, print RepairReport
    faninsar stack repair --dry-run work/   # rescan only, no write
-   faninsar stack verify work/      # checksum-verify every committed product
+   faninsar stack verify work/      # structural check of committed products
+
+``verify`` inspects required assets, paths, and declared array metadata. It
+does not compare historical payload checksums. Local inputs are treated as
+stable during a run, and one writer owns each work directory. Concurrent
+overwrite of the same product is unsupported.
+
+Explicit reruns
+---------------
+
+A full scientific rerun is an explicit caller sequence, not an implicit
+overwrite. Keep the default reuse behavior, then replace products in
+dependency order with the existing ``overwrite=True`` /
+``replace_existing=True`` flags. ``prepare_data`` has no overwrite
+argument; it reuses a complete local ready set or continues qualification
+with ``on_error``, ``offline``, and ``budget``. Scientific stages that
+publish products accept ``overwrite=True``::
+
+   stack.prepare_data()
+   stack.coregister_scenes(overwrite=True)
+   stack.form_interferograms(overwrite=True)
+   stack.unwrap(overwrite=True)
+
+Each requested overwrite publishes a fresh ``write_id``. Downstream products
+bound to the previous id become stale until they are also replaced.
 
 What repair cannot fix
 ----------------------

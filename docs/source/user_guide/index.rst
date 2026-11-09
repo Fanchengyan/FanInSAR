@@ -18,4 +18,6 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    sampler
    dem
    remote
+   transfer_completion
+   scientific_lineage
    workspace_recovery

@@ -2,8 +2,11 @@
 
 The Pair, geo, and Stack orchestration layers exchange these immutable
 records instead of importing each other's mutable workflow state.  The
-module owns the residual/phase lineage types consumed by the S1 production
-pipeline; it deliberately keeps no lease, token, or provider state machine.
+module owns the residual/phase operation records consumed by the S1
+production pipeline.  Those records identify operations, parameters, and
+phase-state transitions; they are not content checksums of scientific
+arrays.  The module deliberately keeps no lease, token, or provider state
+machine.
 """
 
 from __future__ import annotations
@@ -58,6 +61,13 @@ def _require_digest(value: str, name: str) -> None:
     _require_text(value, name)
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         reject_invalid_state(f"{name} must be a lowercase SHA-256 digest")
+
+
+def _optional_legacy_text(value: str | None, name: str) -> None:
+    """Accept an inert stored string; omit or reject empty placeholders."""
+    if value is None:
+        return
+    _require_text(value, name)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -282,21 +292,26 @@ class PairResidualSolution:
 
 @dataclass(frozen=True, slots=True)
 class ResidualSolution:
-    """Network or Pair residual lineage consumed by a prepared view."""
+    """Network or Pair residual identity consumed by a prepared view.
+
+    ``payload_digest`` is an optional inert legacy field.  New solutions omit
+    it (``None``).  A stored value is metadata only and is not a content
+    checksum of a residual payload.
+    """
 
     solution_id: str
     kind: Literal["pair", "network"]
     parent_observation_ids: tuple[str, ...]
-    payload_digest: str
+    payload_digest: str | None
     application_id: str
     status: ResidualStatus
 
     def __post_init__(self) -> None:
-        """Validate solution lineage and application identity."""
+        """Validate solution identity; ignore legacy payload bytes."""
         _require_text(self.solution_id, "solution_id")
         if self.kind not in ("pair", "network"):
             reject_invalid_state("solution kind must be pair or network")
-        _require_digest(self.payload_digest, "payload_digest")
+        _optional_legacy_text(self.payload_digest, "payload_digest")
         _require_text(self.application_id, "application_id")
         if self.status is ResidualStatus.VALID and not self.parent_observation_ids:
             reject_invalid_state("valid solutions require observation lineage")
@@ -307,7 +322,7 @@ class AppliedSolution:
     """Exactly-once residual application boundary."""
 
     kind: Literal["pair", "network"]
-    solution_payload_digest: str
+    solution_payload_digest: str | None
     application_id: str
     domain: ArtifactDomain
     parent_observation_ids: tuple[str, ...]
@@ -317,31 +332,33 @@ class AppliedSolution:
         """Validate the exactly-once applied-solution transition."""
         if self.kind not in ("pair", "network"):
             reject_invalid_state("applied solution kind must be pair or network")
-        _require_digest(self.solution_payload_digest, "solution_payload_digest")
+        _optional_legacy_text(self.solution_payload_digest, "solution_payload_digest")
         _require_text(self.application_id, "application_id")
         _require_digest(self.transition_digest, "transition_digest")
 
 
 @dataclass(frozen=True, slots=True)
 class PhaseTransitionRecord:
-    """Auditable state transition for carrier, residual, or phase changes."""
+    """Auditable state transition for carrier, residual, or phase changes.
+
+    ``input_payload_digest`` and ``output_payload_digest`` are optional inert
+    legacy fields.  New transitions omit them.  Present values are stored
+    metadata only and are not payload checksums.
+    """
 
     operation_id: str
     input_state_digest: str
     output_state_digest: str
-    input_payload_digest: str
-    output_payload_digest: str
+    input_payload_digest: str | None = None
+    output_payload_digest: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate exactly-once solution application lineage."""
+        """Validate exactly-once solution application identity."""
         _require_text(self.operation_id, "operation_id")
-        for name in (
-            "input_state_digest",
-            "output_state_digest",
-            "input_payload_digest",
-            "output_payload_digest",
-        ):
+        for name in ("input_state_digest", "output_state_digest"):
             _require_digest(getattr(self, name), name)
+        _optional_legacy_text(self.input_payload_digest, "input_payload_digest")
+        _optional_legacy_text(self.output_payload_digest, "output_payload_digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,11 +392,17 @@ class PhaseState:
         self,
         solution: ResidualSolution,
         *,
-        payload_digest: str,
+        payload_digest: str | None = None,
         operation_id: str,
     ) -> PhaseState:
-        """Apply one residual solution and reject duplicate or conflicting use."""
-        _require_digest(payload_digest, "payload_digest")
+        """Apply one residual solution and reject duplicate or conflicting use.
+
+        ``payload_digest`` is an optional legacy keyword kept so older callers
+        can still pass a stored digest.  New applications omit it.  The value
+        is not hashed against array payloads and is not a content-binding
+        proof.
+        """
+        _optional_legacy_text(payload_digest, "payload_digest")
         _require_text(operation_id, "operation_id")
         if self.residual_application_id is not None:
             if self.residual_solution_id == solution.solution_id:
@@ -404,19 +427,22 @@ class PhaseState:
             residual_solution_id=solution.solution_id,
             residual_application_id=solution.application_id,
             transition_history=history,
-            transition_digest=_digest(
-                [
-                    {
-                        "operation_id": item.operation_id,
-                        "input_state_digest": item.input_state_digest,
-                        "output_state_digest": item.output_state_digest,
-                        "input_payload_digest": item.input_payload_digest,
-                        "output_payload_digest": item.output_payload_digest,
-                    }
-                    for item in history
-                ]
-            ),
+            transition_digest=_digest([_transition_identity(item) for item in history]),
         )
+
+
+def _transition_identity(item: PhaseTransitionRecord) -> dict[str, str]:
+    """Return metadata-only identity for one phase transition."""
+    identity = {
+        "operation_id": item.operation_id,
+        "input_state_digest": item.input_state_digest,
+        "output_state_digest": item.output_state_digest,
+    }
+    if item.input_payload_digest:
+        identity["input_payload_digest"] = item.input_payload_digest
+    if item.output_payload_digest:
+        identity["output_payload_digest"] = item.output_payload_digest
+    return identity
 
 
 __all__ = [

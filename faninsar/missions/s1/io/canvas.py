@@ -19,7 +19,6 @@ The canvas tree mirrors :mod:`faninsar.missions.s1.io.export`::
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import tempfile
@@ -874,8 +873,7 @@ class _RoiCanvasWriter:
                     or src.dtypes != ("complex64",)
                 ):
                     reject_product("incremental canvas raster shape or dtype mismatch")
-                # Full completed-burst validation belongs to burst_digest; this
-                # probe rejects unreadable rasters without reading the whole owner.
+                # Probe rejects unreadable rasters without reading the whole owner.
                 src.read(1, window=Window(0, 0, 1, 1))
         except (
             OSError,
@@ -934,12 +932,13 @@ class _RoiCanvasWriter:
         overlaps: Iterable[
             tuple[BurstOverlapWindow, Literal["top", "bottom"], np.ndarray]
         ],
-    ) -> str:
-        """Replace one burst incrementally, sync its samples/mask and digest it.
+    ) -> None:
+        """Replace one burst incrementally and sync its samples and mask.
 
         Only the current decoded rectangle is retained. An interrupted iterator
         leaves no success receipt; retry clears this burst before rewriting it.
         ROI and overlap validity remain the union of actually written support.
+        Completion is recorded by the caller only after this method returns.
         """
         canvas = self.canvas
         slot = canvas.slot_of(burst_index)
@@ -1008,44 +1007,6 @@ class _RoiCanvasWriter:
             _sync_canvas_file(annotation_path)
             annotation_path.replace(canvas.annotation_path)
         _sync_canvas_directory(canvas.annotation_path.parent)
-        return self.burst_digest(burst_index)
-
-    def burst_digest(self, burst_index: int) -> str:
-        """Hash one burst's complex64 blocks and XML mask with bounded memory.
-
-        The deterministic SHA-256 excludes all other bursts and TIFF/XML file
-        layout. Callers compare it to their checkpoint before skipping transfer
-        at resume; unreadable samples or malformed masks are never accepted.
-        """
-        canvas = self.canvas
-        slot = canvas.slot_of(burst_index)
-        try:
-            _, bursts = _burst_elements(ET.parse(canvas.annotation_path).getroot())
-            mask = self._checked_mask(_read_valid_samples(bursts[slot]))
-            digest = hashlib.sha256()
-            digest.update(
-                np.asarray(
-                    [burst_index, canvas.lines_per_burst, canvas.samples_per_burst],
-                    dtype="<i8",
-                ).tobytes()
-            )
-            digest.update(np.asarray(mask, dtype="<i8").tobytes())
-            with rasterio.open(canvas.measurement_path) as src:
-                for block in _canvas_burst_blocks(canvas, burst_index):
-                    digest.update(
-                        src.read(1, window=block, out_dtype="complex64")
-                        .astype("<c8", copy=False)
-                        .tobytes()
-                    )
-            return digest.hexdigest()
-        except (
-            OSError,
-            ValueError,
-            IndexError,
-            ET.ParseError,
-            rasterio.errors.RasterioError,
-        ):
-            reject_product(f"cannot digest burst {burst_index} in {canvas.safe_root}")
 
     def finish(self) -> RoiSafeCanvas:
         """Return the canvas handle; successful writes already closed all files."""

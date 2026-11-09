@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _METADATA_DIR_NAMES = frozenset({"annotations", "layouts"})
+_COMPLETION_SCHEMA = "p0082-completion-v1"
 
 
 def _invalid(message: str) -> NoReturn:
@@ -55,8 +56,8 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 class SpanCache:
     """Durable per-item span cache under ``tmp/s1-transfer/<canvas>/<F>/``.
 
-    ``manifest.json`` records ``{fingerprint, spans: [{key, url, start,
-    end, label, state, part_size, sha1}]}``; ``key`` is
+    ``manifest.json`` records ``{schema, fingerprint, spans: [{key, url,
+    start, end, label, state, part_size}]}``; ``key`` is
     ``sha1(url|start|end)`` of the scrubbed URL so manifest ``url`` fields
     never carry signed query parameters.  Each span body streams into an
     append-only ``<key>.part`` via ``RangeFetcher.fetch_into``, which
@@ -65,10 +66,9 @@ class SpanCache:
 
     A ``state="complete"`` record is honored only when
     ``part_size == actual .part size == end-start+1``; any drift refetches
-    the span from byte 0.  The optional ``sha1`` is verified on read-back
-    so a same-size corrupted ``.part`` is never mistaken for a clean span.
-    Completing the canvas deletes this directory; product coverage lives
-    in the SAFE as ``coverage.json``.
+    the span from byte 0.  Completed payloads are not rehashed.  Completing
+    the canvas deletes this directory; product coverage lives in the SAFE
+    as ``coverage.json``.
     """
 
     def __init__(self, root: Path, fingerprint: str, *, label: str = "") -> None:
@@ -109,6 +109,9 @@ class SpanCache:
             return
         if not isinstance(raw, dict) or raw.get("fingerprint") != self.fingerprint:
             return
+        schema = raw.get("schema")
+        if schema is not None and schema != _COMPLETION_SCHEMA:
+            return
         spans = raw.get("spans")
         if not isinstance(spans, list):
             return
@@ -119,6 +122,7 @@ class SpanCache:
     def _save_manifest(self) -> None:
         """Atomically persist the current span records."""
         payload = {
+            "schema": _COMPLETION_SCHEMA,
             "fingerprint": self.fingerprint,
             "spans": list(self._records.values()),
         }
@@ -137,13 +141,11 @@ class SpanCache:
         record = self._records.get(key)
         if record is not None:
             if record.get("state") == "complete":
-                honored = record.get(
-                    "part_size"
-                ) == part_size == expected and self._sha1_ok(record, part)
+                honored = record.get("part_size") == part_size == expected
                 if honored:
                     return record
-                # Drift or corruption: a recorded-complete span whose bytes
-                # no longer verify is refetched from byte 0.
+                # Size drift: a recorded-complete span whose length no longer
+                # matches is refetched from byte 0.
                 part.unlink(missing_ok=True)
                 part_size = 0
                 record = None
@@ -170,18 +172,6 @@ class SpanCache:
         self._records[key] = record
         return record
 
-    def _sha1_ok(self, record: Mapping[str, Any], part: Path) -> bool:
-        """Verify a recorded sha1 against the current ``.part`` bytes."""
-        recorded = record.get("sha1")
-        if not isinstance(recorded, str) or not recorded:
-            return True
-        try:
-            with part.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha1").hexdigest()
-        except OSError:
-            return False
-        return digest == recorded
-
     def _mark_complete(self, record: dict[str, Any], part: Path) -> None:
         """Record one span complete after ``fetch_into`` returned."""
         size = part.stat().st_size
@@ -189,8 +179,7 @@ class SpanCache:
         if size != expected:
             _invalid(f"span cache part length {size} differs from expected {expected}")
         record["part_size"] = size
-        with part.open("rb") as stream:
-            record["sha1"] = hashlib.file_digest(stream, "sha1").hexdigest()
+        record.pop("sha1", None)
         record["state"] = "complete"
         self._save_manifest()
 
@@ -334,10 +323,9 @@ class SpanCache:
             self._tasks.pop(key, None)
 
     def reader(self, spans: Sequence[RangeSpan]) -> Callable[[int, int], bytes]:
-        """Verify staged regions and return a bounded absolute-offset local reader.
+        """Return a bounded absolute-offset reader over completed local spans.
 
-        SHA1 payload integrity is checked without loading whole spans. Reads
-        outside the verified region set fail before touching disk.
+        Reads outside the completed region set fail before touching disk.
         """
         regions = []
         for span in spans:

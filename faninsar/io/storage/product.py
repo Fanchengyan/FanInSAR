@@ -20,9 +20,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from faninsar.io.storage._zarr_stac import digest_path, read_zarr_array
+from faninsar.io.storage._zarr_stac import inspect_zarr_array_metadata, read_zarr_array
 from faninsar.logging import setup_logger
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -113,18 +113,53 @@ def _remove_sibling(path: Path) -> None:
     shutil.rmtree(path)
 
 
-def _stale_siblings(target: Path) -> list[Path]:
-    """Return staging and aside siblings this kernel may have left for ``target``."""
+def _staging_path(target: Path) -> Path:
+    """Return the kernel staging sibling of ``target``."""
+    return target.parent / f".{target.name}.tmp"
+
+
+def _aside_siblings(target: Path) -> list[Path]:
+    """Return aside siblings this kernel may have left for ``target``."""
     parent = target.parent
     if not parent.is_dir():
         return []
-    prefix_tmp = f".{target.name}.tmp"
-    prefix_aside = f".{target.name}.aside-"
-    return [
-        entry
-        for entry in parent.iterdir()
-        if entry.name == prefix_tmp or entry.name.startswith(prefix_aside)
-    ]
+    prefix = f".{target.name}.aside-"
+    return [entry for entry in parent.iterdir() if entry.name.startswith(prefix)]
+
+
+def _restore_aside_if_missing(target: Path) -> None:
+    """Move the newest aside back onto ``target`` when the live product is gone."""
+    if target.exists() or target.is_symlink():
+        return
+    asides = [entry for entry in _aside_siblings(target) if not entry.is_symlink()]
+    if not asides:
+        return
+    newest = max(asides, key=lambda path: path.name)
+    try:
+        newest.rename(target)
+    except OSError as error:
+        logger.warning(
+            "could not restore product aside %s onto %s: %s",
+            newest,
+            target,
+            error,
+        )
+
+
+def _prepare_target(target: Path) -> None:
+    """Restore a surviving aside, then drop leftover staging and consumed asides.
+
+    Staging leftovers are always removed. An aside is restored onto ``target``
+    when the live product is missing so the last usable copy is not deleted.
+    Remaining asides are removed only after a live product directory exists.
+    """
+    staging = _staging_path(target)
+    if staging.exists() or staging.is_symlink():
+        _remove_sibling(staging)
+    _restore_aside_if_missing(target)
+    if target.exists():
+        for leftover in _aside_siblings(target):
+            _remove_sibling(leftover)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,13 +277,12 @@ class ProductWriter:
         self.kind = kind
         self.overwrite = overwrite
         self.target.parent.mkdir(parents=True, exist_ok=True)
-        for stale in _stale_siblings(self.target):
-            _remove_sibling(stale)
+        _prepare_target(self.target)
         if self.target.exists() and not overwrite:
             reject_invalid_state(
                 f"product already exists: {self.target}; pass overwrite=True"
             )
-        self.staging = self.target.parent / f".{self.target.name}.tmp"
+        self.staging = _staging_path(self.target)
         self.staging.mkdir()
         self._assets: dict[str, dict[str, Any]] = {}
         self._closed = False
@@ -269,13 +303,13 @@ class ProductWriter:
         """Write ``item.json`` and publish the product atomically."""
         if self._closed:
             reject_invalid_state("product writer is already closed")
+        aside = None
         try:
             write_id = new_write_id()
             assets = {}
             for name, asset in self._assets.items():
                 entry = dict(asset)
                 entry.setdefault("roles", ["data"])
-                entry["file:checksum"] = digest_path(self.staging / entry["href"])
                 assets[name] = entry
             item = {
                 "stac_version": "1.0.0",
@@ -303,7 +337,6 @@ class ProductWriter:
                 stream.write(text)
                 stream.flush()
                 os.fsync(stream.fileno())
-            aside = None
             if self.target.exists():
                 if not self.overwrite:
                     reject_invalid_state(f"product already exists: {self.target}")
@@ -311,11 +344,26 @@ class ProductWriter:
                 self.target.rename(aside)
             self.staging.rename(self.target)
             _fsync_directory(self.target.parent)
-            if aside is not None:
-                _remove_sibling(aside)
         except BaseException:
+            if (
+                aside is not None
+                and aside.exists()
+                and not self.target.exists()
+                and not self.target.is_symlink()
+            ):
+                try:
+                    aside.rename(self.target)
+                except OSError as error:
+                    logger.warning(
+                        "could not restore previous product %s onto %s: %s",
+                        aside,
+                        self.target,
+                        error,
+                    )
             self.abort()
             raise
+        if aside is not None and aside.exists():
+            _remove_sibling(aside)
         self._closed = True
         return Product(path=self.target, item=item)
 
@@ -381,23 +429,8 @@ def publish_product(
         return writer.commit(properties, inputs=inputs)
 
 
-def open_product(path: str | Path, *, kind: str | None = None) -> Product:
-    """Open a committed product without re-hashing its payloads.
-
-    Parameters
-    ----------
-    path : path-like
-        Product directory.
-    kind : str, optional
-        Required product kind.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        If ``item.json`` is missing or invalid, the kind differs, or an asset
-        is missing, symlinked, or outside the product directory.
-
-    """
+def _read_product_item(path: str | Path) -> tuple[Path, dict[str, Any]]:
+    """Parse a committed ``item.json`` without inspecting payload bytes."""
     root = Path(path)
     item_path = root / ITEM_NAME
     if not item_path.is_file() or item_path.is_symlink() or root.is_symlink():
@@ -417,6 +450,28 @@ def open_product(path: str | Path, *, kind: str | None = None) -> Product:
             f"{item_path} is not a FanInSAR product item; rebuild this work "
             "directory with the current FanInSAR version"
         )
+    return root, item
+
+
+def open_product(path: str | Path, *, kind: str | None = None) -> Product:
+    """Open a committed product without re-hashing its payloads.
+
+    Parameters
+    ----------
+    path : path-like
+        Product directory.
+    kind : str, optional
+        Required product kind.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If ``item.json`` is missing or invalid, the kind differs, or an asset
+        is missing, symlinked, or outside the product directory.
+
+    """
+    root, item = _read_product_item(path)
+    properties = item["properties"]
     if kind is not None and properties["faninsar:kind"] != kind:
         reject_invalid_state(
             f"product {root} has kind {properties['faninsar:kind']!r}, "
@@ -457,11 +512,125 @@ def remove_product(path: str | Path) -> None:
     _remove_sibling(Path(path))
 
 
+def _as_shape(value: object) -> tuple[int, ...] | None:
+    """Return a positive integer shape tuple, or ``None`` when undeclared."""
+    if not isinstance(value, list | tuple) or not value:
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        return None
+    if any(int(item) <= 0 for item in value):
+        return None
+    return tuple(int(item) for item in value)
+
+
+def _declared_array_shape(
+    name: str, asset: Mapping[str, Any], properties: Mapping[str, Any]
+) -> tuple[int, ...] | None:
+    """Return the shape declared for one asset, when the schema records one."""
+    declared = _as_shape(asset.get("faninsar:shape"))
+    if declared is not None:
+        return declared
+    rows = asset.get("faninsar:rows")
+    cols = asset.get("faninsar:cols")
+    if rows is not None and cols is not None:
+        unit = _as_shape([rows, cols])
+        if unit is not None:
+            return unit
+    if "." in name or "faninsar:row_origin" in asset:
+        return None
+    return _as_shape(properties.get("faninsar:shape"))
+
+
+def _required_asset_names(kind: str, assets: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return domain-mandatory asset names for known product kinds.
+
+    Unknown kinds add no extra names. Scene geometry is required only after
+    the item already declares any of the published geometry set, so lazy
+    materialization is not treated as a missing-asset failure.
+    """
+    if kind == "ifg":
+        from faninsar.io.storage.ifg_store import _REQUIRED_IFG_LAYERS
+
+        return _REQUIRED_IFG_LAYERS
+    if kind == "mask":
+        return ("mask",)
+    if kind == "scene":
+        from faninsar.io.storage.scene_geometry import SCENE_GEOMETRY_ASSETS
+
+        if any(name in assets for name in SCENE_GEOMETRY_ASSETS):
+            return SCENE_GEOMETRY_ASSETS
+    return ()
+
+
+def _asset_fails_structural_check(
+    root: Path, name: str, asset: object, properties: Mapping[str, Any]
+) -> bool:
+    """Return whether one required asset fails path or declared array checks."""
+    if not isinstance(asset, dict):
+        return True
+    try:
+        href = _basename(asset.get("href"))
+    except InvalidProcessingStateError:
+        return True
+    path = root / href
+    if path.is_symlink() or not path.exists():
+        return True
+    if path.is_file():
+        return False
+    try:
+        shape, dtype = inspect_zarr_array_metadata(path)
+    except InvalidProcessingStateError:
+        return True
+    declared_dtype = asset.get("faninsar:dtype")
+    dtype_mismatch = False
+    if declared_dtype is not None:
+        import numpy as np
+
+        try:
+            dtype_mismatch = np.dtype(declared_dtype) != dtype
+        except TypeError:
+            dtype_mismatch = True
+    declared_shape = _declared_array_shape(name, asset, properties)
+    shape_mismatch = declared_shape is not None and declared_shape != shape
+    return dtype_mismatch or shape_mismatch
+
+
 def verify_product(path: str | Path) -> list[str]:
-    """Return asset names whose bytes differ from their write-time checksum."""
-    product = open_product(path)
-    return [
-        name
-        for name, asset in sorted(product.assets.items())
-        if digest_path(product.asset_path(name)) != asset.get("file:checksum")
+    """Return asset names that fail structural or declared-array checks.
+
+    Verification inspects required assets, path safety, and declared Zarr
+    shape/dtype metadata. It does not hash payloads or compare a legacy
+    ``file:checksum``. Missing or malformed assets, including required
+    assets omitted from the item, are reported by name.
+
+    Parameters
+    ----------
+    path : path-like
+        Product directory.
+
+    Returns
+    -------
+    list of str
+        Failing asset names, sorted; empty means the product item and every
+        required asset passed the structural contract.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If ``item.json`` itself is missing or is not a FanInSAR product item.
+
+    """
+    root, item = _read_product_item(path)
+    properties = item["properties"]
+    assets = item["assets"]
+    failing = [
+        str(name)
+        for name, asset in assets.items()
+        if _asset_fails_structural_check(root, str(name), asset, properties)
     ]
+    omitted = [
+        name
+        for name in _required_asset_names(str(properties["faninsar:kind"]), assets)
+        if name not in assets
+    ]
+    return sorted({*failing, *omitted})

@@ -357,13 +357,15 @@ class NISARStack(Stack):
                 metadata = sensor.admission_metadata(handle)
                 if metadata is None:
                     native = result.mission_native
-                    if native.get("source_id") and native.get("source_digest"):
+                    if native.get("source_id"):
                         metadata = {
                             "source_id": native["source_id"],
-                            "source_digest": native["source_digest"],
-                            "source_size_bytes": native.get("source_size_bytes", 0),
                             "policy": native.get("admission_policy"),
                         }
+                        if native.get("source_digest"):
+                            metadata["source_digest"] = native["source_digest"]
+                        if "source_size_bytes" in native:
+                            metadata["source_size_bytes"] = native["source_size_bytes"]
                 if metadata is not None:
                     admission_lineage[acquisition_id] = metadata
             except OSError as error:
@@ -469,7 +471,7 @@ class NISARStack(Stack):
 
     @property
     def source_admission(self) -> Mapping[str, Mapping[str, object]]:
-        """Return digest, source id, and trusted-open policy by acquisition."""
+        """Return canonical source id and recorded policy by acquisition."""
         return {date_id: dict(item) for date_id, item in self._nisar_admission.items()}
 
     @property

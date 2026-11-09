@@ -49,7 +49,10 @@ class StackConfig:
     ``nlooks_divisor`` is an inheritance sentinel: ``None`` means the
     concrete Stack class default is installed at construction. The live
     ``stack.config.nlooks_divisor`` is always a finite number greater
-    than zero.
+    than zero. ``record_scientific_lineage`` (default ``False``) records
+    lightweight operation, parameter, and phase-state metadata when
+    enabled. It does not hash scientific array payloads or bind products
+    to content checksums. See :doc:`/user_guide/scientific_lineage`.
     """
 
     work_dir: Path

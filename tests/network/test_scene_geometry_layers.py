@@ -195,16 +195,23 @@ def test_los_cache_drops_on_new_collection(tmp_path: Path) -> None:
 
 
 def test_verify_catches_corrupted_geometry_asset(tmp_path: Path) -> None:
-    """verify_product flags a damaged committed geometry payload."""
+    """verify_product flags a missing geometry asset, not a payload hash."""
+    import json
+    import shutil
+
+    import zarr
+
     stack = _stack_with_geometry(tmp_path)
     reference_root = stack.config.work_dir / "coreg" / stack.reference
     _ = stack.scenes.incidence.values  # materialize the six assets
 
-    from faninsar.io.storage.product import verify_product
+    from faninsar.io.storage.product import ITEM_NAME, verify_product
 
+    item = json.loads((reference_root / ITEM_NAME).read_text(encoding="utf-8"))
+    assert "file:checksum" not in item["assets"]["incidence"]
     assert verify_product(reference_root) == []
-    import zarr
-
     array = zarr.open_array(store=str(reference_root / "incidence.zarr"), mode="a")
     array[0, 0] = -999.0
+    assert verify_product(reference_root) == []
+    shutil.rmtree(reference_root / "incidence.zarr")
     assert "incidence" in verify_product(reference_root)

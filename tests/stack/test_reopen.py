@@ -84,12 +84,15 @@ def _stack(
         lambda *, overwrite, polygon=None: None
     )
     stack._prepare_inputs = (  # type: ignore[method-assign]
-        lambda context: PreparedInputs(sources=stack.catalog.paths, mission=MissionPreparedInputs(
-            orbit_paths_by_acquisition={
-                date_id: path for date_id, path in _orbit_fixtures(stack).items()
-            }
+        lambda context: PreparedInputs(
+            sources=stack.catalog.paths,
+            mission=MissionPreparedInputs(
+                orbit_paths_by_acquisition={
+                    date_id: path for date_id, path in _orbit_fixtures(stack).items()
+                }
+            ),
         )
-    ))
+    )
     return stack
 
 
@@ -232,7 +235,9 @@ def test_status_reports_missing_and_stale_products(tmp_path: Path) -> None:
 
 
 def test_verify_detects_a_damaged_payload(tmp_path: Path) -> None:
-    """verify() re-hashes payloads and names the damaged asset."""
+    """verify() names missing assets and ignores same-size payload edits."""
+    import shutil
+
     import zarr
 
     stack = _stack(tmp_path)
@@ -244,6 +249,8 @@ def test_verify_detects_a_damaged_payload(tmp_path: Path) -> None:
     scene = stack.config.work_dir / "coreg" / "20240113"
     array = zarr.open_array(store=str(scene / "f0_IW1_b0.slc.zarr"), mode="r+")
     array[0, 0] = 9.0 + 9.0j
+    assert stack.verify() == []
+    shutil.rmtree(scene / "f0_IW1_b0.slc.zarr")
     problems = stack.verify()
     assert problems == [f"{scene}: f0_IW1_b0"]
 
@@ -363,6 +370,7 @@ def test_science_configuration_round_trips(tmp_path: Path) -> None:
     stack.config.dem = DEM.from_constant(12.0)
     stack.config.extra["polarizations"] = ("VV", "VH")
     from dataclasses import replace
+
     stack._request_config = replace(stack.config, extra=dict(stack.config.extra))
     stack.prepare_data()
     work = stack.config.work_dir
@@ -430,7 +438,14 @@ def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> 
         path.write_bytes(b"orbit")
         orbits[date_id] = path
     stack.config.extra["orbit_paths"] = dict(orbits)
-    stack._prepare_inputs = lambda context: __import__("faninsar.stack.preparation", fromlist=["PreparedInputs"]).PreparedInputs(sources=stack.catalog.paths, mission=__import__("faninsar.stack.search", fromlist=["MissionPreparedInputs"]).MissionPreparedInputs(orbit_paths_by_acquisition=orbits))
+    stack._prepare_inputs = lambda context: __import__(
+        "faninsar.stack.preparation", fromlist=["PreparedInputs"]
+    ).PreparedInputs(
+        sources=stack.catalog.paths,
+        mission=__import__(
+            "faninsar.stack.search", fromlist=["MissionPreparedInputs"]
+        ).MissionPreparedInputs(orbit_paths_by_acquisition=orbits),
+    )
     # Mark the first orbit as verified at download time (the P0055 record).
     verified_orbit = orbits[stack.catalog.dates[0]]
     manifest = verified_orbit.with_name(

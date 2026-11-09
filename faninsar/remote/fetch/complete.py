@@ -44,6 +44,7 @@ from faninsar.remote.auth import (
     _netrc_authorization,
 )
 from faninsar.remote.cache import (
+    _COMPLETION_SCHEMA,
     _identity,
     _is_qualified,
     _manifest_path,
@@ -523,8 +524,9 @@ def _stream_and_verify(
     before raising :class:`RemoteIntegrityError`.
 
     When ``resume_from`` is a positive byte offset, the already-received
-    ``staging`` prefix is re-read through both hashers before the HTTP
-    request, and every transport issues ``Range: bytes=<resume_from>-``
+    ``staging`` prefix is fed into the provider digest hasher (when one
+    exists) before the HTTP request, and every transport issues
+    ``Range: bytes=<resume_from>-``
     against the resolved transfer URL.  A strict ``206``/``Content-Range``
     answer appends the suffix; a ``200`` means the server ignored the Range
     header and falls back to a clean restart of the whole object.  The
@@ -561,11 +563,23 @@ def _stream_and_verify(
             _fail(RemoteAccessError, "transfer_setup_failed")
     if not isinstance(transfer_url, str):
         _fail(RemoteAccessError, "invalid_endpoint")
-    hasher = hashlib.sha256()
     checksum_algorithm = asset.checksum.split(":", 1)[0] if asset.checksum else None
     checksum_hasher = (
         hashlib.new(checksum_algorithm) if checksum_algorithm is not None else None
     )
+
+    def reset_provider_hasher() -> None:
+        """Rebuild the provider digest hasher after a clean restart."""
+        nonlocal checksum_hasher
+        checksum_hasher = (
+            hashlib.new(checksum_algorithm) if checksum_algorithm is not None else None
+        )
+
+    def recorded_digest() -> str:
+        """Return the provider SHA-256 hex when that is the advertised digest."""
+        if checksum_algorithm == "sha256" and checksum_hasher is not None:
+            return checksum_hasher.hexdigest()
+        return ""
 
     def check_output(total: int) -> None:
         """Enforce output, temporary, and cache limits while streaming."""
@@ -589,7 +603,6 @@ def _stream_and_verify(
                 if response_bytes > budget.max_response_bytes:
                     _fail(RemoteLimitError, "max_response_bytes")
                 stream.write(part)
-                hasher.update(part)
                 if checksum_hasher is not None:
                     checksum_hasher.update(part)
                 check_output(stream.tell())
@@ -598,12 +611,15 @@ def _stream_and_verify(
         return response_bytes
 
     def rehash_prefix(offset: int) -> None:
-        """Re-read the retained ``.part`` prefix through both hashers.
+        """Feed the retained ``.part`` prefix into the provider digest hasher.
 
-        On resume the retained prefix bytes are digested (and counted by
-        ``hasher``) before the HTTP suffix request so the final digest is
-        identical to a single-pass download (PROPOSAL-0070 §1b).
+        On resume the retained prefix must contribute to the provider digest
+        before the HTTP suffix request so verification matches a single-pass
+        download (PROPOSAL-0070 §1b, PROPOSAL-0082).  Without a provider
+        checksum the prefix is not scanned.
         """
+        if checksum_hasher is None:
+            return
         hashed = 0
         with staging.open("rb") as stream:
             while hashed < offset:
@@ -611,9 +627,7 @@ def _stream_and_verify(
                 if not chunk:
                     break
                 hashed += len(chunk)
-                hasher.update(chunk)
-                if checksum_hasher is not None:
-                    checksum_hasher.update(chunk)
+                checksum_hasher.update(chunk)
         if hashed != offset:
             logger.warning(
                 "Retained .part prefix shrank to %d bytes during resume "
@@ -663,9 +677,7 @@ def _stream_and_verify(
     for attempt in range(budget.max_retries + 1):
         if attempt:
             ledger.retry()
-        hasher = hashlib.sha256()
-        if checksum_algorithm is not None:
-            checksum_hasher = hashlib.new(checksum_algorithm)
+        reset_provider_hasher()
         range_start: int | None = None
         if attempt == 0 and resume_offset:
             actual = staging.stat().st_size if staging.is_file() else 0
@@ -702,6 +714,8 @@ def _stream_and_verify(
                     asset = replace(asset, checksum=discovered)
                     checksum_algorithm = discovered.split(":", 1)[0]
                     checksum_hasher = hashlib.new(checksum_algorithm)
+                    if range_start:
+                        rehash_prefix(range_start)
 
             if result is None and asset.auth_profile == "earthdata-asf":
                 authenticated_session = _facade_hook(
@@ -770,9 +784,7 @@ def _stream_and_verify(
                             # the retained prefix and fall through to a clean
                             # re-GET of the whole object.
                             staging.write_bytes(b"")
-                            hasher = hashlib.sha256()
-                            if checksum_algorithm is not None:
-                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            reset_provider_hasher()
                             range_start = None
                         elif observe_total is not None:
                             observe_total(total)
@@ -820,9 +832,7 @@ def _stream_and_verify(
                         )
                         if total is None:
                             staging.write_bytes(b"")
-                            hasher = hashlib.sha256()
-                            if checksum_algorithm is not None:
-                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            reset_provider_hasher()
                             range_start = None
                         elif observe_total is not None:
                             observe_total(total)
@@ -870,9 +880,7 @@ def _stream_and_verify(
                             # Server ignored Range: truncate and fall through
                             # to the clean full-object path.
                             staging.write_bytes(b"")
-                            hasher = hashlib.sha256()
-                            if checksum_algorithm is not None:
-                                checksum_hasher = hashlib.new(checksum_algorithm)
+                            reset_provider_hasher()
                             range_start = None
                         elif observe_total is not None:
                             observe_total(total)
@@ -897,9 +905,7 @@ def _stream_and_verify(
                     # Adapter fetch() has no byte-range seam: the retained
                     # prefix cannot be honored, so restart the object.
                     staging.write_bytes(b"")
-                    hasher = hashlib.sha256()
-                    if checksum_algorithm is not None:
-                        checksum_hasher = hashlib.new(checksum_algorithm)
+                    reset_provider_hasher()
                     range_start = None
                 if not supplied_ledger:
                     ledger.begin_response()
@@ -942,9 +948,9 @@ def _stream_and_verify(
             # A bytes-vs-checksum mismatch is the only verification failure.
             # Return it so the caller records ``status: failed`` in the
             # per-destination manifest before raising the integrity error.
-            return size, hasher.hexdigest(), verification
+            return size, recorded_digest(), verification
     _validate_representation(staging, asset)
-    return size, hasher.hexdigest(), verification
+    return size, recorded_digest(), verification
 
 
 def _stream_download(
@@ -957,7 +963,12 @@ def _stream_download(
     poll_token: _BurstPollToken | None = None,
     transfer_url_override: str | None = None,
 ) -> tuple[int, str]:
-    """Stream one complete asset into ``staging`` and return size/digest."""
+    """Stream one complete asset into ``staging`` and return size/digest.
+
+    The digest is the provider SHA-256 hex when that algorithm was advertised
+    and compared; otherwise it is empty.  A second self digest is never
+    computed solely for this return value.
+    """
     size, digest, verification = _stream_and_verify(
         asset,
         adapter,
@@ -1293,9 +1304,11 @@ def _publish_manifest(
 ) -> None:
     """Atomically publish one per-destination transfer manifest.
 
-    The manifest keeps the cache identity, the streaming self digest, and the
-    downloaded size, and carries the PROPOSAL-0055 verification record
-    (``{algorithm, checksum, status, size}`` or ``{status, size}``).
+    The manifest keeps the cache identity, expected size, completion
+    discriminator, and the PROPOSAL-0055 verification record
+    (``{algorithm, checksum, status, size}`` or ``{status, size}``).  A
+    provider SHA-256 is recorded when that digest was already computed for
+    verification; a second self digest is never calculated for cache identity.
     """
     temporary: Path | None = None
     try:
@@ -1306,22 +1319,26 @@ def _publish_manifest(
             delete=False,
         ) as stream:
             temporary = Path(stream.name)
-            json.dump(
-                {
-                    "identity": identity,
-                    "sha256": digest,
-                    "size": size,
-                    "verification": dict(verification),
-                    "local_stat": None
-                    if destination is None
-                    else {
-                        "path": str(destination.resolve()),
-                        "size": destination.stat().st_size,
-                        "mtime_ns": destination.stat().st_mtime_ns,
-                        "ctime_ns": destination.stat().st_ctime_ns,
-                        "inode": destination.stat().st_ino,
-                    },
+            payload: dict[str, object] = {
+                "schema": _COMPLETION_SCHEMA,
+                "identity": identity,
+                "size": size,
+                "complete": verification.get("status") != "failed",
+                "verification": dict(verification),
+                "local_stat": None
+                if destination is None
+                else {
+                    "path": str(destination.resolve()),
+                    "size": destination.stat().st_size,
+                    "mtime_ns": destination.stat().st_mtime_ns,
+                    "ctime_ns": destination.stat().st_ctime_ns,
+                    "inode": destination.stat().st_ino,
                 },
+            }
+            if digest:
+                payload["sha256"] = digest
+            json.dump(
+                payload,
                 stream,
                 separators=(",", ":"),
             )
@@ -1332,36 +1349,6 @@ def _publish_manifest(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-
-
-def _extended_manifest_matches(path: Path, asset: RemoteAsset) -> bool:
-    """Return whether a verification-extended manifest qualifies for reuse.
-
-    ``cache._matching_manifest`` compares the manifest mapping exactly, so a
-    manifest carrying the PROPOSAL-0055 verification record cannot match it.
-    This fallback keeps the same identity, self-digest, and size gate while
-    ignoring the added record; the strict check is still tried first.
-    """
-    if not _is_qualified(asset) or not path.is_file():
-        return False
-    manifest_path = _manifest_path(path, asset)
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, ValueError):
-        return False
-    if (
-        not isinstance(manifest, dict)
-        or not manifest_path.is_file()
-        or manifest.get("identity") != _identity(asset)
-    ):
-        return False
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    except OSError:
-        return False
-    return manifest.get("sha256") == digest and manifest.get("size") == size
 
 
 def download(
@@ -1379,11 +1366,13 @@ def download(
     """Download one complete asset and publish it atomically.
 
     Existing files are reused only with a qualified checksum or immutable
-    version and a matching private manifest.  Each download records a
-    PROPOSAL-0055 checksum verification entry (``{algorithm, checksum,
-    status, size}``, or ``{status, size}`` when the provider offers no
-    checksum) in the private per-destination manifest.  Concurrent publishers
-    targeting one destination are serialized by a private process-local guard.
+    version and a matching private completion record (identity, size, and
+    non-failed completion state).  Destination bytes are not rehashed for
+    reuse.  Each download records a PROPOSAL-0055 checksum verification
+    entry (``{algorithm, checksum, status, size}``, or ``{status, size}``
+    when the provider offers no checksum) in the private per-destination
+    manifest.  Concurrent publishers targeting one destination are serialized
+    by a private process-local guard.
 
     When ``resume`` is true (the default), the transfer stages bytes in a
     deterministic ``<destination>.faninsar.remote.<identity>.part`` file
@@ -1411,9 +1400,7 @@ def download(
         lock = _DESTINATION_LOCKS.setdefault(lock_key, threading.Lock())
     with lock:
         if destination.exists() and not overwrite:
-            if _matching_manifest(destination, asset) or _extended_manifest_matches(
-                destination, asset
-            ):
+            if _matching_manifest(destination, asset):
                 if poll_scheduler is not None:
                     poll_scheduler.complete(poll_token)
                 return destination
@@ -1421,9 +1408,7 @@ def download(
                 _fail(RemoteIntegrityError, "destination_conflict")
         ledger = ledger or _CallLedger(budget)
         if destination.exists() and not overwrite:
-            if _matching_manifest(destination, asset) or _extended_manifest_matches(
-                destination, asset
-            ):
+            if _matching_manifest(destination, asset):
                 return destination
             _fail(RemoteIntegrityError, "destination_conflict")
         identity = _identity(asset)
@@ -1605,12 +1590,21 @@ def qualified_download_receipt(path: Path) -> dict[str, object] | None:
                 and verification.get("size") == stat.st_size
                 and record.get("size") == stat.st_size
                 and isinstance(record.get("identity"), str)
-                and isinstance(record.get("sha256"), str)
+                and record.get("complete") is not False
             ):
-                return {
-                    key: record[key]
-                    for key in ("identity", "sha256", "size", "verification")
+                receipt: dict[str, object] = {
+                    "identity": record["identity"],
+                    "size": record["size"],
+                    "verification": record["verification"],
                 }
+                if isinstance(record.get("sha256"), str):
+                    receipt = {
+                        "identity": record["identity"],
+                        "sha256": record["sha256"],
+                        "size": record["size"],
+                        "verification": record["verification"],
+                    }
+                return receipt
     except (OSError, ValueError, TypeError):
         return None
     return None

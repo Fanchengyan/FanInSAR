@@ -23,13 +23,11 @@ topographic-phase removal, filtering, or unwrapping theory.
 | Mission | Acquisition structure | Guide status | Mission-specific focus |
 |---|---|---|---|
 | Sentinel-1 IW | TOPS bursts in three subswaths | Available | SAFE SLC, TOPS carrier, ESD, burst/subswath continuity |
-| NISAR | RSLC swaths without the Sentinel-1 TOPS burst model | Planned | RSLC metadata, frequency/polarization structure, mission-specific preprocessing |
-
-Adding NISAR later requires a new mission subsection, not a copy of the shared
-processing chapters.
+| NISAR | RSLC swaths without the Sentinel-1 TOPS burst model | Available | RSLC metadata, frequency/polarization structure, source identity without payload hashing |
 
 ```{toctree}
 :maxdepth: 2
 
 sentinel1/index
+nisar
 ```

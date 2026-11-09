@@ -74,7 +74,8 @@ def test_verified_provider_checksum_is_recorded(tmp_path: Path) -> None:
     assert destination.read_bytes() == PAYLOAD
     manifest = _manifest(destination, asset)
     assert manifest["identity"] == _identity(asset)
-    assert manifest["sha256"] == hashlib.sha256(PAYLOAD).hexdigest()
+    assert manifest["complete"] is True
+    assert "sha256" not in manifest
     assert manifest["verification"] == {
         "algorithm": "md5",
         "checksum": md5,
@@ -139,7 +140,7 @@ def test_extended_manifest_keeps_destination_reuse(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest))
     assert remote.download(asset, destination) == destination
 
-    destination.write_bytes(b"corrupted")
+    destination.write_bytes(b"truncated")
     with pytest.raises(remote.RemoteIntegrityError, match="destination_conflict"):
         remote.download(asset, destination)
 

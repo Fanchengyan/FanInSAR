@@ -250,7 +250,7 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     size, digest = _stream_download(asset, adapter, ledger.budget, ledger, staging)
 
     assert size == len(payload)
-    assert digest == hashlib.sha256(payload).hexdigest()
+    assert digest == ""
     assert staging.read_bytes() == payload
     assert ledger.requests == 6
     assert ledger.redirects == 3
@@ -499,7 +499,7 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
     size, digest = _stream_download(asset, adapter, ledger.budget, ledger, staging)
 
     assert size == len(payload)
-    assert digest == hashlib.sha256(payload).hexdigest()
+    assert digest == ""
     assert ledger.requests == 5, [item[1] for item in session.requests]
     assert ledger.redirects == 4
     assert ledger.response_bytes_total == len(payload) + sum(
@@ -986,8 +986,81 @@ def test_resume_completes_with_one_range_request_after_mid_stream_kill(
     manifest = json.loads(
         (tmp_path / f"data.bin.faninsar.remote.{identity}.json").read_text()
     )
-    assert manifest["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert manifest["complete"] is True
+    assert "sha256" not in manifest
     assert manifest["size"] == len(payload)
+
+
+def test_resume_provider_digest_covers_retained_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed suffix is verified together with the retained prefix."""
+    payload = b"pk\x03\x04".join([bytes([i]) * 8 for i in range(16)])
+    digest = hashlib.sha256(payload).hexdigest()
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-resume-digest", adapter)
+    asset = _ranged_asset(
+        "ranged-resume-digest",
+        size_bytes=len(payload),
+        checksum=f"sha256:{digest}",
+    )
+    destination = tmp_path / "data.bin"
+    opener = _ResumeOpener(payload, drop_first_after=24)
+    _stub_urllib_opener(monkeypatch, opener)
+    with pytest.raises(remote.RemoteIntegrityError):
+        remote.download(asset, destination)
+
+    resume_opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, resume_opener)
+    remote.download(asset, destination)
+
+    assert destination.read_bytes() == payload
+    manifest = json.loads(
+        destination.with_name(
+            f"{destination.name}.faninsar.remote.{_identity(asset)}.json"
+        ).read_text()
+    )
+    assert manifest["verification"]["status"] == "verified"
+    assert manifest["sha256"] == digest
+    assert resume_opener.requests[0]["range"] == "bytes=24-"
+
+
+def test_corrupt_resume_prefix_fails_provider_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A mutated retained prefix cannot verify against the full-object digest."""
+    payload = b"pk\x03\x04".join([bytes([i]) * 8 for i in range(16)])
+    digest = hashlib.sha256(payload).hexdigest()
+    adapter = _AnonymousRangeAdapter()
+    _register_adapter("ranged-resume-corrupt", adapter)
+    asset = _ranged_asset(
+        "ranged-resume-corrupt",
+        size_bytes=len(payload),
+        checksum=f"sha256:{digest}",
+    )
+    destination = tmp_path / "data.bin"
+    opener = _ResumeOpener(payload, drop_first_after=24)
+    _stub_urllib_opener(monkeypatch, opener)
+    with pytest.raises(remote.RemoteIntegrityError):
+        remote.download(asset, destination)
+    identity = _identity(asset)
+    part = _part_path(destination, identity)
+    corrupted = bytearray(part.read_bytes())
+    corrupted[0] ^= 0xFF
+    part.write_bytes(bytes(corrupted))
+
+    resume_opener = _ResumeOpener(payload)
+    _stub_urllib_opener(monkeypatch, resume_opener)
+    with pytest.raises(remote.RemoteIntegrityError) as raised:
+        remote.download(asset, destination)
+    assert raised.value.reason == "checksum_mismatch"
+    manifest = json.loads(
+        destination.with_name(
+            f"{destination.name}.faninsar.remote.{identity}.json"
+        ).read_text()
+    )
+    assert manifest["verification"]["status"] == "failed"
+    assert manifest["complete"] is False
 
 
 def test_resume_false_performs_a_full_get(
@@ -1287,4 +1360,5 @@ def test_asf_resume_prefix_is_rehashed_before_range_request(
     manifest = json.loads(
         (tmp_path / f"item.zip.faninsar.remote.{identity}.json").read_text()
     )
-    assert manifest["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert manifest["complete"] is True
+    assert "sha256" not in manifest

@@ -42,6 +42,10 @@ def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
     return stack
 
 
+class _FakePrepareContext(dict):
+    """Dict stub that still accepts production ``context.dem`` assignment."""
+
+
 def _install_fake_apply(
     stack: S1Stack,
     monkeypatch: pytest.MonkeyPatch,
@@ -50,9 +54,9 @@ def _install_fake_apply(
     """Replace Reference preparation and secondary apply with scene writers."""
     calls = [] if captured is None else captured
 
-    def fake_prepare(_reference_path: object, **kwargs: object) -> dict[str, object]:
+    def fake_prepare(_reference_path: object, **kwargs: object) -> _FakePrepareContext:
         if (Path(kwargs["output_scene"]) / "item.json").is_file():  # type: ignore[arg-type]
-            return {"prepare": kwargs}
+            return _FakePrepareContext(prepare=kwargs)
         write_test_scene(
             stack.config.work_dir,
             date_id=stack.reference,
@@ -60,7 +64,7 @@ def _install_fake_apply(
             payload=np.ones((2, 2), dtype=np.complex64),
             tag="IW1_b0",
         )
-        return {"prepare": kwargs}
+        return _FakePrepareContext(prepare=kwargs)
 
     def fake_secondary(
         context: dict[str, object],

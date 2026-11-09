@@ -749,12 +749,124 @@ def test_ready_burst_is_written_and_released_before_sibling_finishes(
     assert SlowSibling.requests
     starts = [request[1] for request in SlowSibling.requests]
     boundary = 16 + 50 * SAMPLES_PER_BURST * 4
-    if corrupt:
-        assert any(start < boundary for start in starts)
-    else:
-        assert all(start >= boundary for start in starts)
+    # Same-size mutation of a completed burst is intentionally undetected.
+    assert all(start >= boundary for start in starts)
     assert _progress_file(tmp_path, safe) is None
     assert not _transfer_parts(tmp_path, safe)
+    assert _coverage(safe)["complete"]
+
+
+def test_legacy_progress_digest_map_skips_completed_burst(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy digest map is completion after plan/structure checks, without hashing."""
+    item = _binding(
+        "S1A_TEST",
+        ANNOTATION_URL,
+        MEASUREMENT_URL,
+        measurement_size=len(mission_env["blob"]),
+        annotation_size=len(mission_env["xml_text"]),
+    )
+    safe = staged_acquisition_path(tmp_path / "inputs", "S1A_TEST-IW1-VV.SAFE")
+    fail = True
+
+    class SlowSibling(_FakeRangeFetcher):
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            if span.start >= 16 + 50 * SAMPLES_PER_BURST * 4 and fail:
+
+                async def wait_for_burst() -> None:
+                    while True:
+                        progress = _progress_file(tmp_path, safe)
+                        if progress is None:
+                            await asyncio.sleep(0.001)
+                            continue
+                        try:
+                            checkpoint = json.loads(progress.read_text())
+                        except (OSError, ValueError):
+                            await asyncio.sleep(0.001)
+                            continue
+                        if "4" in checkpoint.get("bursts", {}):
+                            return
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_burst(), timeout=2)
+                raise RuntimeError("unfinished sibling")
+            return await super().fetch_into(span, sink, **kwargs)
+
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", SlowSibling)
+    with pytest.raises(RuntimeError, match="unfinished sibling"):
+        _materialize_items(tmp_path, [item])
+    progress = _progress_file(tmp_path, safe)
+    assert progress is not None
+    checkpoint = json.loads(progress.read_text())
+    progress.write_text(
+        json.dumps(
+            {
+                "fingerprint": checkpoint["fingerprint"],
+                "bursts": {"4": "ab" * 32},
+            }
+        )
+    )
+    fail = False
+    SlowSibling.requests.clear()
+    assert _materialize_items(tmp_path, [item]) == [safe]
+    boundary = 16 + 50 * SAMPLES_PER_BURST * 4
+    assert all(request[1] >= boundary for request in SlowSibling.requests)
+    assert _coverage(safe)["complete"]
+
+
+def test_torn_progress_replays_the_completed_burst(
+    tmp_path: Path,
+    mission_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Torn burst progress is not completion; the unit is fetched again."""
+    item = _binding(
+        "S1A_TEST",
+        ANNOTATION_URL,
+        MEASUREMENT_URL,
+        measurement_size=len(mission_env["blob"]),
+        annotation_size=len(mission_env["xml_text"]),
+    )
+    safe = staged_acquisition_path(tmp_path / "inputs", "S1A_TEST-IW1-VV.SAFE")
+    fail = True
+
+    class SlowSibling(_FakeRangeFetcher):
+        async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+            if span.start >= 16 + 50 * SAMPLES_PER_BURST * 4 and fail:
+
+                async def wait_for_burst() -> None:
+                    while True:
+                        progress = _progress_file(tmp_path, safe)
+                        if progress is None:
+                            await asyncio.sleep(0.001)
+                            continue
+                        try:
+                            checkpoint = json.loads(progress.read_text())
+                        except (OSError, ValueError):
+                            await asyncio.sleep(0.001)
+                            continue
+                        if "4" in checkpoint.get("bursts", {}):
+                            return
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_burst(), timeout=2)
+                raise RuntimeError("unfinished sibling")
+            return await super().fetch_into(span, sink, **kwargs)
+
+    monkeypatch.setattr(acquisition_mod, "RangeFetcher", SlowSibling)
+    with pytest.raises(RuntimeError, match="unfinished sibling"):
+        _materialize_items(tmp_path, [item])
+    progress = _progress_file(tmp_path, safe)
+    assert progress is not None
+    progress.write_text("{")
+    fail = False
+    SlowSibling.requests.clear()
+    assert _materialize_items(tmp_path, [item]) == [safe]
+    boundary = 16 + 50 * SAMPLES_PER_BURST * 4
+    assert any(request[1] < boundary for request in SlowSibling.requests)
     assert _coverage(safe)["complete"]
 
 
@@ -1076,12 +1188,12 @@ class TestSpanCacheFetchInto:
         assert fetcher.requests == []
         assert bodies["row-0-1"] == b"\xcd" * 100
 
-    def test_corrupt_same_size_part_detected_by_sha1(
+    def test_same_size_part_mutation_is_not_detected(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A same-size byte-corrupted .part fails the recorded sha1 -> refetch."""
+        """Same-size edits after a complete length record are intentionally trusted."""
         cache = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
         span = RangeSpan(MEASUREMENT_URL, 0, 99, "row-0-1")
         fetcher = _FakeRangeFetcher
@@ -1098,8 +1210,65 @@ class TestSpanCacheFetchInto:
         fetcher.requests.clear()
         cache2 = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
         bodies = cache2.fetch((span,))
-        assert fetcher.requests  # refetched, not read back
+        assert fetcher.requests == []
+        assert bodies["row-0-1"] == bytes(corrupted)
+
+    def test_legacy_sha1_field_is_not_rescanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A legacy complete record is reused from size/state without hashing."""
+        import hashlib
+
+        cache = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
+        span = RangeSpan(MEASUREMENT_URL, 0, 99, "row-0-1")
+        fetcher = _FakeRangeFetcher
+        fetcher.blob = b"\x77" * 200
+        fetcher.requests = []
+        monkeypatch.setattr(acquisition_mod, "RangeFetcher", fetcher)
+        cache.fetch((span,))
+        manifest_path = cache.dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("schema", None)
+        manifest["spans"][0]["sha1"] = "00" * 20
+        manifest_path.write_text(json.dumps(manifest))
+        scans: list[str] = []
+        real = hashlib.file_digest
+
+        def spy(
+            stream: object, algorithm: str, *args: object, **kwargs: object
+        ) -> object:
+            scans.append(str(algorithm))
+            return real(stream, algorithm, *args, **kwargs)
+
+        monkeypatch.setattr(hashlib, "file_digest", spy)
+        fetcher.requests.clear()
+        cache2 = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
+        bodies = cache2.fetch((span,))
+        assert fetcher.requests == []
+        assert scans == []
         assert bodies["row-0-1"] == b"\x77" * 100
+
+    def test_torn_span_manifest_replays_the_unit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Torn JSON is not treated as completion; the span is fetched again."""
+        cache = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
+        span = RangeSpan(MEASUREMENT_URL, 0, 99, "row-0-1")
+        fetcher = _FakeRangeFetcher
+        fetcher.blob = b"\x55" * 200
+        fetcher.requests = []
+        monkeypatch.setattr(acquisition_mod, "RangeFetcher", fetcher)
+        cache.fetch((span,))
+        (cache.dir / "manifest.json").write_text("{")
+        fetcher.requests.clear()
+        cache2 = acquisition_mod._SpanCache(tmp_path / ".span-cache", "F" * 16)
+        bodies = cache2.fetch((span,))
+        assert fetcher.requests  # not skipped as a complete record
+        assert bodies["row-0-1"] == b"\x55" * 100
 
     def test_span_manifest_url_carries_no_query(
         self,
@@ -1191,8 +1360,11 @@ class TestCanvasManifest:
         self,
         tmp_path: Path,
         mission_env: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A complete coverage record + intact SAFE skips all fetches on rerun."""
+        import hashlib
+
         item = _binding(
             "S1A_TEST",
             ANNOTATION_URL,
@@ -1206,11 +1378,22 @@ class TestCanvasManifest:
         assert coverage["complete"] is True
         assert coverage["fingerprint"]
         assert coverage["parent"] == "S1A_TEST"
+        scans: list[str] = []
+        real = hashlib.file_digest
+
+        def spy(
+            stream: object, algorithm: str, *args: object, **kwargs: object
+        ) -> object:
+            scans.append(str(algorithm))
+            return real(stream, algorithm, *args, **kwargs)
+
+        monkeypatch.setattr(hashlib, "file_digest", spy)
         fetcher = mission_env["fetcher"]
         fetcher.requests.clear()
         rerun = _materialize_items(tmp_path, [item])
         assert rerun == paths
         assert fetcher.requests == []  # no span fetches at all
+        assert scans == []
 
     def test_legacy_hidden_manifest_is_promoted_on_skip(
         self,

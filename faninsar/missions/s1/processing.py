@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 import numpy as np
 
@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-    from faninsar.processing.geometry.prepared import PhaseState
+    from faninsar.processing.geometry.prepared import PhaseState, PhaseTransitionRecord
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.memory import MemoryWatchdog
     from faninsar.processing.unwrapping.common import SpatialUnwrapResult
@@ -132,15 +132,22 @@ CoregistrationGrid = Literal["radar", "geo"]
 
 
 class ScientificTransitionRecord(TypedDict):
-    """Hash-bound record for one scientific phase transition."""
+    """Lightweight record for one scientific phase transition.
+
+    Records identify the operation, parameter metadata, and the metadata
+    hash of the operation chain.  They are not content checksums of
+    scientific arrays.  ``input_payload_digest`` and
+    ``output_payload_digest`` are optional inert legacy fields present only
+    on old stored records.
+    """
 
     operation: str
     operation_id: str
     input_state_digest: str
     output_state_digest: str
-    input_payload_digest: str
-    output_payload_digest: str
     metadata: str
+    input_payload_digest: NotRequired[str]
+    output_payload_digest: NotRequired[str]
 
 
 #: Lanczos half-width of the radar resampler (``resample_complex`` default).
@@ -152,35 +159,6 @@ _WINDOW_HALO_MARGIN_PX = 16
 _WINDOW_HALO_FLOOR_PX = 64
 #: Window-growth attempts before falling back to full-burst coregistration.
 _MAX_WINDOW_HALO_GROWTH = 3
-
-
-def _lineage_payload_digest(*arrays: np.ndarray | None) -> str:
-    """Hash array payloads with shape and dtype for scientific lineage."""
-    digest = hashlib.sha256()
-    chunk_bytes = 4 * 1024 * 1024
-    for array in arrays:
-        if array is None:
-            digest.update(b"<none>")
-            continue
-        value = np.asarray(array)
-        digest.update(value.dtype.str.encode("ascii"))
-        digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode())
-        if value.ndim == 0:
-            digest.update(np.ascontiguousarray(value).view(np.uint8).tobytes())
-            continue
-        if value.shape[0] == 0:
-            continue
-        # Hash in bounded C-order chunks.  This preserves the prior digest for
-        # contiguous arrays while avoiding a full temporary copy for memmaps or
-        # strided views when lineage is enabled.
-        rows_per_chunk = max(
-            1,
-            chunk_bytes // max(1, value[0].nbytes),
-        )
-        for row_start in range(0, value.shape[0], rows_per_chunk):
-            chunk = np.ascontiguousarray(value[row_start : row_start + rows_per_chunk])
-            digest.update(chunk.view(np.uint8).tobytes())
-    return digest.hexdigest()
 
 
 def _phase_state_manifest(state: ProductionPairState) -> dict[str, object] | None:
@@ -206,26 +184,37 @@ def _phase_state_manifest(state: ProductionPairState) -> dict[str, object] | Non
         "residual_application_id": phase_state.residual_application_id,
         "transition_digest": phase_state.transition_digest,
         "transition_history": [
-            {
-                "operation_id": transition.operation_id,
-                "input_state_digest": transition.input_state_digest,
-                "output_state_digest": transition.output_state_digest,
-                "input_payload_digest": transition.input_payload_digest,
-                "output_payload_digest": transition.output_payload_digest,
-            }
+            _transition_manifest(transition)
             for transition in phase_state.transition_history
         ],
     }
 
 
+def _transition_manifest(transition: PhaseTransitionRecord) -> dict[str, str]:
+    """Serialize one phase transition without empty payload-digest placeholders."""
+    item = {
+        "operation_id": transition.operation_id,
+        "input_state_digest": transition.input_state_digest,
+        "output_state_digest": transition.output_state_digest,
+    }
+    if transition.input_payload_digest:
+        item["input_payload_digest"] = transition.input_payload_digest
+    if transition.output_payload_digest:
+        item["output_payload_digest"] = transition.output_payload_digest
+    return item
+
+
 def _record_scientific_transition(
     state: ProductionPairState,
     operation: str,
-    input_arrays: tuple[np.ndarray | None, ...],
-    output_arrays: tuple[np.ndarray | None, ...],
     **metadata: object,
 ) -> None:
-    """Append one ordered, hash-bound scientific operation when enabled."""
+    """Append one ordered scientific operation record when enabled.
+
+    The record stores the operation name, parameter metadata, and a
+    metadata-only hash of the operation chain.  It does not scan scientific
+    array payloads.
+    """
     if not state.record_scientific_lineage:
         return
     operation_order = {
@@ -250,22 +239,21 @@ def _record_scientific_transition(
                 + " -> "
                 + operation
             )
-    input_payload_digest = _lineage_payload_digest(*input_arrays)
-    output_payload_digest = _lineage_payload_digest(*output_arrays)
     previous_state_digest = (
         state.scientific_lineage[-1]["output_state_digest"]
         if state.scientific_lineage
         else hashlib.sha256(state.pair_id.encode()).hexdigest()
     )
+    metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
     operation_id = hashlib.sha256(
         json.dumps(
-            [state.pair_id, operation, previous_state_digest, input_payload_digest],
+            [state.pair_id, operation, previous_state_digest, metadata_json],
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
     output_state_digest = hashlib.sha256(
         json.dumps(
-            [previous_state_digest, operation_id, output_payload_digest],
+            [previous_state_digest, operation_id, operation],
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
@@ -275,9 +263,7 @@ def _record_scientific_transition(
             "operation_id": operation_id,
             "input_state_digest": previous_state_digest,
             "output_state_digest": output_state_digest,
-            "input_payload_digest": input_payload_digest,
-            "output_payload_digest": output_payload_digest,
-            "metadata": json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            "metadata": metadata_json,
         }
     )
     if operation in {
@@ -297,7 +283,7 @@ def _record_scientific_transition(
                 carrier=PhaseCarrier.DERAMPED,
                 registration_model="network_relative",
                 geometric_phase=GeometricPhase.NONE,
-                phase_model_id="p18-p19.scientific-lineage.v1",
+                phase_model_id="p0082.operation-lineage.v1",
                 phase_lineage_id=hashlib.sha256(
                     state.pair_id.encode("utf-8")
                 ).hexdigest(),
@@ -313,13 +299,12 @@ def _record_scientific_transition(
                 else "pair"
             ),
             parent_observation_ids=(operation_id,),
-            payload_digest=output_payload_digest,
+            payload_digest=None,
             application_id=operation_id,
             status=ResidualStatus.VALID,
         )
         state.phase_state = state.phase_state.apply_solution(
             solution,
-            payload_digest=input_payload_digest,
             operation_id=operation_id,
         )
 
@@ -961,8 +946,6 @@ def stage_deramp(
         state.note(f"DERAMP secondary shape={state.secondary_deramped.shape}")
         return state
 
-    primary_input = state.primary.array.samples
-    secondary_input = state.secondary.array.samples
     if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
         state.primary_deramped = deramp(
             state.primary.array.samples, state.primary.carrier
@@ -1005,8 +988,6 @@ def stage_deramp(
     _record_scientific_transition(
         state,
         "deramp",
-        (primary_input, secondary_input),
-        (state.primary_deramped, state.secondary_deramped),
         carrier="tops",
     )
     return state
@@ -1785,8 +1766,6 @@ def stage_coregister(
         _record_scientific_transition(
             state,
             "measure_residual_solution",
-            (ref, sec),
-            (offsets.range_offset_px, offsets.azimuth_offset_px),
             ampcor_range_px=state.amplitude_residual_rg_px,
             ampcor_azimuth_px=amp_az_measured,
             esd_azimuth_px=state.esd_azimuth_shift_px,
@@ -1927,8 +1906,6 @@ def stage_coregister(
         state.primary_geocoded_slc = reference_geo
         state.secondary_geocoded_slc = secondary_geo
         state.geocoded_slc_valid = valid
-        geo_input_reference = ref
-        geo_input_secondary = sec
         state.primary_deramped = reference_geo
         state.secondary_deramped = None
         state.secondary_aligned = secondary_geo
@@ -1939,20 +1916,6 @@ def stage_coregister(
         state.geo_height_field = height_field
         state.geo_work_dir = work_directory
         state.memory_watchdog = memory_watchdog
-        geo_offset_digest: str | None = None
-        geo_lut_digest: str | None = None
-        geo_topographic_phase_digest: str | None = None
-        if state.record_scientific_lineage:
-            geo_offset_digest = _lineage_payload_digest(
-                offsets.range_offset_px,
-                offsets.azimuth_offset_px,
-            )
-            geo_lut_digest = _lineage_payload_digest(
-                lut.az_full,
-                lut.rg_full,
-                lut.valid,
-            )
-            geo_topographic_phase_digest = _lineage_payload_digest(topo_phase)
         del ref, sec, offsets
         gc.collect()
         state.note(
@@ -1965,15 +1928,10 @@ def stage_coregister(
         _record_scientific_transition(
             state,
             "apply_geo_carrier_residual_geometric_phase",
-            (geo_input_reference, geo_input_secondary),
-            (state.primary_geocoded_slc, state.secondary_aligned),
             amplitude_residual_rg_px=state.amplitude_residual_rg_px,
             esd_azimuth_shift_px=state.esd_azimuth_shift_px,
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
-            offset_field_digest=geo_offset_digest,
-            lut_digest=geo_lut_digest,
-            topographic_phase_digest=geo_topographic_phase_digest,
             carrier_model="tops",
             solution_kind="network" if (misreg_az_px or misreg_rg_px) else "pair",
             geometric_phase="topographic",
@@ -1981,7 +1939,6 @@ def stage_coregister(
         return state
 
     substage_started = _clock_start(device)
-    secondary_input = state.secondary_deramped
     from faninsar.processing.coregistration.offsets import (
         _resample_complex_deramped_reramp_with_validity,
     )
@@ -2064,16 +2021,6 @@ def stage_coregister(
     state.coregistration_timings_s["radar_reramp"] = _clock_stop(device, reramp_started)
     state.secondary_aligned = sec_resamp
     state.secondary_aligned_valid = np.asarray(sec_resamp_valid, dtype=bool)
-    radar_offset_digest: str | None = None
-    radar_range_phase_digest: str | None = None
-    if state.record_scientific_lineage:
-        radar_offset_digest = _lineage_payload_digest(
-            offsets.range_offset_px,
-            offsets.azimuth_offset_px,
-        )
-        radar_range_phase_digest = _lineage_payload_digest(
-            state.range_offset_flatten_phase,
-        )
     del sec_resamp, sec, ref, offsets
     gc.collect()
     state.note(
@@ -2088,14 +2035,10 @@ def stage_coregister(
     _record_scientific_transition(
         state,
         "apply_carrier_residual_range_phase",
-        (secondary_input,),
-        (state.secondary_aligned,),
         amplitude_residual_rg_px=state.amplitude_residual_rg_px,
         esd_azimuth_shift_px=state.esd_azimuth_shift_px,
         misreg_az_px=misreg_az_px,
         misreg_rg_px=misreg_rg_px,
-        offset_field_digest=radar_offset_digest,
-        range_phase_screen_digest=radar_range_phase_digest,
         carrier_model="tops",
         solution_kind="network" if (misreg_az_px or misreg_rg_px) else "pair",
         geometric_phase="range_offset_screen",
@@ -2142,19 +2085,6 @@ def stage_interferogram(
     if state.primary_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
     state.multilook = multilook
-    primary_input = state.primary_deramped
-    secondary_input = state.secondary_aligned
-    # Geographic coregistration keeps the two aligned SLCs in memmaps that
-    # are released below.  Scientific lineage hashes are computed after the
-    # interferogram is materialized, so retain owning copies only when the
-    # opt-in lineage record is enabled; otherwise preserve the zero-copy
-    # production path.
-    if state.record_scientific_lineage:
-        primary_lineage_input = np.array(primary_input, copy=True)
-        secondary_lineage_input = np.array(secondary_input, copy=True)
-    else:
-        primary_lineage_input = primary_input
-        secondary_lineage_input = secondary_input
     from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     accelerated = should_accelerate(
@@ -2239,8 +2169,6 @@ def stage_interferogram(
     _record_scientific_transition(
         state,
         "form_interferogram",
-        (primary_lineage_input, secondary_lineage_input),
-        (state.complex, state.coherence, state.wrapped_phase),
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
     )
@@ -2306,7 +2234,6 @@ def stage_flatten(
     """
     if state.complex is None:
         reject_invalid_state("flatten requires interferogram")
-    complex_input = state.complex
     height, width = state.complex.shape
     # Multilooked grid → full-res radar indices on the geometry model.
     # Geometry (0,0) is the array origin (already cropped). Use look-window
@@ -2421,8 +2348,6 @@ def stage_flatten(
         _record_scientific_transition(
             state,
             "apply_geometric_phase_flatten",
-            (complex_input,),
-            (state.complex_ifg_flat, state.wrapped_phase),
             phase_model="range_offset_screen_or_dem_residual",
         )
         return state
@@ -2470,8 +2395,6 @@ def stage_flatten(
     _record_scientific_transition(
         state,
         "apply_geometric_phase_flatten",
-        (complex_input,),
-        (state.complex_ifg_flat, state.wrapped_phase),
         phase_model="topographic",
     )
     return state
@@ -2512,7 +2435,6 @@ def stage_unwrap(
     )
     if ifg is None or state.coherence is None:
         reject_invalid_state("unwrap requires interferogram")
-    unwrap_input = ifg
     result: SpatialUnwrapResult = unwrap_dispatch(
         ifg,
         state.coherence,
@@ -2563,8 +2485,6 @@ def stage_unwrap(
     _record_scientific_transition(
         state,
         "spatial_unwrap_and_residual_screen",
-        (unwrap_input,),
-        (state.unwrapped_phase, state.complex_ifg_flat),
         method=method,
         residual_screen_applied=applied,
     )

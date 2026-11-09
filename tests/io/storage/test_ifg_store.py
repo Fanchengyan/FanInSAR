@@ -366,8 +366,25 @@ def test_ifg_artifact_payload_damage_fails_closed(
         InterferogramArtifactStore.open(root).read()
 
 
+def _omit_asset(root: Path, name: str) -> None:
+    """Drop one asset from ``item.json`` and delete its payload."""
+    item_path = root / "item.json"
+    item = json.loads(item_path.read_text(encoding="utf-8"))
+    href = item["assets"].pop(name)["href"]
+    item_path.write_text(
+        json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    payload = root / href
+    if payload.is_dir():
+        shutil.rmtree(payload)
+    elif payload.exists():
+        payload.unlink()
+
+
 def test_verify_detects_modified_payload(tmp_path: Path) -> None:
-    """Normal reads skip hashing; ``verify_product`` re-hashes every asset."""
+    """Payload byte edits are inert; declared shape and missing assets are not."""
+    from faninsar.io.storage._zarr_stac import write_zarr_array
+
     root = _ifg_dir(tmp_path)
     _write_base(root)
     assert verify_product(root) == []
@@ -375,7 +392,32 @@ def test_verify_detects_modified_payload(tmp_path: Path) -> None:
 
     array = zarr.open_array(store=str(root / "coherence.zarr"), mode="r+")
     array[0, 0] = 99.0
+    assert verify_product(root) == []
+    write_zarr_array(root / "coherence.zarr", np.ones((1, 1), dtype=np.float32))
     assert verify_product(root) == ["coherence"]
+    shutil.rmtree(root / "complex.zarr")
+    assert verify_product(root) == ["coherence", "complex"]
+
+
+def test_verify_reports_required_ifg_layer_omitted_from_manifest(
+    tmp_path: Path,
+) -> None:
+    """A required IFG layer dropped from the item is reported, not healthy."""
+    root = _ifg_dir(tmp_path)
+    _write_base(root)
+    assert verify_product(root) == []
+    _omit_asset(root, "complex")
+    assert verify_product(root) == ["complex"]
+
+
+def test_verify_allows_optional_ifg_layer_omitted_from_manifest(
+    tmp_path: Path,
+) -> None:
+    """Optional IFG layers may be absent from the item without failing verify."""
+    root = _ifg_dir(tmp_path)
+    _write_base(root)
+    _omit_asset(root, "coherence")
+    assert verify_product(root) == []
 
 
 def test_ifg_artifact_rejects_inconsistent_arrays(tmp_path: Path) -> None:

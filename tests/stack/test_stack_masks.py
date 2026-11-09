@@ -134,9 +134,8 @@ def test_geo_domain_read_commits_product(tmp_path: Path) -> None:
     product = open_product(product_dir, kind=MASK_KIND)
     assert product.properties["faninsar:mask_name"] == "observed"
     assert product.properties["faninsar:mask_domain"] == "geo"
-    assert (
-        product.properties["faninsar:mask_recipe_identity"]
-        == mask_recipe_identity(plan.masks["observed"])
+    assert product.properties["faninsar:mask_recipe_identity"] == mask_recipe_identity(
+        plan.masks["observed"]
     )
     # Second read reuses the persisted product (same write id).
     plane_again = stack.masks["observed"].sel("geo")
@@ -247,7 +246,9 @@ def test_discover_mask_products_finds_committed(tmp_path: Path) -> None:
 
 
 def test_verify_covers_mask_products(tmp_path: Path) -> None:
-    """``Stack.verify()`` hashes mask product payloads."""
+    """``Stack.verify()`` reports missing mask assets, not payload hashes."""
+    import shutil
+
     mask_path = _raster_mask_path(tmp_path)
     plan = MaskPlan(
         {"observed": {"kind": "raster", "path": str(mask_path)}},
@@ -257,18 +258,19 @@ def test_verify_covers_mask_products(tmp_path: Path) -> None:
     _ = stack.masks.observed.geo
 
     assert stack.verify() == []
-    # Corrupt the committed payload and confirm verify() flags it.
+    mask_root = stack.config.work_dir / "masks" / "observed" / "geo"
     chunks = [
         entry
-        for entry in (
-            stack.config.work_dir / "masks" / "observed" / "geo" / "mask.zarr"
-        ).rglob("*")
-        if entry.is_file()
+        for entry in (mask_root / "mask.zarr").rglob("*")
+        if entry.is_file() and entry.name not in {"zarr.json", ".zarray", ".zattrs"}
     ]
     assert chunks, "mask.zarr payload must contain files"
-    chunks[0].write_bytes(b"corrupt")
+    payload = chunks[0].read_bytes()
+    chunks[0].write_bytes(bytes((payload[0] ^ 0xFF,)) + payload[1:])
+    assert stack.verify() == []
+    shutil.rmtree(mask_root / "mask.zarr")
     problems = stack.verify()
-    assert any("masks" in entry for entry in problems)
+    assert any("masks" in entry and "mask" in entry for entry in problems)
 
 
 def test_water_recipe_detection_and_geometry_graceful_fallback(
