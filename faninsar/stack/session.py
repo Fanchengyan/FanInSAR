@@ -2243,7 +2243,8 @@ class Stack(NetworkContract, ABC):
             drop_prepared_dem_state(previous)
         self.config.dem = raster
         self._dem_wgs84 = raster if is_geodetic_crs(raster.crs) else None
-        drop_prepared_dem_state(raster)
+        if raster is not previous:
+            drop_prepared_dem_state(raster)
         return raster
 
     def _resolve_managed_dem(self, selected: object | None = None) -> RasterDEM:
@@ -2272,10 +2273,10 @@ class Stack(NetworkContract, ABC):
             self._persist_raster_dem(raster)
             return self._bind_live_dem(raster)
         roi_bounds = self._explicit_roi_bounds()
-        loaded = self._load_persisted_raster_dem()
-        existing = current if isinstance(current, LiveRaster) else loaded
-        if existing is None and loaded is not None:
-            existing = loaded
+        if isinstance(current, LiveRaster):
+            existing = current
+        else:
+            existing = self._load_persisted_raster_dem()
         required = roi_bounds
         if existing is None and required is None:
             required = self._initial_dem_bounds()
@@ -2390,7 +2391,9 @@ class Stack(NetworkContract, ABC):
         current = self.config.dem
         if type(current).__name__ == "ConstantDEM":
             return current
-        loaded = self._load_persisted_raster_dem()
+        loaded = None
+        if not isinstance(current, RasterDEM):
+            loaded = self._load_persisted_raster_dem()
         if (
             current is None
             and loaded is None

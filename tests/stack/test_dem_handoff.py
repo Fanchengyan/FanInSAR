@@ -433,3 +433,130 @@ def test_produce_pair_retries_actual_callback_with_refreshed_dem(
     assert west <= _USE_TIME_BOUNDS[0]
     assert east >= _USE_TIME_BOUNDS[2]
     assert len(grids) == n_prepare + 1
+
+
+def _instrument_managed_dem_reads(
+    monkeypatch: object, managed: Path
+) -> tuple[list[int], list[Path]]:
+    """Count full-array loads of the canonical managed DEM file."""
+    from pathlib import Path as PathType
+
+    import rasterio
+
+    from faninsar.processing.geometry.api import RasterDEM as LiveRaster
+
+    cells_read: list[int] = []
+    path_loads: list[PathType] = []
+    real_open = rasterio.open
+    real_init = LiveRaster.__init__
+    managed_key = managed.resolve()
+
+    def _open(*args: object, **kwargs: object) -> object:
+        dataset = real_open(*args, **kwargs)
+        opened = args[0] if args else kwargs.get("fp")
+        try:
+            same = PathType(str(opened)).resolve() == managed_key
+        except OSError:
+            same = False
+        if not same:
+            return dataset
+        real_read = dataset.read
+
+        def _read(*r_args: object, **r_kwargs: object) -> object:
+            array = real_read(*r_args, **r_kwargs)
+            cells_read.append(int(np.size(array)))
+            return array
+
+        dataset.read = _read  # type: ignore[method-assign]
+        return dataset
+
+    def _init(self: LiveRaster, *args: object, **kwargs: object) -> None:
+        path = kwargs.get("path")
+        if path is not None and PathType(str(path)).resolve() == managed_key:
+            path_loads.append(PathType(str(path)))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(rasterio, "open", _open)
+    monkeypatch.setattr(LiveRaster, "__init__", _init)
+    return cells_read, path_loads
+
+
+def test_repeated_ensure_reuses_live_canonical_dem_without_disk_reread(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A live sufficient RasterDEM stays in memory across production ensures."""
+    from types import SimpleNamespace
+
+    from faninsar.processing.geometry import prepare_production as prepare_mod
+    from faninsar.processing.geometry.dem_view import lonlat_dem_view
+
+    stack, grids = _roi_bounded_stack(tmp_path, monkeypatch)
+    _drop_explicit_roi(stack)
+    live = stack.dem
+    assert isinstance(live, RasterDEM)
+    managed = stack._stack_dem_raster_path()
+    assert managed.is_file()
+    n_materialize = len(grids)
+
+    view = lonlat_dem_view(live)
+    sentinel = object()
+    prepare_mod._prepared_store(live, ("live-reuse",), sentinel)
+    prepare_mod._GPU_DEM_TABLE[live] = {"cpu": {"token": sentinel}}
+
+    cells_read, path_loads = _instrument_managed_dem_reads(monkeypatch, managed)
+    first = stack._ensure_raster_dem()
+    second = stack._ensure_raster_dem()
+    assert first is live
+    assert second is live
+    assert stack.dem is live
+    assert cells_read == []
+    assert path_loads == []
+    assert lonlat_dem_view(live) is view
+    assert prepare_mod._prepared_lookup(live, ("live-reuse",)) is sentinel
+    assert prepare_mod._GPU_DEM_TABLE[live]["cpu"]["token"] is sentinel
+    assert len(grids) == n_materialize
+
+    stack.config.roi = SimpleNamespace(bounds=_USE_TIME_BOUNDS, crs="EPSG:4326")
+    grown = stack._ensure_raster_dem()
+    assert grown is not live
+    west, south, east, north = stack.dem.grid.bounds
+    assert west <= _USE_TIME_BOUNDS[0]
+    assert south <= _USE_TIME_BOUNDS[1]
+    assert east >= _USE_TIME_BOUNDS[2]
+    assert north >= _USE_TIME_BOUNDS[3]
+    assert len(grids) == n_materialize + 1
+    assert lonlat_dem_view(live) is not view
+    assert prepare_mod._prepared_lookup(live, ("live-reuse",)) is None
+
+
+def test_bind_live_dem_replacement_drops_previous_and_new_owner_state(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """A true live-DEM replacement still invalidates previous and new views."""
+    from faninsar.processing.geometry import prepare_production as prepare_mod
+    from faninsar.processing.geometry.dem_view import lonlat_dem_view
+
+    stack, _grids = _roi_bounded_stack(tmp_path, monkeypatch)
+    previous = stack.dem
+    assert isinstance(previous, RasterDEM)
+    previous_view = lonlat_dem_view(previous)
+    previous_token = object()
+    prepare_mod._prepared_store(previous, ("live-reuse",), previous_token)
+
+    replacement = RasterDEM(
+        array=np.full(previous.grid.shape, 50.0, dtype=np.float32),
+        grid=previous.grid,
+        vertical_datum="ellipsoidal",
+        provenance={"product": "glo30", "provider": "pc"},
+    )
+    replacement_view = lonlat_dem_view(replacement)
+    replacement_token = object()
+    prepare_mod._prepared_store(replacement, ("live-reuse",), replacement_token)
+
+    bound = stack._bind_live_dem(replacement)
+    assert bound is replacement
+    assert stack.dem is replacement
+    assert lonlat_dem_view(previous) is not previous_view
+    assert lonlat_dem_view(replacement) is not replacement_view
+    assert prepare_mod._prepared_lookup(previous, ("live-reuse",)) is None
+    assert prepare_mod._prepared_lookup(replacement, ("live-reuse",)) is None
