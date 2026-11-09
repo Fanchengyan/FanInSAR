@@ -150,280 +150,71 @@ def _ints(text: str) -> tuple[int, ...]:
 
 def _geolocation_grid_points(
     root: ET.Element,
-) -> dict[tuple[float, int], tuple[float, float]]:
-    """Return ``{(azimuth_seconds, pixel): (lon, lat)}`` per grid point.
+) -> dict[int, list[tuple[float, float]]]:
+    """Return ``{line: [(lon, lat), ...]}`` grouped by physical TIFF row.
 
-    The geolocation grid labels rows by their physical TIFF slot ``line``,
-    but each point's *sensing instant* is its own ``azimuthTime``.  Burst
-    windows are expressed in the same time axis, so the interpolation
-    abscissa is seconds since the earliest grid point — never the slot
-    label, which is offset by the accumulated TOPS azimuth overlap.
+    ``line`` is the slot row index.  Burst *i*'s footprint is the bounding
+    box of the gridline sitting at ``i*lines_per_burst`` — the swath's own
+    scan line, which matches the equal-height nominal burst grid ASF's
+    ``processingLevel=BURST`` catalogue returns.  Points keep document
+    order within the line (the range direction).
     """
     grid = next(
         (child for child in root if _local(child.tag) == "geolocationGrid"), None
     )
     if grid is None:
         return {}
-    # Group points by their physical ``line`` tag: every slot row is one
-    # scan line whose 21 pixel samples share (nearly) one instant.  The
-    # abscissa for interpolation is the row's own sensing instant.
-    rows: dict[int, list[tuple[int | None, float | None, float, float]]] = {}
+    rows: dict[int, list[tuple[float, float]]] = {}
     for gp in grid.iter():
         if _local(gp.tag) != "geolocationGridPoint":
             continue
         line = int(_text(gp, "line"))
-        pixel_text = _optional_text(gp, "pixel")
-        az_text = _optional_text(gp, "azimuthTime")
-        az = _parse_time(az_text).timestamp() if az_text is not None else None
         lat = float(_text(gp, "latitude"))
         lon = float(_text(gp, "longitude"))
-        rows.setdefault(line, []).append(
-            (int(pixel_text) if pixel_text is not None else None, az, lon, lat)
-        )
-    if not rows:
-        return {}
-    # One abscissa per scan line: its own azimuthTime when present, else the
-    # physical row index so interpolation still works on degenerate grids.
-    az_of_line: dict[int, float] = {}
-    have_az = any(az is not None for pts in rows.values() for _, az, _, _ in pts)
-    t0 = (
-        min(az for pts in rows.values() for _, az, _, _ in pts if az is not None)
-        if have_az
-        else 0.0
-    )
-    for line, pts in rows.items():
-        if have_az:
-            azs = [az for _, az, _, _ in pts if az is not None]
-            az_of_line[line] = (min(azs) if azs else t0) - t0
-        else:
-            az_of_line[line] = float(line)
-    points: dict[tuple[float, int], tuple[float, float]] = {}
-    for line, pts in rows.items():
-        auto = 0
-        for raw_pixel, _az, lon, lat in sorted(pts, key=lambda p: (p[0] is None, p[0])):
-            pixel = raw_pixel if raw_pixel is not None else auto
-            auto = pixel + 1
-            points[(az_of_line[line], pixel)] = (lon, lat)
-    return points
-
-
-def _interp_grid_point(
-    points: dict[tuple[float, int], tuple[float, float]],
-    time_s: float,
-    pixel: float,
-) -> tuple[float, float]:
-    """Bilinear-interpolate (lon, lat) at ``(time_s, pixel)``.
-
-    ``time_s`` counts seconds from the grid's earliest azimuth time, and
-    ``pixel`` is the range coordinate.  Out-of-range inputs clamp to the
-    nearest grid cell so a burst edge past the last sampled instant still
-    yields a finite coordinate.
-    """
-    times = sorted({k[0] for k in points})
-    pixels = sorted({k[1] for k in points})
-    t_lo = max((t for t in times if t <= time_s), default=times[0])
-    t_hi = min((t for t in times if t >= time_s), default=times[-1])
-    p0 = max((px for px in pixels if px <= pixel), default=pixels[0])
-    p1 = min((px for px in pixels if px >= pixel), default=pixels[-1])
-    if time_s < t_lo or time_s > t_hi:
-        # Extrapolate along track from the two nearest scan lines: the
-        # burst edge falls past the grid's sampled instants (a product's
-        # trailing overlap tail is real sensing time, not footprint).
-        if len(times) >= 2:
-            if time_s < t_lo:
-                t_lo, t_hi = times[0], times[1]
-            else:
-                t_lo, t_hi = times[-2], times[-1]
-            tl = (time_s - t_lo) / (t_hi - t_lo)
-        else:
-            tl = 0.0
-    else:
-        tl = 0.0 if t_hi == t_lo else (time_s - t_lo) / (t_hi - t_lo)
-    tp = 0.0 if p1 == p0 else (pixel - p0) / (p1 - p0)
-    tp = min(max(tp, 0.0), 1.0)
-    c00 = points[(t_lo, p0)]
-    c01 = points[(t_lo, p1)]
-    c10 = points[(t_hi, p0)]
-    c11 = points[(t_hi, p1)]
-    lon = (
-        c00[0] * (1 - tl) * (1 - tp)
-        + c10[0] * tl * (1 - tp)
-        + c01[0] * (1 - tl) * tp
-        + c11[0] * tl * tp
-    )
-    lat = (
-        c00[1] * (1 - tl) * (1 - tp)
-        + c10[1] * tl * (1 - tp)
-        + c01[1] * (1 - tl) * tp
-        + c11[1] * tl * tp
-    )
-    return lon, lat
-
-
-def _burst_time_window_seconds(
-    root: ET.Element,
-    lines_per_burst: int,
-    n_bursts: int,
-) -> list[tuple[float, float]] | None:
-    """Per-burst ``(start_s, end_s)`` windows in grid-anchored seconds.
-
-    Each window is ``azimuthTime_i .. azimuthTime_i + lines_per_burst*ati``,
-    expressed in the same seconds-since-first-grid-point axis as
-    :func:`_geolocation_grid_points`.  Returns ``None`` when timing metadata
-    is missing or inconsistent.
-    """
-    timing = next((child for child in root if _local(child.tag) == "swathTiming"), None)
-    image = next(
-        (child for child in root if _local(child.tag) == "imageAnnotation"), None
-    )
-    image_info = (
-        next(
-            (child for child in image if _local(child.tag) == "imageInformation"),
-            None,
-        )
-        if image is not None
-        else None
-    )
-    if timing is None or image_info is None:
-        return None
-    burst_list = next(
-        (child for child in timing if _local(child.tag) == "burstList"), None
-    )
-    if burst_list is None:
-        return None
-    burst_times = [
-        _parse_time(_text(burst_el, "azimuthTime"))
-        for burst_el in burst_list
-        if _local(burst_el.tag) == "burst"
-    ]
-    ati_text = _optional_text(image_info, "azimuthTimeInterval")
-    if not burst_times or ati_text is None:
-        return None
-    grid = next(
-        (child for child in root if _local(child.tag) == "geolocationGrid"), None
-    )
-    grid_times: list[float] = []
-    if grid is not None:
-        for gp in grid.iter():
-            if _local(gp.tag) != "geolocationGridPoint":
-                continue
-            az_text = _optional_text(gp, "azimuthTime")
-            if az_text is not None:
-                grid_times.append(_parse_time(az_text).timestamp())
-    # Anchor the time axis on the earliest grid instant (same as the
-    # interpolation abscissa); fall back to the first burst time.
-    t0 = min(grid_times) if grid_times else burst_times[0].timestamp()
-    ati = float(ati_text)
-    starts = [t.timestamp() - t0 for t in burst_times]
-    # A burst's sensing window ends where the next burst starts — the
-    # nominal burst period, not the product's trailing overlap rows.  The
-    # final burst reuses the median inter-burst period so an un-listed tail
-    # never inflates its footprint.
-    periods = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
-    period = sorted(periods)[len(periods) // 2] if periods else lines_per_burst * ati
-    windows = [(start, start + period) for start in starts]
-    if len(windows) != n_bursts:
-        return None
-    # Sane TOPS windows are strictly increasing with sub-burst spacing
-    # (azimuth overlap).  Anything else is not trustworthy.
-    overlapped = all(
-        0 < starts[i + 1] - starts[i] <= lines_per_burst * ati
-        for i in range(len(starts) - 1)
-    )
-    return windows if overlapped else None
+        rows.setdefault(line, []).append((lon, lat))
+    return rows
 
 
 def _parse_burst_footprints(
     root: ET.Element,
     lines_per_burst: int,
-    azimuth_windows_s: list[tuple[float, float]] | None = None,
 ) -> list[tuple[tuple[float, float], ...]] | None:
     """Return one polygon per burst from the geolocation grid.
 
-    A burst's footprint is the swath swept during its azimuth sensing
-    window ``azimuthTime_i .. azimuthTime_i + linesPerBurst*ati``.  The four
-    corners are bilinearly interpolated on the geolocation grid — indexed
-    by each point's own ``azimuthTime`` (not its slot ``line`` label, which
-    is shifted by the accumulated TOPS overlap) — at the window's first and
-    last instant and the grid's range edges.
+    Burst *i*'s footprint is the bounding box of the geolocation gridline
+    at its slot start ``i*lines_per_burst``.  Using each burst's own scan
+    line — instead of every gridline up to the product's final row — keeps
+    all footprints the same height and stops the last burst from absorbing
+    the slice's trailing TOPS-overlap rows (~2x inflation).
+
+    When a slot start has no sampled gridline, the nearest sampled line is
+    used so a burst still yields a finite rectangle.
     """
-    points = _geolocation_grid_points(root)
-    if not points:
+    rows = _geolocation_grid_points(root)
+    if not rows:
         return None
-    times = sorted({k[0] for k in points})
-    pixels = sorted({k[1] for k in points})
-    p_min, p_max = pixels[0], pixels[-1]
-
-    timing = next((child for child in root if _local(child.tag) == "swathTiming"), None)
-    burst_els: list[ET.Element] = []
-    if timing is not None:
-        burst_list = next(
-            (child for child in timing if _local(child.tag) == "burstList"),
-            None,
-        )
-        if burst_list is not None:
-            burst_els = [b for b in burst_list if _local(b.tag) == "burst"]
-    n_bursts = len(burst_els)
-    if n_bursts == 0:
-        # No burst metadata: size the strip by lines_per_burst over the
-        # grid's row span (the grid times are slot-row indices then).
-        max_line = int(times[-1]) if times else 0
-        n_bursts = max(max_line // lines_per_burst + 1, 1)
-    if azimuth_windows_s is None:
-        windows = (
-            _burst_time_window_seconds(root, lines_per_burst, n_bursts)
-            if burst_els
-            else None
-        )
-        if windows is None:
-            # No usable timing: the abscissa is slot-row indices, so the
-            # windows are the physical burst slots themselves.
-            azimuth_windows_s = [
-                (index * float(lines_per_burst), (index + 1) * float(lines_per_burst))
-                for index in range(n_bursts)
-            ]
-        else:
-            azimuth_windows_s = windows
-    n_bursts = len(azimuth_windows_s)
-
-    # Degenerate grids carry a single point per instant (no range dim).
-    pts_per_time: dict[float, list[tuple[float, float]]] = {}
-    for (t, _), coord in points.items():
-        pts_per_time.setdefault(t, []).append(coord)
-    range_dim = len(pixels) > 1
+    lines = sorted(rows)
+    max_line = lines[-1]
+    n_bursts = max_line // lines_per_burst + 1
 
     footprints: list[tuple[tuple[float, float], ...]] = []
     for index in range(n_bursts):
-        t_start, t_end = azimuth_windows_s[index]
-        if not range_dim:
-            rows = [
-                coord
-                for t, coords in pts_per_time.items()
-                if t_start <= t < t_end
-                for coord in coords
-            ]
-            if not rows:
-                mid = (t_start + t_end) / 2.0
-                nearest = min(pts_per_time, key=lambda t: abs(t - mid))
-                rows = pts_per_time[nearest]
-            lats = [c[1] for c in rows]
-            lons = [c[0] for c in rows]
-            footprints.append(
-                (
-                    (min(lons), min(lats)),
-                    (max(lons), min(lats)),
-                    (max(lons), max(lats)),
-                    (min(lons), max(lats)),
-                )
+        slot_start = index * lines_per_burst
+        if slot_start in rows:
+            pts = rows[slot_start]
+        else:
+            nearest = min(lines, key=lambda ln: abs(ln - slot_start))
+            pts = rows[nearest]
+        lats = [c[1] for c in pts]
+        lons = [c[0] for c in pts]
+        footprints.append(
+            (
+                (min(lons), min(lats)),
+                (max(lons), min(lats)),
+                (max(lons), max(lats)),
+                (min(lons), max(lats)),
             )
-            continue
-        corners = (
-            _interp_grid_point(points, t_start, p_min),
-            _interp_grid_point(points, t_start, p_max),
-            _interp_grid_point(points, t_end, p_max),
-            _interp_grid_point(points, t_end, p_min),
         )
-        footprints.append(corners)
     return footprints
 
 
