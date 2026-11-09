@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import geopandas as gpd
@@ -13,6 +14,7 @@ from faninsar.io.storage.scene_store import (
     SceneWriter,
     write_scene,
 )
+from faninsar.missions.s1.coregister import _stage_reference_footprint
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,3 +101,65 @@ def test_scene_without_footprint_geojson_returns_empty(tmp_path: Path) -> None:
     assert "geometry" in gdf.columns
     assert gdf.crs is not None
     assert gdf.crs.to_epsg() == 4326
+
+
+def _writer(root: Path) -> SceneWriter:
+    return SceneWriter(
+        root,
+        date_id="20240101",
+        reference_id="20240101",
+        domain="radar",
+        grid_shape=(4, 4),
+    )
+
+
+def _unit(*, footprint: object, absolute_burst_id: int | None = 111) -> SimpleNamespace:
+    burst = SimpleNamespace(
+        footprint=footprint,
+        absolute_burst_id=absolute_burst_id,
+        azimuth_anx_time_s=0.0,
+    )
+    return SimpleNamespace(
+        tag="f0_IW1_b0",
+        swath="IW1",
+        scene=SimpleNamespace(burst=burst),
+    )
+
+
+def test_stage_reference_footprint_writes_geojson(tmp_path: Path) -> None:
+    """Reference publication copies XML burst rings into footprint.geojson."""
+    with _writer(tmp_path / "scene") as writer:
+        writer.add_unit(
+            tag="f0_IW1_b0",
+            payload=np.ones((4, 4), np.complex64),
+            row_origin=0,
+            col_origin=0,
+            burst_id="IW1-111",
+        )
+        _stage_reference_footprint(writer, {"f0_IW1_b0": _unit(footprint=_RING)})
+        store = writer.commit()
+
+    gdf = store.footprint
+    assert len(gdf) == 1
+    row = gdf.iloc[0]
+    assert row["tag"] == "f0_IW1_b0"
+    assert row["burst_id"] == "IW1-111"
+    assert int(row["absolute_burst_id"]) == 111
+    assert row["geometry"].bounds == (100.8, 37.5, 102.0, 38.0)
+
+
+def test_stage_reference_footprint_skips_invalid_rings(tmp_path: Path) -> None:
+    """A non-ring burst.footprint does not publish a GeoJSON asset."""
+    with _writer(tmp_path / "scene") as writer:
+        writer.add_unit(
+            tag="f0_IW1_b0",
+            payload=np.ones((4, 4), np.complex64),
+            row_origin=0,
+            col_origin=0,
+            burst_id="IW1-111",
+        )
+        _stage_reference_footprint(writer, {"f0_IW1_b0": _unit(footprint=object())})
+        store = writer.commit()
+
+    assert not (store.root / "footprint.geojson").exists()
+    assert len(store.footprint) == 0

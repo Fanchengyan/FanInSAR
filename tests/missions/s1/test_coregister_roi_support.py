@@ -49,6 +49,14 @@ _INTERIOR_ZERO = (3, 3)
 _CANVAS_INVALID = (3, 2)
 _HOLE_PIXEL = (4, 4)
 _BBOX_CORNER = (0, 0)
+_BURST_FOOTPRINT = (
+    (10.02, 45.02),
+    (10.06, 45.02),
+    (10.08, 45.02),
+    (10.07, 45.06),
+    (10.05, 45.06),
+    (10.01, 45.06),
+)
 
 
 def _burst() -> S1Burst:
@@ -187,6 +195,8 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     scene.path = path
     scene.burst.index = 0
     scene.burst.azimuth_time = _ORIGIN
+    scene.burst.azimuth_anx_time_s = 0.0
+    scene.burst.footprint = _BURST_FOOTPRINT
     scene.burst.first_valid_sample = tuple([0] * _LINES)
     scene.burst.last_valid_sample = tuple([_SAMPLES - 1] * _LINES)
     scene.swath = _product(path).swaths[0]
@@ -326,6 +336,11 @@ def test_radar_reference_publication_excludes_hole_and_canvas_fill(
     assert bool(mask[_INTERIOR_ZERO])
     assert not bool(mask[_CANVAS_INVALID])
     assert (tmp_path / REFERENCE / "manifest.safe").is_file()
+    gdf = context.product.footprint
+    assert (context.product.root / "footprint.geojson").is_file()
+    assert len(gdf) == 1
+    assert gdf.iloc[0]["tag"] == "f0_IW1_b0"
+    assert gdf.iloc[0]["geometry"].bounds == (10.01, 45.02, 10.08, 45.06)
 
 
 def _prepare_hole_reference(tmp_path: Path) -> S1ReferenceContext:
