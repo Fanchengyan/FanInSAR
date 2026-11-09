@@ -608,7 +608,14 @@ class InterferogramArtifactStore:
         return unwrap_root(self.root, representation=self.representation)
 
     def has_unwrapped(self) -> bool:
-        """Return whether a current unwrap product is bound to this IFG."""
+        """Return whether a current unwrap product is bound to this IFG.
+
+        Burst IFGs return ``False`` without traversing the unwrap root.
+        Unwrap consumes merged products; ``unwrap_root`` still rejects
+        burst paths unless ``allow_burst=True``.
+        """
+        if self.representation == BURST_REPRESENTATION:
+            return False
         item = self.unwrap_root / "item.json"
         if not item.is_file():
             return False

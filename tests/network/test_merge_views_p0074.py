@@ -482,6 +482,52 @@ def test_interferograms_merge_bursts_reads_committed_layout(tmp_path: Path) -> N
     np.testing.assert_allclose(values[:, 8:], 2.0)
 
 
+def test_interferograms_merge_bursts_layers_lists_without_unwrap_traversal(
+    tmp_path: Path,
+) -> None:
+    """Lazy merged IFG views list layers without probing burst unwrap roots."""
+    from faninsar.io.storage.ifg_store import ifg_artifact_dir, write_ifg_artifact
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from tests.network.test_scene_collection import _stack_with_scenes
+
+    stack = _stack_with_scenes(tmp_path)
+    _publish_stack_layout(stack, source_ids=("f0_IW1_b0", "f0_IW2_b0"))
+    pair = ("20240101", "20240113")
+    primary = stack.scenes["20240101"].write_id
+    secondary = stack.scenes["20240113"].write_id
+    for burst_id, payload, col0 in (
+        ("f0_IW1_b0", np.full((8, 8), 1.0 + 0.0j, dtype=np.complex64), 0),
+        ("f0_IW2_b0", np.full((8, 8), 2.0 + 0.0j, dtype=np.complex64), 8),
+    ):
+        write_ifg_artifact(
+            ifg_artifact_dir(
+                stack.config.work_dir,
+                (1, 1),
+                pair,
+                representation="burst",
+                burst_id=burst_id,
+            ),
+            pair=pair,
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": primary, "secondary": secondary},
+            complex_ifg=payload,
+            valid_mask=np.ones((8, 8), dtype=bool),
+            representation="burst",
+            burst_id=burst_id,
+            row_origin=0,
+            col_origin=col0,
+            grid_shape=(8, 16),
+        )
+    merged = stack.interferograms.merge_bursts()["20240101_20240113"]
+    np.testing.assert_allclose(merged.complex.read()[:, :8], 1.0)
+    np.testing.assert_allclose(merged.wrapped_phase.read()[:, :8], 0.0)
+    assert merged.layers == ["amplitude", "complex", "wrapped_phase"]
+    with pytest.raises(InvalidProcessingStateError, match="allow_burst"):
+        merged.unwrapped_phase
+
+
 def test_merge_to_xarray_uses_shared_midpoint_selector(tmp_path: Path) -> None:
     """Lazy xarray compute must match merge_bursts, not first-valid mosaicking."""
     from tests.network.test_scene_collection import _stack_with_scenes

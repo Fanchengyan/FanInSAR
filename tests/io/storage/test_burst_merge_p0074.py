@@ -377,6 +377,7 @@ def test_ifg_burst_products_coexist_with_merged_and_reject_unwrap(
     assert reopened_burst.layout_id == merged.layout_id
     np.testing.assert_array_equal(reopened_merged.read().complex, complex_merged)
     np.testing.assert_array_equal(reopened_burst.read().complex, complex_burst)
+    assert not reopened_burst.has_unwrapped()
     with pytest.raises(InvalidProcessingStateError, match="merged"):
         unwrap_root(burst_root)
     with pytest.raises(InvalidProcessingStateError, match="merged"):
