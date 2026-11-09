@@ -16,6 +16,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.geometry.managed_dem import DEMCoverageInsufficientError
 from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
 from faninsar.processing.runtime.memory import release_memmap_pages
 
@@ -33,6 +34,35 @@ def _grid_axes(grid: GeoGridSpec) -> tuple[float, float, float, float]:
 
     affine = Affine(*grid.transform)
     return affine.c, affine.a, affine.f, affine.e
+
+
+def _rdr2geo_bbox_points(
+    geometry: RadarGeometryModel,
+    points: np.ndarray,
+    dem: DEM | None,
+    *,
+    device: DeviceLike,
+) -> object:
+    """Map a few radar corners for a crop window; ellipsoid if DEM extent is short."""
+    try:
+        return run_rdr2geo(
+            geometry,
+            points[:, 0],
+            points[:, 1],
+            dem,
+            device=device,
+        )
+    except DEMCoverageInsufficientError:
+        logger.warning(
+            "burst bbox corners exceed DEM extent; using ellipsoid for the crop window"
+        )
+        return run_rdr2geo(
+            geometry,
+            points[:, 0],
+            points[:, 1],
+            None,
+            device=device,
+        )
 
 
 def _add_timing(timings: dict[str, float] | None, key: str, started: float) -> None:
@@ -147,13 +177,7 @@ def derive_burst_geo_bbox(
         ],
         dtype=np.float64,
     )
-    res = run_rdr2geo(
-        geometry,
-        points[:, 0],
-        points[:, 1],
-        dem,
-        device=device,
-    )
+    res = _rdr2geo_bbox_points(geometry, points, dem, device=device)
     lat = np.asarray(res.latitude_deg)
     lon = np.asarray(res.longitude_deg)
     ok = np.isfinite(lat) & np.isfinite(lon)
@@ -214,13 +238,7 @@ def burst_geo_quad_lonlat(
         ],
         dtype=np.float64,
     )
-    res = run_rdr2geo(
-        geometry,
-        points[:, 0],
-        points[:, 1],
-        dem,
-        device=device,
-    )
+    res = _rdr2geo_bbox_points(geometry, points, dem, device=device)
     lat = np.asarray(res.latitude_deg, dtype=np.float64)
     lon = np.asarray(res.longitude_deg, dtype=np.float64)
     ok = np.isfinite(lat) & np.isfinite(lon)
@@ -279,13 +297,7 @@ def burst_geo_footprint_lonlat(
         ],
         dtype=np.float64,
     )
-    res = run_rdr2geo(
-        geometry,
-        points[:, 0],
-        points[:, 1],
-        dem,
-        device=device,
-    )
+    res = _rdr2geo_bbox_points(geometry, points, dem, device=device)
     lat = np.asarray(res.latitude_deg, dtype=np.float64)
     lon = np.asarray(res.longitude_deg, dtype=np.float64)
     ok = np.isfinite(lat) & np.isfinite(lon)

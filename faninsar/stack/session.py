@@ -1968,7 +1968,10 @@ class Stack(NetworkContract, ABC):
         if layer is not None:
             layer.validate_reference(reference.write_id)
         from faninsar.processing.geometry.api import dem_content_identity
+        from faninsar.processing.geometry.managed_dem import wgs84_bounds
 
+        dest_bounds = self._dem_request_bounds(wgs84_bounds(destination))
+        self._ensure_dem_covers_request(dest_bounds)
         identity["dem"] = dem_content_identity(self._geometry_dem())
         inputs = (
             None
@@ -1993,30 +1996,6 @@ class Stack(NetworkContract, ABC):
         if support is not None and resolved_kind != "label":
             values[~support] = np.nan
         from faninsar.processing.geocoding import Geocoder
-        from faninsar.processing.geometry.dem_view import native_spacing_deg
-        from faninsar.processing.geometry.managed_dem import (
-            expand_bounds,
-            interpolation_margin_deg,
-            wgs84_bounds,
-        )
-
-        product = None if self._dem_source is None else self._dem_source.product
-        self._ensure_dem_covers_request(
-            expand_bounds(
-                wgs84_bounds(destination),
-                interpolation_margin_deg(native_spacing_deg(product)),
-            )
-        )
-        engine = Geocoder(
-            geometry,
-            destination,
-            dem=self._geometry_dem(),
-            full_radar_shape=full_radar_shape,
-            device=self.config.device,
-            cache_dir=self.config.work_dir / "cache" / "geo-lut",
-            cache_key=f"stack_{self.reference}",
-            storage_dir=self.config.work_dir / "cache" / "geo-lut" / "storage",
-        )
 
         def correction(coords: Any) -> Any:
             """Map into the source frame and preserve authoritative support."""
@@ -2030,17 +2009,32 @@ class Stack(NetworkContract, ABC):
                 mapped.az, mapped.rg, mapped.valid & admissible & sampled
             )
 
-        raster = engine.apply(
-            values,
-            kind=resolved_kind,
-            correction=correction,
-            rows_per_chunk=_GEOCODE_ROWS_PER_CHUNK,
-        )
-        if layer is not None:
-            from faninsar.processing.geocoding import GeocodedRaster
+        def _apply() -> Any:
+            engine = Geocoder(
+                geometry,
+                destination,
+                dem=self._geometry_dem(),
+                full_radar_shape=full_radar_shape,
+                device=self.config.device,
+                cache_dir=self.config.work_dir / "cache" / "geo-lut",
+                cache_key=f"stack_{self.reference}",
+                storage_dir=self.config.work_dir / "cache" / "geo-lut" / "storage",
+            )
+            raster = engine.apply(
+                values,
+                kind=resolved_kind,
+                correction=correction,
+                rows_per_chunk=_GEOCODE_ROWS_PER_CHUNK,
+            )
+            if layer is not None:
+                from faninsar.processing.geocoding import GeocodedRaster
 
-            valid = raster.valid & np.isfinite(raster.values)
-            raster = GeocodedRaster(raster.values, valid, raster.grid)
+                valid = raster.valid & np.isfinite(raster.values)
+                return GeocodedRaster(raster.values, valid, raster.grid)
+            return raster
+
+        raster = self._call_with_dem_coverage(dest_bounds, _apply)
+        identity["dem"] = dem_content_identity(self._geometry_dem())
         if target_dir is not None:
             _commit_geocoded_product(
                 target_dir,
@@ -2327,9 +2321,26 @@ class Stack(NetworkContract, ABC):
         self._persist_raster_dem(raster)
         return self._bind_live_dem(raster)
 
+    def _dem_request_bounds(
+        self, bounds: tuple[float, float, float, float] | None
+    ) -> tuple[float, float, float, float] | None:
+        """Expand WGS84 bounds by the interpolation stencil, if present."""
+        if bounds is None:
+            return None
+        from faninsar.processing.geometry.dem_view import native_spacing_deg
+        from faninsar.processing.geometry.managed_dem import (
+            expand_bounds,
+            interpolation_margin_deg,
+        )
+
+        product = None if self._dem_source is None else self._dem_source.product
+        return expand_bounds(
+            bounds, interpolation_margin_deg(native_spacing_deg(product))
+        )
+
     def _call_with_dem_coverage(
         self,
-        required_bounds: tuple[float, float, float, float],
+        required_bounds: tuple[float, float, float, float] | None,
         operation: Any,
     ) -> Any:
         """Run ``operation``, expanding the managed DEM once if coverage is short."""
@@ -2340,18 +2351,14 @@ class Stack(NetworkContract, ABC):
         )
 
         current = self.config.dem
-        retried = False
-        if isinstance(current, LiveRaster):
+        if required_bounds is not None and isinstance(current, LiveRaster):
             try:
                 require_dem_coverage(current, required_bounds)
             except DEMCoverageInsufficientError:
                 self._expand_managed_dem(required_bounds)
-                retried = True
         try:
             return operation()
         except DEMCoverageInsufficientError as error:
-            if retried:
-                raise
             self._expand_managed_dem(error.required_bounds)
             current = self.config.dem
             if isinstance(current, LiveRaster):
@@ -3154,18 +3161,23 @@ class Stack(NetworkContract, ABC):
                 dem=self._geometry_dem(),
             )
             if projection_key not in self._radar_projected_masks:
-                self._radar_projected_masks[projection_key] = project_mask_to_radar(
-                    materialized,
-                    full_radar_shape=tuple(int(value) for value in full_shape),
-                    lut=lut,
-                    geometry=geometry,
-                    mask_transform=target.transform,
-                    dem=self._geometry_dem(),
-                    device=self.config.device,
-                    multilook=looks,
-                    master_grid=target,
-                    reference_scene=self.reference,
-                )
+
+                def _project() -> Any:
+                    return project_mask_to_radar(
+                        materialized,
+                        full_radar_shape=tuple(int(value) for value in full_shape),
+                        lut=lut,
+                        geometry=geometry,
+                        mask_transform=target.transform,
+                        dem=self._geometry_dem(),
+                        device=self.config.device,
+                        multilook=looks,
+                        master_grid=target,
+                        reference_scene=self.reference,
+                    )
+
+                projected = self._call_with_dem_coverage(None, _project)
+                self._radar_projected_masks[projection_key] = projected
             projected_shape = tuple(
                 expected_shape or self._radar_projected_masks[projection_key].shape
             )
@@ -3726,13 +3738,21 @@ class Stack(NetworkContract, ABC):
         has_extent = self._has_stack_extent()
         if type(self.config.dem).__name__ == "ConstantDEM" and has_extent:
             self.config.dem = self.materialize_dem(self.config.dem)
-        if self.config.dem is not None:
-            options.setdefault("dem", self._geometry_dem())
-        return self.scene_provider(
-            SourceHandle._from_source(primary_path),
-            SourceHandle._from_source(secondary_path),
-            output_dir=output_dir,
-            options=options,
+
+        def _run() -> Any:
+            live_options = dict(options)
+            if self.config.dem is not None:
+                live_options["dem"] = self._geometry_dem()
+            return self.scene_provider(
+                SourceHandle._from_source(primary_path),
+                SourceHandle._from_source(secondary_path),
+                output_dir=output_dir,
+                options=live_options,
+            )
+
+        return self._call_with_dem_coverage(
+            self._dem_request_bounds(self._explicit_roi_bounds()),
+            _run,
         )
 
     def release_accelerator(self) -> None:

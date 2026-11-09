@@ -60,6 +60,7 @@ _GPU_DEM_TABLE: WeakKeyDictionary[object, dict[str, dict[str, object]]] = (
 )
 _NONE_DEM_OWNER = ConstantDEM(0.0)
 _RDR2GEO_DEM_FIELDS = ("dem_values", "dem_metadata", "dem_height_bounds")
+_TERRAIN_PROBE_HEIGHTS_M = (0.0, 9000.0)
 
 
 def _require_device(device: DeviceLike) -> object:
@@ -1018,6 +1019,96 @@ def _reshape_transform_result(
     )
 
 
+def _radar_boundary_samples(
+    azimuth_index: np.ndarray, range_index: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return at most eight radar samples on the query boundary."""
+    azimuth = np.asarray(azimuth_index, dtype=np.float64)
+    slant = np.asarray(range_index, dtype=np.float64)
+    if azimuth.size == 0:
+        return azimuth.reshape(-1), slant.reshape(-1)
+    if azimuth.ndim >= 2 and min(azimuth.shape[:2]) > 1:
+        last_az = azimuth.shape[0] - 1
+        last_rg = azimuth.shape[1] - 1
+        mid_az = last_az // 2
+        mid_rg = last_rg // 2
+        rows = np.array([0, 0, last_az, last_az, 0, last_az, mid_az, mid_az])
+        cols = np.array([0, last_rg, 0, last_rg, mid_rg, mid_rg, 0, last_rg])
+        return azimuth[rows, cols], slant[rows, cols]
+    flat_az = azimuth.reshape(-1)
+    flat_rg = slant.reshape(-1)
+    count = int(flat_az.size)
+    if count <= 8:
+        return flat_az, flat_rg
+    index = np.unique(np.linspace(0, count - 1, 8, dtype=np.int64))
+    return flat_az[index], flat_rg[index]
+
+
+def _require_rdr2geo_dem_coverage(
+    model: RadarGeometryModel,
+    azimuth_index: np.ndarray,
+    range_index: np.ndarray,
+    dem: DEM | None,
+    *,
+    device: DeviceLike,
+    max_iter: int,
+    range_tol_m: float,
+    doppler_tol_hz: float,
+) -> None:
+    """Raise when a raster DEM's extent cannot cover this radar query."""
+    if not isinstance(dem, RasterDEM):
+        return
+    from faninsar.processing.geometry.dem_view import (
+        is_geodetic_crs,
+        native_spacing_deg,
+    )
+    from faninsar.processing.geometry.managed_dem import (
+        expand_bounds,
+        interpolation_margin_deg,
+        require_dem_coverage,
+    )
+
+    sample_az, sample_rg = _radar_boundary_samples(azimuth_index, range_index)
+    latitudes: list[np.ndarray] = []
+    longitudes: list[np.ndarray] = []
+    for height in _TERRAIN_PROBE_HEIGHTS_M:
+        result = run_rdr2geo(
+            model,
+            sample_az,
+            sample_rg,
+            ConstantDEM(float(height)),
+            device=device,
+            max_iter=max_iter,
+            range_tol_m=range_tol_m,
+            doppler_tol_hz=doppler_tol_hz,
+        )
+        lat = np.asarray(result.latitude_deg)
+        lon = np.asarray(result.longitude_deg)
+        good = np.isfinite(lat) & np.isfinite(lon)
+        if np.any(good):
+            latitudes.append(lat[good])
+            longitudes.append(lon[good])
+    if not latitudes:
+        return
+    lat = np.concatenate(latitudes)
+    lon = np.concatenate(longitudes)
+    envelope = (
+        float(lon.min()),
+        float(lat.min()),
+        float(lon.max()),
+        float(lat.max()),
+    )
+    if is_geodetic_crs(dem.grid.crs):
+        spacing = abs(float(dem.grid.transform[0]))
+    else:
+        provenance = getattr(dem, "provenance", None)
+        product = provenance.get("product") if isinstance(provenance, dict) else None
+        spacing = native_spacing_deg(product)
+    require_dem_coverage(
+        dem, expand_bounds(envelope, interpolation_margin_deg(spacing))
+    )
+
+
 def run_geo2rdr(
     model: RadarGeometryModel,
     latitude_deg: np.ndarray,
@@ -1080,6 +1171,16 @@ def run_rdr2geo(
     az = np.asarray(azimuth_index, dtype=np.float64)
     rg = np.asarray(range_index, dtype=np.float64)
     az, rg = np.broadcast_arrays(az, rg)
+    _require_rdr2geo_dem_coverage(
+        model,
+        az,
+        rg,
+        dem,
+        device=device,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+    )
     prepared = prepare_production_geometry(
         Operation.RDR2GEO,
         model,
@@ -1115,6 +1216,16 @@ def run_rdr2geo_chunked(
     az = np.asarray(azimuth_index, dtype=np.float64)
     rg = np.asarray(range_index, dtype=np.float64)
     az_b, rg_b = np.broadcast_arrays(az, rg)
+    _require_rdr2geo_dem_coverage(
+        model,
+        az_b,
+        rg_b,
+        dem,
+        device=device,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+    )
     shape = az_b.shape
     buffers: dict[str, np.ndarray] = {}
     az_chunk, rg_chunk = chunk_size

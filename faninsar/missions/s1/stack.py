@@ -1207,6 +1207,22 @@ class S1Stack(Stack):
             interpolation_margin_deg(native_spacing_deg(product)),
         )
 
+    def _s1_use_time_coverage_bounds(
+        self, roi: object | None
+    ) -> tuple[float, float, float, float] | None:
+        """Return the current S1 geometry envelope, or ``None`` when unknown."""
+        if roi is not None:
+            return self._s1_roi_coverage_bounds(roi)
+        selected = self._selected_footprint_roi()
+        bounds = getattr(selected, "bounds", None)
+        if bounds is None:
+            return None
+        try:
+            west, south, east, north = (float(value) for value in bounds)
+        except (TypeError, ValueError):
+            return None
+        return self._dem_request_bounds((west, south, east, north))
+
     def _resolve_s1_roi_burst_selection(
         self,
         *,
@@ -1242,7 +1258,6 @@ class S1Stack(Stack):
         from faninsar.missions.s1.safe import open_acquisition_products
 
         logger.info("ROI provided; explicit swaths/bursts selection ignored")
-        self._ensure_dem_covers_request(self._s1_roi_coverage_bounds(roi))
         ref_paths = list(self.catalog.paths_for(self.reference))
         polarizations = self.config.extra.get("polarizations")
         selected_polarizations = (
@@ -1254,12 +1269,18 @@ class S1Stack(Stack):
         swath_tuple = _union_swath_names(products)
         ref_orbit = self._orbit_path_for(self.reference)
         orbits = [ref_orbit] * len(products)
-        resolved = _select_bursts_by_roi(
-            roi,
-            ref_paths,
-            swath_tuple,
-            orbits=orbits,
-            dem=self._geometry_dem(),
+
+        def _select() -> dict[tuple[int, str], list[int]]:
+            return _select_bursts_by_roi(
+                roi,
+                ref_paths,
+                swath_tuple,
+                orbits=orbits,
+                dem=self._geometry_dem(),
+            )
+
+        resolved = self._call_with_dem_coverage(
+            self._s1_roi_coverage_bounds(roi), _select
         )
         bursts = _burst_selection_from_resolved(resolved, len(products), swath_tuple)
         bursts, swath_tuple = _drop_empty_swaths(bursts, swath_tuple)
@@ -1324,22 +1345,26 @@ class S1Stack(Stack):
         from faninsar.missions.s1.measure import measure_s1_pair_misreg
 
         swaths, bursts = self._resolve_s1_nesd_selection()
-        self._ensure_dem_covers_request(
-            self._s1_roi_coverage_bounds(self._effective_roi_with_mask().roi)
-        )
-        return measure_s1_pair_misreg(
-            _source_input(self.catalog.paths_for(primary)),
-            _source_input(self.catalog.paths_for(secondary)),
-            dem=self._geometry_dem(),
-            swaths=swaths,
-            bursts=bursts,
-            coherence_threshold=self.config.esd_coherence_threshold,
-            ampcor_snr_threshold=self.config.ampcor_snr_threshold,
-            primary_orbit_path=self._orbit_path_for(primary),
-            secondary_orbit_path=self._orbit_path_for(secondary),
-            primary_aux_cal_path=self._aux_cal_path_for(primary),
-            secondary_aux_cal_path=self._aux_cal_path_for(secondary),
-            device=self.config.device,
+        roi = self._effective_roi_with_mask().roi
+
+        def _run() -> Any:
+            return measure_s1_pair_misreg(
+                _source_input(self.catalog.paths_for(primary)),
+                _source_input(self.catalog.paths_for(secondary)),
+                dem=self._geometry_dem(),
+                swaths=swaths,
+                bursts=bursts,
+                coherence_threshold=self.config.esd_coherence_threshold,
+                ampcor_snr_threshold=self.config.ampcor_snr_threshold,
+                primary_orbit_path=self._orbit_path_for(primary),
+                secondary_orbit_path=self._orbit_path_for(secondary),
+                primary_aux_cal_path=self._aux_cal_path_for(primary),
+                secondary_aux_cal_path=self._aux_cal_path_for(secondary),
+                device=self.config.device,
+            )
+
+        return self._call_with_dem_coverage(
+            self._s1_use_time_coverage_bounds(roi), _run
         )
 
     def _geo_lut_cache_dir(self) -> Path:
@@ -1397,22 +1422,27 @@ class S1Stack(Stack):
         else:
             roi = self._effective_roi_with_mask().roi
         swaths, bursts = self._resolve_s1_roi_burst_selection(polygon=polygon)
-        self._ensure_dem_covers_request(self._s1_roi_coverage_bounds(roi))
-        return prepare_s1_reference(
-            _source_input(self.catalog.paths_for(self.reference)),
-            output_scene=self._scene_dir(self.reference, polygon),
-            swaths=swaths,
-            bursts=bursts,
-            roi=roi,
-            dem=self._geometry_dem(),
-            coregistration_grid=self.config.coregistration_grid,
-            geo_grid=self.config.geo_grid,
-            geo_lut_cache_dir=self._geo_lut_cache_dir(),
-            orbit_path=self._orbit_path_for(self.reference),
-            aux_cal_path=self._aux_cal_path_for(self.reference),
-            polarizations=self.config.extra.get("polarizations"),
-            device=self.config.device,
-            overwrite=overwrite,
+
+        def _run() -> Any:
+            return prepare_s1_reference(
+                _source_input(self.catalog.paths_for(self.reference)),
+                output_scene=self._scene_dir(self.reference, polygon),
+                swaths=swaths,
+                bursts=bursts,
+                roi=roi,
+                dem=self._geometry_dem(),
+                coregistration_grid=self.config.coregistration_grid,
+                geo_grid=self.config.geo_grid,
+                geo_lut_cache_dir=self._geo_lut_cache_dir(),
+                orbit_path=self._orbit_path_for(self.reference),
+                aux_cal_path=self._aux_cal_path_for(self.reference),
+                polarizations=self.config.extra.get("polarizations"),
+                device=self.config.device,
+                overwrite=overwrite,
+            )
+
+        return self._call_with_dem_coverage(
+            self._s1_use_time_coverage_bounds(roi), _run
         )
 
     def _coregister_one_scene(
@@ -1450,24 +1480,33 @@ class S1Stack(Stack):
                 f"Reference is on {reference_track!r}; different tracks "
                 "cannot form a pair"
             )
-        if reference_context is None:
-            reference_context = self._prepare_reference_scene(
-                overwrite=False, polygon=polygon
+
+        def _run() -> None:
+            context = reference_context
+            if context is None:
+                context = self._prepare_reference_scene(
+                    overwrite=False, polygon=polygon
+                )
+            live_dem = self._geometry_dem()
+            if context is not None:
+                context.dem = live_dem
+            coregister_s1_secondary(
+                context,
+                _source_input(self.catalog.paths_for(date_id)),
+                output_scene=output_dir,
+                misreg_az_px=misreg_az_px,
+                misreg_rg_px=misreg_rg_px,
+                secondary_orbit_path=self._orbit_path_for(date_id),
+                secondary_aux_cal_path=self._aux_cal_path_for(date_id),
+                polarizations=self.config.extra.get("polarizations"),
+                device=self.config.device,
+                inputs=inputs,
+                properties=properties,
+                overwrite=overwrite,
             )
-        coregister_s1_secondary(
-            reference_context,
-            _source_input(self.catalog.paths_for(date_id)),
-            output_scene=output_dir,
-            misreg_az_px=misreg_az_px,
-            misreg_rg_px=misreg_rg_px,
-            secondary_orbit_path=self._orbit_path_for(date_id),
-            secondary_aux_cal_path=self._aux_cal_path_for(date_id),
-            polarizations=self.config.extra.get("polarizations"),
-            device=self.config.device,
-            inputs=inputs,
-            properties=properties,
-            overwrite=overwrite,
-        )
+
+        roi = self._effective_roi_with_mask().roi
+        self._call_with_dem_coverage(self._s1_use_time_coverage_bounds(roi), _run)
         return None
 
 

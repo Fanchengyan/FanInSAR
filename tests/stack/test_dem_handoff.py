@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from faninsar.processing.geometry import DEM, GridSpec, RasterDEM, SourceDEM
+from faninsar.processing.geometry.managed_dem import (
+    DEMCoverageInsufficientError,
+    raster_covers_bounds,
+)
 from faninsar.stack.session import Stack
 
 
@@ -314,3 +318,118 @@ def test_use_time_shortage_grows_same_file_and_failed_expand_preserves_bytes(
     assert east >= 11.0
     assert north >= 41.0
     assert len(grids) == n_materialize + 1
+
+
+_USE_TIME_BOUNDS = (9.5, 39.5, 11.0, 41.0)
+
+
+def _roi_bounded_stack(
+    tmp_path: Path, monkeypatch: object
+) -> tuple[LocalStack, list[GridSpec]]:
+    """Prepare one ROI-bounded managed DEM; later use-time requests may grow it."""
+    from faninsar.data.query.bbox import BoundingBox
+
+    roi = BoundingBox(10.0, 40.0, 10.05, 40.05, crs="EPSG:4326")
+    cache = tmp_path / "dem-cache"
+    cache.mkdir()
+    source = DEM.from_source("auto", cache_dir=cache)
+    grids: list[GridSpec] = []
+    monkeypatch.setattr(SourceDEM, "to_raster", _fake_source_to_raster(grids))
+    work = tmp_path / "work-use-time"
+    stack = LocalStack.from_paths(
+        _dummy_safes(tmp_path),
+        work_dir=work,
+        dem=source,
+        roi=roi,
+        dem_cache_dir=cache,
+    )
+    stack.prepare_data()
+    west, _south, east, _north = stack.dem.grid.bounds
+    assert west > _USE_TIME_BOUNDS[0]
+    assert east < _USE_TIME_BOUNDS[2]
+    return stack, grids
+
+
+def _drop_explicit_roi(stack: LocalStack) -> None:
+    """Leave the prepared DEM in place and drop the ROI so prechecks become no-ops."""
+    stack.config.roi = None
+    stack._effective_roi_resolution = None
+    stack._s1_roi_burst_selection_cache = {}
+
+
+def _raise_if_short(dem: object, required: tuple[float, float, float, float]) -> None:
+    """Raise the production coverage error when ``dem`` does not cover ``required``."""
+    if not isinstance(dem, RasterDEM) or not raster_covers_bounds(dem, required):
+        actual = None if not isinstance(dem, RasterDEM) else tuple(dem.grid.bounds)
+        raise DEMCoverageInsufficientError(
+            "actual geometry request is outside the managed DEM",
+            required_bounds=required,
+            actual_bounds=actual,
+        )
+
+
+def test_noroi_reference_prepare_retries_actual_callback_with_refreshed_dem(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """noROI reuse stays small until an actual reference prepare needs more terrain."""
+    stack, grids = _roi_bounded_stack(tmp_path, monkeypatch)
+    _drop_explicit_roi(stack)
+    n_prepare = len(grids)
+    dem_ids: list[int] = []
+
+    def _fake_prepare(*_args: object, dem: object | None = None, **_kwargs: object) -> object:
+        dem_ids.append(id(dem))
+        _raise_if_short(dem, _USE_TIME_BOUNDS)
+        return object()
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.prepare_s1_reference",
+        _fake_prepare,
+    )
+    stack._prepare_reference_scene(overwrite=True)
+    assert dem_ids[0] != dem_ids[1]
+    assert len(dem_ids) == 2
+    west, south, east, north = stack.dem.grid.bounds
+    assert west <= _USE_TIME_BOUNDS[0]
+    assert south <= _USE_TIME_BOUNDS[1]
+    assert east >= _USE_TIME_BOUNDS[2]
+    assert north >= _USE_TIME_BOUNDS[3]
+    assert id(stack._geometry_dem()) == dem_ids[1]
+    assert len(grids) == n_prepare + 1
+
+
+def test_produce_pair_retries_actual_callback_with_refreshed_dem(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Pair production expands once and retries with a live refreshed DEM."""
+    stack, grids = _roi_bounded_stack(tmp_path, monkeypatch)
+    _drop_explicit_roi(stack)
+    n_prepare = len(grids)
+    dem_ids: list[int] = []
+
+    def _provider(
+        _primary: object,
+        _secondary: object,
+        *,
+        output_dir: Path,
+        options: dict[str, object],
+    ) -> object:
+        del output_dir
+        dem = options.get("dem")
+        dem_ids.append(id(dem))
+        _raise_if_short(dem, _USE_TIME_BOUNDS)
+        return object()
+
+    stack.scene_provider = _provider
+    dates = list(stack.catalog.dates)
+    stack._produce_pair(
+        stack.catalog.paths_for(dates[0]),
+        stack.catalog.paths_for(dates[1]),
+        output_dir=tmp_path / "pair-out",
+    )
+    assert dem_ids[0] != dem_ids[1]
+    assert len(dem_ids) == 2
+    west, _south, east, _north = stack.dem.grid.bounds
+    assert west <= _USE_TIME_BOUNDS[0]
+    assert east >= _USE_TIME_BOUNDS[2]
+    assert len(grids) == n_prepare + 1
