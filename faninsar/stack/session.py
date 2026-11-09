@@ -1426,6 +1426,65 @@ class Stack(NetworkContract, ABC):
             "stale": unwrap_stale,
         }
 
+        from faninsar.io.storage.ifg_store import (
+            COMPLEX_ION_KIND,
+            UNWRAP_ION_KIND,
+            complex_ion_root,
+            unwrap_ion_root,
+        )
+        from faninsar.io.storage.ion_store import ION_KIND, ion_dir
+
+        def _sibling_status(kind: str, root_for: Any) -> dict[str, list[str]]:
+            committed: list[str] = []
+            stale: list[str] = []
+            for pair_id in planned_pairs:
+                pair_root = ifg_root / pair_id
+                target = root_for(pair_root)
+                if not (target / "item.json").is_file():
+                    continue
+                try:
+                    product = open_product(target, kind=kind)
+                    store = InterferogramArtifactStore.open(pair_root)
+                    if kind == COMPLEX_ION_KIND:
+                        current = store.complex_ion_product()
+                    else:
+                        current = store.unwrap_ion_product()
+                    if current.write_id == product.write_id:
+                        committed.append(pair_id)
+                    else:
+                        stale.append(pair_id)
+                except InvalidProcessingStateError:
+                    if (target / "item.json").is_file():
+                        stale.append(pair_id)
+            return {
+                "planned": planned_pairs,
+                "committed": committed,
+                "missing": [p for p in planned_pairs if p not in committed],
+                "stale": stale,
+            }
+
+        report["complex_ion"] = _sibling_status(COMPLEX_ION_KIND, complex_ion_root)
+        report["unwrap_ion"] = _sibling_status(UNWRAP_ION_KIND, unwrap_ion_root)
+
+        ion_committed: list[str] = []
+        ion_stale: list[str] = []
+        ion_looks = looks
+        for pair_id in planned_pairs:
+            ion_path = ion_dir(work, pair_id, ion_looks)
+            if not (ion_path / "item.json").is_file():
+                continue
+            try:
+                open_product(ion_path, kind=ION_KIND)
+                ion_committed.append(pair_id)
+            except InvalidProcessingStateError:
+                ion_stale.append(pair_id)
+        report["ionosphere"] = {
+            "planned": planned_pairs,
+            "committed": ion_committed,
+            "missing": [p for p in planned_pairs if p not in ion_committed],
+            "stale": ion_stale,
+        }
+
         timeseries_path = work / "timeseries"
         timeseries_committed = (timeseries_path / "item.json").is_file()
         timeseries_stale = False
@@ -5156,14 +5215,18 @@ class Stack(NetworkContract, ABC):
         unwrapper: SpatialUnwrapper | None = None,
         *,
         overwrite: bool = False,
+        source: Literal["complex", "complex_ion"] = "complex",
     ) -> Self:
         """Spatially unwrap every persisted interferogram in this Stack.
 
         ``Stack`` owns pair iteration, Dataset materialization, and one unwrap
-        product per Pair (``work_dir/unwrap/ml_AxR/<pair>``, bound to the IFG
-        ``write_id``).  ``unwrapper`` owns the numerical solve for one
-        two-dimensional pair.  This method has no temporal/network options and
-        does not perform temporal reconciliation or time-series inversion.
+        product per Pair. Ordinary unwrap is the pair sibling
+        ``ifg/ml_AxR/<pair>/unwrap`` bound to the IFG ``write_id``.
+        ``source="complex_ion"`` unwraps the ion-corrected complex sibling
+        into ``unwrap_ion/`` and never falls back to the ordinary branch.
+        ``unwrapper`` owns the numerical solve for one two-dimensional pair.
+        This method has no temporal/network options and does not perform
+        temporal reconciliation or time-series inversion.
 
         Parameters
         ----------
@@ -5179,6 +5242,9 @@ class Stack(NetworkContract, ABC):
             Recompute every Pair. Without it a Pair whose unwrap product is
             bound to the current IFG with the same method and mask is reused,
             and a stale or differently configured product is rejected.
+        source : {"complex", "complex_ion"}, default="complex"
+            Ordinary unwrap of the original complex IFG, or unwrap of the
+            ``complex_ion`` sibling. A missing named branch raises.
 
         Returns
         -------
@@ -5217,7 +5283,11 @@ class Stack(NetworkContract, ABC):
         import torch
 
         from faninsar.data.datasets.ifg import StackInterferogramDataset
-        from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+        from faninsar.io.storage.ifg_store import (
+            UNWRAP_ION_KIND,
+            unwrap_ion_root,
+            write_unwrapped_artifact,
+        )
         from faninsar.processing.runtime.device import parse_device
         from faninsar.processing.runtime.resources import (
             ResourceAdmissionError,
@@ -5235,6 +5305,8 @@ class Stack(NetworkContract, ABC):
             UnwrapFailedError,
         )
 
+        if source not in {"complex", "complex_ion"}:
+            reject_invalid_state("unwrap source must be 'complex' or 'complex_ion'")
         if unwrapper is None:
             unwrapper = Snaphu()
         if not isinstance(unwrapper, SpatialUnwrapper):
@@ -5301,11 +5373,23 @@ class Stack(NetworkContract, ABC):
             unwrap_properties["faninsar:nlooks"] = nlooks_record
         try:
             for pair_id, store in zip(pair_ids, stores, strict=True):
-                if (store.unwrap_root / "item.json").is_file() and not overwrite:
-                    existing = open_product(store.unwrap_root, kind=UNWRAP_KIND)
+                unwrap_dir = (
+                    store.unwrap_root
+                    if source == "complex"
+                    else unwrap_ion_root(store.root)
+                )
+                unwrap_kind = UNWRAP_KIND if source == "complex" else UNWRAP_ION_KIND
+                if (unwrap_dir / "item.json").is_file() and not overwrite:
+                    existing = open_product(unwrap_dir, kind=unwrap_kind)
                     recorded = existing.properties
+                    expected_ifg = existing.inputs.get("ifg") == store.write_id
+                    if source == "complex_ion":
+                        complex_ion = store.complex_ion_product()
+                        expected_ifg = expected_ifg and (
+                            existing.inputs.get("complex_ion") == complex_ion.write_id
+                        )
                     if (
-                        existing.inputs.get("ifg") == store.write_id
+                        expected_ifg
                         and recorded.get("faninsar:method")
                         == {"name": method_name, "parameters": method_parameters}
                         and all(
@@ -5329,8 +5413,22 @@ class Stack(NetworkContract, ABC):
                     )
                 try:
                     dataset = StackInterferogramDataset.from_product(store)
+                    if source == "complex_ion":
+                        wrapped_np = np.asarray(
+                            store.read_layer("wrapped_ion"), dtype=np.float32
+                        )
+                        complex_ion = store.complex_ion_product()
+                        if "valid_mask" in complex_ion.assets:
+                            valid_np = np.asarray(
+                                complex_ion.read("valid_mask"), dtype=bool
+                            )
+                        else:
+                            valid_np = np.isfinite(wrapped_np)
+                    else:
+                        wrapped_np = np.asarray(dataset.wrapped_phase, dtype=np.float32)
+                        valid_np = np.asarray(dataset.valid_mask, dtype=bool)
                     wrapped_phase = torch.as_tensor(
-                        dataset.wrapped_phase,
+                        wrapped_np,
                         dtype=torch.float32,
                         device=device,
                     )
@@ -5344,7 +5442,7 @@ class Stack(NetworkContract, ABC):
                             device=device,
                         )
                     valid_mask = torch.as_tensor(
-                        dataset.valid_mask,
+                        valid_np,
                         dtype=torch.bool,
                         device=device,
                     )
@@ -5463,6 +5561,7 @@ class Stack(NetworkContract, ABC):
                     },
                     properties=unwrap_properties,
                     replace_existing=overwrite,
+                    source=source,
                 )
         except (
             NoValidSupportError,
@@ -5490,9 +5589,10 @@ class Stack(NetworkContract, ABC):
         pair_phases: dict[str, np.ndarray] | None = None,
         device: str | None = None,
         multilook: tuple[int, int] | None = None,
-        ionosphere_corrected: bool = False,
+        phase: Literal["unwrapped", "unwrapped_ion"] = "unwrapped",
         pairs: Pairs | None = None,
         overwrite: bool = False,
+        **kwargs: Any,
     ) -> TimeSeries:
         """Invert the persisted unwrapped Pair network with SBAS.
 
@@ -5504,14 +5604,17 @@ class Stack(NetworkContract, ABC):
             Solver device. Defaults to :attr:`StackConfig.invert_device`.
         multilook : tuple[int, int], optional
             Product view to consume. Defaults to the configured look factors.
-        ionosphere_corrected : bool, default=False
-            Consume the ionosphere-corrected unwrap of every Pair instead of
-            the raw unwrap.
+        phase : {"unwrapped", "unwrapped_ion"}, default="unwrapped"
+            Ordinary unwrap products, or the unwrap of ``complex_ion``. A
+            missing named branch raises; there is no fallback.
         pairs : Pairs, optional
             Pair subset to invert. Defaults to every planned Pair. The
             canonical time-series product always reflects the latest call.
         overwrite : bool, default=False
             Replace an existing time-series product bound to other inputs.
+        **kwargs : Any
+            Must be empty. The retired ``ionosphere_corrected`` flag raises
+            ``TypeError``.
 
         Returns
         -------
@@ -5530,6 +5633,19 @@ class Stack(NetworkContract, ABC):
         from faninsar.timeseries.io import read_timeseries, write_timeseries_product
         from faninsar.timeseries.results import SpatialMetadata, invert_unwrapped_pairs
 
+        if "ionosphere_corrected" in kwargs:
+            raise TypeError(
+                "ionosphere_corrected is no longer accepted; pass "
+                "phase='unwrapped' or phase='unwrapped_ion'"
+            )
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            message = (
+                f"invert_timeseries got unexpected keyword argument(s): {unexpected}"
+            )
+            raise TypeError(message)
+        if phase not in {"unwrapped", "unwrapped_ion"}:
+            reject_invalid_state("phase must be 'unwrapped' or 'unwrapped_ion'")
         solver_device = device or self.config.invert_device
         if pair_phases is not None:
             self.timeseries = invert_unwrapped_pairs(pair_phases, device=solver_device)
@@ -5541,11 +5657,9 @@ class Stack(NetworkContract, ABC):
             stores = [store for store in stores if store.pair in selected]
             if not stores:
                 reject_invalid_state("requested Pair subset matches no IFG product")
-        sources = _pair_phase_sources(
-            self.config.work_dir, stores, ionosphere_corrected=ionosphere_corrected
-        )
+        sources = _pair_phase_sources(self.config.work_dir, stores, phase=phase)
         inputs = {pair_id: source.write_id for pair_id, source in sources.items()}
-        phase_source = "ion_corrected" if ionosphere_corrected else "unwrap"
+        phase_source = phase
         target = self.config.work_dir / "timeseries"
         complete_network = pairs is None
         if complete_network and (target / "item.json").is_file() and not overwrite:
@@ -5689,7 +5803,7 @@ class Stack(NetworkContract, ABC):
         return estimate_ionosphere(self, **kwargs)
 
     def apply_ionosphere_correction(self, **kwargs: Any) -> dict[str, Path]:
-        """Subtract qualified ion screens from unwrapped pair phases.
+        """Map ion screens onto IFG grids and commit ``complex_ion`` siblings.
 
         See
         :func:`faninsar.stack.analysis.apply_ionosphere_correction`
@@ -5876,51 +5990,38 @@ def _pair_phase_sources(
     work_dir: Path,
     stores: Sequence[InterferogramArtifactStore],
     *,
-    ionosphere_corrected: bool,
+    phase: str,
 ) -> dict[str, Product]:
-    """Return the current unwrap (or corrected unwrap) product of each Pair.
+    """Return the current unwrap (or unwrap_ion) product of each Pair.
 
     Raises
     ------
     InvalidProcessingStateError
-        If a Pair has no current unwrap, or its ionosphere correction is
-        missing or bound to a replaced unwrap or ion product.
+        If a Pair has no current unwrap of the named branch, or the
+        ``unwrapped_ion`` product is bound to a replaced complex_ion or ion.
 
     """
-    from faninsar.io.storage.ion_store import (
-        ION_CORRECTED_NAME,
-        IonosphereArtifactStore,
-        ion_dir,
-        open_ion_correction,
-    )
-
+    del work_dir
     sources: dict[str, Product] = {}
     for store in stores:
         pair_id = f"{store.pair[0]}_{store.pair[1]}"
-        if not store.has_unwrapped():
-            reject_invalid_state(
-                f"Pair {pair_id} has no unwrap product bound to its current IFG; "
-                "run unwrap() first"
-            )
-        if not ionosphere_corrected:
+        if phase == "unwrapped":
+            if not store.has_unwrapped():
+                reject_invalid_state(
+                    f"Pair {pair_id} has no unwrap product bound to its current IFG; "
+                    "run unwrap() first"
+                )
             sources[pair_id] = store.unwrap_product()
             continue
-        if not (store.unwrap_root / ION_CORRECTED_NAME / "item.json").is_file():
-            reject_invalid_state(
-                f"Pair {pair_id} has no ionosphere correction; run "
-                "apply_ionosphere_correction() first"
-            )
-        corrected = open_ion_correction(store.root)
-        looks = tuple(
-            int(value) for value in corrected.properties["faninsar:ion_looks"]
-        )
-        ion = IonosphereArtifactStore.open(ion_dir(work_dir, pair_id, looks))
-        if corrected.inputs.get("ion") != ion.write_id:
-            reject_invalid_state(
-                f"ionosphere correction of {pair_id} is bound to a replaced ion "
-                "product; rerun apply_ionosphere_correction(overwrite=True)"
-            )
-        sources[pair_id] = corrected
+        try:
+            sources[pair_id] = store.unwrap_ion_product()
+        except InvalidProcessingStateError as error:
+            message = str(error)
+            if "unwrap_ion" in message or "complex_ion" in message or "ion" in message:
+                reject_invalid_state(
+                    f"Pair {pair_id} has no current unwrapped_ion product; {message}"
+                )
+            raise
     return sources
 
 

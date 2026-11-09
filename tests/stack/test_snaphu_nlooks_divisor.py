@@ -335,7 +335,7 @@ def test_default_unwrap_is_fresh_snaphu_and_custom_subclass_is_kept(
     custom = _CustomSnaphu()
     stack.unwrap(custom, overwrite=True)
     item = open_product(
-        stack.config.work_dir / "unwrap" / "ml_1x1" / "20240101_20240113"
+        stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113" / "unwrap"
     )
     assert item.properties["faninsar:method"]["name"] == "_CustomSnaphu"
 
@@ -456,7 +456,7 @@ def test_unwrap_records_nlooks_diagnostics_outside_identity(
     stack = _stack_with_ifg(tmp_path, looks=(5, 2))
     stack.unwrap()
     item = open_product(
-        stack.config.work_dir / "unwrap" / "ml_5x2" / "20240101_20240113"
+        stack.config.work_dir / "ifg" / "ml_5x2" / "20240101_20240113" / "unwrap"
     )
     recorded = item.properties["faninsar:nlooks"]
     assert recorded["source"] == "multilook_divisor"
@@ -468,7 +468,7 @@ def test_unwrap_records_nlooks_diagnostics_outside_identity(
 
     stack.unwrap(Snaphu(SnaphuConfig(nlooks=12.0, ntiles=(1, 1))), overwrite=True)
     explicit = open_product(
-        stack.config.work_dir / "unwrap" / "ml_5x2" / "20240101_20240113"
+        stack.config.work_dir / "ifg" / "ml_5x2" / "20240101_20240113" / "unwrap"
     )
     recorded = explicit.properties["faninsar:nlooks"]
     assert recorded["source"] == "explicit"

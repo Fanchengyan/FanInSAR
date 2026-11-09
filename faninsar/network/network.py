@@ -393,6 +393,7 @@ class Network(NetworkContract):
         *,
         model: type[TimeSeriesModels] | TimeSeriesModels | None = None,
         pairs: Any | None = None,
+        phase: str = "unwrapped",
         **kwargs: Any,
     ) -> Any:
         """Invert unwrapped Network products into a time series.
@@ -407,6 +408,9 @@ class Network(NetworkContract):
         pairs : Pairs, optional
             Pair subset to read and invert.  The selected pairs are resolved
             before a model class is instantiated.
+        phase : {"unwrapped", "unwrapped_ion"}, optional
+            Ordinary unwrap products (default) or the unwrap of
+            ``complex_ion``. A missing named branch raises.
         **kwargs : Any
             Options forwarded to the selected inversion implementation.
 
@@ -425,6 +429,15 @@ class Network(NetworkContract):
             If a configured model's dates do not match the selected pairs.
 
         """
+        if "ionosphere_corrected" in kwargs:
+            message = (
+                "ionosphere_corrected is no longer accepted; pass "
+                "phase='unwrapped' or phase='unwrapped_ion'"
+            )
+            reject(message, TypeError, logger=logger)
+        if phase not in {"unwrapped", "unwrapped_ion"}:
+            message = "phase must be 'unwrapped' or 'unwrapped_ion'"
+            reject(message, ValueError, logger=logger)
         if self.interferograms is None:
             message = "Network has no interferogram products to invert"
             reject(message, RuntimeError, logger=logger)
@@ -438,7 +451,8 @@ class Network(NetworkContract):
         if normalized_model is None:
             from faninsar.timeseries.results import invert_unwrapped_pairs
 
-            values = self.interferograms.open_stack("unw_phase", pairs=stack.pairs)
+            asset = "unw_phase" if phase == "unwrapped" else "unwrapped_ion"
+            values = self.interferograms.open_stack(asset, pairs=stack.pairs)
             pair_ids = [str(value) for value in values.coords["pair"].values]
             pair_phases = {
                 pair_id: np.asarray(values.isel(pair=index).values)
@@ -448,8 +462,14 @@ class Network(NetworkContract):
                 pair_phases,
                 device=kwargs.pop("device", "cpu"),
             )
-            return self._persist_result(result)
+            return self._persist_result(result, phase=phase)
 
+        if phase != "unwrapped":
+            message = (
+                "Network NSBAS invert consumes ordinary unwrapped phase; "
+                "use phase='unwrapped' or Stack.invert_timeseries(phase=...)"
+            )
+            reject(message, ValueError, logger=logger)
         return self._run_nsbas(stack, model=normalized_model, **kwargs)
 
     def _run_nsbas(
@@ -626,7 +646,7 @@ class Network(NetworkContract):
 
         return self._run_nsbas(stack, model=None, **kwargs)
 
-    def _persist_result(self, result: Any) -> Any:
+    def _persist_result(self, result: Any, *, phase: str = "unwrapped") -> Any:
         """Commit a time-series result as this Network's time-series product.
 
         The product Item records the ``write_id`` of every unwrap product the
@@ -639,7 +659,10 @@ class Network(NetworkContract):
         from faninsar.timeseries.io import write_timeseries_product
 
         bound = replace(result, spatial=self._spatial_metadata_for_result(result))
-        source = getattr(self.interferograms, "unwrap_write_ids", None)
+        writer_name = (
+            "unwrap_ion_write_ids" if phase == "unwrapped_ion" else "unwrap_write_ids"
+        )
+        source = getattr(self.interferograms, writer_name, None)
         inputs: dict[str, str] = {}
         if callable(source):
             available = source()
@@ -648,7 +671,7 @@ class Network(NetworkContract):
             bound,
             self.root / "timeseries",
             inputs=inputs,
-            properties={"faninsar:phase_source": "unwrap"} if inputs else None,
+            properties={"faninsar:phase_source": phase} if inputs else None,
             overwrite=True,
         )
         persisted = replace(bound, canonical_path=path)

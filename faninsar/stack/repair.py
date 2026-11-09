@@ -77,7 +77,7 @@ class RepairReport:
     """Pair names inferred from committed ``ifg/ml_*`` product directories."""
 
     inferred_misreg_pairs: list[str] = field(default_factory=list)
-    """Pair names inferred from ``unwrap/ml_*`` and the ``misreg`` product."""
+    """Pair names inferred from nested pair unwrap products and ``misreg``."""
 
     products_found: dict[str, list[str]] = field(default_factory=dict)
     """Committed product ids grouped by kind (``scene``, ``ifg``, ``unwrap``, …)."""
@@ -215,8 +215,14 @@ def _discover(
     root: Path,
 ) -> tuple[dict[str, list[str]], list[str], list[str]]:
     """Discover committed products and infer the planned networks."""
-    from faninsar.io.storage.ifg_store import IFG_KIND, UNWRAP_KIND
-    from faninsar.io.storage.product import discover_products
+    from faninsar.io.storage.ifg_store import (
+        COMPLEX_ION_KIND,
+        IFG_KIND,
+        UNWRAP_ION_KIND,
+        UNWRAP_KIND,
+    )
+    from faninsar.io.storage.ion_store import ION_KIND
+    from faninsar.io.storage.product import discover_products, open_product
     from faninsar.io.storage.scene_store import SCENE_KIND
 
     products_found: dict[str, list[str]] = {}
@@ -236,9 +242,14 @@ def _discover(
 
     _scan(root / "coreg", SCENE_KIND, "scene")
 
-    # IFG products live under ifg/ml_AxR/<pair>; unwrap mirrors the same
-    # pair under unwrap/ml_AxR/<pair>.  Scan every committed multilook.
+    # IFG products live under ifg/ml_AxR/<pair>; pair-owned unwrap, complex_ion,
+    # and unwrap_ion are nested siblings.  ifg/ion holds shared ion estimates.
+    # Legacy top-level unwrap/ and ion/ are recorded but not treated as the
+    # current products.
     ifg_root = root / "ifg"
+    unwrap_ids: list[str] = []
+    complex_ion_ids: list[str] = []
+    unwrap_ion_ids: list[str] = []
     if ifg_root.is_dir():
         for looks_dir in sorted(ifg_root.glob("ml_*")):
             if not looks_dir.is_dir():
@@ -248,17 +259,48 @@ def _discover(
                 pair = _product_label(product, "ifg")
                 if pair not in inferred_pairs:
                     inferred_pairs.append(pair)
-
-    unwrap_base = root / "unwrap"
-    if unwrap_base.is_dir():
-        for looks_dir in sorted(unwrap_base.glob("ml_*")):
-            if not looks_dir.is_dir():
-                continue
-            _scan(looks_dir, UNWRAP_KIND, "unwrap")
-            for product in _products(looks_dir, UNWRAP_KIND):
-                pair = _product_label(product, "unwrap")
-                if pair not in inferred_misreg_pairs:
-                    inferred_misreg_pairs.append(pair)
+                for child_name, child_kind, bucket in (
+                    ("unwrap", UNWRAP_KIND, unwrap_ids),
+                    ("complex_ion", COMPLEX_ION_KIND, complex_ion_ids),
+                    ("unwrap_ion", UNWRAP_ION_KIND, unwrap_ion_ids),
+                ):
+                    child = product.path / child_name
+                    if not (child / "item.json").is_file():
+                        continue
+                    try:
+                        child_product = open_product(child, kind=child_kind)
+                    except InvalidProcessingStateError:
+                        continue
+                    label = _product_label(child_product, child_kind)
+                    if label not in bucket:
+                        bucket.append(label)
+                    if child_kind == UNWRAP_KIND and label not in inferred_misreg_pairs:
+                        inferred_misreg_pairs.append(label)
+        ion_root = ifg_root / "ion"
+        if ion_root.is_dir():
+            ion_ids: list[str] = []
+            for looks_dir in sorted(ion_root.glob("ml_*")):
+                if not looks_dir.is_dir():
+                    continue
+                for product in _products(looks_dir, ION_KIND):
+                    label = _product_label(product, "ion")
+                    if label not in ion_ids:
+                        ion_ids.append(label)
+            if ion_ids:
+                products_found["ion"] = sorted(ion_ids)
+    if unwrap_ids:
+        products_found["unwrap"] = sorted(unwrap_ids)
+    if complex_ion_ids:
+        products_found["complex_ion"] = sorted(complex_ion_ids)
+    if unwrap_ion_ids:
+        products_found["unwrap_ion"] = sorted(unwrap_ion_ids)
+    leftover: list[str] = []
+    if (root / "unwrap").is_dir():
+        leftover.append("unwrap")
+    if (root / "ion").is_dir():
+        leftover.append("ion")
+    if leftover:
+        products_found["legacy"] = leftover
 
     # The single misreg product binds every measured arc; its recorded arcs
     # are the authoritative misreg network.
@@ -301,7 +343,7 @@ def _products(base: Path, kind: str) -> list[Product]:
 
 def _product_label(product: Product, kind: str) -> str:
     """Return a stable display id for one committed product."""
-    if kind in {"ifg", "unwrap"}:
+    if kind in {"ifg", "unwrap", "unwrap_ion", "complex_ion", "ion"}:
         pair = product.properties.get("faninsar:pair")
         if isinstance(pair, (list, tuple)) and len(pair) == 2:
             return f"{pair[0]}_{pair[1]}"

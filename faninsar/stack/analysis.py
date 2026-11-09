@@ -19,11 +19,15 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import torch
 
+from faninsar.io.storage.ifg_store import (
+    COMPLEX_ION_KIND,
+    complex_ion_root,
+    ifg_sample_placement,
+    write_complex_ion_artifact,
+)
 from faninsar.io.storage.ion_store import (
-    ION_CORRECTED_NAME,
     IonosphereArtifactStore,
     ion_dir,
-    write_ion_correction_artifact,
     write_ionosphere_artifact,
 )
 from faninsar.io.storage.product import open_product
@@ -33,6 +37,7 @@ from faninsar.processing.atmosphere.filter import (
     remove_small_components,
     smooth_inverse_variance,
 )
+from faninsar.processing.atmosphere.grid_map import map_unwrapped_phase_bilinear
 from faninsar.processing.atmosphere.network import (
     IonosphereNetworkResult,
     invert_ionosphere_network,
@@ -152,7 +157,7 @@ def estimate_ionosphere(
     the configured range bandpass, forms low/high subband interferograms
     without Goldstein filtering, unwraps them, and runs the dispersive /
     non-dispersive estimation and inverse-variance smoothing. Each pair
-    result is committed as the product ``work_dir/ion/ml_<az>x<rg>/<pair>``
+    result is committed as the product ``work_dir/ifg/ion/ml_<az>x<rg>/<pair>``
     bound to the consumed scene ``write_id``s and the canonical Stack
     runtime fingerprint.
 
@@ -428,6 +433,7 @@ def estimate_ionosphere(
             ionosphere_phase=screen_np,
             nondispersive_phase=nondisp_np,
             weight=weight_np,
+            native_origin=(0, 0),
             replace_existing=overwrite,
         )
         stores.append(published)
@@ -443,35 +449,36 @@ def apply_ionosphere_correction(
     allow_degraded: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Path]:
-    """Subtract qualified ion screens from unwrapped pair phases.
+    """Map qualified ion screens onto IFG grids and commit ``complex_ion``.
 
-    For every planned Pair the IFG, its current unwrap, and the ion product
-    are reopened and cross-validated (pair ids, grid identity, scene write
-    ids, layer shapes). Degraded ion products are refused unless
-    ``allow_degraded`` is true. Each corrected phase is committed as the
-    ``ion_corrected`` child of the Pair's unwrap product, bound to the unwrap
-    and ion ``write_id``s; upstream layers are never rewritten.
+    For every planned Pair the IFG and ion product are reopened and
+    cross-validated (pair ids, grid identity, scene write ids). Degraded ion
+    products are refused unless ``allow_degraded`` is true. The ion screen is
+    mapped onto the IFG grid with masked bilinear interpolation of unwrapped
+    radians, then subtracted in the complex domain
+    ``I * exp(-1j * phi_ion)``. Ordinary unwrap is not required. The
+    ``complex_ion`` sibling binds the IFG and ion ``write_id``s; upstream
+    layers are never rewritten.
 
     Parameters
     ----------
     stack : Stack
-        Session whose planned Pairs carry current unwrap products.
+        Session whose planned Pairs carry current IFG products.
     ion_multilook : tuple[int, int]
-        Look factors of the ion products to consume. Their shape must match
-        the unwrap grid exactly (fail-closed otherwise).
+        Look factors of the ion products to consume. Their native-pixel
+        placement is mapped onto each target IFG grid.
     multilook : tuple[int, int], optional
         IFG product view to correct. Defaults to the configured multilook.
     allow_degraded : bool, optional
         Explicitly consume degraded ion products when true.
     overwrite : bool, optional
-        Replace existing corrections. Without it a correction bound to the
-        current unwrap and ion products is reused and a stale one is
-        rejected.
+        Replace existing ``complex_ion`` products. Without it a product bound
+        to the current IFG and ion is reused and a stale one is rejected.
 
     Returns
     -------
     dict[str, pathlib.Path]
-        Pair id to the committed correction directory.
+        Pair id to the committed ``complex_ion`` directory.
 
     """
     looks = (int(ion_multilook[0]), int(ion_multilook[1]))
@@ -479,11 +486,6 @@ def apply_ionosphere_correction(
     published: dict[str, Path] = {}
     for store in stores:
         pair_id = f"{store.pair[0]}_{store.pair[1]}"
-        if not store.has_unwrapped():
-            reject_invalid_state(
-                f"Pair {pair_id} has no unwrap product bound to its current IFG; "
-                "call Stack.unwrap(unwrapper) first"
-            )
         ion_store = IonosphereArtifactStore.open(
             ion_dir(stack.config.work_dir, pair_id, looks)
         )
@@ -507,39 +509,47 @@ def apply_ionosphere_correction(
                     f"ion artifact for {pair_id} was estimated from "
                     f"different {role} scenes than the IFG"
                 )
-        unwrap = store.unwrap_product()
-        target = store.unwrap_root / ION_CORRECTED_NAME
+        target = complex_ion_root(store.root)
         if (target / "item.json").is_file() and not overwrite:
-            existing = open_product(target)
+            existing = open_product(target, kind=COMPLEX_ION_KIND)
             if existing.inputs == {
-                "unwrap": unwrap.write_id,
+                "ifg": store.write_id,
                 "ion": ion_store.write_id,
             }:
                 published[pair_id] = target
                 continue
             reject_invalid_state(
-                f"ion correction for {pair_id} is bound to replaced products; "
+                f"complex_ion for {pair_id} is bound to replaced products; "
                 "pass overwrite=True to recompute it"
             )
-        unwrapped_phase = unwrap.read("unwrapped_phase")
-        if unwrapped_phase.shape != store.shape:
-            reject_invalid_state(
-                f"unwrap grid shape for {pair_id} differs from the IFG grid"
-            )
+        ifg = store.read()
         ion = ion_store.read()
-        if ion.ionosphere_phase.shape != unwrapped_phase.shape:
-            reject_invalid_state(
-                f"ion grid shape for {pair_id} differs from the IFG "
-                "unwrap grid; estimate the ionosphere at the same "
-                "multilook to correct it"
-            )
-        write_ion_correction_artifact(
+        target_anchor, target_spacing = ifg_sample_placement(store)
+        mapped, mapped_valid = map_unwrapped_phase_bilinear(
+            ion.ionosphere_phase,
+            ion.weight,
+            source_anchor=ion_store.sample_center_anchor,
+            source_spacing=ion_store.sample_spacing,
+            target_shape=store.shape,
+            target_anchor=target_anchor,
+            target_spacing=target_spacing,
+        )
+        support = np.asarray(mapped_valid, dtype=bool)
+        if ifg.valid_mask is not None:
+            support &= ifg.valid_mask
+        corrected = ifg.complex * np.exp(-1j * mapped)
+        corrected = np.where(support, corrected, np.complex64(np.nan + 1j * np.nan))
+        write_complex_ion_artifact(
             store.root,
-            unwrapped_phase=(unwrapped_phase - ion.ionosphere_phase).astype(np.float32),
-            unwrap_write_id=unwrap.write_id,
+            complex_ifg=np.asarray(corrected, dtype=np.complex64),
+            valid_mask=support,
             ion_write_id=ion_store.write_id,
             ion_looks=looks,
-            degraded_consumed=bool(ion_store.degraded),
+            interpolation="masked_bilinear_unwrapped",
+            source_anchor=ion_store.sample_center_anchor,
+            source_spacing=ion_store.sample_spacing,
+            target_anchor=target_anchor,
+            target_spacing=target_spacing,
             replace_existing=overwrite,
         )
         published[pair_id] = target

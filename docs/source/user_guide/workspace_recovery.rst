@@ -23,7 +23,9 @@ Tolerant ``Stack.open``
 ``stack.json`` that is readable but drifted still opens a degraded-but-usable
 Stack: decodable science fields are recovered, unrecoverable ones are left
 at their ``StackConfig`` defaults, and the planned Pair network falls back
-to whatever the committed ``ifg/ml_*`` and ``unwrap/ml_*`` products imply.
+to whatever the committed ``ifg/ml_*`` products and their nested
+``unwrap/`` siblings imply. Legacy top-level ``unwrap/`` and ``ion/``
+trees are not treated as the current products.
 Only a *missing* ``stack.json`` still raises — there is nothing to recover
 from. ``open`` never rewrites the file; persistence is only through
 ``repair``::

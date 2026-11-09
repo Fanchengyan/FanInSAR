@@ -445,17 +445,33 @@ class ProductLayer:
     def _read_virtual(self, name: str, window: Window | None = None) -> np.ndarray:
         """Derive one virtual IFG layer through the owning artifact store."""
         from faninsar.io.storage.ifg_store import (
+            COMPLEX_ION_KIND,
             IFG_KIND,
             InterferogramArtifactStore,
         )
 
-        if self._product.kind != IFG_KIND:
-            reject_invalid_state(
-                f"layer {self.name!r} is virtual and requires an IFG product source"
+        if self._product.kind == IFG_KIND:
+            return InterferogramArtifactStore.open(self._product.path).read_layer(
+                name, window=window
             )
-        return InterferogramArtifactStore.open(self._product.path).read_layer(
-            name, window=window
+        if self._product.kind != COMPLEX_ION_KIND:
+            reject_invalid_state(
+                f"layer {self.name!r} is virtual and requires an IFG or "
+                "complex_ion product source"
+            )
+        complex_ifg = self._read_product_array("complex", window)
+        valid_mask = (
+            self._read_product_array("valid_mask", window)
+            if "valid_mask" in self._product.assets
+            else None
         )
+        if name == "wrapped_phase":
+            derived = np.asarray(np.angle(complex_ifg))
+        else:
+            derived = np.asarray(np.abs(complex_ifg))
+        if valid_mask is not None:
+            derived[~np.asarray(valid_mask, dtype=bool)] = np.nan
+        return derived
 
     def _read_scene_layer(self, name: str, window: Window | None = None) -> np.ndarray:
         """Read one scene layer through its store's mosaic reader.
@@ -1577,25 +1593,43 @@ class InterferogramLayers:
             _burst_products=self._burst_products,
         )
 
-    def _unwrap_layer(self, name: str, asset_kind: AssetKind | None) -> ProductLayer:
+    def _unwrap_layer(
+        self,
+        name: str,
+        asset_kind: AssetKind | None,
+        *,
+        source: str = "complex",
+    ) -> ProductLayer:
         """Return one layer of the unwrap product bound to this IFG commit."""
-        from faninsar.io.storage.ifg_store import UNWRAP_KIND, unwrap_root
+        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
-        root = unwrap_root(self.root)
-        if not (root / "item.json").is_file():
-            message = (
-                f"Pair has no unwrapped result at {root}; run an unwrap stage first"
-            )
-            raise FileNotFoundError(message)
-        product = open_product(root, kind=UNWRAP_KIND)
-        if product.inputs.get("ifg") != self._product.write_id:
-            reject_invalid_state("unwrap product belongs to a replaced IFG")
+        store = InterferogramArtifactStore.open(self.root)
+        if source == "complex_ion":
+            product = store.unwrap_ion_product()
+        else:
+            product = store.unwrap_product()
         if name not in product.assets:
             message = (
-                f"unwrap product {root} has no {name!r} layer; "
+                f"unwrap product {product.path} has no {name!r} layer; "
                 f"available layers: {sorted(product.assets)}"
             )
             raise FileNotFoundError(message)
+        return ProductLayer(
+            product,
+            name,
+            asset_kind,
+            self.full_radar_shape,
+            self.multilook,
+            crs=self.crs,
+            _upstream=(self._product, *self._upstream),
+            _session=self._session,
+        )
+
+    def _complex_ion_layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
+        """Return one layer of the current complex_ion sibling."""
+        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+
+        product = InterferogramArtifactStore.open(self.root).complex_ion_product()
         return ProductLayer(
             product,
             name,
@@ -1641,6 +1675,35 @@ class InterferogramLayers:
     def connected_components(self) -> ProductLayer:
         """Return integer component labels sampled with nearest neighbors."""
         return self._unwrap_layer("connected_components", AssetKind.LABEL)
+
+    @property
+    def complex_ion(self) -> ProductLayer:
+        """Return the ion-corrected complex interferogram sibling."""
+        return self._complex_ion_layer("complex", AssetKind.COMPLEX_INTERFEROGRAM)
+
+    @property
+    def wrapped_ion(self) -> ProductLayer:
+        """Return wrapped phase derived from the complex_ion sibling."""
+        return self._complex_ion_layer("wrapped_phase", AssetKind.WRAPPED_PHASE)
+
+    @property
+    def amplitude_ion(self) -> ProductLayer:
+        """Return amplitude derived from the complex_ion sibling."""
+        return self._complex_ion_layer("amplitude", AssetKind.AMPLITUDE)
+
+    @property
+    def unwrapped_ion(self) -> ProductLayer:
+        """Return unwrapped phase of the ion-corrected complex IFG."""
+        return self._unwrap_layer(
+            "unwrapped_phase", AssetKind.UNWRAPPED_PHASE, source="complex_ion"
+        )
+
+    @property
+    def connected_components_ion(self) -> ProductLayer:
+        """Return component labels of the ion-corrected unwrap product."""
+        return self._unwrap_layer(
+            "connected_components", AssetKind.LABEL, source="complex_ion"
+        )
 
     def __repr__(self) -> str:
         """Return a concise summary of this per-Pair IFG layer view."""

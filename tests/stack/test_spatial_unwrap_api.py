@@ -89,7 +89,12 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
 
 def _unwrap_item(stack: Stack) -> Path:
     return (
-        stack.config.work_dir / "unwrap" / "ml_1x1" / "20240101_20240113" / "item.json"
+        stack.config.work_dir
+        / "ifg"
+        / "ml_1x1"
+        / "20240101_20240113"
+        / "unwrap"
+        / "item.json"
     )
 
 
@@ -226,7 +231,7 @@ def test_stack_unwrap_public_signature_has_no_temporal_controls() -> None:
     import inspect
 
     parameters = inspect.signature(Stack.unwrap).parameters
-    assert tuple(parameters) == ("self", "unwrapper", "overwrite")
+    assert tuple(parameters) == ("self", "unwrapper", "overwrite", "source")
     assert not any(name.startswith("temporal") for name in parameters)
 
 
@@ -306,7 +311,7 @@ def test_stack_unwrap_rejects_other_method_without_overwrite(tmp_path: Path) -> 
 
 
 def test_replaced_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> None:
-    """An IFG recompute makes its unwrap stale; analysis is unavailable."""
+    """Replacing the pair IFG removes nested unwrap; analysis waits for a rerun."""
     stack = _stack_with_ifg(tmp_path)
     stack.unwrap(_IdentityUnwrapper())
     root = stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"
@@ -326,9 +331,8 @@ def test_replaced_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> Non
     stack._refresh_network()
     assert not stack.analysis_ready
     assert stack.network is None
-    with pytest.raises(InvalidProcessingStateError, match="stale"):
-        stack.unwrap(_IdentityUnwrapper())
-    stack.unwrap(_IdentityUnwrapper(), overwrite=True)
+    assert not (root / "unwrap" / "item.json").is_file()
+    stack.unwrap(_IdentityUnwrapper())
     assert stack.analysis_ready
     np.testing.assert_allclose(
         stack.network.interferograms.open_stack("unw_phase").values[0], 0.4
@@ -353,5 +357,10 @@ def test_stack_unwrap_rejects_unplanned_pair_products(tmp_path: Path) -> None:
     with pytest.raises(InvalidProcessingStateError, match="Pair set"):
         stack.unwrap(_IdentityUnwrapper())
     assert not (
-        stack.config.work_dir / "unwrap" / "ml_1x1" / "20240101_20240113" / "item.json"
+        stack.config.work_dir
+        / "ifg"
+        / "ml_1x1"
+        / "20240101_20240113"
+        / "unwrap"
+        / "item.json"
     ).exists()

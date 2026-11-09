@@ -1,10 +1,13 @@
-"""Ionosphere products of a Stack (PROPOSAL-0036, PROPOSAL-0059).
+"""Ionosphere products of a Stack (PROPOSAL-0036, PROPOSAL-0059, PROPOSAL-0080).
 
-A per-Pair ionosphere estimate is the product ``ion/ml_AxR/<pair>/`` (kind
-``ion``) bound to both scene write ids. The ionosphere-corrected unwrapped
-phase is the child product ``unwrap/ml_AxR/<pair>/ion_corrected/`` (kind
-``ion_corrected``) bound to the unwrap and ion write ids, so replacing the
-unwrap removes it and replacing the ion estimate makes it stale.
+A per-Pair ionosphere estimate is the product ``ifg/ion/ml_AxR/<pair>/``
+(kind ``ion``) bound to both scene write ids. The grouping directory
+``ifg/ion`` is not an IFG multilook collection. Placement is persisted as
+``faninsar:sample_center_anchor`` and ``faninsar:sample_spacing`` using the
+native integer-center convention. The ion-corrected complex IFG is the pair
+sibling ``complex_ion/`` (see :mod:`faninsar.io.storage.ifg_store`); replacing
+the shared ion makes those descendants stale, while ordinary unwrap is
+independent.
 """
 
 from __future__ import annotations
@@ -17,8 +20,6 @@ import numpy as np
 
 from faninsar.io.storage._zarr_stac import read_zarr_array, write_zarr_array
 from faninsar.io.storage.ifg_store import (
-    UNWRAP_KIND,
-    InterferogramArtifactStore,
     _canonical_parameters,
     _is_sha256,
     _is_source_identity,
@@ -34,8 +35,26 @@ logger = setup_logger(__name__)
 
 ION_KIND = "ion"
 ION_CORRECTED_KIND = "ion_corrected"
-ION_CORRECTED_NAME = "ion_corrected"
 _ION_LAYERS = ("ionosphere_phase", "nondispersive_phase", "weight")
+
+
+def _read_placement_pair(value: object, name: str) -> tuple[float, float]:
+    """Validate a two-element finite placement pair from product metadata."""
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        )
+    ):
+        reject_invalid_state(f"ion artifact {name} must be two finite numbers")
+    pair = (float(value[0]), float(value[1]))
+    if not np.isfinite(pair).all():
+        reject_invalid_state(f"ion artifact {name} must be two finite numbers")
+    if name == "sample_spacing" and (pair[0] <= 0.0 or pair[1] <= 0.0):
+        reject_invalid_state("ion artifact sample_spacing must be two positive numbers")
+    return pair
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +87,7 @@ class IonosphereArtifactStore:
     Attributes
     ----------
     root : pathlib.Path
-        Product directory ``ion/ml_AxR/<pair>``.
+        Product directory ``ifg/ion/ml_AxR/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
     looks : tuple[int, int]
@@ -115,6 +134,8 @@ class IonosphereArtifactStore:
     source_manifest_digests: dict[str, str]
     shape: tuple[int, int]
     manifest_digest: str
+    sample_center_anchor: tuple[float, float]
+    sample_spacing: tuple[float, float]
 
     @property
     def write_id(self) -> str:
@@ -169,6 +190,10 @@ class IonosphereArtifactStore:
             reject_invalid_state(f"ion product is missing layers: {missing}")
         raw_wavelength = p.get("faninsar:wavelength_m")
         reason = degraded.get("reason")
+        if "faninsar:sample_center_anchor" not in p:
+            reject_invalid_state("ion product is missing faninsar:sample_center_anchor")
+        if "faninsar:sample_spacing" not in p:
+            reject_invalid_state("ion product is missing faninsar:sample_spacing")
         return cls(
             root=product.path,
             pair=(raw_pair[0], raw_pair[1]),
@@ -187,6 +212,12 @@ class IonosphereArtifactStore:
             source_manifest_digests=dict(product.inputs),
             shape=(raw_shape[0], raw_shape[1]),
             manifest_digest=product.write_id,
+            sample_center_anchor=_read_placement_pair(
+                p.get("faninsar:sample_center_anchor"), "sample_center_anchor"
+            ),
+            sample_spacing=_read_placement_pair(
+                p.get("faninsar:sample_spacing"), "sample_spacing"
+            ),
         )
 
     def close(self) -> None:
@@ -231,6 +262,7 @@ def write_ionosphere_artifact(
     ionosphere_phase: np.ndarray,
     nondispersive_phase: np.ndarray,
     weight: np.ndarray,
+    native_origin: Sequence[int | float] = (0, 0),
     replace_existing: bool = False,
 ) -> IonosphereArtifactStore:
     """Commit one ionosphere product.
@@ -238,7 +270,7 @@ def write_ionosphere_artifact(
     Parameters
     ----------
     root : str or pathlib.Path
-        Product directory ``ion/ml_AxR/<pair>``.
+        Product directory ``ifg/ion/ml_AxR/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
     looks : tuple[int, int]
@@ -266,6 +298,11 @@ def write_ionosphere_artifact(
         Upstream scene write ids, recorded as Item inputs.
     ionosphere_phase, nondispersive_phase, weight : numpy.ndarray
         Matching two-dimensional float layers.
+    native_origin : sequence of int or float, optional
+        Native-pixel index ``(azimuth, range)`` of the first contributing
+        sample of the first block. Full-scene estimates pass ``(0, 0)``
+        explicitly (the default). The persisted first-sample center is
+        ``s + (L - 1) / 2`` with spacing ``L``.
     replace_existing : bool, optional
         Replace an existing product.
 
@@ -324,13 +361,20 @@ def write_ionosphere_artifact(
         for name, value in sources.items()
     ):
         reject_invalid_state("ion artifact source manifest digests are invalid")
+    from faninsar.processing.atmosphere.grid_map import native_block_center_anchor
+
+    look_pair = (int(looks[0]), int(looks[1]))
+    anchor = native_block_center_anchor(native_origin, look_pair)
+    spacing = (float(look_pair[0]), float(look_pair[1]))
     properties = {
         "faninsar:pair": list(pair),
-        "faninsar:looks": [int(looks[0]), int(looks[1])],
+        "faninsar:looks": [look_pair[0], look_pair[1]],
         "faninsar:domain": domain,
         "faninsar:shape": [int(shape[0]), int(shape[1])],
         "faninsar:wavelength_m": wavelength_m,
         "faninsar:grid_identity": grid_identity,
+        "faninsar:sample_center_anchor": [anchor[0], anchor[1]],
+        "faninsar:sample_spacing": [spacing[0], spacing[1]],
         "faninsar:method": {
             "name": method_name,
             "parameters": _canonical_parameters(
@@ -360,122 +404,38 @@ def write_ionosphere_artifact(
 
 
 def ion_dir(work_dir: str | Path, pair_id: str, looks: tuple[int, int]) -> Path:
-    """Return the ion product directory ``work_dir/ion/ml_AxR/<pair>``."""
-    return Path(work_dir) / "ion" / f"ml_{int(looks[0])}x{int(looks[1])}" / pair_id
-
-
-def _current_unwrap(store: InterferogramArtifactStore) -> Product:
-    """Open the unwrap product bound to this exact IFG."""
-    unwrap = open_product(store.unwrap_root, kind=UNWRAP_KIND)
-    if unwrap.inputs.get("ifg") != store.write_id:
-        reject_invalid_state("unwrap artifact is bound to a different IFG")
-    return unwrap
-
-
-def write_ion_correction_artifact(
-    root: str | Path,
-    *,
-    unwrapped_phase: np.ndarray,
-    unwrap_write_id: str,
-    ion_write_id: str,
-    ion_looks: tuple[int, int],
-    degraded_consumed: bool,
-    replace_existing: bool = False,
-) -> Product:
-    """Commit the ionosphere-corrected unwrapped phase of one Pair.
-
-    The product is the ``ion_corrected`` child of the Pair's unwrap product;
-    upstream IFG, unwrap, and ion layers are never rewritten.
-
-    Parameters
-    ----------
-    root : str or pathlib.Path
-        The interferogram product directory ``ifg/ml_AxR/<pair>``.
-    unwrapped_phase : numpy.ndarray
-        Corrected unwrapped phase on the unwrap grid.
-    unwrap_write_id : str
-        ``write_id`` of the unwrap product that was corrected.
-    ion_write_id : str
-        ``write_id`` of the ion product that was subtracted.
-    ion_looks : tuple[int, int]
-        Look factors of the consumed ion product.
-    degraded_consumed : bool
-        Whether a degraded ion product was consumed under explicit admission.
-    replace_existing : bool, optional
-        Replace an existing correction.
-
-    Returns
-    -------
-    Product
-        The committed correction product.
-
-    """
-    store = InterferogramArtifactStore.open(root)
-    unwrap = _current_unwrap(store)
-    phase = np.asarray(unwrapped_phase)
-    if phase.shape != store.shape or phase.dtype.kind != "f":
-        reject_invalid_state(
-            "corrected phase must match the IFG shape as a float array"
-        )
-    if unwrap_write_id != unwrap.write_id or not _is_source_identity(ion_write_id):
-        reject_invalid_state("ion correction binding is invalid")
-    properties = {
-        "faninsar:pair": list(store.pair),
-        "faninsar:shape": list(store.shape),
-        "faninsar:ion_looks": [int(ion_looks[0]), int(ion_looks[1])],
-        "faninsar:degraded_consumed": bool(degraded_consumed),
-    }
-
-    def write(staging: Path) -> dict[str, dict[str, Any]]:
-        write_zarr_array(
-            staging / "unwrapped_phase.zarr", phase.astype(np.float32, copy=False)
-        )
-        return {"unwrapped_phase": {"href": "unwrapped_phase.zarr"}}
-
-    product = publish_product(
-        store.unwrap_root / ION_CORRECTED_NAME,
-        kind=ION_CORRECTED_KIND,
-        properties=properties,
-        write_payloads=write,
-        inputs={"unwrap": unwrap.write_id, "ion": ion_write_id},
-        overwrite=replace_existing,
+    """Return the ion product directory ``work_dir/ifg/ion/ml_AxR/<pair>``."""
+    return (
+        Path(work_dir) / "ifg" / "ion" / f"ml_{int(looks[0])}x{int(looks[1])}" / pair_id
     )
-    logger.info("Committed ion correction %s", product.path)
-    return product
+
+
+def write_ion_correction_artifact(*args: object, **kwargs: object) -> Product:
+    """Raise: ion correction is the ``complex_ion`` sibling (PROPOSAL-0080)."""
+    del args, kwargs
+    reject_invalid_state(
+        "write_ion_correction_artifact is no longer accepted; commit "
+        "complex_ion with write_complex_ion_artifact, then unwrap "
+        "source='complex_ion'"
+    )
 
 
 def open_ion_correction(root: str | Path) -> Product:
-    """Open the ionosphere correction bound to the current unwrap of an IFG.
-
-    Parameters
-    ----------
-    root : str or pathlib.Path
-        The interferogram product directory ``ifg/ml_AxR/<pair>``.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        If the correction is missing or bound to another unwrap.
-
-    """
-    store = InterferogramArtifactStore.open(root)
-    unwrap = _current_unwrap(store)
-    corrected = open_product(
-        store.unwrap_root / ION_CORRECTED_NAME, kind=ION_CORRECTED_KIND
+    """Raise: ion correction is the ``complex_ion`` sibling (PROPOSAL-0080)."""
+    del root
+    reject_invalid_state(
+        "open_ion_correction is no longer accepted; open the complex_ion "
+        "or unwrap_ion sibling of the IFG product"
     )
-    if corrected.inputs.get("unwrap") != unwrap.write_id:
-        reject_invalid_state("ion correction is bound to a different unwrap")
-    return corrected
 
 
 def read_ion_correction_artifact(root: str | Path) -> np.ndarray:
-    """Read the ionosphere-corrected unwrapped phase of one Pair."""
-    corrected = open_ion_correction(root)
-    phase = read_zarr_array(corrected.asset_path("unwrapped_phase"))
-    expected = tuple(int(size) for size in corrected.properties["faninsar:shape"])
-    if phase.shape != expected or phase.dtype.kind != "f":
-        reject_invalid_state("ion correction layer shape or dtype is incompatible")
-    return phase
+    """Raise: ion correction is the ``complex_ion`` sibling (PROPOSAL-0080)."""
+    del root
+    reject_invalid_state(
+        "read_ion_correction_artifact is no longer accepted; read the "
+        "complex_ion or unwrapped_ion layer of the IFG product"
+    )
 
 
 __all__ = [

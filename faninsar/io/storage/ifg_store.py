@@ -1,14 +1,17 @@
-"""Interferogram and unwrap products of a Stack (PROPOSAL-0059).
+"""Interferogram, unwrap, and ion-corrected products of a Stack.
 
 An interferogram product is ``ifg/ml_AxR/<pair>/`` with Zarr layers and one
 ``item.json`` (kind ``ifg``) that binds both scene write ids. The persisted
 layers are the canonical ``complex_ifg`` plus optional ``coherence`` and
 ``valid_mask``; ``wrapped_phase`` and ``amplitude`` are virtual layers derived
 as ``angle(complex_ifg)`` and ``abs(complex_ifg)`` at read time and never
-materialize separate Zarr stores. The spatially unwrapped phase of that Pair
-is a separate product at ``unwrap/ml_AxR/<pair>`` (kind ``unwrap``) bound to
-the IFG ``write_id``. Both are written through :mod:`faninsar.io.storage.product`;
-reads validate the Item, shapes, and dtypes without re-hashing payloads.
+materialize separate Zarr stores. Ordinary unwrap is the pair sibling
+``ifg/ml_AxR/<pair>/unwrap`` (kind ``unwrap``). Ion estimates live under
+``ifg/ion/ml_AxR/<pair>``. The ion-corrected complex IFG is the pair sibling
+``complex_ion/`` (kind ``complex_ion``) written before any full-band unwrap;
+its unwrap is ``unwrap_ion/`` (kind ``unwrap_ion``). Products are written
+through :mod:`faninsar.io.storage.product`; reads validate the Item, shapes,
+and dtypes without re-hashing payloads (PROPOSAL-0059, PROPOSAL-0080).
 """
 
 from __future__ import annotations
@@ -36,12 +39,14 @@ from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 logger = setup_logger(__name__)
 
 IFG_KIND = "ifg"
 UNWRAP_KIND = "unwrap"
+COMPLEX_ION_KIND = "complex_ion"
+UNWRAP_ION_KIND = "unwrap_ion"
 MERGED_REPRESENTATION = "merged"
 BURST_REPRESENTATION = "burst"
 #: Persisted IFG layers; ``wrapped_phase`` and ``amplitude`` are virtual.
@@ -50,6 +55,26 @@ _REQUIRED_IFG_LAYERS = ("complex",)
 #: Virtual layers derived from the canonical ``complex_ifg``.
 _VIRTUAL_IFG_LAYERS = ("wrapped_phase", "amplitude")
 _UNWRAP_LAYERS = ("unwrapped_phase", "connected_components")
+_MASKED_BILINEAR = "masked_bilinear_unwrapped"
+_UNWRAP_SOURCES = ("complex", "complex_ion")
+#: Public layer name → (branch, real asset, derivation).
+_LAYER_SPECS: dict[str, tuple[str, str, str]] = {
+    "complex": ("ifg", "complex", "identity"),
+    "wrapped": ("ifg", "complex", "angle"),
+    "wrapped_phase": ("ifg", "complex", "angle"),
+    "amplitude": ("ifg", "complex", "abs"),
+    "coherence": ("ifg", "coherence", "identity"),
+    "valid_mask": ("ifg", "valid_mask", "identity"),
+    "unwrapped": ("unwrap", "unwrapped_phase", "identity"),
+    "unw_phase": ("unwrap", "unwrapped_phase", "identity"),
+    "unwrapped_phase": ("unwrap", "unwrapped_phase", "identity"),
+    "connected_components": ("unwrap", "connected_components", "identity"),
+    "complex_ion": ("complex_ion", "complex", "identity"),
+    "wrapped_ion": ("complex_ion", "complex", "angle"),
+    "amplitude_ion": ("complex_ion", "complex", "abs"),
+    "unwrapped_ion": ("unwrap_ion", "unwrapped_phase", "identity"),
+    "connected_components_ion": ("unwrap_ion", "connected_components", "identity"),
+}
 
 
 def _derive_virtual_layer(
@@ -154,9 +179,33 @@ def unwrap_root(
 ) -> Path:
     """Return the unwrap product directory paired with an IFG product.
 
-    ``<work>/ifg/ml_AxR/<pair>`` maps to ``<work>/unwrap/ml_AxR/<pair>``.
-    Burst products are rejected unless ``allow_burst=True``.
+    ``<work>/ifg/ml_AxR/<pair>`` maps to ``<work>/ifg/ml_AxR/<pair>/unwrap``.
+    Burst products are rejected unless ``allow_burst=True``, in which case
+    unwrap is the sibling ``unwrap/`` under the burst IFG root.
     """
+    root = _validated_ifg_root(
+        ifg_root, allow_burst=allow_burst, representation=representation
+    )
+    return root / "unwrap"
+
+
+def complex_ion_root(ifg_root: str | Path) -> Path:
+    """Return the ion-corrected complex product directory of an IFG pair."""
+    return Path(ifg_root) / "complex_ion"
+
+
+def unwrap_ion_root(ifg_root: str | Path) -> Path:
+    """Return the unwrap product directory of the ion-corrected complex IFG."""
+    return Path(ifg_root) / "unwrap_ion"
+
+
+def _validated_ifg_root(
+    ifg_root: str | Path,
+    *,
+    allow_burst: bool = False,
+    representation: str | None = None,
+) -> Path:
+    """Reject burst unwrap unless explicitly allowed; return the IFG root."""
     root = Path(ifg_root)
     resolved = representation
     item = root / "item.json"
@@ -180,20 +229,103 @@ def unwrap_root(
                 "burst IFG product is not under "
                 f"ifg/bursts/ml_AxR/<pair>/<burst>: {root}"
             )
-        work = root.parent.parent.parent.parent.parent
-        return (
-            work
-            / "unwrap"
-            / "bursts"
-            / root.parent.parent.name
-            / root.parent.name
-            / root.name
-        )
+        return root
     if root.parent.parent.name != "ifg":
         reject_invalid_state(
             f"IFG product is not under an ifg/ml_AxR/<pair> layout: {root}"
         )
-    return root.parent.parent.parent / "unwrap" / root.parent.name / root.name
+    return root
+
+
+def ifg_sample_placement(
+    store: InterferogramArtifactStore,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return native-pixel first-sample center and spacing of an IFG grid.
+
+    Native pixel centers are integers. The first contributing sample of the
+    first block is ``row_origin + look_origin * looks``; the published center
+    is that origin plus ``(L - 1) / 2`` with spacing ``L``.
+    """
+    from faninsar.processing.atmosphere.grid_map import native_block_center_anchor
+
+    native_origin = (
+        int(store.row_origin) + int(store.look_origin[0]) * int(store.looks[0]),
+        int(store.col_origin) + int(store.look_origin[1]) * int(store.looks[1]),
+    )
+    return native_block_center_anchor(native_origin, store.looks), (
+        float(store.looks[0]),
+        float(store.looks[1]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedIfgLayer:
+    """Public IFG layer mapped onto one product, real asset, and derivation.
+
+    Attributes
+    ----------
+    product_root : pathlib.Path
+        Directory of the product that owns the real asset.
+    real_asset : str
+        Persisted asset name inside that product.
+    derivation : {"identity", "angle", "abs"}
+        How the public layer is obtained from ``real_asset``.
+    branch : {"ifg", "unwrap", "complex_ion", "unwrap_ion"}
+        Owning product kind relative to the pair IFG.
+
+    """
+
+    product_root: Path
+    real_asset: str
+    derivation: str
+    branch: str
+
+
+def resolve_ifg_layer(ifg_root: str | Path, name: str) -> ResolvedIfgLayer:
+    """Map a public IFG layer name onto its owning product and derivation.
+
+    Ordinary names read the IFG or its ``unwrap/`` sibling. Ion names
+    (``complex_ion``, ``wrapped_ion``, ``amplitude_ion``, ``unwrapped_ion``,
+    ``connected_components_ion``) never fall back to the ordinary branch.
+
+    Parameters
+    ----------
+    ifg_root : str or pathlib.Path
+        Interferogram product directory.
+    name : str
+        Public layer name, including short aliases ``wrapped`` and
+        ``unwrapped``.
+
+    Returns
+    -------
+    ResolvedIfgLayer
+        Product root, real asset, and derivation.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If ``name`` is not a known public IFG layer.
+
+    """
+    spec = _LAYER_SPECS.get(str(name))
+    if spec is None:
+        reject_invalid_state(f"unknown IFG layer: {name!r}")
+    branch, real_asset, derivation = spec
+    root = Path(ifg_root)
+    if branch == "ifg":
+        product_root = root
+    elif branch == "unwrap":
+        product_root = unwrap_root(root)
+    elif branch == "complex_ion":
+        product_root = complex_ion_root(root)
+    else:
+        product_root = unwrap_ion_root(root)
+    return ResolvedIfgLayer(
+        product_root=product_root,
+        real_asset=real_asset,
+        derivation=derivation,
+        branch=branch,
+    )
 
 
 def _validate_phase_screen_digests(value: object) -> dict[str, dict[str, str]]:
@@ -528,12 +660,15 @@ class InterferogramArtifactStore:
 
         Parameters
         ----------
-        name : {"complex", "wrapped_phase", "amplitude", "coherence", "valid_mask"}
-            Canonical layer name. ``wrapped_phase`` and ``amplitude`` are
-            virtual layers derived from ``complex_ifg`` as ``angle`` and
-            ``abs``; they are never persisted. Where a persisted
-            ``valid_mask`` is False, derived samples are NaN. The other names
-            read their persisted payloads.
+        name : str
+            Public layer name. Ordinary names include ``complex``,
+            ``wrapped``/``wrapped_phase``, ``amplitude``, ``coherence``, and
+            ``valid_mask``. Ion names ``complex_ion``, ``wrapped_ion``, and
+            ``amplitude_ion`` read the ``complex_ion`` sibling; they never
+            fall back to the ordinary complex IFG. ``wrapped_phase`` and
+            ``amplitude`` (and their ion counterparts) are virtual
+            ``angle``/``abs`` derivations and are never persisted. Where a
+            persisted ``valid_mask`` is False, derived samples are NaN.
         window : tuple of int, optional
             Local half-open ``(r0, r1, c0, c1)`` in the layer array.
 
@@ -546,19 +681,129 @@ class InterferogramArtifactStore:
         Raises
         ------
         InvalidProcessingStateError
-            If the layer name is unknown, the persisted layer is absent or
-            damaged, or its dtype or shape is unexpected.
+            If the layer name is unknown, the named branch is missing or
+            stale, the persisted layer is absent or damaged, or its dtype or
+            shape is unexpected.
 
         """
-        if name in _VIRTUAL_IFG_LAYERS:
-            complex_ifg = self._read_persisted_layer("complex", window=window)
-            valid_mask = (
-                self._read_persisted_layer("valid_mask", window=window)
-                if "valid_mask" in self._payloads
-                else None
+        resolved = resolve_ifg_layer(self.root, name)
+        if resolved.branch == "ifg":
+            if resolved.derivation == "angle":
+                return self._virtual_ifg_layer("wrapped_phase", window=window)
+            if resolved.derivation == "abs":
+                return self._virtual_ifg_layer("amplitude", window=window)
+            return self._read_persisted_layer(resolved.real_asset, window=window)
+        if resolved.branch == "complex_ion":
+            return self._read_complex_ion_layer(resolved, window=window)
+        product = (
+            self.unwrap_product()
+            if resolved.branch == "unwrap"
+            else self._require_unwrap_ion()
+        )
+        if resolved.real_asset not in product.assets:
+            reject_invalid_state(
+                f"{resolved.branch} product has no layer {resolved.real_asset!r}"
             )
-            return _derive_virtual_layer(name, complex_ifg, valid_mask)
-        return self._read_persisted_layer(name, window=window)
+        array = read_zarr_array(product.asset_path(resolved.real_asset), window=window)
+        expected = (
+            self.shape
+            if window is None
+            else (window[1] - window[0], window[3] - window[2])
+        )
+        if array.shape != expected:
+            reject_invalid_state(
+                f"{resolved.branch} layer {resolved.real_asset} "
+                "shape differs from the IFG"
+            )
+        return array
+
+    def _virtual_ifg_layer(
+        self, name: str, window: tuple[int, int, int, int] | None = None
+    ) -> np.ndarray:
+        """Derive one ordinary virtual IFG layer from the canonical complex."""
+        complex_ifg = self._read_persisted_layer("complex", window=window)
+        valid_mask = (
+            self._read_persisted_layer("valid_mask", window=window)
+            if "valid_mask" in self._payloads
+            else None
+        )
+        return _derive_virtual_layer(name, complex_ifg, valid_mask)
+
+    def _read_complex_ion_layer(
+        self,
+        resolved: ResolvedIfgLayer,
+        window: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        """Read one layer of the current, non-stale complex_ion product."""
+        product = self._require_complex_ion()
+        if resolved.real_asset not in product.assets:
+            reject_invalid_state("complex_ion product is missing the complex layer")
+        array = product.read(resolved.real_asset, window=window)
+        valid_mask = (
+            product.read("valid_mask", window=window)
+            if "valid_mask" in product.assets
+            else None
+        )
+        if resolved.derivation == "identity":
+            return array
+        derived_name = (
+            "wrapped_phase" if resolved.derivation == "angle" else "amplitude"
+        )
+        return _derive_virtual_layer(derived_name, array, valid_mask)
+
+    def _require_complex_ion(self) -> Product:
+        """Open the complex_ion sibling bound to this IFG and the current ion."""
+        root = complex_ion_root(self.root)
+        if not (root / "item.json").is_file():
+            reject_invalid_state(f"IFG product {self.root} has no complex_ion sibling")
+        product = open_product(root, kind=COMPLEX_ION_KIND)
+        if product.inputs.get("ifg") != self.write_id:
+            reject_invalid_state("complex_ion is bound to a different IFG")
+        ion_write_id = product.inputs.get("ion")
+        if not isinstance(ion_write_id, str) or not ion_write_id:
+            reject_invalid_state("complex_ion is missing its ion binding")
+        current_ion = self._current_ion_write_id(product)
+        if current_ion != ion_write_id:
+            reject_invalid_state("complex_ion is bound to a replaced ion product")
+        return product
+
+    def _current_ion_write_id(self, complex_ion: Product) -> str | None:
+        """Return the write id of the ion product this complex_ion named."""
+        from faninsar.io.storage.ion_store import ION_KIND, ion_dir
+
+        raw_looks = complex_ion.properties.get("faninsar:ion_looks")
+        if (
+            not isinstance(raw_looks, list)
+            or len(raw_looks) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+                for value in raw_looks
+            )
+        ):
+            reject_invalid_state("complex_ion ion_looks metadata is invalid")
+        pair_id = f"{self.pair[0]}_{self.pair[1]}"
+        ion_looks = (int(raw_looks[0]), int(raw_looks[1]))
+        ion_path = ion_dir(self.root.parent.parent.parent, pair_id, ion_looks)
+        if not (ion_path / "item.json").is_file():
+            return None
+        return open_product(ion_path, kind=ION_KIND).write_id
+
+    def _require_unwrap_ion(self) -> Product:
+        """Open unwrap_ion bound to the current complex_ion of this IFG."""
+        root = unwrap_ion_root(self.root)
+        if not (root / "item.json").is_file():
+            reject_invalid_state(f"IFG product {self.root} has no unwrap_ion sibling")
+        product = open_product(root, kind=UNWRAP_ION_KIND)
+        if product.inputs.get("ifg") != self.write_id:
+            reject_invalid_state("unwrap_ion is bound to a different IFG")
+        complex_ion = self._require_complex_ion()
+        if product.inputs.get("complex_ion") != complex_ion.write_id:
+            reject_invalid_state(
+                "unwrap_ion is bound to a replaced complex_ion product"
+            )
+        if product.inputs.get("ion") != complex_ion.inputs.get("ion"):
+            reject_invalid_state("unwrap_ion is bound to a replaced ion product")
+        return product
 
     def read(
         self, window: tuple[int, int, int, int] | None = None
@@ -636,23 +881,45 @@ class InterferogramArtifactStore:
             reject_invalid_state("unwrap artifact is bound to a different IFG")
         return product
 
-    def read_unwrapped_layer(self, name: str) -> np.ndarray:
+    def complex_ion_product(self) -> Product:
+        """Open the ion-corrected complex sibling bound to this IFG."""
+        return self._require_complex_ion()
+
+    def unwrap_ion_product(self) -> Product:
+        """Open the unwrap_ion sibling bound to the current complex_ion."""
+        return self._require_unwrap_ion()
+
+    def read_unwrapped_layer(self, name: str, *, source: str = "complex") -> np.ndarray:
         """Read one named layer of the unwrap product bound to this IFG."""
-        product = self.unwrap_product()
+        product = (
+            self.unwrap_product() if source == "complex" else self._require_unwrap_ion()
+        )
         if name not in product.assets:
             reject_invalid_state(f"unwrap product has no layer {name!r}")
         return read_zarr_array(product.asset_path(name))
 
-    def read_unwrapped(self) -> UnwrappedArtifact:
+    def read_unwrapped(self, *, source: str = "complex") -> UnwrappedArtifact:
         """Read the unwrap product bound to this exact IFG.
+
+        Parameters
+        ----------
+        source : {"complex", "complex_ion"}, optional
+            Ordinary unwrap (default) or the unwrap of the ion-corrected
+            complex IFG. A missing or stale named branch raises; it never
+            falls back to the other branch.
 
         Raises
         ------
         InvalidProcessingStateError
-            If no unwrap product exists or it is bound to another IFG.
+            If the named unwrap product is missing, stale, or bound to
+            another IFG.
 
         """
-        product = self.unwrap_product()
+        if source not in _UNWRAP_SOURCES:
+            reject_invalid_state("unwrap source must be 'complex' or 'complex_ion'")
+        product = (
+            self.unwrap_product() if source == "complex" else self._require_unwrap_ion()
+        )
         arrays: dict[str, np.ndarray] = {}
         for name in _UNWRAP_LAYERS:
             if name not in product.assets:
@@ -934,6 +1201,129 @@ def write_ifg_artifact(
     return InterferogramArtifactStore.open(product.path)
 
 
+def _placement_pair(value: Sequence[float], name: str) -> list[float]:
+    """Validate a two-element finite placement pair for product metadata."""
+    try:
+        pair = (float(value[0]), float(value[1]))
+    except (TypeError, ValueError, IndexError):
+        reject_invalid_state(f"{name} must be two finite numbers")
+    if len(value) != 2 or not np.isfinite(pair).all():
+        reject_invalid_state(f"{name} must be two finite numbers")
+    return [pair[0], pair[1]]
+
+
+def write_complex_ion_artifact(
+    root: str | Path,
+    *,
+    complex_ifg: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+    ion_write_id: str,
+    ion_looks: tuple[int, int],
+    interpolation: str,
+    source_anchor: Sequence[float],
+    source_spacing: Sequence[float],
+    target_anchor: Sequence[float],
+    target_spacing: Sequence[float],
+    replace_existing: bool = False,
+) -> Product:
+    """Commit the ion-corrected complex IFG sibling of one pair.
+
+    The product is ``<ifg>/complex_ion`` (kind ``complex_ion``) with a
+    persisted ``complex.zarr`` written before any full-band unwrap. It binds
+    the IFG write id and the ion write id; replacing the parent IFG removes
+    it, replacing the shared ion makes it stale.
+
+    Parameters
+    ----------
+    root : str or pathlib.Path
+        Interferogram product directory.
+    complex_ifg : numpy.ndarray
+        Corrected complex samples on the IFG grid.
+    valid_mask : numpy.ndarray, optional
+        Support of the correction (IFG validity ∩ mapped ion support).
+    ion_write_id : str
+        ``write_id`` of the consumed ion product.
+    ion_looks : tuple[int, int]
+        Look factors of that ion product.
+    interpolation : str
+        Interpolation policy; must be ``masked_bilinear_unwrapped``.
+    source_anchor, source_spacing, target_anchor, target_spacing : sequence
+        Native-pixel placement of the ion grid and the target IFG grid.
+    replace_existing : bool, optional
+        Replace an existing ``complex_ion`` sibling. The ordinary unwrap
+        sibling is left in place.
+
+    Returns
+    -------
+    Product
+        The committed ``complex_ion`` product.
+
+    """
+    store = InterferogramArtifactStore.open(root)
+    array = np.asarray(complex_ifg)
+    if array.shape != store.shape or array.dtype.kind != "c":
+        reject_invalid_state("complex_ion must match the IFG shape as a complex array")
+    mask = None if valid_mask is None else np.asarray(valid_mask)
+    if mask is not None and (mask.shape != store.shape or mask.dtype != np.bool_):
+        reject_invalid_state("complex_ion valid_mask must match the IFG as a boolean")
+    if interpolation != _MASKED_BILINEAR:
+        reject_invalid_state(
+            "complex_ion interpolation must be 'masked_bilinear_unwrapped'"
+        )
+    if (
+        len(ion_looks) != 2
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in ion_looks
+        )
+        or not _is_source_identity(ion_write_id)
+    ):
+        reject_invalid_state("complex_ion ion binding is invalid")
+    item_properties: dict[str, object] = {
+        "faninsar:pair": list(store.pair),
+        "faninsar:looks": list(store.looks),
+        "faninsar:domain": store.domain,
+        "faninsar:shape": list(store.shape),
+        "faninsar:grid_identity": store.grid_identity,
+        "faninsar:ion_looks": [int(ion_looks[0]), int(ion_looks[1])],
+        "faninsar:interpolation": interpolation,
+        "faninsar:sample_center_anchor": _placement_pair(
+            target_anchor, "target_anchor"
+        ),
+        "faninsar:sample_spacing": _placement_pair(target_spacing, "target_spacing"),
+        "faninsar:source_sample_center_anchor": _placement_pair(
+            source_anchor, "source_anchor"
+        ),
+        "faninsar:source_sample_spacing": _placement_pair(
+            source_spacing, "source_spacing"
+        ),
+    }
+    if store.crs is not None:
+        item_properties["proj:code"] = store.crs
+        item_properties["proj:transform"] = list(store.transform or ())
+
+    def write(staging: Path) -> dict[str, dict[str, Any]]:
+        write_zarr_array(staging / "complex.zarr", array)
+        assets: dict[str, dict[str, Any]] = {"complex": {"href": "complex.zarr"}}
+        if mask is not None:
+            write_zarr_array(staging / "valid_mask.zarr", mask)
+            assets["valid_mask"] = {"href": "valid_mask.zarr"}
+        return assets
+
+    product = publish_product(
+        complex_ion_root(store.root),
+        kind=COMPLEX_ION_KIND,
+        properties=item_properties,
+        write_payloads=write,
+        inputs={"ifg": store.write_id, "ion": ion_write_id},
+        overwrite=replace_existing,
+    )
+    logger.info(
+        "Committed complex_ion product %s for pair %s", product.path, store.pair
+    )
+    return product
+
+
 def write_unwrapped_artifact(
     root: str | Path,
     *,
@@ -945,14 +1335,16 @@ def write_unwrapped_artifact(
     extra_layers: Mapping[str, np.ndarray] | None = None,
     properties: Mapping[str, object] | None = None,
     replace_existing: bool = False,
+    source: str = "complex",
 ) -> Product:
     """Commit the unwrap product of one interferogram.
 
     Parameters
     ----------
     root : str or pathlib.Path
-        The interferogram product directory; the unwrap product is written
-        to the paired ``unwrap/ml_AxR/<pair>`` directory.
+        The interferogram product directory; ordinary unwrap is written to
+        the pair sibling ``unwrap/``, and ion-corrected unwrap to
+        ``unwrap_ion/``.
     unwrapped_phase : numpy.ndarray
         Floating-point unwrapped phase in radians.
     connected_components : numpy.ndarray
@@ -970,8 +1362,12 @@ def write_unwrapped_artifact(
         Extra ``faninsar:`` Item properties (for example mask lineage).
         Geographic metadata is inherited from the IFG.
     replace_existing : bool, optional
-        Replace an existing unwrap product (and its ``ion_corrected``
-        child).
+        Replace an existing unwrap product of the selected ``source``.
+        Sibling products of the other branch are left in place.
+    source : {"complex", "complex_ion"}, optional
+        Ordinary unwrap of the original IFG, or unwrap of the
+        ``complex_ion`` sibling. ``complex_ion`` binds that product and the
+        transitive ion write id.
 
     Returns
     -------
@@ -982,6 +1378,8 @@ def write_unwrapped_artifact(
     store = InterferogramArtifactStore.open(root)
     if ifg_manifest_digest != store.write_id:
         reject_invalid_state("unwrap artifact IFG binding is invalid")
+    if source not in _UNWRAP_SOURCES:
+        reject_invalid_state("unwrap source must be 'complex' or 'complex_ion'")
     phase = np.asarray(unwrapped_phase)
     components = np.asarray(connected_components)
     if (
@@ -999,6 +1397,7 @@ def write_unwrapped_artifact(
         "faninsar:domain": store.domain,
         "faninsar:shape": list(store.shape),
         "faninsar:grid_identity": store.grid_identity,
+        "faninsar:source": source,
         "faninsar:method": {
             "name": method,
             "parameters": _canonical_parameters(
@@ -1016,6 +1415,19 @@ def write_unwrapped_artifact(
     if store.crs is not None:
         item_properties["proj:code"] = store.crs
         item_properties["proj:transform"] = list(store.transform or ())
+    if source == "complex":
+        target = store.unwrap_root
+        kind = UNWRAP_KIND
+        inputs: dict[str, str] = {"ifg": store.write_id}
+    else:
+        complex_ion = store._require_complex_ion()
+        target = unwrap_ion_root(store.root)
+        kind = UNWRAP_ION_KIND
+        inputs = {
+            "ifg": store.write_id,
+            "complex_ion": complex_ion.write_id,
+            "ion": str(complex_ion.inputs["ion"]),
+        }
 
     def write(staging: Path) -> dict[str, dict[str, Any]]:
         layers = {
@@ -1027,14 +1439,13 @@ def write_unwrapped_artifact(
             write_zarr_array(staging / f"{name}.zarr", array)
         return {name: {"href": f"{name}.zarr"} for name in layers}
 
-    target = store.unwrap_root
     target.parent.mkdir(parents=True, exist_ok=True)
     product = publish_product(
         target,
-        kind=UNWRAP_KIND,
+        kind=kind,
         properties=item_properties,
         write_payloads=write,
-        inputs={"ifg": store.write_id},
+        inputs=inputs,
         overwrite=replace_existing,
     )
     logger.info("Committed unwrap product %s with method %s", target, method)
@@ -1042,13 +1453,21 @@ def write_unwrapped_artifact(
 
 
 __all__ = [
+    "COMPLEX_ION_KIND",
     "IFG_KIND",
+    "UNWRAP_ION_KIND",
     "UNWRAP_KIND",
     "InterferogramArtifact",
     "InterferogramArtifactStore",
+    "ResolvedIfgLayer",
     "UnwrappedArtifact",
+    "complex_ion_root",
     "ifg_artifact_dir",
+    "ifg_sample_placement",
+    "resolve_ifg_layer",
+    "unwrap_ion_root",
     "unwrap_root",
+    "write_complex_ion_artifact",
     "write_ifg_artifact",
     "write_unwrapped_artifact",
 ]

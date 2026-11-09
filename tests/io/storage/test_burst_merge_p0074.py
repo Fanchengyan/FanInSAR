@@ -317,9 +317,7 @@ def test_ifg_merged_path_stays_under_ml_and_defaults_representation(
         store.read_layer("complex", window=(0, 1, 1, 3)),
         np.ones((1, 2), dtype=np.complex64),
     )
-    assert unwrap_root(root) == tmp_path / "work" / "unwrap" / "ml_2x3" / (
-        f"{REFERENCE_ID}_{SECONDARY_ID}"
-    )
+    assert unwrap_root(root) == root / "unwrap"
 
 
 def test_ifg_burst_products_coexist_with_merged_and_reject_unwrap(

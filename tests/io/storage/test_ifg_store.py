@@ -238,13 +238,13 @@ def test_read_layer_rejects_wrong_shape_mask_payload(tmp_path: Path) -> None:
 
 
 def test_unwrap_is_a_separate_product_bound_to_the_ifg(tmp_path: Path) -> None:
-    """Unwrap lives under ``unwrap/ml_AxR/<pair>`` and records the IFG write id."""
+    """Unwrap lives under the pair sibling ``unwrap/`` and records the IFG write id."""
     root = _ifg_dir(tmp_path)
     store = _write_base(root)
     _unwrap(store)
 
     target = unwrap_root(root)
-    assert target == tmp_path / "work" / "unwrap" / "ml_2x3" / "20240101_20240113"
+    assert target == root / "unwrap"
     item = json.loads((target / "item.json").read_text())
     assert item["properties"]["faninsar:kind"] == "unwrap"
     assert item["properties"]["faninsar:inputs"] == {"ifg": store.write_id}
@@ -471,23 +471,22 @@ def test_unwrapped_artifact_rejects_wrong_ifg_binding(tmp_path: Path) -> None:
     assert not unwrap_root(root).exists()
 
 
-def test_replacing_the_ifg_makes_its_unwrap_stale(tmp_path: Path) -> None:
-    """A recomputed IFG gets a new write id; the old unwrap no longer binds."""
+def test_replacing_the_ifg_removes_nested_unwrap(tmp_path: Path) -> None:
+    """Replacing the pair IFG directory also removes nested unwrap children."""
     root = _ifg_dir(tmp_path)
     store = _write_base(root)
     _unwrap(store)
     replaced = _write_base(root, replace_existing=True)
 
     assert not replaced.has_unwrapped()
+    assert not unwrap_root(root).exists()
     stale = _layers(replaced)
     assert stale.layers == ["amplitude", "coherence", "complex", "wrapped_phase"]
-    with pytest.raises(InvalidProcessingStateError, match="replaced IFG"):
+    with pytest.raises(InvalidProcessingStateError):
         stale.unwrapped_phase
-    with pytest.raises(InvalidProcessingStateError, match="different IFG"):
+    with pytest.raises(InvalidProcessingStateError):
         replaced.read_unwrapped()
-    with pytest.raises(InvalidProcessingStateError, match="already exists"):
-        _unwrap(replaced)
-    _unwrap(replaced, replace_existing=True)
+    _unwrap(replaced)
     assert replaced.has_unwrapped()
     assert _layers(replaced).layers == [
         "amplitude",

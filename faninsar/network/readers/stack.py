@@ -1,7 +1,8 @@
 """Network-facing view over the committed products of a Stack (PROPOSAL-0059).
 
-The collection reads ``ifg/ml_AxR/<pair>`` and ``unwrap/ml_AxR/<pair>``
-products in place; nothing is copied into a second layout.
+The collection reads ``ifg/ml_AxR/<pair>`` and the pair-owned
+``unwrap/``, ``complex_ion/``, and ``unwrap_ion/`` siblings in place;
+nothing is copied into a second layout.
 
 ``sel(looks=, pairs=, polygon=, track=, direction=, pol=, burst=)`` returns
 an immutable view bound to a committed multilook tree, a subset of the
@@ -38,12 +39,27 @@ if TYPE_CHECKING:
     from faninsar.processing.mosaicking import MergeLayoutWindow
     from faninsar.stack.session import Stack
 
-_ASSETS = ("complex", "unw_phase", "wrapped_phase", "amplitude", "coherence")
+_ASSETS = (
+    "complex",
+    "unw_phase",
+    "wrapped_phase",
+    "amplitude",
+    "coherence",
+    "complex_ion",
+    "unwrapped_ion",
+    "wrapped_ion",
+    "amplitude_ion",
+)
 _READABLE_ASSETS = frozenset(_ASSETS)
 #: Short public layer spellings accepted alongside the internal asset names.
-_SHORT_ASSET_NAMES = {"wrapped": "wrapped_phase", "unwrapped": "unw_phase"}
-#: Layers derived at read time from ``complex_ifg``; no file exists for them.
-_VIRTUAL_ASSETS = ("wrapped_phase", "amplitude")
+_SHORT_ASSET_NAMES = {
+    "wrapped": "wrapped_phase",
+    "unwrapped": "unw_phase",
+    "unwrapped_ion": "unwrapped_ion",
+}
+#: Layers derived at read time from a complex asset; no file exists for them.
+_VIRTUAL_ASSETS = ("wrapped_phase", "amplitude", "wrapped_ion", "amplitude_ion")
+_ION_VIRTUAL_ASSETS = ("wrapped_ion", "amplitude_ion")
 
 
 def _canonical_asset_name(name: str) -> str:
@@ -844,12 +860,22 @@ class StackInterferogramCollection(InterferogramCollection):
             if not store.has_unwrapped():
                 raise FileNotFoundError(store.unwrap_root)
             return np.asarray(store.read_unwrapped_layer("unwrapped_phase"))
+        if canonical == "unwrapped_ion":
+            unwrapped = store.read_unwrapped(source="complex_ion")
+            return np.asarray(unwrapped.unwrapped_phase)
         if canonical == "coherence":
             if "coherence" not in store._payloads:
                 message = "coherence is not present"
                 raise FileNotFoundError(message)
             return np.asarray(store.read_layer("coherence"))
-        if canonical in {"wrapped_phase", "amplitude", "complex"}:
+        if canonical in {
+            "wrapped_phase",
+            "amplitude",
+            "complex",
+            "complex_ion",
+            "wrapped_ion",
+            "amplitude_ion",
+        }:
             return np.asarray(store.read_layer(canonical))
         message = f"unknown Stack interferogram asset: {name}"
         raise ValueError(message)
@@ -921,6 +947,20 @@ class StackInterferogramCollection(InterferogramCollection):
             return False
         if canonical == "unw_phase":
             return selected.has_unwrapped()
+        if canonical == "unwrapped_ion" or canonical in {
+            "complex_ion",
+            *_ION_VIRTUAL_ASSETS,
+        }:
+            opener = (
+                selected.unwrap_ion_product
+                if canonical == "unwrapped_ion"
+                else selected.complex_ion_product
+            )
+            try:
+                opener()
+            except Exception:
+                return False
+            return True
         if canonical in _VIRTUAL_ASSETS:
             return "complex" in selected._payloads
         return canonical in selected._payloads
@@ -946,7 +986,7 @@ class StackInterferogramCollection(InterferogramCollection):
         selected = self._pair_store(str(pair))
         if canonical in _VIRTUAL_ASSETS:
             message = (
-                f"{canonical} is a virtual layer derived from complex_ifg; "
+                f"{canonical} is a virtual layer derived from a complex asset; "
                 f"no file exists for it in {selected.root}"
             )
             raise FileNotFoundError(message)
@@ -954,6 +994,16 @@ class StackInterferogramCollection(InterferogramCollection):
             if not selected.has_unwrapped():
                 raise FileNotFoundError(selected.unwrap_root)
             return selected.unwrap_root / "unwrapped_phase.zarr"
+        if canonical == "unwrapped_ion":
+            from faninsar.io.storage.ifg_store import unwrap_ion_root
+
+            selected.unwrap_ion_product()
+            return unwrap_ion_root(selected.root) / "unwrapped_phase.zarr"
+        if canonical == "complex_ion":
+            from faninsar.io.storage.ifg_store import complex_ion_root
+
+            selected.complex_ion_product()
+            return complex_ion_root(selected.root) / "complex.zarr"
         payload = selected._payloads.get(canonical)
         if payload is None:
             message = f"{canonical} is not present in the IFG product {selected.root}"
@@ -995,6 +1045,13 @@ class StackInterferogramCollection(InterferogramCollection):
         """Return the ``write_id`` of each selected Pair's current unwrap product."""
         return {
             _pair_id(store): store.unwrap_product().write_id
+            for store in self._selected_stores()
+        }
+
+    def unwrap_ion_write_ids(self) -> dict[str, str]:
+        """Return the ``write_id`` of each selected Pair's current unwrap_ion."""
+        return {
+            _pair_id(store): store.unwrap_ion_product().write_id
             for store in self._selected_stores()
         }
 

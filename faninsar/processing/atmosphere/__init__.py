@@ -24,6 +24,7 @@ from .filter import (
     remove_small_components,
     smooth_inverse_variance,
 )
+from .grid_map import map_unwrapped_phase_bilinear, native_block_center_anchor
 from .network import IonosphereNetworkResult, invert_ionosphere_network
 from .split_spectrum import SubBandResult, split_range_spectrum
 
@@ -38,6 +39,8 @@ __all__ = [
     "estimate_disp_nondisp",
     "gaussian_kernel_1d",
     "invert_ionosphere_network",
+    "map_unwrapped_phase_bilinear",
+    "native_block_center_anchor",
     "remove_small_components",
     "smooth_inverse_variance",
     "solve_2x2_low_high",

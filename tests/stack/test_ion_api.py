@@ -11,7 +11,7 @@ import pytest
 
 from faninsar.io.storage.ion_store import (
     IonosphereArtifactStore,
-    read_ion_correction_artifact,
+    ion_dir,
 )
 from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import write_scene
@@ -128,28 +128,26 @@ def test_estimate_apply_and_invert_end_to_end(tmp_path: Path) -> None:
     assert set(corrected) == set(expected_pair_screens)
     # A repeated call reuses the corrections bound to the current products.
     assert stack.apply_ionosphere_correction(ion_multilook=(1, 1)) == corrected
-    unwrapped_stack = stack.network.interferograms.open_stack("unw_phase")
     for store in stores:
         pair_id = f"{store.pair[0]}_{store.pair[1]}"
-        ifg_store_path = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
-        unwrapped = unwrapped_stack.sel(pair=pair_id).values
         ion_screen = (
-            IonosphereArtifactStore.open(
-                stack.config.work_dir / "ion" / "ml_1x1" / pair_id
-            )
+            IonosphereArtifactStore.open(ion_dir(stack.config.work_dir, pair_id, (1, 1)))
             .read()
             .ionosphere_phase
         )
+        original = stack.interferograms.open(pair_id, "complex").values
+        complex_ion = stack.interferograms.open(pair_id, "complex_ion").values
         np.testing.assert_allclose(
-            read_ion_correction_artifact(ifg_store_path),
-            unwrapped - ion_screen,
-            atol=1e-6,
+            np.angle(complex_ion),
+            np.angle(original) - ion_screen,
+            atol=1e-5,
         )
 
+    stack.unwrap(SpatialIRLS(), source="complex_ion")
     raw = stack.invert_timeseries()
-    ion_corrected = stack.invert_timeseries(ionosphere_corrected=True, overwrite=True)
+    ion_corrected = stack.invert_timeseries(phase="unwrapped_ion", overwrite=True)
     item = open_product(stack.config.work_dir / "timeseries")
-    assert item.properties["faninsar:phase_source"] == "ion_corrected"
+    assert item.properties["faninsar:phase_source"] == "unwrapped_ion"
     assert set(item.inputs) == set(expected_pair_screens)
     assert not np.allclose(
         np.nan_to_num(raw.phase_cumulative_rad),
