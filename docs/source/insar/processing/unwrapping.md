@@ -101,6 +101,39 @@ cannot prove that $k(p)$ is correct.
   seams;
 - perturb mask/filter parameters and check solution stability.
 
+## FanInSAR SNAPHU adapter
+
+The built-in `Snaphu` strategy forwards `nlooks`, `ntiles`, `nproc`,
+`tile_overlap`, and `single_tile_reoptimize` to `snaphu-py`. Fields left as
+`None` are filled by a private resolver: tiles of 2048 samples, 64-sample
+overlap on tiled axes (zero on untiled axes, capped below half the nominal
+tile extent), and at most four processes. That rule is a modest heuristic
+qualified on small synthetics; it is not a measured optimum and does not
+guarantee runtime or memory. Explicit values win, including `ntiles=(1, 1)`,
+zero or other nonnegative overlap, `nlooks=1.0`, and nonpositive `nproc`
+(upstream "all CPUs"). `single_tile_reoptimize` defaults to `True`.
+
+Stack supplies `nlooks` from the actual interferogram looks and
+`StackConfig.nlooks_divisor` when `SnaphuConfig.nlooks` is omitted:
+
+$$
+n_{\mathrm{looks}} = N_{\mathrm{az}} N_{\mathrm{rg}} / d.
+$$
+
+The class default is `1.0` on `Stack` and `0.64` on `S1Stack` (the ISCE2 TOPS
+approximation). An explicit `nlooks` bypasses the divisor. Unwrap products
+record the effective `nlooks`, its source (`explicit`, `multilook_divisor`,
+or `default`), the divisor, and look factors as diagnostics outside method
+identity. The coefficient is an unwrap-only convention; changing it does
+not invalidate source, coreg, or IFG products.
+
+Each wrapper call owns a scratch directory under
+`<work_dir>/tmp/snaphu/snaphu-<pair>-<random>/` (or `snaphu-<random>/` without
+a Pair). FanInSAR deletes that directory after success and ordinary exception
+unwinding. Standalone calls without `work_dir` use `Path.cwd()`. Upstream
+SNAPHU does not accept workspace paths that contain whitespace; successful
+native runs must use a space-free WorkDir.
+
 ## Common mistakes
 
 - Treating unwrapping as noise removal or atmospheric correction.

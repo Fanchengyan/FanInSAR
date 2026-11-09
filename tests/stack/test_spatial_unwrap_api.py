@@ -122,7 +122,7 @@ def test_stack_unwrap_defaults_to_snaphu_without_running_external_backend(
 
     stack = _stack_with_ifg(tmp_path)
     default = inspect.signature(Stack.unwrap).parameters["unwrapper"].default
-    assert isinstance(default, Snaphu)
+    assert default is None
     dispatched: list[type[Snaphu]] = []
 
     def fake_unwrap(

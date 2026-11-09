@@ -80,6 +80,12 @@ UNSAVED_FIELDS = frozenset(
 # multi-track workspace root.  Look factors can differ per track; a leftover
 # root copy would silently override the track that actually formed products.
 TRACK_OWNED_SCIENCE_FIELDS = frozenset({"multilook"})
+# Unwrap-only science persisted on ``stack.json`` and recorded in
+# ``inputs/request.json``, but stripped from preparation identity
+# comparison. Changing these must not reject a workspace whose
+# ``inputs/request.json`` predates the field, or invalidate source
+# readiness after a live config mutation.
+PREPARATION_EXCLUDED_SCIENCE_FIELDS = frozenset({"nlooks_divisor"})
 
 SAVED_EXTRA_KEYS = frozenset(
     {

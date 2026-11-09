@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -45,6 +46,10 @@ class StackConfig:
     explicit ``GridSpec`` always wins over automatic ROI selection.
     ``coreg_mode`` is ``"geometry"`` or ``"nesd"`` (default ``"geometry"``).
     ``swaths=None`` and ``bursts=None`` select every sub-swath and burst.
+    ``nlooks_divisor`` is an inheritance sentinel: ``None`` means the
+    concrete Stack class default is installed at construction. The live
+    ``stack.config.nlooks_divisor`` is always a finite number greater
+    than zero.
     """
 
     work_dir: Path
@@ -54,6 +59,7 @@ class StackConfig:
     esd_coherence_threshold: float = 0.85
     ampcor_snr_threshold: float = 6.0
     multilook: tuple[int, int] = (5, 2)
+    nlooks_divisor: float | None = None
     goldstein_alpha: float = 0.5
     executor: str = "torch"
     device: str = "auto"
@@ -123,6 +129,19 @@ class StackConfig:
             reject(message, TypeError)
         ml = self.multilook
         self.multilook = (int(ml[0]), int(ml[1]))
+        if self.nlooks_divisor is not None:
+            try:
+                divisor = float(self.nlooks_divisor)
+            except (TypeError, ValueError):
+                divisor = float("nan")
+            if (
+                isinstance(self.nlooks_divisor, bool)
+                or not math.isfinite(divisor)
+                or divisor <= 0.0
+            ):
+                message = "nlooks_divisor must be a finite number greater than zero"
+                reject(message, ValueError)
+            self.nlooks_divisor = divisor
 
 
 def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:

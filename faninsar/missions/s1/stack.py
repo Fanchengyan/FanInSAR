@@ -7,7 +7,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import (
@@ -228,6 +228,7 @@ class S1Stack(Stack):
     search = staticmethod(search_acquisitions)
 
     _sensor_registry_key = "sentinel1"
+    _default_nlooks_divisor: ClassVar[float] = 0.64
 
     @classmethod
     def from_safes(
@@ -1324,6 +1325,14 @@ class S1Stack(Stack):
         if configured is not None:
             return Path(configured)
         return self.config.work_dir / "cache" / "geo-lut"
+
+    def _source_processing_identity(self, date_id: str) -> Mapping[str, object]:
+        """Bind the S1 scientific-validity revision into scene reuse identity."""
+        from faninsar.missions.s1.coregister import S1_SLC_VALIDITY_REVISION
+
+        identity = dict(super()._source_processing_identity(date_id))
+        identity["slc_validity_revision"] = S1_SLC_VALIDITY_REVISION
+        return identity
 
     def _prepare_reference_scene(
         self, *, overwrite: bool, polygon: int | None = None

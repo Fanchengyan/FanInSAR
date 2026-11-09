@@ -94,6 +94,37 @@ def _load_scene_payload(store: CoregisteredSceneStore) -> np.ndarray:
     return payload
 
 
+def _resolved_ion_snaphu(
+    stack: Stack,
+    *,
+    snaphu_config: SnaphuConfig | None,
+    grid_shape: tuple[int, int],
+    looks: tuple[int, int],
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve one effective SNAPHU config for the ion subband grid."""
+    from faninsar.processing.unwrapping.snaphu_backend import (
+        SnaphuConfig as BackendSnaphuConfig,
+    )
+    from faninsar.processing.unwrapping.snaphu_backend import (
+        _resolve_snaphu_config,
+        _snaphu_json_parameters,
+    )
+
+    azimuth_looks, range_looks = looks
+    height, width = int(grid_shape[0]), int(grid_shape[1])
+    shape = (max(1, height // azimuth_looks), max(1, width // range_looks))
+    budget = stack.config.resource_budget
+    process_limit = None if budget is None else budget.max_processes
+    resolved = _resolve_snaphu_config(
+        snaphu_config or BackendSnaphuConfig(),
+        shape=shape,
+        looks=looks,
+        nlooks_divisor=stack.config.nlooks_divisor,
+        process_limit=process_limit,
+    )
+    return resolved, _snaphu_json_parameters(resolved)
+
+
 def estimate_ionosphere(
     stack: Stack,
     *,
@@ -159,7 +190,8 @@ def estimate_ionosphere(
         device with ``auto`` resolved explicitly.
     overwrite : bool, optional
         Replace existing ion products. Without it a product bound to the
-        current scenes is reused and a stale one is rejected.
+        current scenes and the same effective SNAPHU settings is reused,
+        and a stale or differently configured product is rejected.
     degraded : bool, optional
         Mark every committed estimate degraded (requires a reason).
     degradation_reason : str, optional
@@ -199,6 +231,8 @@ def estimate_ionosphere(
     runtime_fingerprint = _runtime_identity(stack)
 
     stores: list[IonosphereArtifactStore] = []
+    resolved_snaphu = None
+    snaphu_parameters: dict[str, Any] | None = None
     for primary, secondary in _iter_pair_dates(pairs or stack.pairs):
         if primary not in stack.catalog.paths or secondary not in stack.catalog.paths:
             continue
@@ -206,6 +240,13 @@ def estimate_ionosphere(
         root = ion_dir(stack.config.work_dir, pair_id, ion_looks)
         primary_store = _scene_pair_store(stack, primary)
         secondary_store = _scene_pair_store(stack, secondary)
+        if unwrap_method == "snaphu" and snaphu_parameters is None:
+            resolved_snaphu, snaphu_parameters = _resolved_ion_snaphu(
+                stack,
+                snaphu_config=snaphu_config,
+                grid_shape=primary_store.grid_shape,
+                looks=ion_looks,
+            )
         if (root / "item.json").exists() and not overwrite:
             store = IonosphereArtifactStore.open(root)
             if store.pair != (primary, secondary):
@@ -219,6 +260,14 @@ def estimate_ionosphere(
                 reject_invalid_state(
                     f"ion product for {pair_id} is bound to replaced scenes; "
                     "pass overwrite=True to re-estimate it"
+                )
+            if (
+                unwrap_method == "snaphu"
+                and store.method_parameters.get("snaphu") != snaphu_parameters
+            ):
+                reject_invalid_state(
+                    f"ion product for {pair_id} was produced with different "
+                    "SNAPHU settings; pass overwrite=True to re-estimate it"
                 )
             stores.append(store)
             continue
@@ -278,10 +327,14 @@ def estimate_ionosphere(
                 else np.asarray(product.coherence, dtype=np.float32)
                 * np.asarray(valid_mask, dtype=np.float32),
                 method=unwrap_method,
-                snaphu_config=snaphu_config,
+                snaphu_config=(
+                    resolved_snaphu if unwrap_method == "snaphu" else snaphu_config
+                ),
                 irls_kwargs={"device": resolved_device}
                 if unwrap_method == "irls"
                 else None,
+                work_dir=(stack.config.work_dir if unwrap_method == "snaphu" else None),
+                _pair_id=pair_id if unwrap_method == "snaphu" else None,
             )
             for product in subband_products
         ]
@@ -337,6 +390,24 @@ def estimate_ionosphere(
             weights.to(dtype=torch.float32).cpu().numpy(),
             np.float32(0.0),
         ).astype(np.float32)
+        method_parameters: dict[str, Any] = {
+            "f0_hz": float(config.f0),
+            "freq_low_hz": float(config.freq_low),
+            "freq_high_hz": float(config.freq_high),
+            "low_offset_hz": float(split_low),
+            "high_offset_hz": float(split_high),
+            "range_sampling_rate_hz": float(range_sampling_rate_hz),
+            "window_function": config.window_function,
+            "window_shape": float(config.window_shape),
+            "alignment_strategy": config.alignment_strategy,
+            "coherence_threshold": float(config.coherence_threshold),
+            "looks": list(ion_looks),
+            "filter_sigma": [float(filter_sigma[0]), float(filter_sigma[1])],
+            "min_cluster_pixels": int(min_cluster_pixels),
+            "unwrap_method": str(unwrap_method),
+        }
+        if snaphu_parameters is not None:
+            method_parameters["snaphu"] = snaphu_parameters
         published = write_ionosphere_artifact(
             root,
             pair=(primary, secondary),
@@ -345,22 +416,7 @@ def estimate_ionosphere(
             wavelength_m=primary_store.wavelength_m,
             grid_identity=primary_store.grid_identity,
             method_name=IONOSPHERE_METHOD_NAME,
-            method_parameters={
-                "f0_hz": float(config.f0),
-                "freq_low_hz": float(config.freq_low),
-                "freq_high_hz": float(config.freq_high),
-                "low_offset_hz": float(split_low),
-                "high_offset_hz": float(split_high),
-                "range_sampling_rate_hz": float(range_sampling_rate_hz),
-                "window_function": config.window_function,
-                "window_shape": float(config.window_shape),
-                "alignment_strategy": config.alignment_strategy,
-                "coherence_threshold": float(config.coherence_threshold),
-                "looks": list(ion_looks),
-                "filter_sigma": [float(filter_sigma[0]), float(filter_sigma[1])],
-                "min_cluster_pixels": int(min_cluster_pixels),
-                "unwrap_method": str(unwrap_method),
-            },
+            method_parameters=method_parameters,
             degraded=degraded,
             degradation_reason=degradation_reason,
             runtime_fingerprint=runtime_fingerprint,
@@ -375,6 +431,7 @@ def estimate_ionosphere(
             replace_existing=overwrite,
         )
         stores.append(published)
+    stack._persist_nlooks_divisor()
     return stores
 
 

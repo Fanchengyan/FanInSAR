@@ -162,7 +162,6 @@ def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
 
 
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
-_DEFAULT_UNWRAPPER = Snaphu()
 
 
 def _phase_filter_metadata(  # noqa: PLR0911
@@ -992,6 +991,7 @@ class Stack(NetworkContract, ABC):
     """
 
     _sensor_registry_key: ClassVar[str | None] = None
+    _default_nlooks_divisor: ClassVar[float] = 1.0
     _selection_facts_cache: tuple[AcquisitionFacts, ...] | None = field(
         default=None, init=False, repr=False
     )
@@ -1049,6 +1049,11 @@ class Stack(NetworkContract, ABC):
                 setattr(self, item.name, item.default_factory())
             elif item.default is not MISSING:
                 setattr(self, item.name, deepcopy(item.default))
+        if config.nlooks_divisor is None:
+            config = replace(
+                config,
+                nlooks_divisor=float(type(self)._default_nlooks_divisor),
+            )
         self.config = config
         self._request_config = replace(config, extra=dict(config.extra))
         self.request = freeze({})
@@ -2732,6 +2737,7 @@ class Stack(NetworkContract, ABC):
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (5, 2),
         goldstein_alpha: float = 0.5,
+        nlooks_divisor: float | None = None,
         esd_coherence_threshold: float = 0.85,
         ampcor_snr_threshold: float = 6.0,
         swaths: tuple[str, ...] | None = None,
@@ -2758,6 +2764,7 @@ class Stack(NetworkContract, ABC):
             esd_coherence_threshold=esd_coherence_threshold,
             ampcor_snr_threshold=ampcor_snr_threshold,
             multilook=multilook,
+            nlooks_divisor=nlooks_divisor,
             goldstein_alpha=goldstein_alpha,
             executor=executor,
             device=device,
@@ -4522,6 +4529,19 @@ class Stack(NetworkContract, ABC):
 
         save_stack_identity(self)
 
+    def _persist_nlooks_divisor(self) -> None:
+        """Write the live unwrap coefficient into ``stack.json``.
+
+        Called after a successful unwrap or ionosphere estimate. A mutable
+        ``StackConfig.nlooks_divisor`` change is the normal seam before those
+        stages. Without this write, reopen would restore the previous number
+        and reuse would disagree with the products just written. Source and
+        coregistration identity are unchanged.
+        """
+        from faninsar.stack.identity import save_stack_identity
+
+        save_stack_identity(self)
+
     @_reclaim_after_stage
     def form_interferograms(
         self,
@@ -5103,7 +5123,7 @@ class Stack(NetworkContract, ABC):
     @_reclaim_after_stage
     def unwrap(
         self,
-        unwrapper: SpatialUnwrapper = _DEFAULT_UNWRAPPER,
+        unwrapper: SpatialUnwrapper | None = None,
         *,
         overwrite: bool = False,
     ) -> Self:
@@ -5117,14 +5137,14 @@ class Stack(NetworkContract, ABC):
 
         Parameters
         ----------
-        unwrapper : SpatialUnwrapper, default=Snaphu()
-            Trusted runtime strategy for one pair.  The default is the
-            production SNAPHU backend.  ``SpatialIRLS`` remains available as
-            an explicit developer/experimental strategy.  The strategy
-            receives Torch tensors in ``(azimuth, range)`` order.  Its result
-            must be a same-shape, same-device :class:`SpatialUnwrapResult`
-            whose valid output is finite and is a subset of the Dataset
-            support.
+        unwrapper : SpatialUnwrapper, optional
+            Trusted runtime strategy for one pair.  ``None`` builds a fresh
+            :class:`~faninsar.processing.unwrapping.snaphu_backend.Snaphu`
+            for this call.  ``SpatialIRLS`` remains available as an explicit
+            developer/experimental strategy.  The strategy receives Torch
+            tensors in ``(azimuth, range)`` order.  Its result must be a
+            same-shape, same-device :class:`SpatialUnwrapResult` whose valid
+            output is finite and is a subset of the Dataset support.
         overwrite : bool, default=False
             Recompute every Pair. Without it a Pair whose unwrap product is
             bound to the current IFG with the same method and mask is reused,
@@ -5185,6 +5205,8 @@ class Stack(NetworkContract, ABC):
             UnwrapFailedError,
         )
 
+        if unwrapper is None:
+            unwrapper = Snaphu()
         if not isinstance(unwrapper, SpatialUnwrapper):
             message = "unwrapper must be a SpatialUnwrapper"
             reject(message, TypeError, logger=logger)
@@ -5198,6 +5220,25 @@ class Stack(NetworkContract, ABC):
             f"{primary}_{secondary}" for primary, secondary in expected_pairs
         )
         stores = self._pair_artifact_stores(looks=self.config.multilook)
+        requested_snaphu = unwrapper.config if type(unwrapper) is Snaphu else None
+        unwrapper = _bound_stack_unwrapper(
+            self,
+            unwrapper,
+            shape=stores[0].shape,
+            looks=stores[0].looks,
+        )
+        nlooks_record = None
+        if requested_snaphu is not None:
+            from faninsar.processing.unwrapping.snaphu_backend import (
+                _nlooks_diagnostics,
+            )
+
+            nlooks_record = _nlooks_diagnostics(
+                requested_snaphu,
+                looks=stores[0].looks,
+                nlooks_divisor=self.config.nlooks_divisor,
+                nlooks=float(unwrapper.config.nlooks),
+            )
         device = parse_device(self.config.device)
         method_name, method_parameters = _unwrapper_metadata(unwrapper)
         failed_result: SpatialUnwrapResult | None = None
@@ -5225,6 +5266,9 @@ class Stack(NetworkContract, ABC):
             "faninsar:mask_plan_identity": mask_plan_identity,
             "faninsar:mask_identity": mask_identity,
         }
+        unwrap_properties = dict(lineage)
+        if nlooks_record is not None:
+            unwrap_properties["faninsar:nlooks"] = nlooks_record
         try:
             for pair_id, store in zip(pair_ids, stores, strict=True):
                 if (store.unwrap_root / "item.json").is_file() and not overwrite:
@@ -5309,6 +5353,8 @@ class Stack(NetworkContract, ABC):
                                 ),
                             )
                     try:
+                        if type(unwrapper) is Snaphu:
+                            unwrapper._pair_id = pair_id
                         result = unwrapper.unwrap(
                             wrapped_phase,
                             coherence=coherence,
@@ -5385,7 +5431,7 @@ class Stack(NetworkContract, ABC):
                         .cpu()
                         .numpy(),
                     },
-                    properties=lineage,
+                    properties=unwrap_properties,
                     replace_existing=overwrite,
                 )
         except (
@@ -5404,6 +5450,7 @@ class Stack(NetworkContract, ABC):
             # rebuilt only from a complete set.
             self._clear_network()
         self._refresh_network()
+        self._persist_nlooks_divisor()
         return self
 
     @_reclaim_after_stage
@@ -5741,6 +5788,35 @@ def _canonical_pair_strings(values: tuple[str, str]) -> tuple[str, str]:
     except (TypeError, ValueError):
         reject_invalid_state(f"Stack IFG artifact has an invalid Pair: {values!r}")
     return pair.primary_string(), pair.secondary_string()
+
+
+def _bound_stack_unwrapper(
+    stack: Stack,
+    unwrapper: object,
+    *,
+    shape: tuple[int, int],
+    looks: tuple[int, int],
+) -> object:
+    """Return a WorkDir-bound built-in SNAPHU invocation, or ``unwrapper``.
+
+    Exact :class:`Snaphu` instances are replaced with a fresh object that
+    carries the resolved config and owning WorkDir. Subclasses and other
+    strategies are returned unchanged.
+    """
+    from faninsar.processing.unwrapping.snaphu_backend import _resolve_snaphu_config
+
+    if type(unwrapper) is not Snaphu:
+        return unwrapper
+    budget = stack.config.resource_budget
+    process_limit = None if budget is None else budget.max_processes
+    resolved = _resolve_snaphu_config(
+        unwrapper.config,
+        shape=shape,
+        looks=looks,
+        nlooks_divisor=stack.config.nlooks_divisor,
+        process_limit=process_limit,
+    )
+    return Snaphu(resolved, work_dir=stack.config.work_dir)
 
 
 def _unwrapper_metadata(unwrapper: object) -> tuple[str, dict[str, Any]]:

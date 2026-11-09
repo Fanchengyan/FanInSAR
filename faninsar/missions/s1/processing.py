@@ -34,7 +34,6 @@ from faninsar.processing.coregistration import (
     geometry_offset_window_extent,
     refine_shift_with_correlation,
     resample_complex,
-    resample_complex_deramped_reramp,
     resolve_ampcor_policy,
 )
 from faninsar.processing.coregistration.tops.carrier import carrier_from_swath
@@ -340,6 +339,32 @@ def _conform_to_shape(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     conformed = np.zeros(shape, dtype=values.dtype)
     conformed[:rows, :cols] = values[:rows, :cols]
     return conformed
+
+
+def _secondary_source_valid(
+    state: ProductionPairState, shape: tuple[int, int]
+) -> np.ndarray:
+    """Return the secondary native mask conformed to the resampled operand shape."""
+    mask = getattr(state.secondary.array, "valid_mask", None)
+    if mask is None:
+        return np.ones(shape, dtype=bool)
+    valid = np.asarray(mask, dtype=bool)
+    if valid.shape != shape:
+        valid = _conform_to_shape(valid, shape)
+    return valid
+
+
+def _finite_complex_mask(values: np.ndarray) -> np.ndarray:
+    """Return True where both real and imaginary parts are finite."""
+    samples = np.asarray(values)
+    return np.isfinite(samples.real) & np.isfinite(samples.imag)
+
+
+def _invalidate_complex(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Write complex NaN outside ``valid``."""
+    return np.where(valid, values, np.complex64(np.nan + 1j * np.nan)).astype(
+        np.complex64, copy=False
+    )
 
 
 def reference_window_crop(
@@ -702,6 +727,7 @@ class ProductionPairState:
     esd_azimuth_shift_px: float | None = None
     amplitude_residual_rg_px: float | None = None
     secondary_aligned: np.ndarray | None = None
+    secondary_aligned_valid: np.ndarray | None = None
     secondary_aligned_is_flattened: bool = False
     range_offset_flatten_phase: np.ndarray | None = None
     complex: np.ndarray | None = None
@@ -1478,6 +1504,7 @@ def stage_coregister(
         sec = _conform_to_shape(sec, ref.shape)
         state.secondary_deramped = sec
         state.note(f"COREG conformed secondary to reference shape {ref.shape}")
+    sec_valid = _secondary_source_valid(state, sec.shape)
 
     if prepared_geometry_field is not None:
         if coregistration_grid != "radar":
@@ -1545,11 +1572,13 @@ def stage_coregister(
     )
     ref_full = ref
     sec_full = sec
+    sec_valid_full = sec_valid
     growth_attempts = 0
     if prepared_geometry_field is not None:
         cr0, cr1, cc0, cc1 = prepared_geometry_field.crop_bounds
         ref = ref_full[cr0:cr1, cc0:cc1]
         sec = sec_full[cr0:cr1, cc0:cc1]
+        sec_valid = sec_valid_full[cr0:cr1, cc0:cc1]
         window = None
         window_origin = (cr0, cc0)
         state.primary_deramped = ref
@@ -1566,6 +1595,7 @@ def stage_coregister(
             cr0, cr1, cc0, cc1 = crop_bounds
             ref = ref_full[cr0:cr1, cc0:cc1]
             sec = sec_full[cr0:cr1, cc0:cc1]
+            sec_valid = sec_valid_full[cr0:cr1, cc0:cc1]
             window_origin = (cr0, cc0)
             state.primary_deramped = ref
             state.secondary_deramped = sec
@@ -1734,6 +1764,7 @@ def stage_coregister(
             state.radar_roi_origin = None
             ref = ref_full
             sec = sec_full
+            sec_valid = sec_valid_full
             state.primary_deramped = ref
             state.secondary_deramped = sec
             continue
@@ -1830,16 +1861,26 @@ def stage_coregister(
                 sec,
                 secondary_carrier=state.secondary.carrier,
                 reference_lut=lut,
-                reference_valid=reference_geo_valid,
+                reference_valid=np.asarray(lut.valid, dtype=bool),
                 offsets=offsets,
                 output_dir=work_directory / "slc",
                 row_chunk=geo_chunk_size,
                 device=resolved_torch_device,
                 dask_client=dask_client,
                 watchdog=memory_watchdog,
+                source_valid=sec_valid,
             )
             reference_geo = None
         else:
+            reference_source_valid = None
+            if state.primary.array.valid_mask is not None:
+                reference_source_valid = np.asarray(
+                    state.primary.array.valid_mask, dtype=bool
+                )
+                if reference_source_valid.shape != ref.shape:
+                    reference_source_valid = _conform_to_shape(
+                        reference_source_valid, ref.shape
+                    )
             reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
                 ref,
                 sec,
@@ -1852,6 +1893,8 @@ def stage_coregister(
                 device=resolved_torch_device,
                 dask_client=dask_client,
                 watchdog=memory_watchdog,
+                reference_source_valid=reference_source_valid,
+                secondary_source_valid=sec_valid,
             )
         state.coregistration_timings_s["geo_slc_resample"] = _clock_stop(
             device, substage_started
@@ -1889,6 +1932,7 @@ def stage_coregister(
         state.primary_deramped = reference_geo
         state.secondary_deramped = None
         state.secondary_aligned = secondary_geo
+        state.secondary_aligned_valid = _own_geo_valid_mask(valid)
         state.geo2rdr_lut = lut
         state.geo_grid = geo_grid
         state.topo_phase = topo_phase
@@ -1938,8 +1982,14 @@ def stage_coregister(
 
     substage_started = _clock_start(device)
     secondary_input = state.secondary_deramped
-    sec_resamp = resample_complex_deramped_reramp(
+    from faninsar.processing.coregistration.offsets import (
+        _resample_complex_deramped_reramp_with_validity,
+    )
+
+    source_valid = sec_valid & _finite_complex_mask(sec)
+    sec_resamp, sec_resamp_valid = _resample_complex_deramped_reramp_with_validity(
         sec,
+        source_valid,
         secondary_carrier=state.secondary.carrier,
         range_offset_px=offsets.range_offset_px,
         azimuth_offset_px=offsets.azimuth_offset_px,
@@ -1967,6 +2017,8 @@ def stage_coregister(
         resolved_torch_device,
         dask_client,
     ).astype(np.complex64, copy=False)
+    sec_resamp_valid = sec_resamp_valid & _finite_complex_mask(sec_resamp)
+    sec_resamp = _invalidate_complex(sec_resamp, sec_resamp_valid)
     state.coregistration_timings_s["radar_range_flatten"] = _clock_stop(
         device, flatten_started
     )
@@ -2011,6 +2063,7 @@ def stage_coregister(
         )
     state.coregistration_timings_s["radar_reramp"] = _clock_stop(device, reramp_started)
     state.secondary_aligned = sec_resamp
+    state.secondary_aligned_valid = np.asarray(sec_resamp_valid, dtype=bool)
     radar_offset_digest: str | None = None
     radar_range_phase_digest: str | None = None
     if state.record_scientific_lineage:
@@ -2430,6 +2483,7 @@ def stage_unwrap(
     method: UnwrapBackend = "snaphu",
     config: SnaphuConfig | None = None,
     irls_kwargs: dict[str, Any] | None = None,
+    work_dir: str | Path | None = None,
 ) -> ProductionPairState:
     """Unwrap the flattened interferogram with the selected backend.
 
@@ -2443,6 +2497,9 @@ def stage_unwrap(
         SNAPHU configuration when ``method="snaphu"``.
     irls_kwargs : dict, optional
         Arguments forwarded to the IRLS backend.
+    work_dir : str or pathlib.Path, optional
+        Workspace for SNAPHU invocation scratch. ``None`` uses
+        :func:`pathlib.Path.cwd`.
 
     Returns
     -------
@@ -2462,6 +2519,7 @@ def stage_unwrap(
         method=method,
         snaphu_config=config,
         irls_kwargs=irls_kwargs,
+        work_dir=work_dir,
     )
     state.unwrapped_phase = result.phase.detach().cpu().numpy()
     state.connected_components = result.component_labels.detach().cpu().numpy()

@@ -204,13 +204,39 @@ def atomic_json(path: Path, document: dict[str, Any]) -> None:
         os.close(directory)
 
 
+def _preparation_identity(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a request document with unwrap-only science stripped.
+
+    Legacy ``inputs/request.json`` files omit ``nlooks_divisor``. Newer
+    snapshots must compare equal to those files so a coefficient-only
+    change cannot reject ``prepare_data``.
+    """
+    from faninsar.stack.identity import PREPARATION_EXCLUDED_SCIENCE_FIELDS
+
+    payload = copy.deepcopy(dict(document))
+    science = payload.get("science")
+    if isinstance(science, dict):
+        for name in PREPARATION_EXCLUDED_SCIENCE_FIELDS:
+            science.pop(name, None)
+    return payload
+
+
 def request_document(stack: Stack) -> dict[str, Any]:
-    """Validate and encode the captured science and mission source request."""
+    """Validate and encode the captured science and mission source request.
+
+    ``_request_config`` is the immutable construction snapshot. The live
+    unwrap coefficient is overlaid onto a copy so request-only reopen
+    keeps the current numeric divisor without mutating the snapshot.
+    """
     from faninsar.stack.identity import UNSAVED_FIELDS, encode_value
 
+    snapshot = replace(
+        stack._request_config,
+        nlooks_divisor=stack.config.nlooks_divisor,
+    )
     science = {
-        item.name: encode_value(getattr(stack._request_config, item.name))
-        for item in fields(stack._request_config)
+        item.name: encode_value(getattr(snapshot, item.name))
+        for item in fields(snapshot)
         if item.name not in UNSAVED_FIELDS and item.name != "work_dir"
     }
     from faninsar.remote.records import _sanitize
@@ -221,7 +247,7 @@ def request_document(stack: Stack) -> dict[str, Any]:
             "mission": type(stack).__name__,
             "source": encode_value(thaw(stack.request)),
             "science": science,
-            "extra": encode_value(stack._request_config.extra),
+            "extra": encode_value(snapshot.extra),
         }
     )
 
@@ -295,7 +321,9 @@ def _prepare_stack_data(
     root = stack.config.work_dir
     with writer_guard(root):
         request_path = root / "inputs" / "request.json"
-        if request_path.exists() and json.loads(request_path.read_text()) != document:
+        if request_path.exists() and _preparation_identity(
+            json.loads(request_path.read_text())
+        ) != _preparation_identity(document):
             message = (
                 "workspace holds a different preparation request; "
                 "choose a different work_dir"
@@ -394,7 +422,9 @@ def _prepare_stack_data(
         if any(entry["kind"] == "dem" for entry in unavailable.values()):
             candidate._dem_wgs84 = None
         candidate.config = replace(
-            stack._request_config, extra=thaw(freeze(stack._request_config.extra))
+            stack._request_config,
+            nlooks_divisor=stack.config.nlooks_divisor,
+            extra=thaw(freeze(stack._request_config.extra)),
         )
         candidate.config.extra.update(thaw(inputs.extra))
         if stack._inputs_state is not None:

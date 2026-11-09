@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import math
+import os
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from importlib import import_module
 from importlib.util import find_spec
-from typing import Any, Literal
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -18,9 +24,16 @@ from faninsar.processing.unwrapping.common import (
 )
 from faninsar.processing.unwrapping.errors import NoValidSupportError
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 logger = setup_logger(__name__)
 
 SnaphuCostMode = Literal["defo", "smooth"]
+
+_AUTO_TILE_SIZE = 2048
+_AUTO_TILE_OVERLAP = 64
+_AUTO_MAX_PROCESSES = 4
 
 
 class SnaphuNotAvailableError(ProcessingContractError):
@@ -29,12 +42,236 @@ class SnaphuNotAvailableError(ProcessingContractError):
 
 @dataclass(frozen=True, slots=True)
 class SnaphuConfig:
-    """Typed configuration for the snaphu-py backend."""
+    """Typed configuration for the snaphu-py backend.
+
+    ``None`` on ``nlooks``, ``ntiles``, ``nproc``, or ``tile_overlap`` means
+    the value is unresolved and is filled for one invocation from the image
+    shape, interferogram looks, and Stack divisor. Explicit zeros and
+    nonpositive ``nproc`` are preserved. New fields are keyword-only so
+    ``SnaphuConfig("defo", 10.0, (2, 2), -1)`` still means ``nproc=-1``.
+
+    Parameters
+    ----------
+    cost : {"defo", "smooth"}, optional
+        SNAPHU statistical-cost mode. Default ``"defo"``.
+    nlooks : float, optional
+        Effective number of looks forwarded to SNAPHU. ``None`` is resolved
+        from interferogram looks and ``nlooks_divisor``, or ``1.0`` for a
+        standalone array call without look metadata.
+    ntiles : tuple of int, optional
+        Tile counts ``(azimuth, range)``. ``None`` uses tiles of 2048
+        samples. Explicit ``(1, 1)`` disables tiling.
+    nproc : int, optional
+        Process count. ``None`` uses a bounded automatic rule. Explicit
+        nonpositive values keep snaphu-py's all-CPU meaning.
+    tile_overlap : int or tuple of int, optional
+        Tile overlap in samples. A scalar is applied to both axes.
+        ``None`` uses 64 samples on tiled axes and zero on untiled axes.
+        Explicit zero is preserved. Keyword-only.
+    single_tile_reoptimize : bool, optional
+        Forwarded to snaphu-py. Default ``True``. Keyword-only.
+
+    """
 
     cost: SnaphuCostMode = "defo"
-    nlooks: float = 1.0
-    ntiles: tuple[int, int] = (1, 1)
-    nproc: int = 1
+    nlooks: float | None = None
+    ntiles: tuple[int, int] | None = None
+    nproc: int | None = None
+    tile_overlap: int | tuple[int, int] | None = field(default=None, kw_only=True)
+    single_tile_reoptimize: bool = field(default=True, kw_only=True)
+
+
+def _require_positive_finite(value: object, name: str) -> float:
+    """Return ``value`` as a finite number strictly greater than zero."""
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = float("nan")
+    if isinstance(value, bool) or not math.isfinite(number) or number <= 0.0:
+        reject(f"{name} must be a finite number greater than zero", ValueError)
+    return number
+
+
+def _require_int(value: object, name: str) -> int:
+    """Return a non-bool integer."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        reject(f"{name} must be an integer", ValueError)
+    return int(value)
+
+
+def _as_tile_pair(value: object, *, name: str) -> tuple[int, int]:
+    """Normalize an int or length-2 sequence into a pair of integers."""
+    if isinstance(value, bool):
+        reject(f"{name} must be an int or a pair of ints", ValueError)
+    if isinstance(value, int):
+        item = int(value)
+        return item, item
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return _require_int(value[0], name), _require_int(value[1], name)
+    return reject(f"{name} must be an int or a pair of ints", ValueError)
+
+
+def _resolve_nlooks(
+    config: SnaphuConfig,
+    *,
+    looks: tuple[int, int] | None,
+    nlooks_divisor: float | None,
+) -> float:
+    """Return the SNAPHU ``nlooks`` argument for one invocation."""
+    if config.nlooks is not None:
+        nlooks = float(config.nlooks)
+    elif looks is not None:
+        divisor = _require_positive_finite(nlooks_divisor, "nlooks_divisor")
+        nlooks = float(int(looks[0]) * int(looks[1])) / divisor
+    else:
+        nlooks = 1.0
+    if not math.isfinite(nlooks) or nlooks < 1.0:
+        reject("resolved SNAPHU nlooks must be finite and at least 1", ValueError)
+    return nlooks
+
+
+def _nlooks_diagnostics(
+    config: SnaphuConfig,
+    *,
+    looks: tuple[int, int] | None,
+    nlooks_divisor: float | None,
+    nlooks: float,
+) -> dict[str, Any]:
+    """Return unwrap-product diagnostics for the nlooks resolution path.
+
+    These fields are recorded on the unwrap Item, not in compared method
+    identity. An explicit ``SnaphuConfig.nlooks`` bypasses the divisor for
+    reuse while still recording the applicable coefficient and looks.
+    """
+    if config.nlooks is not None:
+        source: Literal["explicit", "multilook_divisor", "default"] = "explicit"
+    elif looks is not None:
+        source = "multilook_divisor"
+    else:
+        source = "default"
+    payload: dict[str, Any] = {
+        "nlooks": float(nlooks),
+        "source": source,
+        "nlooks_divisor": (None if nlooks_divisor is None else float(nlooks_divisor)),
+        "looks": None if looks is None else [int(looks[0]), int(looks[1])],
+    }
+    return json.loads(json.dumps(payload, allow_nan=False))
+
+
+def _nominal_tile_extent(length: int, n_tiles: int) -> int:
+    """Return the nominal extent of one tile along an axis."""
+    return max(1, math.ceil(length / n_tiles))
+
+
+def _capped_overlap(overlap: int, extent: int) -> int:
+    """Cap overlap strictly below half of ``extent``."""
+    limit = max(0, (extent - 1) // 2)
+    return min(overlap, limit)
+
+
+def _resolve_snaphu_config(
+    config: SnaphuConfig,
+    *,
+    shape: tuple[int, int],
+    looks: tuple[int, int] | None = None,
+    nlooks_divisor: float | None = None,
+    process_limit: int | None = None,
+) -> SnaphuConfig:
+    """Fill unresolved SNAPHU execution fields for one image shape.
+
+    Only ``None`` fields are resolved. Explicit ``ntiles=(1, 1)``, overlap
+    ``0``, and nonpositive ``nproc`` are forwarded unchanged. Automatic
+    overlap is zero on untiled axes and capped below half the nominal tile
+    extent; explicit overlap is a nonnegative pair with no invented half
+    bound. Automatic ``nproc`` is at least one and at most the tile count,
+    CPU count, the private cap, and ``process_limit`` when supplied. The
+    2048/64/4 tile rule is a modest heuristic, not a runtime or memory
+    guarantee.
+    """
+    if len(shape) != 2 or any(int(axis) < 1 for axis in shape):
+        reject("SNAPHU input shape must be two positive integers", ValueError)
+    height, width = int(shape[0]), int(shape[1])
+    nlooks = _resolve_nlooks(config, looks=looks, nlooks_divisor=nlooks_divisor)
+
+    if config.ntiles is None:
+        tile_size = _AUTO_TILE_SIZE
+        ntiles = (
+            max(1, math.ceil(height / tile_size)),
+            max(1, math.ceil(width / tile_size)),
+        )
+    else:
+        ntiles = _as_tile_pair(config.ntiles, name="ntiles")
+        if ntiles[0] < 1 or ntiles[1] < 1:
+            reject("ntiles values must be at least 1", ValueError)
+        if ntiles[0] > height or ntiles[1] > width:
+            reject("ntiles cannot exceed the image shape", ValueError)
+
+    if config.tile_overlap is None:
+        overlap_az = 0 if ntiles[0] == 1 else _AUTO_TILE_OVERLAP
+        overlap_rg = 0 if ntiles[1] == 1 else _AUTO_TILE_OVERLAP
+        tile_overlap = (
+            _capped_overlap(overlap_az, _nominal_tile_extent(height, ntiles[0])),
+            _capped_overlap(overlap_rg, _nominal_tile_extent(width, ntiles[1])),
+        )
+    else:
+        tile_overlap = _as_tile_pair(config.tile_overlap, name="tile_overlap")
+        if tile_overlap[0] < 0 or tile_overlap[1] < 0:
+            reject("tile_overlap values must be non-negative", ValueError)
+
+    if config.nproc is None:
+        tile_count = ntiles[0] * ntiles[1]
+        if tile_count == 1:
+            nproc = 1
+        else:
+            cpus = os.cpu_count() or 1
+            caps = [tile_count, int(cpus), _AUTO_MAX_PROCESSES]
+            if process_limit is not None:
+                caps.append(_require_int(process_limit, "process_limit"))
+            nproc = max(1, min(caps))
+    else:
+        nproc = _require_int(config.nproc, "nproc")
+
+    if not isinstance(config.single_tile_reoptimize, bool):
+        reject("single_tile_reoptimize must be a bool", ValueError)
+
+    return replace(
+        config,
+        nlooks=nlooks,
+        ntiles=ntiles,
+        nproc=nproc,
+        tile_overlap=tile_overlap,
+        single_tile_reoptimize=bool(config.single_tile_reoptimize),
+    )
+
+
+def _snaphu_json_parameters(config: SnaphuConfig) -> dict[str, Any]:
+    """Return strict-JSON method parameters for an effective SNAPHU config."""
+    return json.loads(json.dumps(asdict(config), allow_nan=False))
+
+
+def _pair_prefix_token(pair_id: str | None) -> str:
+    """Return a filesystem-safe Pair token, or empty when none is supplied."""
+    if pair_id is None or pair_id == "":
+        return ""
+    return Path(str(pair_id).replace("\\", "/")).name
+
+
+@contextmanager
+def _snaphu_scratch_directory(work_dir: Path, pair_id: str | None) -> Iterator[str]:
+    """Yield one invocation-owned scratch directory under ``work_dir/tmp/snaphu``."""
+    scratch_root = Path(work_dir) / "tmp" / "snaphu"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    token = _pair_prefix_token(pair_id)
+    prefix = "snaphu-" if not token else f"snaphu-{token}-"
+    scratch = TemporaryDirectory(dir=scratch_root, prefix=prefix)
+    try:
+        yield scratch.name
+    finally:
+        try:
+            scratch.cleanup()
+        except Exception:
+            logger.exception("SNAPHU scratch cleanup failed for %s", scratch.name)
+            raise
 
 
 class Snaphu(SpatialUnwrapper):
@@ -44,18 +281,30 @@ class Snaphu(SpatialUnwrapper):
     ----------
     config : SnaphuConfig, optional
         Typed configuration passed to ``snaphu-py``.
+    work_dir : str or pathlib.Path, optional
+        Workspace used for invocation-owned scratch. ``None`` uses
+        :func:`pathlib.Path.cwd`.
 
     Notes
     -----
     The adapter accepts Torch tensors and performs the only NumPy boundary in
     this strategy around the external SNAPHU package. It never falls back to
     another unwrapper. Input tensors are returned on their original device.
+    ``work_dir`` and the private Pair prefix are execution context, not
+    scientific method identity.
 
     """
 
-    def __init__(self, config: SnaphuConfig | None = None) -> None:
-        """Store the explicit SNAPHU configuration."""
+    def __init__(
+        self,
+        config: SnaphuConfig | None = None,
+        *,
+        work_dir: str | Path | None = None,
+    ) -> None:
+        """Store the explicit SNAPHU configuration and scratch workspace."""
         self.config = config or SnaphuConfig()
+        self._work_dir = None if work_dir is None else Path(work_dir)
+        self._pair_id: str | None = None
 
     def unwrap(
         self,
@@ -87,7 +336,7 @@ class Snaphu(SpatialUnwrapper):
         SnaphuNotAvailableError
             If the external SNAPHU package is unavailable.
         ValueError
-            If tensor inputs violate the spatial contract.
+            If tensor inputs or SNAPHU configuration violate the contract.
 
         """
         import torch
@@ -111,11 +360,17 @@ class Snaphu(SpatialUnwrapper):
         phase = torch.remainder(wrapped_phase + torch.pi, 2 * torch.pi) - torch.pi
         if coherence is None:
             coherence = backend_coherence
+        resolved = _resolve_snaphu_config(
+            self.config,
+            shape=(int(wrapped_phase.shape[0]), int(wrapped_phase.shape[1])),
+        )
         try:
             backend_phase, _backend_components = _snaphu_numpy(
                 torch.exp(1j * torch.nan_to_num(phase)).detach().cpu().numpy(),
                 backend_coherence.detach().cpu().numpy(),
-                config=self.config,
+                config=resolved,
+                work_dir=self._work_dir,
+                pair_id=self._pair_id,
             )
         except SnaphuNotAvailableError:
             raise
@@ -290,6 +545,8 @@ def _snaphu_numpy(
     coherence: np.ndarray,
     *,
     config: SnaphuConfig | None = None,
+    work_dir: str | Path | None = None,
+    pair_id: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     r"""Unwrap a complex interferogram with the snaphu-py API.
 
@@ -301,6 +558,11 @@ def _snaphu_numpy(
         Coherence in ``[0, 1]`` matching the interferogram shape.
     config : SnaphuConfig, optional
         Typed snaphu configuration.
+    work_dir : str or pathlib.Path, optional
+        Workspace for invocation scratch. ``None`` uses the current working
+        directory.
+    pair_id : str, optional
+        Private library-normalized Pair token used only in the scratch prefix.
 
     Raises
     ------
@@ -320,16 +582,27 @@ def _snaphu_numpy(
     if coherence.shape != complex_ifg.shape:
         reject_invalid_state("coherence must match the interferogram shape")
 
-    cfg = config or SnaphuConfig()
+    cfg = _resolve_snaphu_config(
+        config or SnaphuConfig(),
+        shape=(int(complex_ifg.shape[0]), int(complex_ifg.shape[1])),
+    )
+    nlooks = cfg.nlooks
+    ntiles = cfg.ntiles
+    nproc = cfg.nproc
+    tile_overlap = cfg.tile_overlap
+    if nlooks is None or ntiles is None or nproc is None or tile_overlap is None:
+        reject("internal SNAPHU config resolution left a field unset", RuntimeError)
     snaphu = require_snaphu()
     capability = snaphu_capability()
 
-    # snaphu-py public API: snaphu.unwrap(igram, corr, nlooks=..., cost=...)
     kwargs: dict[str, Any] = {
-        "nlooks": float(cfg.nlooks),
+        "nlooks": float(nlooks),
         "cost": cfg.cost,
-        "nproc": int(cfg.nproc),
-        "ntiles": (int(cfg.ntiles[0]), int(cfg.ntiles[1])),
+        "nproc": int(nproc),
+        "ntiles": (int(ntiles[0]), int(ntiles[1])),
+        "tile_overlap": (int(tile_overlap[0]), int(tile_overlap[1])),
+        "single_tile_reoptimize": bool(cfg.single_tile_reoptimize),
+        "delete_scratch": False,
     }
     valid = (
         np.isfinite(complex_ifg.real)
@@ -345,15 +618,18 @@ def _snaphu_numpy(
         capability.bundled_snaphu_version,
         cfg.cost,
     )
-    unwrapped, conncomp = snaphu.unwrap(
-        np.asarray(complex_ifg),
-        np.asarray(coherence, dtype=np.float32),
-        **kwargs,
-    )
-    return (
-        np.asarray(unwrapped, dtype=np.float32),
-        np.asarray(conncomp, dtype=np.int32),
-    )
+    resolved_work_dir = Path.cwd() if work_dir is None else Path(work_dir)
+    with _snaphu_scratch_directory(resolved_work_dir, pair_id) as scratchdir:
+        unwrapped, conncomp = snaphu.unwrap(
+            np.asarray(complex_ifg),
+            np.asarray(coherence, dtype=np.float32),
+            scratchdir=scratchdir,
+            **kwargs,
+        )
+        return (
+            np.asarray(unwrapped, dtype=np.float32),
+            np.asarray(conncomp, dtype=np.int32),
+        )
 
 
 def snaphu_unwrap(
@@ -361,6 +637,8 @@ def snaphu_unwrap(
     coherence: np.ndarray,
     *,
     config: SnaphuConfig | None = None,
+    work_dir: str | Path | None = None,
+    _pair_id: str | None = None,
 ) -> SpatialUnwrapResult:
     """Unwrap a complex interferogram and return the spatial result contract.
 
@@ -372,6 +650,9 @@ def snaphu_unwrap(
         Coherence in ``[0, 1]`` matching ``complex_ifg``.
     config : SnaphuConfig, optional
         Explicit SNAPHU configuration.
+    work_dir : str or pathlib.Path, optional
+        Workspace for invocation scratch. ``None`` uses the current working
+        directory.
 
     Returns
     -------
@@ -387,7 +668,9 @@ def snaphu_unwrap(
     if not isinstance(coherence, np.ndarray):
         coherence = np.asarray(coherence)
     phase = np.angle(complex_ifg).astype(np.float32)
-    return Snaphu(config).unwrap(
+    strategy = Snaphu(config, work_dir=work_dir)
+    strategy._pair_id = _pair_id
+    return strategy.unwrap(
         torch.as_tensor(phase),
         coherence=torch.as_tensor(coherence, dtype=torch.float32),
     )

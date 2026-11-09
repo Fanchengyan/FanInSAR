@@ -11,6 +11,8 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.unwrapping.irls import SpatialIRLS, _resolve_device
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from faninsar.processing.unwrapping.common import SpatialUnwrapResult
     from faninsar.processing.unwrapping.snaphu_backend import SnaphuConfig
 
@@ -31,6 +33,8 @@ def unwrap(
     method: UnwrapBackend = "snaphu",
     snaphu_config: SnaphuConfig | None = None,
     irls_kwargs: dict[str, Any] | None = None,
+    work_dir: str | Path | None = None,
+    _pair_id: str | None = None,
 ) -> SpatialUnwrapResult:
     """Unwrap phase with an explicitly selected backend.
 
@@ -47,6 +51,9 @@ def unwrap(
     irls_kwargs : dict, optional
         Extra keyword arguments for :class:`~.irls.SpatialIRLS`. The
         ``device`` entry selects the Torch device before input conversion.
+    work_dir : str or pathlib.Path, optional
+        Workspace for SNAPHU invocation scratch. ``None`` uses
+        :func:`pathlib.Path.cwd`. Ignored by the IRLS backend.
 
     Returns
     -------
@@ -100,7 +107,9 @@ def unwrap(
         phase = np.angle(wrapped_or_complex)
         phase_tensor = torch.as_tensor(phase, dtype=torch.float32)
         coherence_tensor = torch.as_tensor(coherence, dtype=torch.float32)
-        return Snaphu(snaphu_config).unwrap(
+        strategy = Snaphu(snaphu_config, work_dir=work_dir)
+        strategy._pair_id = _pair_id
+        return strategy.unwrap(
             phase_tensor,
             coherence=coherence_tensor,
         )
