@@ -413,6 +413,7 @@ def prepare_s1_reference(
             dem=dem,
             device=device,
         )
+        _require_selected_crop_dem_coverage(units, dem, device=device)
         header = {}
     else:
         grid_shape = (int(frame_rows), int(frame_cols))
@@ -509,6 +510,8 @@ def prepare_s1_reference(
                 from faninsar.missions.s1.merge_layout import physical_burst_id
 
                 samples, published = payload
+                from faninsar.missions.s1.scene_bursts import official_absolute_burst_id
+
                 _stage_scene_unit(
                     writer,
                     tag=tag,
@@ -523,11 +526,15 @@ def prepare_s1_reference(
                             "source": str(primary_paths[frame_index]),
                         }
                     ],
+                    absolute_burst_id=official_absolute_burst_id(
+                        getattr(unit.scene, "burst", None)
+                    ),
                 )
             del payload, scene
         if not units:
             reject_invalid_state("Reference selection produced no scene units")
         if writer is not None:
+            _stage_reference_footprint(writer, units)
             properties: dict[str, object] = {}
             if coregistration_grid == "radar":
                 properties["faninsar:radar_geometry"] = frame_geometry_record(
@@ -683,6 +690,58 @@ def _radar_roi_units(
         unit.col_origin += unit.crop[2] - scene_c0  # type: ignore[index]
     grid_shape = (int(scene_r1 - scene_r0), int(scene_c1 - scene_c0))
     return units, grid_shape, int(scene_r0), int(scene_c0)
+
+
+def _require_selected_crop_dem_coverage(
+    units: Mapping[str, S1ReferenceUnit],
+    dem: DEM,
+    *,
+    device: str,
+) -> None:
+    """Raise once if the union of selected crop DEM demands exceeds ``dem``.
+
+    Constant and other non-raster samplers are skipped. Each unit uses the
+    crop already resolved by :func:`_radar_roi_units` (full native burst when
+    ``crop`` is unset). The union is the currently selected windows only.
+    """
+    from faninsar.processing.geometry.api import RasterDEM
+    from faninsar.processing.geometry.managed_dem import (
+        require_dem_coverage,
+        union_bounds,
+    )
+    from faninsar.processing.geometry.prepare_production import (
+        _rdr2geo_dem_required_bounds,
+    )
+
+    if not isinstance(dem, RasterDEM):
+        return
+    union: tuple[float, float, float, float] | None = None
+    for unit in units.values():
+        crop = unit.crop
+        if crop is None:
+            crop = (0, unit.native_shape[0], 0, unit.native_shape[1])
+        row0, row1, col0, col1 = (int(value) for value in crop)
+        if row1 <= row0 or col1 <= col0:
+            reject_invalid_state("radar ROI crop must have positive shape")
+        rows = np.arange(row0, row1, dtype=np.float64)[:, None]
+        cols = np.arange(col0, col1, dtype=np.float64)[None, :]
+        azimuth, slant = np.broadcast_arrays(rows, cols)
+        demand = _rdr2geo_dem_required_bounds(
+            unit.scene.geometry,
+            azimuth,
+            slant,
+            dem,
+            device=device,
+            max_iter=20,
+            range_tol_m=0.01,
+            doppler_tol_hz=0.1,
+        )
+        if demand is None:
+            continue
+        union = demand if union is None else union_bounds(union, demand)
+    if union is None:
+        return
+    require_dem_coverage(dem, union)
 
 
 def _prepare_radar_unit(
@@ -1082,6 +1141,11 @@ def coregister_s1_secondary(
                         f"{tag}: Reference unit is missing physical burst_id"
                     )
 
+                from faninsar.missions.s1.scene_bursts import (
+                    official_absolute_burst_id,
+                    qualified_absolute_burst_id,
+                )
+
                 _stage_scene_unit(
                     writer,
                     tag=tag,
@@ -1092,6 +1156,13 @@ def coregister_s1_secondary(
                     burst_id=placed.burst_id,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
+                    absolute_burst_id=qualified_absolute_burst_id(
+                        official_absolute_burst_id(
+                            getattr(state.secondary, "burst", None)
+                        ),
+                        placed.absolute_burst_id,
+                        tag=tag,
+                    ),
                 )
                 unit_baselines.append(_unit_scene_baseline(state))
                 del payload, state
@@ -1453,6 +1524,7 @@ def _stage_scene_unit(
     burst_id: str,
     scientific_lineage: Sequence[Mapping[str, str]] | None = None,
     phase_state: Mapping[str, object] | None = None,
+    absolute_burst_id: int | None = None,
 ) -> None:
     """Publish one unit with declared ``valid_mask`` and physical ``burst_id``."""
     mask = None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
@@ -1465,7 +1537,42 @@ def _stage_scene_unit(
         phase_state=phase_state,
         valid_mask=mask,
         burst_id=burst_id,
+        absolute_burst_id=absolute_burst_id,
     )
+
+
+def _stage_reference_footprint(
+    writer: SceneWriter,
+    units: Mapping[str, S1ReferenceUnit],
+) -> None:
+    """Persist burst footprints as one GeoJSON asset on the Reference scene."""
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+
+    from faninsar.missions.s1.merge_layout import physical_burst_id
+    from faninsar.missions.s1.scene_bursts import official_absolute_burst_id
+
+    rows: list[dict[str, object]] = []
+    for tag, unit in units.items():
+        ring = getattr(getattr(unit.scene, "burst", None), "footprint", None)
+        if not isinstance(ring, (list, tuple)) or len(ring) < 3:
+            continue
+        geometry = Polygon(ring)
+        if geometry.is_empty:
+            continue
+        rows.append(
+            {
+                "tag": tag,
+                "burst_id": physical_burst_id(unit),
+                "absolute_burst_id": official_absolute_burst_id(
+                    getattr(unit.scene, "burst", None)
+                ),
+                "geometry": geometry,
+            }
+        )
+    if not rows:
+        return
+    writer.add_footprint(gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326"))
 
 
 def coregister_s1_scene(

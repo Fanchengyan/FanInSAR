@@ -39,10 +39,13 @@ from faninsar.processing.mosaicking.windows import intersect_windows, window_sli
 
 SCENE_KIND = "scene"
 MERGED_SCENE_UNIT_TAG = "merged"
+SCENE_FOOTPRINT_ASSET = "footprint"
+SCENE_FOOTPRINT_HREF = "footprint.geojson"
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    import geopandas as gpd
     import torch
 
     from faninsar.io.storage.product import Product
@@ -177,6 +180,18 @@ def _require_basename(value: object, field: str) -> str:
     return require_basename(value, f"scene {field}")
 
 
+def _coerce_absolute_burst_id(value: object) -> int | None:
+    """Return a persisted official burst ID, or None when the field is absent."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        reject_invalid_state("faninsar:absolute_burst_id must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        reject_invalid_state("faninsar:absolute_burst_id must be an integer")
+
+
 @dataclass(frozen=True, slots=True)
 class SceneUnit:
     """One Reference-grid aligned SLC unit (burst or tile) of one acquisition."""
@@ -191,6 +206,7 @@ class SceneUnit:
     phase_screen_path: Path | None = None
     burst_id: str | None = None
     valid_mask_path: Path | None = None
+    absolute_burst_id: int | None = None
 
     def __post_init__(self) -> None:
         """Validate the unit's bounded shape."""
@@ -355,6 +371,9 @@ class CoregisteredSceneStore:
                 if raw_burst_id is not None
                 else None
             )
+            absolute_burst_id = _coerce_absolute_burst_id(
+                asset.get("faninsar:absolute_burst_id")
+            )
             valid_name = f"{name}.valid"
             unit = SceneUnit(
                 tag=str(name),
@@ -381,6 +400,7 @@ class CoregisteredSceneStore:
                     if valid_name in product.assets
                     else None
                 ),
+                absolute_burst_id=absolute_burst_id,
             )
             if (
                 unit.row_origin < 0
@@ -474,6 +494,29 @@ class CoregisteredSceneStore:
                 else fallback
             ),
         }
+
+    @property
+    def footprint(self) -> gpd.GeoDataFrame:
+        """Load the scene's burst-footprint GeoJSON as a GeoDataFrame.
+
+        The Reference scene persists one ``footprint.geojson`` asset (EPSG:4326
+        polygons with ``tag``, ``burst_id``, and ``absolute_burst_id``).
+        Secondary scenes, and a Reference without the asset, return an empty
+        frame with those columns.
+        """
+        import geopandas as gpd
+
+        columns = ["tag", "burst_id", "absolute_burst_id", "geometry"]
+        empty = gpd.GeoDataFrame(columns=columns, geometry="geometry", crs="EPSG:4326")
+        product = open_product(self.root, kind=SCENE_KIND)
+        if SCENE_FOOTPRINT_ASSET not in product.assets:
+            return empty
+        gdf = gpd.read_file(product.asset_path(SCENE_FOOTPRINT_ASSET))
+        if gdf.empty:
+            return empty
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        return gdf
 
     def __repr__(self) -> str:
         """Return a concise one-line scene-product summary."""
@@ -609,6 +652,7 @@ class _PendingUnit:
     phase_screen: bool
     burst_id: str | None = None
     valid_mask: bool = False
+    absolute_burst_id: int | None = None
 
 
 class SceneWriter:
@@ -700,6 +744,7 @@ class SceneWriter:
         phase_screen: np.ndarray | None = None,
         valid_mask: np.ndarray | None = None,
         burst_id: str | None = None,
+        absolute_burst_id: int | None = None,
     ) -> None:
         """Stage one aligned unit payload."""
         _require_basename(tag, "tag")
@@ -738,6 +783,7 @@ class SceneWriter:
             if burst_id is not None
             else None
         )
+        resolved_absolute_burst_id = _coerce_absolute_burst_id(absolute_burst_id)
         write_zarr_array(self.staging / f"{tag}.slc.zarr", payload)
         if phase_screen is not None:
             write_zarr_array(self.staging / f"{tag}.phase.zarr", phase_screen)
@@ -754,6 +800,30 @@ class SceneWriter:
             phase_screen=phase_screen is not None,
             burst_id=resolved_burst_id,
             valid_mask=valid_mask is not None,
+            absolute_burst_id=resolved_absolute_burst_id,
+        )
+
+    def add_footprint(self, gdf: gpd.GeoDataFrame) -> None:
+        """Stage one burst-footprint GeoJSON asset on this scene product.
+
+        The Reference scene is the only writer today. An empty frame is a
+        no-op so a Reference without XML footprints still commits.
+
+        Parameters
+        ----------
+        gdf : geopandas.GeoDataFrame
+            EPSG:4326 polygons with ``tag``, ``burst_id``, and
+            ``absolute_burst_id`` columns.
+
+        """
+        if gdf.empty:
+            return
+        path = self.staging / SCENE_FOOTPRINT_HREF
+        path.write_text(gdf.to_json())
+        self._writer.add_asset(
+            SCENE_FOOTPRINT_ASSET,
+            SCENE_FOOTPRINT_HREF,
+            **{"faninsar:role": "footprint"},
         )
 
     def commit(
@@ -805,6 +875,8 @@ class SceneWriter:
             }
             if unit.burst_id is not None:
                 fields["faninsar:burst_id"] = unit.burst_id
+            if unit.absolute_burst_id is not None:
+                fields["faninsar:absolute_burst_id"] = int(unit.absolute_burst_id)
             if unit.phase_screen:
                 fields["faninsar:phase_screen"] = f"{tag}.phase"
                 self._writer.add_asset(
