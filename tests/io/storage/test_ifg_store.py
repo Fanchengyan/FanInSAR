@@ -482,7 +482,7 @@ def test_replacing_the_ifg_removes_nested_unwrap(tmp_path: Path) -> None:
     assert not unwrap_root(root).exists()
     stale = _layers(replaced)
     assert stale.layers == ["amplitude", "coherence", "complex", "wrapped_phase"]
-    with pytest.raises(InvalidProcessingStateError):
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
         stale.unwrapped_phase
     with pytest.raises(InvalidProcessingStateError):
         replaced.read_unwrapped()

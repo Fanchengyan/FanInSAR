@@ -1601,13 +1601,28 @@ class InterferogramLayers:
         source: str = "complex",
     ) -> ProductLayer:
         """Return one layer of the unwrap product bound to this IFG commit."""
-        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+        from faninsar.io.storage.ifg_store import (
+            InterferogramArtifactStore,
+            unwrap_ion_root,
+            unwrap_root,
+        )
 
+        root = (
+            unwrap_ion_root(self.root)
+            if source == "complex_ion"
+            else unwrap_root(self.root)
+        )
+        if not (root / "item.json").is_file():
+            message = (
+                f"Pair has no unwrapped result at {root}; run an unwrap stage first"
+            )
+            raise FileNotFoundError(message)
         store = InterferogramArtifactStore.open(self.root)
-        if source == "complex_ion":
-            product = store.unwrap_ion_product()
-        else:
-            product = store.unwrap_product()
+        product = (
+            store.unwrap_ion_product()
+            if source == "complex_ion"
+            else store.unwrap_product()
+        )
         if name not in product.assets:
             message = (
                 f"unwrap product {product.path} has no {name!r} layer; "
@@ -1627,8 +1642,18 @@ class InterferogramLayers:
 
     def _complex_ion_layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
         """Return one layer of the current complex_ion sibling."""
-        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+        from faninsar.io.storage.ifg_store import (
+            InterferogramArtifactStore,
+            complex_ion_root,
+        )
 
+        root = complex_ion_root(self.root)
+        if not (root / "item.json").is_file():
+            message = (
+                f"Pair has no complex_ion result at {root}; "
+                "run apply_ionosphere_correction first"
+            )
+            raise FileNotFoundError(message)
         product = InterferogramArtifactStore.open(self.root).complex_ion_product()
         return ProductLayer(
             product,

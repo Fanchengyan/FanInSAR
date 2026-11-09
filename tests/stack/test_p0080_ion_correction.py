@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tests.support.local_stack import LocalStack
 
+import json
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -13,10 +14,15 @@ import pytest
 import torch
 
 from faninsar import Pairs
-from faninsar.io.storage.ifg_store import write_ifg_artifact, write_unwrapped_artifact
+from faninsar.io.storage.ifg_store import (
+    InterferogramArtifactStore,
+    write_ifg_artifact,
+    write_unwrapped_artifact,
+)
 from faninsar.io.storage.ion_store import ion_dir, write_ionosphere_artifact
-from faninsar.io.storage.product import open_product
+from faninsar.io.storage.product import new_write_id, open_product
 from faninsar.network import Network
+from faninsar.network.layers import InterferogramLayers
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
 from faninsar.stack import Stack
@@ -455,3 +461,65 @@ def test_network_nsbas_unwrapped_ion_uses_existing_linear_model(
     assert item.inputs[_PAIR_ID] == unwrap_ion.write_id
     assert result.metadata["method"] == "nsbas"
     assert result.phase_cumulative_rad.shape[0] == 2
+
+
+def _rewrite_ifg_write_id(root: Path) -> None:
+    """Stamp a fresh IFG write id without replacing nested siblings."""
+    payload = json.loads((root / "item.json").read_text(encoding="utf-8"))
+    payload["properties"]["faninsar:write_id"] = new_write_id()
+    (root / "item.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _pair_layers(stack: Stack, pair_id: str = _PAIR_ID) -> InterferogramLayers:
+    """Return the explicit per-pair layer handle without requiring a Reference."""
+    root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+    store = InterferogramArtifactStore.open(root)
+    return InterferogramLayers(
+        open_product(store.root, kind="ifg"), store.shape, store.looks
+    )
+
+
+def test_missing_optional_unwrap_layer_handles_raise_file_not_found(
+    tmp_path: Path,
+) -> None:
+    """Absent unwrap siblings raise FileNotFoundError on explicit layer handles."""
+    ifg = _pair_layers(_stack_with_ifg(tmp_path))
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
+        ifg.unwrapped_phase
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
+        ifg.connected_components
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
+        ifg.unwrapped_ion
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
+        ifg.connected_components_ion
+    with pytest.raises(FileNotFoundError, match="complex_ion"):
+        ifg.complex_ion
+    with pytest.raises(FileNotFoundError, match="complex_ion"):
+        ifg.wrapped_ion
+
+
+def test_stale_unwrap_layer_handles_raise_invalid_state(tmp_path: Path) -> None:
+    """Present unwrap siblings bound to a replaced IFG still fail closed."""
+    stack = _stack_with_ifg(tmp_path)
+    stack.unwrap(_IdentityUnwrapper())
+    root = stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID
+    _rewrite_ifg_write_id(root)
+    ifg = _pair_layers(stack)
+    with pytest.raises(InvalidProcessingStateError):
+        ifg.unwrapped_phase
+    with pytest.raises(InvalidProcessingStateError):
+        ifg.connected_components
+
+
+def test_stale_unwrap_ion_layer_handle_raises_invalid_state(tmp_path: Path) -> None:
+    """Present unwrap_ion siblings bound to a replaced IFG still fail closed."""
+    stack = _stack_with_ifg(tmp_path)
+    _write_ion(stack, looks=(1, 1), shape=(2, 2))
+    stack.apply_ionosphere_correction(ion_multilook=(1, 1))
+    stack.unwrap(_IdentityUnwrapper(), source="complex_ion")
+    _rewrite_ifg_write_id(stack.config.work_dir / "ifg" / "ml_1x1" / _PAIR_ID)
+    ifg = _pair_layers(stack)
+    with pytest.raises(InvalidProcessingStateError):
+        ifg.unwrapped_ion
+    with pytest.raises(InvalidProcessingStateError):
+        ifg.connected_components_ion
