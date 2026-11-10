@@ -260,6 +260,38 @@ def _constant_view(height: float) -> LonLatDEMView:
     )
 
 
+def _fill_one_wide_nodata(values: np.ndarray) -> np.ndarray:
+    """Fill 1-pixel-wide DEM nodata from finite neighbors on both sides.
+
+    Copernicus mosaics and similar rasters can carry single-row or
+    single-column NaN pinholes. The six-point rdr2geo stencil treats any
+    NaN tap as a failed sample, so those pinholes punch coverage holes in
+    dense geometry offsets. Neighbor interpolation restores a locally
+    smooth height; blocks two or more pixels wide stay NaN so missing
+    tiles remain visible to coverage checks.
+    """
+    filled = np.array(values, dtype=np.float64, copy=True)
+    nan = ~np.isfinite(filled)
+    if not nan.any():
+        return filled
+    up = np.full_like(filled, np.nan)
+    down = np.full_like(filled, np.nan)
+    left = np.full_like(filled, np.nan)
+    right = np.full_like(filled, np.nan)
+    up[1:, :] = filled[:-1, :]
+    down[:-1, :] = filled[1:, :]
+    left[:, 1:] = filled[:, :-1]
+    right[:, :-1] = filled[:, 1:]
+    vertical = nan & np.isfinite(up) & np.isfinite(down)
+    filled[vertical] = 0.5 * (up[vertical] + down[vertical])
+    nan = ~np.isfinite(filled)
+    left[:, 1:] = filled[:, :-1]
+    right[:, :-1] = filled[:, 1:]
+    horizontal = nan & np.isfinite(left) & np.isfinite(right)
+    filled[horizontal] = 0.5 * (left[horizontal] + right[horizontal])
+    return filled
+
+
 def _raster_view(dem: RasterDEM) -> LonLatDEMView:
     """Materialize a geographic kernel raster from a public RasterDEM."""
     source = dem
@@ -273,6 +305,9 @@ def _raster_view(dem: RasterDEM) -> LonLatDEMView:
     if not np.any(finite):
         message = "rdr2geo DEM has no finite samples"
         reject(message, ValueError)
+    height_min_m = float(np.min(values[finite]))
+    height_max_m = float(np.max(values[finite]))
+    values = _fill_one_wide_nodata(values)
     affine = Affine(*source.grid.transform)
     return LonLatDEMView(
         values=values,
@@ -280,8 +315,8 @@ def _raster_view(dem: RasterDEM) -> LonLatDEMView:
         longitude_start_deg=float(affine.c),
         latitude_spacing_deg=float(affine.e),
         longitude_spacing_deg=float(affine.a),
-        height_min_m=float(np.min(values[finite])),
-        height_max_m=float(np.max(values[finite])),
+        height_min_m=height_min_m,
+        height_max_m=height_max_m,
     )
 
 

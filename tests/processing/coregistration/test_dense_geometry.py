@@ -10,6 +10,7 @@ import pytest
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coregistration.dense_geometry import (
     _build_control_grid,
+    _coverage_from_control_valid,
     _interpolate_field,
     dense_geometry_offsets,
     geometry_offset_window_extent,
@@ -83,6 +84,31 @@ def test_interpolate_field_linear_recovery() -> None:
     # At the control points the interpolated value should match exactly
     assert full[0, 0] == pytest.approx(values[0, 0], abs=1e-9)
     assert full[32, 16] == pytest.approx(values[2, 1], abs=1e-9)
+
+
+def test_coverage_closes_one_control_row_pinhole() -> None:
+    """A 1-row control-point failure must not punch a coverage stripe."""
+    az = np.arange(0, 64, 16, dtype=np.float64)
+    rg = np.arange(0, 48, 16, dtype=np.float64)
+    valid = np.ones((len(az), len(rg)), dtype=bool)
+    valid[2, :] = False
+    raw = _interpolate_field(
+        az, rg, valid.astype(np.float64), (64, 48), device="cpu", fill_value=0.0
+    )
+    assert not (raw[32] > 0.5).any()
+    coverage = _coverage_from_control_valid(az, rg, valid, (64, 48), device="cpu")
+    assert coverage[32, 24]
+    assert float(coverage[32, 4:-4].mean()) == pytest.approx(1.0)
+
+
+def test_coverage_keeps_large_invalid_regions() -> None:
+    """Closing pinholes must not invent coverage over a wide failed block."""
+    az = np.arange(0, 64, 16, dtype=np.float64)
+    rg = np.arange(0, 48, 16, dtype=np.float64)
+    valid = np.ones((len(az), len(rg)), dtype=bool)
+    valid[:3, :] = False
+    coverage = _coverage_from_control_valid(az, rg, valid, (64, 48), device="cpu")
+    assert not coverage[0:16, 8:-8].any()
 
 
 def test_dense_geometry_identical_models_yield_near_zero_offsets() -> None:

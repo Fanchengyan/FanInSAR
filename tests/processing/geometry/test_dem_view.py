@@ -80,6 +80,38 @@ def test_lonlat_view_keeps_geodetic_affine_in_degrees() -> None:
     np.testing.assert_allclose(view.values, 123.0)
 
 
+def test_lonlat_view_fills_one_row_dem_pinhole() -> None:
+    """A 1-row NaN stripe is interpolated; the public raster stays raw."""
+    grid = GridSpec(
+        "EPSG:4326",
+        Affine(0.01, 0.0, 14.0, 0.0, -0.01, 38.0),
+        shape=(12, 12),
+    )
+    array = np.full((12, 12), 100.0, dtype=np.float32)
+    array[6, :] = np.nan
+    dem = RasterDEM(array=array, grid=grid, vertical_datum="ellipsoidal")
+    view = lonlat_dem_view(dem)
+    assert np.isfinite(view.values[6]).all()
+    np.testing.assert_allclose(view.values[6], 100.0)
+    assert np.isnan(np.asarray(dem.array)[6]).all()
+    assert view.height_min_m == 100.0
+
+
+def test_lonlat_view_keeps_wide_nodata_block() -> None:
+    """Missing-tile blocks must stay NaN so coverage checks still see them."""
+    grid = GridSpec(
+        "EPSG:4326",
+        Affine(0.01, 0.0, 14.0, 0.0, -0.01, 38.0),
+        shape=(12, 12),
+    )
+    array = np.full((12, 12), 100.0, dtype=np.float32)
+    array[3:8, :] = np.nan
+    dem = RasterDEM(array=array, grid=grid, vertical_datum="ellipsoidal")
+    view = lonlat_dem_view(dem)
+    assert not np.isfinite(view.values[5]).any()
+    np.testing.assert_allclose(view.values[0], 100.0)
+
+
 def test_projected_view_metadata_is_degrees_not_metres() -> None:
     """Fallback conversion must not pass UTM metres into the kernel affine."""
     size = 32

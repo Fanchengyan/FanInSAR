@@ -297,10 +297,14 @@ def _sample_dataset(
             finite = np.isfinite(block_rows) & np.isfinite(block_cols)
             if not np.any(finite):
                 continue
+            # P0032 6-tap uses floor(x)-1 .. floor(x)+4 inclusive.  Using
+            # ceil(max)+3 is one pixel short when max is an integer, so the
+            # last row/column of a 128-pixel block becomes NaN on a GLO-30
+            # lattice even though the source tile is finite.
             row_min = math.floor(float(np.min(block_rows[finite]))) - 2
             col_min = math.floor(float(np.min(block_cols[finite]))) - 2
-            row_max = math.ceil(float(np.max(block_rows[finite]))) + 3
-            col_max = math.ceil(float(np.max(block_cols[finite]))) + 3
+            row_max = math.floor(float(np.max(block_rows[finite]))) + 4
+            col_max = math.floor(float(np.max(block_cols[finite]))) + 4
             window = Window(
                 col_min,
                 row_min,

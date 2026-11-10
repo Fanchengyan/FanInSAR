@@ -1012,6 +1012,11 @@ def _apply_geo_topographic_phase_chunked(
 ) -> tuple[np.memmap, np.ndarray]:
     """Apply geometric phase to disk-backed geographic SLC row tiles.
 
+    DEM nodata in ``lut.height_full`` is filled with ``lut.height_m`` (the
+    same fallback geo2rdr already used) so flattening cannot punch holes in
+    pixels that were successfully sampled. Published ``valid`` follows
+    sampling and offset-window support, not ``isfinite(phase)``.
+
     Parameters
     ----------
     state : ProductionPairState
@@ -1094,6 +1099,9 @@ def _apply_geo_topographic_phase_chunked(
             )
         else:
             height = np.asarray(lut.height_full[rows], dtype=np.float64)
+        # Geo2rdr already solved these pixels with fallback-filled height.
+        # Raw DEM nodata must not punch holes in an otherwise sampled SLC.
+        height = np.where(np.isfinite(height), height, float(lut.height_m))
         if timings_out is not None:
             timings_out["compose"] = timings_out.get("compose", 0.0) + (
                 time.perf_counter() - compose_started
@@ -1114,16 +1122,20 @@ def _apply_geo_topographic_phase_chunked(
                 time.perf_counter() - phase_started
             )
         apply_started = time.perf_counter()
-        tile_valid = valid[rows] & coordinate_valid & np.isfinite(phase)
+        tile_valid = valid[rows] & coordinate_valid
+        phase_ok = np.isfinite(phase)
         corrected_secondary = secondary_geo[rows] * np.exp(1j * phase).astype(
             np.complex64
         )
+        # Keep sampled support even when flattening is unavailable: residual
+        # topographic phase is preferable to a dropped geographic pixel.
         # The reference keeps its own support: one Reference payload is shared
         # by every secondary and must not inherit one pair's coverage.
+        original_secondary = np.asarray(secondary_geo[rows])
         secondary_geo[rows] = np.where(
-            tile_valid,
+            tile_valid & phase_ok,
             corrected_secondary,
-            invalid,
+            np.where(tile_valid, original_secondary, invalid),
         ).astype(np.complex64)
         valid[rows] = tile_valid
         topo_phase[rows] = phase.astype(np.float32)

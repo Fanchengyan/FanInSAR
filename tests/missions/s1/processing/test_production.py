@@ -887,6 +887,108 @@ def test_geo_topographic_phase_preserves_row_order_when_chunked(
     np.testing.assert_allclose(height, 2.0)
 
 
+def test_geo_topographic_phase_keeps_samples_when_dem_height_is_nan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NaN DEM rows must not clear geographic secondary support."""
+    from faninsar.missions.s1 import processing as production
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+
+    state = MagicMock()
+    shape = (8, 4)
+    radar_shape = (32, 8)
+    azimuth = np.arange(32, dtype=np.float64).reshape(shape)
+    height_full = np.full(shape, 12.0, dtype=np.float64)
+    height_full[2:4, :] = np.nan
+    lut = Geo2RdrLUT(
+        az_full=azimuth,
+        rg_full=np.full(shape, 2.0),
+        valid=np.ones(shape, dtype=bool),
+        full_radar_shape=radar_shape,
+        height_m=7.5,
+        height_full=height_full,
+    )
+    offsets = OffsetFieldResult(
+        range_offset_px=np.zeros(radar_shape, dtype=np.float32),
+        azimuth_offset_px=np.zeros(radar_shape, dtype=np.float32),
+        coverage=np.ones(radar_shape, dtype=bool),
+        uncertainty_px=np.zeros(radar_shape, dtype=np.float32),
+    )
+    grid = GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(0.0, 1.0, 0.0, 8.0, 0.0, -1.0),
+        width=shape[1],
+        height=shape[0],
+        resolution_m=(1.0, 1.0),
+    )
+    secondary = np.memmap(
+        tmp_path / "secondary.complex64",
+        mode="w+",
+        dtype=np.complex64,
+        shape=shape,
+    )
+    valid = np.memmap(
+        tmp_path / "valid.bool",
+        mode="w+",
+        dtype=np.bool_,
+        shape=shape,
+    )
+    secondary[:] = 1.0 + 0.0j
+    valid[:] = True
+    seen_heights: list[np.ndarray] = []
+
+    def fake_geometric_phase(
+        _reference: object,
+        _secondary: object,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        height: np.ndarray,
+        reference_azimuth: np.ndarray,
+        secondary_azimuth_values: np.ndarray,
+        *,
+        reference_range_index: np.ndarray | None = None,
+    ) -> np.ndarray:
+        assert reference_range_index is not None
+        seen_heights.append(np.asarray(height, dtype=np.float64).copy())
+        return (
+            latitude + longitude + height + reference_azimuth + secondary_azimuth_values
+        )
+
+    monkeypatch.setattr(
+        production,
+        "compute_geometric_phase_from_geo",
+        fake_geometric_phase,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geocoding.geo_lut.grid_lonlat_rows",
+        lambda _grid, row_start, row_stop: (
+            np.arange(32, dtype=np.float64).reshape(shape)[row_start:row_stop],
+            np.full(shape, 1.0)[row_start:row_stop],
+        ),
+    )
+    phase, _height = _apply_geo_topographic_phase_chunked(
+        state,
+        lut,
+        offsets,
+        None,
+        secondary,
+        valid,
+        grid=grid,
+        output_dir=tmp_path,
+        chunk_size=3,
+        watchdog=None,
+    )
+
+    assert np.all(valid)
+    assert np.all(np.isfinite(secondary.real))
+    assert np.all(np.isfinite(phase))
+    stacked = np.concatenate([item.reshape(-1) for item in seen_heights])
+    assert np.all(np.isfinite(stacked))
+    assert np.any(np.isclose(stacked, 7.5))
+
+
 def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
     """Shipped ifg stage must not paint zero-power looks as phase=0 black edge.
 

@@ -104,6 +104,53 @@ def _interpolate_field(
     )
 
 
+def _fill_one_pixel_valid_gaps(valid: np.ndarray) -> np.ndarray:
+    """Fill 1-pixel-wide False gaps that have True neighbors on both sides.
+
+    DEM pinholes and single non-convergences knock out a curve of control
+    points one cell wide. Offset values there are already nearest-filled;
+    restoring those cells to valid keeps coverage from punching stripes
+    through an otherwise sampled geographic SLC. Gaps two or more cells
+    wide, and False regions that touch only one side, stay False.
+    """
+    filled = np.asarray(valid, dtype=bool)
+    if filled.size == 0 or filled.all():
+        return filled
+    up = np.zeros_like(filled)
+    down = np.zeros_like(filled)
+    left = np.zeros_like(filled)
+    right = np.zeros_like(filled)
+    up[1:, :] = filled[:-1, :]
+    down[:-1, :] = filled[1:, :]
+    left[:, 1:] = filled[:, :-1]
+    right[:, :-1] = filled[:, 1:]
+    return filled | ((~filled) & ((up & down) | (left & right)))
+
+
+def _coverage_from_control_valid(
+    az_ctrl: np.ndarray,
+    rg_ctrl: np.ndarray,
+    valid: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    device: DeviceLike,
+) -> np.ndarray:
+    """Interpolate control-point convergence to a full-resolution coverage mask.
+
+    Isolated 1-pixel control-point failures are filled before interpolation.
+    Large invalid regions stay ``False``.
+    """
+    coverage = _interpolate_field(
+        az_ctrl,
+        rg_ctrl,
+        _fill_one_pixel_valid_gaps(valid).astype(np.float64),
+        shape,
+        device=device,
+        fill_value=0.0,
+    )
+    return coverage > 0.5
+
+
 def _control_point_geometry_offsets(
     shape: tuple[int, int],
     *,
@@ -289,10 +336,12 @@ def dense_geometry_offsets(
 
     Notes
     -----
-    The coverage mask is ``True`` only where both the reference
-    ``rdr2geo`` and the secondary ``geo2rdr`` converged.  Uncertainty
-    is a heuristic combining range and Doppler residuals, scaled by
-    the pixel spacing so that it is expressed in pixels.
+    The coverage mask is interpolated from control-point convergence of
+    both the reference ``rdr2geo`` and the secondary ``geo2rdr``. Isolated
+    one-pixel control-point failures are filled before interpolation so
+    DEM pinholes do not punch holes in an otherwise filled offset field.
+    Uncertainty is a heuristic combining range and Doppler residuals,
+    scaled by the pixel spacing so that it is expressed in pixels.
 
     """
     if min(shape) <= 0:
@@ -373,16 +422,13 @@ def dense_geometry_offsets(
         az_ctrl, rg_ctrl, az_offset_ctrl, shape, device=device
     )
 
-    # Coverage: interpolate the valid mask as float then threshold
-    coverage = _interpolate_field(
+    coverage = _coverage_from_control_valid(
         az_ctrl,
         rg_ctrl,
-        valid.astype(np.float64),
+        valid,
         shape,
         device=device,
-        fill_value=0.0,
     )
-    coverage = coverage > 0.5
 
     uncertainty_ctrl = _fill_nan_nearest(uncertainty_ctrl)
     uncertainty = _interpolate_field(
