@@ -95,6 +95,7 @@ class _OwnerPlan:
     completed: dict[str, bool] = field(default_factory=dict)
     abort: threading.Event = field(default_factory=threading.Event)
     skipped: bool = False
+    absolute_burst_ids: dict[int, int] = field(default_factory=dict)
 
     @property
     def progress_path(self) -> Path:
@@ -113,6 +114,7 @@ class _OwnerPlan:
             listed_indices=self.listed,
             ipf_version=self.item.get("ipf_version"),
             resume=resume,
+            absolute_burst_ids=self.absolute_burst_ids or None,
         )
 
 
@@ -128,6 +130,8 @@ def plan_owner(
     dem: Any,
     xml_text: str | None = None,
     plan_spans: bool = True,
+    absolute_burst_ids: Sequence[int] | None = None,
+    catalog_sensing_times: Sequence[datetime] | None = None,
 ) -> _OwnerPlan | None:
     """Plan metadata, spatial unions and burst consumers without bulk transfer.
 
@@ -182,6 +186,11 @@ def plan_owner(
         listed,
         list(bursts.values()),
         granularity,
+    )
+    owner.absolute_burst_ids = source._associate_catalog_absolute_ids(
+        swath,
+        absolute_burst_ids=absolute_burst_ids,
+        catalog_sensing_times=catalog_sensing_times,
     )
     if plan_spans:
         _plan_owner_spans(owner)
@@ -532,6 +541,8 @@ def _coverage_bursts(owner: _OwnerPlan) -> list[dict[str, Any]]:
         burst = by_index.get(int(index))
         if burst is not None:
             record["sensing_time"] = burst.sensing_time.isoformat()
+            if burst.number is not None:
+                record["number"] = int(burst.number)
             if burst.absolute_burst_id is not None:
                 record["absolute_burst_id"] = int(burst.absolute_burst_id)
         records.append(record)
@@ -606,6 +617,8 @@ async def stream_owners(
     coreg_mode: str,
     granularity: str,
     dem: Any,
+    absolute_burst_ids: Sequence[int] | None = None,
+    catalog_sensing_times: Sequence[datetime] | None = None,
 ) -> list[_OwnerPlan]:
     """Fetch each XML, plan it, and queue its measurement spans on one session.
 
@@ -631,6 +644,9 @@ async def stream_owners(
         Acquisition granularity forwarded to window planning.
     dem : RasterDEM or None
         DEM required for ROI-granularity geo2rdr.
+    absolute_burst_ids, catalog_sensing_times : optional
+        Existing catalog hints associated by sensing time onto listed bursts.
+        No additional catalog query is performed.
 
     Returns
     -------
@@ -755,6 +771,8 @@ async def stream_owners(
                 dem=dem,
                 xml_text=xml_text,
                 plan_spans=False,
+                absolute_burst_ids=absolute_burst_ids,
+                catalog_sensing_times=catalog_sensing_times,
             )
             ready_bursts: list[tuple[_OwnerPlan, _BurstPlan]] = []
             new_jobs: list[tuple[_OwnerPlan, _BurstPlan, RangeSpan]] = []

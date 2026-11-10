@@ -28,6 +28,22 @@ class S1Burst:
     attribute).  SAFE annotation XML does not carry it, so annotation
     parsing leaves it ``None``; ``azimuth_anx_time_s`` and
     ``sensing_time`` remain the annotation-derived matching keys.
+
+    Adding ``number`` does not add selection by original parent ordinal.
+
+    Parameters
+    ----------
+    index : int
+        Zero-based Python ordinal in the current local burst sequence. It may
+        change when local bursts are appended or reordered. A singleton subset
+        of original parent burst 8 has index 0.
+    number : int or None
+        Zero-based ordinal in the original parent SAFE sub-swath burstList,
+        scoped by parent SAFE, sub-swath and polarization. The singleton above
+        has number 8, which remains 8 when the local sequence changes. This is
+        not absoluteBurstID or absolute_burst_id. None means the original
+        ordinal is unknown; it must not be guessed from local order.
+
     """
 
     index: int
@@ -42,6 +58,7 @@ class S1Burst:
     footprint: tuple[tuple[float, float], ...] | None = None
     measurement_path: str | None = None
     absolute_burst_id: int | None = None
+    number: int | None = None
 
     @property
     def valid_samples(self) -> ValidSampleMask:

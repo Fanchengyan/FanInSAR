@@ -35,8 +35,13 @@ import rasterio
 from rasterio.transform import Affine
 
 from faninsar.logging import setup_logger
+from faninsar.missions.s1.annotation import (
+    _read_parent_burst_number,
+    _resolved_parent_burst_number,
+    _stamp_parent_burst_number,
+)
 from faninsar.missions.s1.errors import reject_product
-from faninsar.missions.s1.io.canvas import _local
+from faninsar.missions.s1.io.canvas import _local, _stamp_absolute_burst_id
 from faninsar.missions.s1.io.export import _annotation_stem, _read_annotation_source
 from faninsar.stack.layout import staged_acquisition_path
 
@@ -87,6 +92,10 @@ class PathBurstPayload:
         ``burst_index`` value.  The group's
         ``(azimuth_time, sensing_time)`` slot order, not the raw index,
         decides written order.
+    number : int, optional
+        Original parent SAFE sub-swath burstList ordinal.  ASF extractor
+        hrefs supply this (``.../IW1/VV/8.zip``); it is not the inner
+        one-burst annotation index.
 
     """
 
@@ -96,6 +105,7 @@ class PathBurstPayload:
     absolute_burst_id: int | None = None
     data_take: str | None = None
     annotation_xml: str | None = None
+    number: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,11 +153,6 @@ def _child(parent: ET.Element, name: str) -> ET.Element:
     message = f"missing required annotation element: {name}"
     reject_product(message)
     raise AssertionError(message)
-
-
-def _has(parent: ET.Element, name: str) -> bool:
-    """Return whether ``parent`` has a child with the local tag ``name``."""
-    return any(_local(child.tag) == name for child in parent)
 
 
 def _set_text(parent: ET.Element, name: str, value: str) -> None:
@@ -241,6 +246,7 @@ def _build_burst_annotation(
     lines_per_burst: int,
     t_start: datetime,
     t_stop: datetime,
+    number: int | None = None,
 ) -> bytes:
     """Return a one-burst annotation XML for ``keep_index``.
 
@@ -262,15 +268,16 @@ def _build_burst_annotation(
         if index != keep_index:
             burst_list.remove(burst_el)
             continue
-        absolute = payload.absolute_burst_id
-        if absolute is None:
-            continue
-        if not _has(burst_el, "absoluteBurstID"):
-            element = ET.SubElement(burst_el, "absoluteBurstID")
-            element.text = str(absolute)
+        _stamp_absolute_burst_id(burst_el, payload.absolute_burst_id)
     burst_list.set("count", "1")
 
     kept_el = burst_elements[keep_index]
+    stamped = _resolved_parent_burst_number(
+        _read_parent_burst_number(kept_el),
+        number,
+    )
+    if stamped is not None:
+        _stamp_parent_burst_number(kept_el, stamped)
     if payload.line_valid is not None:
         first = [int(pair[0]) for pair in payload.line_valid]
         last = [int(pair[1]) for pair in payload.line_valid]
@@ -572,6 +579,9 @@ def write_path_safe(
             )
         names.append(f"measurement/{stem}.tiff")
 
+        number = payload.number
+        if number is None and payload.annotation_xml is None:
+            number = burst.number
         rewritten = _build_burst_annotation(
             source_text,
             int(payload.burst_index) if payload.annotation_xml is None else 0,
@@ -579,6 +589,7 @@ def write_path_safe(
             lines_per_burst,
             sensing[position],
             sensing[position],
+            number=number,
         )
         ann_path = safe_root / "annotation" / f"{stem}.xml"
         ann_path.write_bytes(rewritten)

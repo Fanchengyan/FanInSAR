@@ -19,9 +19,12 @@ from faninsar.stack.search import MissionPreparedInputs
 from faninsar.stack.session import Stack
 
 from .acquisition import (
+    _apply_asf_burst_hints,
+    _asf_burst_groups,
+    _asf_frame_parent_ids,
     _bind_cdse_item,
+    _binding_parent_id,
     _binding_track_key,
-    asf_burst_selectors,
     asf_frame_selectors,
     discover_cdse_slc_items,
     materialize_cdse_roi_safes,
@@ -349,9 +352,9 @@ class S1Stack(Stack):
         - ``"cdse"`` (default) → byte-range windows materialized via the
           CDSE range path; ``granularity`` selects the window shape.  When
           ``search.catalog`` is ``"sentinel1-asf"`` the searched items are
-          re-discovered inside the CDSE catalog and their
-          ``absoluteBurstID``/``sensingStart`` select the same bursts in the
-          CDSE parent frames (``asf_burst_selectors``).
+          re-discovered inside the CDSE catalog and per-binding
+          ``(parent, IW, pol)`` hints select the same bursts in the
+          CDSE parent frames.
         - ``"asf"`` → complete burst products via the ASF burst-extractor
           path.  ASF always downloads whole bursts, so ``granularity`` is
           forced to ``"burst"``.
@@ -511,11 +514,19 @@ class S1Stack(Stack):
             for item in cdse_items:
                 bindings.extend(_bind_cdse_item(item))
             if asf_items:
-                absolute_ids, sensing_times = asf_burst_selectors(asf_items)
-                frame_window, frame_tracks = asf_frame_selectors(asf_items)
+                burst_groups = _asf_burst_groups(asf_items)
+                if requested is not None:
+                    burst_groups = {
+                        key: hints
+                        for key, hints in burst_groups.items()
+                        if key[2] in requested
+                    }
+                frame_parents = _asf_frame_parent_ids(asf_items)
+                frame_window, frame_tracks, parent_ids = asf_frame_selectors(asf_items)
             else:
-                absolute_ids, sensing_times = [], []
-                frame_window, frame_tracks = None, set()
+                burst_groups = {}
+                frame_parents = frozenset()
+                frame_window, frame_tracks, parent_ids = None, set(), None
             if bindings is not None and requested is not None:
                 bindings = [b for b in bindings if b.get("polarization") in requested]
             if effective_roi is None:
@@ -526,12 +537,16 @@ class S1Stack(Stack):
                 reject(message, ValueError, logger=logger)
             dem = kwargs.pop("dem", None)
             if asf_items:
-                # Re-discover the ASF-selected acquisitions on CDSE, narrowed
-                # to the ASF items' sensing window, then keep only bindings
-                # in the searched tracks so other orbits on the same ROI do
-                # not leak in.  Burst-level items additionally pass their
-                # absoluteBurstID/sensingStart selector through.  Any CDSE
-                # items in the same search are merged in afterwards.
+                # Re-discover ASF-selected acquisitions on CDSE using the
+                # parent SAFE sensing window (not the child burst start),
+                # then keep searched tracks and, when every ASF item has a
+                # confident parent id, those parent product ids so adjacent
+                # same-track frames cannot leak.  SLC-BURST items attach
+                # per-binding (parent, IW, pol) sensing hints; unselected
+                # measurements of a burst-only parent are dropped.  ROI
+                # granularity still chooses bursts spatially inside each
+                # remaining binding.  Direct CDSE items are merged in
+                # afterwards and stay unhinted.
                 rediscovered = discover_cdse_slc_items(
                     effective_roi,
                     datetime_range=frame_window,
@@ -541,6 +556,16 @@ class S1Stack(Stack):
                     rediscovered = [
                         b for b in rediscovered if _binding_track_key(b) in frame_tracks
                     ]
+                if parent_ids:
+                    rediscovered = [
+                        b for b in rediscovered if _binding_parent_id(b) in parent_ids
+                    ]
+                if burst_groups:
+                    rediscovered = _apply_asf_burst_hints(
+                        rediscovered,
+                        burst_groups,
+                        frame_parents=frame_parents,
+                    )
                 per_mission = kwargs.pop("per_mission_limit", None)
                 if per_mission is not None:
                     rediscovered = _cap_per_mission(rediscovered, int(per_mission))
@@ -560,8 +585,6 @@ class S1Stack(Stack):
                     polarizations=selected_polarizations,
                     work_dir=work_dir,
                     items=bindings,
-                    absolute_burst_ids=absolute_ids or None,
-                    catalog_sensing_times=sensing_times or None,
                     orbit_group=orbit_group,
                     dem=dem,
                     coreg_mode=coreg_mode,

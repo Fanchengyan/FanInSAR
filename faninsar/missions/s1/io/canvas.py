@@ -33,6 +33,12 @@ from rasterio.transform import Affine
 from rasterio.windows import Window
 
 from faninsar.logging import setup_logger
+from faninsar.missions.s1.annotation import (
+    _PARENT_BURST_NUMBER_TAG,
+    _read_parent_burst_number,
+    _resolved_parent_burst_number,
+    _stamp_parent_burst_number,
+)
 from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.export import (
     _annotation_stem,
@@ -40,7 +46,7 @@ from faninsar.missions.s1.io.export import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
 
     from faninsar.missions.s1.overlap import BurstOverlapWindow
     from faninsar.missions.s1.types import S1Swath
@@ -50,6 +56,58 @@ logger = setup_logger(__name__)
 
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+_ABSOLUTE_ID_TAGS = ("absoluteBurstID", "burstIdAbsolute")
+
+
+def _stamp_absolute_burst_id(burst_el: ET.Element, absolute_id: int | None) -> None:
+    """Write a qualified official ID onto a materialized burst element.
+
+    The cached parent annotation is never mutated; callers pass a parsed copy.
+    Missing ``absolute_id`` is a no-op. An existing matching value is kept.
+    An empty element is filled. Conflicting qualified values fail closed.
+
+    Parameters
+    ----------
+    burst_el : xml.etree.ElementTree.Element
+        One ``burst`` element of the materialized annotation copy.
+    absolute_id : int or None
+        Catalog or source official identifier to persist.
+
+    Raises
+    ------
+    Sentinel1ProductError
+        If the annotation already carries a different official identifier.
+
+    """
+    if absolute_id is None:
+        return
+    wanted = int(absolute_id)
+    found: dict[str, ET.Element] = {}
+    values: set[int] = set()
+    for child in burst_el:
+        local = _local(child.tag)
+        if local not in _ABSOLUTE_ID_TAGS:
+            continue
+        found[local] = child
+        text = (child.text or "").strip()
+        if not text:
+            continue
+        try:
+            values.add(int(text))
+        except ValueError:
+            reject_product(f"invalid {local} {text!r} on materialized burst annotation")
+    if values and values != {wanted}:
+        reject_product(
+            "conflicting official absolute burst IDs "
+            f"{sorted(values)} vs catalog {wanted}"
+        )
+    if "absoluteBurstID" in found:
+        found["absoluteBurstID"].text = str(wanted)
+    else:
+        element = ET.SubElement(burst_el, "absoluteBurstID")
+        element.text = str(wanted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +341,8 @@ def _build_canvas_annotation(
     xml_text: str,
     kept: Sequence[tuple[int, tuple[list[int], list[int]]]],
     lines_per_burst: int,
+    numbers: dict[int, int | None] | None = None,
+    absolute_burst_ids: Mapping[int, int] | None = None,
 ) -> bytes:
     """Return annotation XML for the canvas tree.
 
@@ -295,6 +355,12 @@ def _build_canvas_annotation(
         lists have ``lines_per_burst`` entries each.
     lines_per_burst : int
         Parent ``linesPerBurst``.
+    numbers : dict of int to int or None, optional
+        Original-parent ordinals keyed by the source burstList index.  Distinct
+        non-``None`` namespaced stamps and mapped values are rejected; missing
+        values are not guessed from local slot order.
+    absolute_burst_ids : mapping of int to int, optional
+        Parent burst index to catalog official ID stamped onto kept bursts.
 
     Returns
     -------
@@ -308,6 +374,7 @@ def _build_canvas_annotation(
     root = ET.fromstring(xml_text)
     slot_by_index = {index: slot for slot, (index, _) in enumerate(kept)}
     mask_by_index = dict(kept)
+    number_by_index = numbers or {}
 
     burst_list, bursts = _burst_elements(root)
     if max(slot_by_index, default=-1) >= len(bursts):
@@ -321,6 +388,14 @@ def _build_canvas_annotation(
             continue
         first, last = mask_by_index[index]
         _set_valid_samples(burst_el, first, last)
+        number = _resolved_parent_burst_number(
+            _read_parent_burst_number(burst_el),
+            number_by_index.get(index),
+        )
+        if number is not None:
+            _stamp_parent_burst_number(burst_el, number)
+        if absolute_burst_ids is not None and index in absolute_burst_ids:
+            _stamp_absolute_burst_id(burst_el, int(absolute_burst_ids[index]))
     burst_list.set("count", str(len(kept)))
 
     image_info = _child(_child(root, "imageAnnotation"), "imageInformation")
@@ -352,6 +427,7 @@ def write_roi_safe_canvas(
     product_id: str | None = None,
     listed_indices: Sequence[int] | None = None,
     ipf_version: str | None = None,
+    absolute_burst_ids: Mapping[int, int] | None = None,
 ) -> RoiSafeCanvas:
     """Write a SAFE-subset canvas tree for ROI-fetched bursts.
 
@@ -387,6 +463,9 @@ def write_roi_safe_canvas(
     ipf_version : str, optional
         Source product IPF version.  When given, a minimal ``manifest.safe``
         records it so loaders keep the EAP-correction decision.
+    absolute_burst_ids : mapping of int to int, optional
+        Parent burst index to catalog official ID.  Known values are stamped
+        onto the materialized annotation copy; the cached parent is unchanged.
 
     Returns
     -------
@@ -488,7 +567,16 @@ def write_roi_safe_canvas(
     source = (
         annotation_xml if annotation_xml is not None else _read_annotation_source(swath)
     )
-    rewritten = _build_canvas_annotation(source, kept_masks, lines_per_burst)
+    rewritten = _build_canvas_annotation(
+        source,
+        kept_masks,
+        lines_per_burst,
+        numbers={
+            burst_index: swath.bursts[burst_index].number
+            for burst_index, _mask in kept_masks
+        },
+        absolute_burst_ids=absolute_burst_ids,
+    )
     ann_path = safe_root / "annotation" / f"{stem}.xml"
     ann_path.write_bytes(rewritten)
 
@@ -757,6 +845,7 @@ class _RoiCanvasWriter:
         listed_indices: Sequence[int],
         ipf_version: str | None = None,
         resume: bool = False,
+        absolute_burst_ids: Mapping[int, int] | None = None,
     ) -> None:
         listed = tuple(sorted({int(index) for index in listed_indices}))
         if not listed:
@@ -782,6 +871,8 @@ class _RoiCanvasWriter:
             annotation_xml,
             [(index, ([-1] * lines, [-1] * lines)) for index in listed],
             lines,
+            numbers={index: swath.bursts[index].number for index in listed},
+            absolute_burst_ids=absolute_burst_ids,
         )
         if resume:
             self._validate_resume(initial)
@@ -848,10 +939,31 @@ class _RoiCanvasWriter:
                 reject_product("incremental canvas annotation burst count mismatch")
             for burst in bursts:
                 self._checked_mask(_read_valid_samples(burst))
+            _, expected_bursts = _burst_elements(expected)
+            _, actual_bursts = _burst_elements(actual)
+            for expected_burst, actual_burst in zip(
+                expected_bursts, actual_bursts, strict=True
+            ):
+                expected_number = _read_parent_burst_number(expected_burst)
+                actual_number = _read_parent_burst_number(actual_burst)
+                if (
+                    expected_number is not None
+                    and actual_number is not None
+                    and expected_number != actual_number
+                ):
+                    reject_product(
+                        "incremental canvas parent burst numbers contradict "
+                        f"persisted mapping {actual_number} vs {expected_number}"
+                    )
             for root in (expected, actual):
                 _, elements = _burst_elements(root)
                 for burst in elements:
                     _set_valid_samples(burst, [], [])
+                    # Number tags are compared above; omit them from the remaining
+                    # scientific identity so a legacy canvas without stamps can resume.
+                    for child in list(burst):
+                        if child.tag == _PARENT_BURST_NUMBER_TAG:
+                            burst.remove(child)
             if ET.canonicalize(
                 ET.tostring(actual, encoding="unicode"), strip_text=True
             ) != (

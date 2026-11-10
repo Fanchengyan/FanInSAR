@@ -596,6 +596,7 @@ def _plan_cdse_windows(
         xml_text,
         annotation_path=str(item.get("annotation_url", "cdse://annotation.xml")),
         measurement_path=str(item.get("measurement_url", "cdse://measurement.tiff")),
+        _original_parent=True,
     )
     if roi is not None and granularity == "roi":
         if dem is None:
@@ -844,6 +845,8 @@ def materialize_cdse_roi_safes(
     dem: RasterDEM | None = None,
     items: Sequence[dict[str, Any]] | None = None,
     orbit_group: str | None = "auto",
+    absolute_burst_ids: Sequence[int] | None = None,
+    catalog_sensing_times: Sequence[datetime] | None = None,
     **kwargs: Any,
 ) -> list[Path]:
     """Materialize CDSE ROI/burst SAFE-subset canvases under ``work_dir``.
@@ -886,6 +889,10 @@ def materialize_cdse_roi_safes(
         must pick one explicitly.  An explicit string like
         ``"S1D/88/ASCENDING"`` keeps only items in that group.  ``None``
         disables grouping entirely (legacy behaviour).
+    absolute_burst_ids, catalog_sensing_times : optional
+        Existing catalog hints.  When both are given they are associated by
+        sensing time onto kept bursts; no extra catalog query is performed.
+        Frame-level searches without per-burst IDs leave official IDs unset.
     **kwargs : Any
         Forwarded to discovery (ignored when ``items`` is given).
 
@@ -978,6 +985,8 @@ def materialize_cdse_roi_safes(
                     coreg_mode=coreg_mode,
                     granularity=granularity,
                     dem=dem,
+                    absolute_burst_ids=absolute_burst_ids,
+                    catalog_sensing_times=catalog_sensing_times,
                 )
             )
         )
@@ -1154,6 +1163,8 @@ def _annotation_burst_coverage(safe_dir: Path) -> list[dict[str, Any]]:
                 "index": index,
                 "sensing_time": burst.sensing_time.isoformat(),
             }
+            if burst.number is not None:
+                record["number"] = int(burst.number)
             if burst.absolute_burst_id is not None:
                 record["absolute_burst_id"] = int(burst.absolute_burst_id)
             bursts.append(record)
@@ -3101,6 +3112,64 @@ def _resolve_burst_indices(
     return tuple(sorted(resolved))
 
 
+def _associate_catalog_absolute_ids(
+    swath: S1Swath,
+    *,
+    absolute_burst_ids: Sequence[int] | None,
+    catalog_sensing_times: Sequence[datetime] | None,
+) -> dict[int, int]:
+    """Map parent burst index to a catalog official ID by sensing time.
+
+    Association uses the same half-burst-window sensing-time match as
+    :func:`_resolve_burst_indices`. IDs are never assigned by list order.
+    Missing sensing hints yield an empty mapping so official IDs stay
+    ``None`` rather than a positional guess.
+
+    Parameters
+    ----------
+    swath : S1Swath
+        Parsed parent sub-swath.
+    absolute_burst_ids : sequence of int, optional
+        Catalog official identifiers.
+    catalog_sensing_times : sequence of datetime, optional
+        Catalog ``sensingStart`` hints aligned with ``absolute_burst_ids``.
+
+    Returns
+    -------
+    dict of int to int
+        ``{burst_index: official_id}`` for bursts that matched a hint.
+
+    Raises
+    ------
+    Sentinel1ProductError
+        If two different catalog IDs match the same parent burst.
+
+    """
+    if not absolute_burst_ids or not catalog_sensing_times:
+        return {}
+    axis = _burst_sensing_axis_seconds(swath)
+    tolerance = 0.5 * _burst_window_seconds(swath)
+    mapping: dict[int, int] = {}
+    count = min(len(absolute_burst_ids), len(catalog_sensing_times))
+    for position in range(count):
+        burst_id = int(absolute_burst_ids[position])
+        hint = _seconds_of_day(catalog_sensing_times[position])
+        gaps = np.abs(axis - hint)
+        gaps = np.minimum(gaps, 86400.0 - gaps)
+        best = int(np.argmin(gaps))
+        if gaps[best] > tolerance:
+            continue
+        index = int(swath.bursts[best].index)
+        previous = mapping.get(index)
+        if previous is not None and previous != burst_id:
+            reject_product(
+                f"conflicting official absolute burst IDs {previous} vs {burst_id} "
+                f"for burst index {index}"
+            )
+        mapping[index] = burst_id
+    return mapping
+
+
 def _fetch_burst_block(
     item: Mapping[str, Any],
     swath: S1Swath,
@@ -3293,11 +3362,19 @@ def materialize_cdse_burst_safes(
             measurement_path=str(
                 item.get("measurement_url", "cdse://measurement.tiff")
             ),
+            _original_parent=True,
         )
+        hints = item.get("_asf_burst_hints")
+        if hints is not None:
+            selected_ids = [int(burst_id) for burst_id, _time in hints]
+            selected_times = [time for _burst_id, time in hints]
+        else:
+            selected_ids = absolute_burst_ids
+            selected_times = catalog_sensing_times
         indices = _resolve_burst_indices(
             swath,
-            absolute_burst_ids=absolute_burst_ids,
-            catalog_sensing_times=catalog_sensing_times,
+            absolute_burst_ids=selected_ids,
+            catalog_sensing_times=selected_times,
         )
         if roi is not None:
             # Drop resolved bursts outside the ROI's line envelope so an
@@ -3316,6 +3393,11 @@ def materialize_cdse_burst_safes(
             )
             continue
         payloads: list[PathBurstPayload] = []
+        id_by_index = _associate_catalog_absolute_ids(
+            swath,
+            absolute_burst_ids=selected_ids,
+            catalog_sensing_times=selected_times,
+        )
         for index in indices:
             block, line_valid = _fetch_burst_block(
                 item,
@@ -3323,12 +3405,26 @@ def materialize_cdse_burst_safes(
                 index,
                 fetch_context=fetch_context,
             )
+            catalog_id = id_by_index.get(int(index))
+            parsed_id = swath.bursts[int(index)].absolute_burst_id
+            if (
+                catalog_id is not None
+                and parsed_id is not None
+                and int(catalog_id) != int(parsed_id)
+            ):
+                reject_product(
+                    f"conflicting official absolute burst IDs {parsed_id} vs "
+                    f"{catalog_id} for burst index {index}"
+                )
             payloads.append(
                 PathBurstPayload(
                     burst_index=int(index),
                     samples=block,
                     line_valid=line_valid,
-                    absolute_burst_id=swath.bursts[int(index)].absolute_burst_id,
+                    absolute_burst_id=(
+                        int(catalog_id) if catalog_id is not None else parsed_id
+                    ),
+                    number=getattr(swath.bursts[int(index)], "number", None),
                 )
             )
         result = write_path_safe(
@@ -3345,6 +3441,245 @@ def materialize_cdse_burst_safes(
         message = "Sentinel-1 CDSE search produced no burst SAFEs"
         reject(message, ValueError, logger=logger)
     return paths
+
+
+_SAFE_PRODUCT_RE = re.compile(
+    r"^(?P<mission>S1[ABCD])_(?P<beam>[A-Z]{2})_SLC__1S(?P<pols>[A-Z]{2})_"
+    r"(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_"
+    r"(?P<absorbit>\d{6})_(?P<datatake>[0-9A-F]{6})_(?P<uid>[0-9A-F]{4})$"
+)
+"""ESA IW SLC product-id grammar; same pattern as ``path_safe._SAFE_PRODUCT_RE``."""
+
+
+def _safe_product_id(segment: str) -> str | None:
+    """Return an ESA IW SLC product id from one path or filename segment."""
+    text = urllib.parse.unquote(str(segment).strip())
+    if text.casefold().endswith(".zip"):
+        text = text[:-4]
+    if text[-5:].upper() == ".SAFE":
+        text = text[:-5]
+    text = text.upper()
+    return text if _SAFE_PRODUCT_RE.fullmatch(text) else None
+
+
+def _parse_safe_sensing_window(product_id: str) -> tuple[datetime, datetime] | None:
+    """Return parent sensing start/stop encoded in an ESA SLC product id."""
+    match = _SAFE_PRODUCT_RE.fullmatch(product_id)
+    if match is None:
+        return None
+    fmt = "%Y%m%dT%H%M%S"
+    start = datetime.strptime(match.group("start"), fmt).replace(tzinfo=UTC)
+    stop = datetime.strptime(match.group("stop"), fmt).replace(tzinfo=UTC)
+    return start, stop
+
+
+def _asf_data_href(item: Any) -> str | None:
+    """Return the ``data`` zip href, not a thumbnail or metadata asset."""
+    assets = getattr(item, "assets", None) or {}
+    if not isinstance(assets, Mapping):
+        return None
+    preferred = assets.get("data")
+    href = getattr(preferred, "href", None) if preferred is not None else None
+    if href:
+        return str(href)
+    for asset in assets.values():
+        href = getattr(asset, "href", None)
+        if href and str(href).casefold().endswith(".zip"):
+            return str(href)
+    return None
+
+
+def _asf_parent_id(item: Any) -> str | None:
+    """Return the parent SAFE id from the data href path or the item id."""
+    measurement = _asf_burst_measurement(item)
+    if measurement is not None:
+        return measurement[0]
+    href = _asf_data_href(item)
+    if href:
+        path = urllib.parse.unquote(urllib.parse.urlsplit(href).path)
+        for segment in path.split("/"):
+            parent = _safe_product_id(segment)
+            if parent is not None:
+                return parent
+    return _safe_product_id(str(getattr(item, "item_id", "")))
+
+
+_SWATH_NAMES = frozenset({"IW1", "IW2", "IW3"})
+_POL_NAMES = frozenset({"VV", "VH", "HH", "HV"})
+
+
+def _asf_burst_measurement(item: Any) -> tuple[str, str, str] | None:
+    """Return ``(parent, swath, polarization)`` from an SLC-BURST data href.
+
+    The extractor layout is ``.../<parent SAFE>/IW1/VV/8.zip``.  The trailing
+    ordinal is the parent ``burstList`` index, not a canvas slot, and is not
+    used as a resolver key.
+    """
+    href = _asf_data_href(item)
+    if not href:
+        return None
+    path = urllib.parse.unquote(urllib.parse.urlsplit(href).path)
+    parts = [part for part in path.split("/") if part]
+    for index, segment in enumerate(parts):
+        parent = _safe_product_id(segment)
+        if parent is None:
+            continue
+        if index + 2 >= len(parts):
+            return None
+        swath = parts[index + 1].upper()
+        pol = parts[index + 2].upper()
+        if swath in _SWATH_NAMES and pol in _POL_NAMES:
+            return parent, swath, pol
+        return None
+    return None
+
+
+def _asf_burst_groups(
+    items: Sequence[Any],
+) -> dict[tuple[str, str, str], list[tuple[int, datetime]]]:
+    """Group ASF SLC-BURST items by ``(parent, swath, polarization)``.
+
+    Each group carries ``(absoluteBurstID, sensing_time)`` pairs for that
+    measurement only.  Identified burst items that lack the href triple or
+    a sensing time fail closed so the time-of-day resolver is never fed
+    another swath or date's hints.
+    """
+    groups: dict[tuple[str, str, str], list[tuple[int, datetime]]] = {}
+    for item in items:
+        if not _asf_is_burst_item(item):
+            continue
+        measurement = _asf_burst_measurement(item)
+        if measurement is None:
+            message = (
+                "ASF SLC-BURST item "
+                f"{getattr(item, 'item_id', '?')!r} has no parent+IW+pol "
+                "identity in its data href"
+            )
+            reject(message, ValueError, logger=logger)
+        parent, swath, pol = measurement
+        science = _asf_item_science(item)
+        absolute = science.get("absoluteBurstID")
+        sensing = _asf_sensing_time(item)
+        if absolute is None or sensing is None:
+            message = (
+                "ASF SLC-BURST item "
+                f"{getattr(item, 'item_id', '?')!r} lacks absoluteBurstID "
+                "or sensing time; refusing positional burst-index fallback"
+            )
+            reject(message, ValueError, logger=logger)
+        groups.setdefault((parent, swath, pol), []).append((int(absolute), sensing))
+    return groups
+
+
+def _asf_frame_parent_ids(items: Sequence[Any]) -> frozenset[str]:
+    """Return parent SAFE ids of whole-frame ASF items (not SLC-BURST)."""
+    parents: set[str] = set()
+    for item in items:
+        if _asf_is_burst_item(item):
+            continue
+        parent = _asf_parent_id(item)
+        if parent is not None:
+            parents.add(parent)
+    return frozenset(parents)
+
+
+def _apply_asf_burst_hints(
+    bindings: Sequence[Mapping[str, Any]],
+    groups: Mapping[tuple[str, str, str], Sequence[tuple[int, datetime]]],
+    *,
+    frame_parents: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Attach per-measurement ASF burst hints; drop unselected IW/pol.
+
+    Burst-only parents keep only the selected ``(parent, swath, pol)``
+    groups.  A parent that was also an explicit whole-frame selection
+    stays unhinted on every measurement, including ones that also match
+    a burst group, so frame-union semantics are preserved.  A selected
+    burst group missing from rediscovery fails closed.
+    """
+    if not groups:
+        return [dict(binding) for binding in bindings]
+    burst_only_parents = {
+        parent for parent, _swath, _pol in groups if parent not in frame_parents
+    }
+    kept: list[dict[str, Any]] = []
+    matched: set[tuple[str, str, str]] = set()
+    for binding in bindings:
+        parent = _binding_parent_id(binding)
+        swath = str(binding.get("swath") or "").upper()
+        pol = str(binding.get("polarization") or "").upper()
+        key = (parent, swath, pol)
+        if key in groups:
+            matched.add(key)
+            if parent in frame_parents:
+                kept.append(dict(binding))
+            else:
+                updated = dict(binding)
+                updated["_asf_burst_hints"] = list(groups[key])
+                kept.append(updated)
+            continue
+        if parent in burst_only_parents:
+            continue
+        kept.append(dict(binding))
+    missing = sorted(key for key in groups if key not in matched)
+    if missing:
+        message = (
+            "CDSE rediscovery is missing ASF-selected measurements "
+            f"{missing!r}; refusing to apply another swath or date's "
+            "burst hints"
+        )
+        reject(message, ValueError, logger=logger)
+    return kept
+
+
+def _asf_is_burst_item(item: Any) -> bool:
+    """Return whether one catalog item is an ASF SLC-BURST, not a whole frame."""
+    collection = str(getattr(item, "collection", "") or "").casefold()
+    if "burst" in collection:
+        return True
+    item_id = str(getattr(item, "item_id", "") or "")
+    if item_id.casefold().endswith("-burst"):
+        return True
+    props = getattr(getattr(item, "acquisition", None), "properties", {}) or {}
+    return bool(props.get("absoluteBurstID") or props.get("BURST_ID_ABSOLUTE"))
+
+
+def _binding_parent_id(item: Mapping[str, Any]) -> str:
+    """Return the SAFE product id of one CDSE binding."""
+    product_id = str(item.get("product_id") or "").strip()
+    parsed = _safe_product_id(product_id)
+    return parsed if parsed is not None else product_id.upper()
+
+
+def _asf_href_burst_number(href: str | None) -> int | None:
+    """Return the parent burstList ordinal encoded as ``.../IW1/VV/8.zip``.
+
+    The trailing zip stem is the original parent sub-swath ordinal, not the
+    inner one-burst annotation index.  Hrefs that are not this extractor
+    layout return ``None``; the ordinal is never guessed from a local list.
+    """
+    if not href:
+        return None
+    path = urllib.parse.unquote(urllib.parse.urlsplit(str(href)).path)
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 3:
+        return None
+    last = parts[-1]
+    stem, dot, suffix = last.rpartition(".")
+    if not dot or suffix.casefold() != "zip" or not stem.isdigit():
+        return None
+    polarization = parts[-2].upper()
+    swath = parts[-3].upper()
+    if polarization not in {"VV", "VH", "HH", "HV"}:
+        return None
+    if not swath.startswith(("IW", "EW")):
+        return None
+    return int(stem)
+
+
+def _asf_item_data_href(item: Any) -> str:
+    """Return the SLC-BURST data zip href, not a thumbnail or metadata asset."""
+    return _asf_data_href(item) or ""
 
 
 def _asf_item_science(item: Any) -> dict[str, Any]:
@@ -3378,16 +3713,28 @@ def _asf_item_track_key(item: Any) -> str | None:
 
 
 def _asf_sensing_time(item: Any) -> datetime | None:
-    """Return the catalog ``sensingStart`` of one ASF burst item."""
+    """Return the burst sensing time of one ASF item.
+
+    Catalog ``sensingStart`` wins when present.  Real ASF ``SLC-BURST``
+    properties leave that field unset; ``acquisition.start`` is then the
+    parent burstList sensingTime (verified against IW XML, not a frame
+    start).
+    """
     science = _asf_item_science(item)
     value = science.get("sensingStart")
-    if value is None:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if value is not None:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            parsed = None
+        else:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    start = getattr(getattr(item, "acquisition", None), "start", None)
+    if isinstance(start, datetime):
+        return start if start.tzinfo else start.replace(tzinfo=UTC)
+    return None
 
 
 def asf_burst_selectors(
@@ -3397,16 +3744,28 @@ def asf_burst_selectors(
 
     ``from_search`` searches on ASF but may download on CDSE.  The two
     catalogs share the ``absoluteBurstID`` namespace and the sensing-time
-    axis, so an ASF item's ``absoluteBurstID`` + ``sensingStart`` is the
-    selector that re-finds the same bursts inside a CDSE-discovered parent
-    frame (``_resolve_burst_indices``).
+    axis, so an ASF item's ``absoluteBurstID`` plus sensing time re-finds
+    the same bursts inside a CDSE parent frame
+    (``_resolve_burst_indices``).  Sensing time is ``sensingStart`` when
+    present, otherwise ``acquisition.start``.
+
+    Identified burst items (those with ``absoluteBurstID``) never return
+    an id without an aligned time: a missing time would otherwise fall
+    through to the positional index resolver, which is unsafe for
+    non-contiguous selections.  Whole-frame items have no
+    ``absoluteBurstID`` and are skipped.
 
     Returns
     -------
     tuple of (list of int, list of datetime)
         Aligned ``absolute_burst_ids`` and ``catalog_sensing_times`` for
-        :func:`materialize_s1_acquisitions`.  Items lacking either field
-        are skipped.
+        :func:`materialize_s1_acquisitions`.
+
+    Raises
+    ------
+    ValueError
+        If an item has ``absoluteBurstID`` but neither ``sensingStart``
+        nor ``acquisition.start``.
 
     """
     ids: list[int] = []
@@ -3415,8 +3774,16 @@ def asf_burst_selectors(
         science = _asf_item_science(item)
         absolute = science.get("absoluteBurstID")
         sensing = _asf_sensing_time(item)
-        if absolute is None or sensing is None:
+        if absolute is None:
             continue
+        if sensing is None:
+            message = (
+                "ASF SLC-BURST item "
+                f"{getattr(item, 'item_id', '?')!r} has absoluteBurstID "
+                f"{absolute} but no sensingStart or acquisition.start; "
+                "refusing positional burst-index fallback"
+            )
+            reject(message, ValueError, logger=logger)
         ids.append(int(absolute))
         times.append(sensing)
     return ids, times
@@ -3424,40 +3791,79 @@ def asf_burst_selectors(
 
 def asf_frame_selectors(
     items: Sequence[Any],
-) -> tuple[tuple[datetime, datetime] | None, set[str]]:
-    """Map ASF frame-granule items to a CDSE rediscovery window + tracks.
+) -> tuple[tuple[datetime, datetime] | None, set[str], frozenset[str] | None]:
+    """Map ASF items to a CDSE rediscovery window, tracks, and parent ids.
 
-    ASF burst-level searches return whole-frame SLC granules (the burst
-    extractor splits them downstream), so there is no ``absoluteBurstID``
-    to match — the bridge to CDSE is the sensing-time window plus the
-    track identity (mission + relativeOrbit + orbitDirection).  Returns
-    the ``datetime_range`` that bounds every item's sensing window and the
-    set of track keys those items belong to, so a CDSE re-discovery can be
-    narrowed to the same frames instead of the whole ROI/time envelope.
+    ASF ``SLC-BURST`` items are one-burst extractor zips, not whole
+    frames.  Their data href encodes the parent SAFE
+    (``.../<parent>/IW1/VV/8.zip``).  The CDSE rediscovery window must
+    cover that parent's sensing start/end, not the child burst start,
+    because :func:`faninsar.remote.search` keeps items by
+    ``acquisition.start`` only.
+
+    Whole-frame SLC items keep the parent id and sensing window from the
+    SAFE zip stem (or catalog interval when the stem is not a SAFE id).
+    Parent product ids are returned only when every selected item has a
+    confident parent, so adjacent same-track frames cannot leak into
+    rediscovery; otherwise the id filter is omitted rather than dropping
+    frame-only identities.
 
     Returns
     -------
-    tuple of (datetime_range or None, set of str)
-        ``(min(start), max(end))`` across items and the resolved
-        ``track_key`` set (e.g. ``{"88A", "117A"}``).
+    tuple of (datetime_range or None, set of str, frozenset of str or None)
+        Inclusive parent sensing window, resolved ``track_key`` set
+        (e.g. ``{"88A", "117A"}``), and parent SAFE ids when every item
+        identified a parent.
+
+    Raises
+    ------
+    ValueError
+        If an SLC-BURST extractor href is present but its parent SAFE
+        identity cannot be parsed.  A child burst start is never used as
+        a silent fallback window.
 
     """
     starts: list[datetime] = []
     ends: list[datetime] = []
     tracks: set[str] = set()
+    parents: list[str] = []
+    all_parents_known = True
     for item in items:
-        acquisition = getattr(item, "acquisition", None)
-        start = getattr(acquisition, "start", None)
-        end = getattr(acquisition, "end", None)
+        key = _asf_item_track_key(item)
+        if key is not None:
+            tracks.add(key)
+        parent_id = _asf_parent_id(item)
+        parent_window = (
+            _parse_safe_sensing_window(parent_id) if parent_id is not None else None
+        )
+        if _asf_is_burst_item(item) and parent_id is None:
+            message = (
+                "ASF SLC-BURST item "
+                f"{getattr(item, 'item_id', '?')!r} has no parent SAFE "
+                "identity in its data href; refusing to rediscover CDSE "
+                "products from the child burst start"
+            )
+            reject(message, ValueError, logger=logger)
+        if parent_id is None:
+            all_parents_known = False
+            acquisition = getattr(item, "acquisition", None)
+            start = getattr(acquisition, "start", None)
+            end = getattr(acquisition, "end", None)
+        else:
+            parents.append(parent_id)
+            if parent_window is not None:
+                start, end = parent_window
+            else:
+                acquisition = getattr(item, "acquisition", None)
+                start = getattr(acquisition, "start", None)
+                end = getattr(acquisition, "end", None)
         if isinstance(start, datetime):
             starts.append(start if start.tzinfo else start.replace(tzinfo=UTC))
         if isinstance(end, datetime):
             ends.append(end if end.tzinfo else end.replace(tzinfo=UTC))
-        key = _asf_item_track_key(item)
-        if key is not None:
-            tracks.add(key)
     window = (min(starts), max(ends)) if starts and ends else None
-    return window, tracks
+    known = frozenset(parents) if all_parents_known and parents else None
+    return window, tracks, known
 
 
 def materialize_asf_burst_safes(
@@ -3628,6 +4034,7 @@ def materialize_asf_burst_safes(
                     samples=array,
                     line_valid=None,
                     absolute_burst_id=(int(absolute) if absolute is not None else None),
+                    number=_asf_href_burst_number(_asf_data_href(item)),
                     annotation_xml=_read_annotation_source(swath),
                 )
             )
@@ -3809,5 +4216,7 @@ def materialize_s1_acquisitions(
         granularity=resolved_granularity,
         items=items,
         orbit_group=orbit_group,
+        absolute_burst_ids=absolute_burst_ids,
+        catalog_sensing_times=catalog_sensing_times,
         **kwargs,
     )

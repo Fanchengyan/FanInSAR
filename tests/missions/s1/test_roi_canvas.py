@@ -269,6 +269,28 @@ class TestRoiCanvasRaster:
         )
         assert not np.any(raster[15:])
 
+    def test_catalog_absolute_ids_stamp_kept_bursts(
+        self,
+        parent: ParentInfo,
+        tmp_path: Path,
+    ) -> None:
+        """Known catalog IDs are written into the canvas annotation copy."""
+        swath, _memfile, xml_text, data = parent
+        handle = write_roi_safe_canvas(
+            swath,
+            _default_windows(data),
+            tmp_path,
+            annotation_xml=xml_text,
+            product_id="ROI_IDS",
+            absolute_burst_ids={4: 44004, 5: 44005},
+        )
+        parsed = parse_annotation_xml(
+            handle.annotation_path.read_text(encoding="utf-8"),
+            annotation_path=str(handle.annotation_path),
+            measurement_path=str(handle.measurement_path),
+        )
+        assert [burst.absolute_burst_id for burst in parsed.bursts] == [44004, 44005]
+
     def test_canvas_is_tiled_deflate_and_smaller_than_uncompressed(
         self,
         parent: ParentInfo,

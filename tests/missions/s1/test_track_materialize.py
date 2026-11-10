@@ -179,6 +179,35 @@ class TestResolveBurstIndices:
                 catalog_sensing_times=[datetime(2016, 12, 7, 0, 0, 0, tzinfo=UTC)],
             )
 
+    def test_catalog_ids_associate_by_sensing_time_not_list_order(self) -> None:
+        """Official IDs bind to the matching burst, never zip(ids, indices)."""
+        from faninsar.missions.s1.acquisition import _associate_catalog_absolute_ids
+
+        swath = _swath()
+        mapping = _associate_catalog_absolute_ids(
+            swath,
+            absolute_burst_ids=[41, 42],
+            catalog_sensing_times=[
+                datetime(2016, 12, 7, 11, 18, 56, 543845, tzinfo=UTC),
+                datetime(2016, 12, 7, 11, 18, 54, 543845, tzinfo=UTC),
+            ],
+        )
+        assert mapping == {2: 41, 0: 42}
+
+    def test_catalog_ids_without_sensing_times_are_not_assigned_by_order(self) -> None:
+        """Missing sensing hints leave official IDs unset rather than list-order."""
+        from faninsar.missions.s1.acquisition import _associate_catalog_absolute_ids
+
+        swath = _swath()
+        assert (
+            _associate_catalog_absolute_ids(
+                swath,
+                absolute_burst_ids=[41, 42],
+                catalog_sensing_times=None,
+            )
+            == {}
+        )
+
 
 class _FakeCatalogAsset:
     key = "product"
@@ -343,6 +372,63 @@ def _tiff_bytes(data: np.ndarray) -> bytes:
     payload = memfile.read()
     memfile.close()
     return payload
+
+
+class TestPathSafeOfficialIdStamp:
+    """Catalog IDs are written into the materialized annotation copy only."""
+
+    def test_write_path_safe_stamps_catalog_id_when_annotation_lacks_it(
+        self, tmp_path: Path
+    ) -> None:
+        from faninsar.missions.s1.io.path_safe import PathBurstPayload, write_path_safe
+
+        swath = _swath()
+        result = write_path_safe(
+            swath,
+            [
+                PathBurstPayload(
+                    burst_index=2,
+                    samples=_burst_raster(2),
+                    absolute_burst_id=4242,
+                )
+            ],
+            "88A",
+            tmp_path,
+            annotation_xml=_parent_xml(),
+        )
+        product = open_safe_product(result.safe_root)
+        assert product.swaths[0].bursts[0].absolute_burst_id == 4242
+
+    def test_write_path_safe_rejects_conflicting_annotation_id(
+        self, tmp_path: Path
+    ) -> None:
+        from faninsar.missions.s1.io.path_safe import PathBurstPayload, write_path_safe
+
+        xml_text = _parent_xml().replace(
+            "<sensingTime>2016-12-07T11:18:54.543845</sensingTime>",
+            "<sensingTime>2016-12-07T11:18:54.543845</sensingTime>\n"
+            "        <absoluteBurstID>111</absoluteBurstID>",
+            1,
+        )
+        swath = parse_annotation_xml(
+            xml_text,
+            annotation_path="memory://parent-annotation.xml",
+            measurement_path="memory://parent-measurement.tiff",
+        )
+        with pytest.raises(Sentinel1ProductError, match="conflicting"):
+            write_path_safe(
+                swath,
+                [
+                    PathBurstPayload(
+                        burst_index=0,
+                        samples=_burst_raster(0),
+                        absolute_burst_id=222,
+                    )
+                ],
+                "88A",
+                tmp_path,
+                annotation_xml=xml_text,
+            )
 
 
 class TestAsfBurstPath:

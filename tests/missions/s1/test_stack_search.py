@@ -658,9 +658,14 @@ def test_from_search_asf_items_rediscover_on_cdse(
         "mission": "S1A",
         "sensingStart": "2024-01-01T00:00:10",
     }
-    item = _item(_asset(), properties=science)
+    parent = "S1A_IW_SLC__1SDV_20240101T000000_20240101T000100_000088_000000_0000"
+    item = _item(
+        _asset(href=f"https://sentinel1-burst.asf.alaska.edu/{parent}/IW1/VV/8.zip"),
+        properties=science,
+    )
     item = replace(
         item,
+        collection="SLC-BURST",
         acquisition=replace(
             item.acquisition,
             start=datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
@@ -668,10 +673,10 @@ def test_from_search_asf_items_rediscover_on_cdse(
         ),
     )
     discover_calls: dict[str, Any] = {}
-    # Two CDSE bindings on different tracks; only the searched one (88A)
+    # Two CDSE bindings on different tracks; only the searched parent (88A)
     # must be materialized.
     cdse_88 = {
-        "product_id": "P88",
+        "product_id": parent,
         "relative_orbit": 88,
         "orbit_direction": "ASCENDING",
         "mission_id": "S1A",
@@ -723,13 +728,14 @@ def test_from_search_asf_items_rediscover_on_cdse(
         datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
         datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
     )
-    # Only the searched-track binding is materialized; burst selector
-    # forwards the ASF absoluteBurstID/sensingStart.
-    assert captured["items"] == [cdse_88]
-    assert captured["absolute_burst_ids"] == [3001]
-    assert [str(t) for t in captured["catalog_sensing_times"]] == [
-        "2024-01-01 00:00:10+00:00"
+    # Only the searched-track binding is materialized; burst identity
+    # is attached per binding, not as a global id/time list.
+    assert [b["product_id"] for b in captured["items"]] == [parent]
+    assert captured["items"][0]["_asf_burst_hints"] == [
+        (3001, datetime(2024, 1, 1, 0, 0, 10, tzinfo=UTC))
     ]
+    assert captured.get("absolute_burst_ids") is None
+    assert captured.get("catalog_sensing_times") is None
     assert captured["provider"] == "cdse"
 
 

@@ -28,6 +28,11 @@ import rasterio
 from rasterio.transform import Affine
 
 from faninsar.logging import setup_logger
+from faninsar.missions.s1.annotation import (
+    _read_parent_burst_number,
+    _resolved_parent_burst_number,
+    _stamp_parent_burst_number,
+)
 from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.extract import extract_bursts
 
@@ -70,16 +75,31 @@ def _read_annotation_source(swath: S1Swath) -> str:
     return ""
 
 
-def _trim_annotation(xml_text: str, keep_indices: list[int]) -> bytes:
+def _trim_annotation(
+    xml_text: str,
+    keep_indices: list[int],
+    numbers: list[int | None] | None = None,
+) -> bytes:
     """Return annotation XML with only the selected bursts in its burstList."""
     root = ET.fromstring(xml_text)
     swath_timing = next(c for c in root if _local(c.tag) == "swathTiming")
     burst_list = next(c for c in swath_timing if _local(c.tag) == "burstList")
     bursts = [c for c in burst_list if _local(c.tag) == "burst"]
     keep_set = set(keep_indices)
+    number_by_index = {
+        int(index): None if numbers is None else numbers[position]
+        for position, index in enumerate(keep_indices)
+    }
     for idx, burst in enumerate(bursts):
         if idx not in keep_set:
             burst_list.remove(burst)
+            continue
+        number = _resolved_parent_burst_number(
+            _read_parent_burst_number(burst),
+            number_by_index.get(idx),
+        )
+        if number is not None:
+            _stamp_parent_burst_number(burst, number)
     burst_list.set("count", str(len(keep_indices)))
     # ET.tostring round-trips namespaces well enough for downstream tools;
     # we emit with encoding="utf-8" to match the SAFE convention.
@@ -186,7 +206,11 @@ def export_swath_bursts(
     _write_burst_tiff(tiff_path, stacked)
 
     xml_text = _read_annotation_source(swath)
-    trimmed = _trim_annotation(xml_text, burst_indices)
+    trimmed = _trim_annotation(
+        xml_text,
+        burst_indices,
+        numbers=[swath.bursts[index].number for index in burst_indices],
+    )
     ann_path = safe_root / "annotation" / f"{stem}.xml"
     ann_path.write_bytes(trimmed)
 
