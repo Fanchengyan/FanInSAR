@@ -17,6 +17,7 @@ normalize differently — CDSE emits ``platform="sentinel-1d"`` and keeps
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -140,6 +141,19 @@ def _direction(item: CatalogItem) -> str:
     return ""
 
 
+def _metadata_field(sources: Sequence[Any], key: str) -> Any:
+    """Read an ASF field from direct or nested burst metadata."""
+    for source in sources:
+        if isinstance(source, Mapping):
+            nested = source.get("burst")
+            value = source.get(key)
+            if value is None and isinstance(nested, Mapping):
+                value = nested.get(key)
+            if value is not None:
+                return value
+    return None
+
+
 @dataclass(frozen=True)
 class S1Search:
     """Immutable, composable set of Sentinel-1 catalog acquisitions.
@@ -256,8 +270,13 @@ class S1Search:
     ) -> Any:
         """Draw frame footprints and the ROI outline, colored by platform.
 
-        Frame-level footprints come from ``acquisition.geometry`` (GeoJSON).
-        Returns the matplotlib Axes.
+        Footprints come from ``acquisition.geometry`` (GeoJSON). Available
+        ASF burst IDs are grouped by track, relative ID and subswath when
+        available. The parenthesized count is the number of search results,
+        including those without a footprint; it is not a count of distinct
+        acquisition dates. A group is annotated only when it has a drawable
+        footprint. An absolute ID without stable grouping fields is displayed
+        per result, not treated as a cross-date identity. Returns the Axes.
         """
         import geopandas as gpd
         import matplotlib.pyplot as plt
@@ -267,13 +286,66 @@ class S1Search:
             _, ax = plt.subplots(figsize=(8, 6))
         geoms: list[Any] = []
         labels: list[str] = []
-        for item in self.items:
+        burst_counts: dict[tuple[str, ...], int] = {}
+        burst_geometries: dict[tuple[str, ...], Any] = {}
+        burst_labels: dict[tuple[str, ...], str] = {}
+        for index, item in enumerate(self.items):
+            props = getattr(item.acquisition, "properties", {}) or {}
+            raw = _raw(item)
+            raw_props = raw.get("properties")
+            sources = (props, raw_props, raw)
+            full = _metadata_field(sources, "fullBurstID")
+            relative = _metadata_field(sources, "relativeBurstID")
+            track = _metadata_field(sources, "relativeOrbit") or _metadata_field(
+                sources, "pathNumber"
+            )
+            swath = _metadata_field(sources, "subswath")
+            # ASF documents this exact granule-name structure. The adapter
+            # currently retains the granule ID but drops the subswath field.
+            match = re.fullmatch(
+                r"S1_(\d+)_(IW[1-3]|EW[1-5])_\d{8}T\d{6}_(?:VV|VH|HH|HV)_[0-9A-Fa-f]{4}-BURST",
+                _item_id(item),
+            )
+            if swath is None and match and str(relative) == str(int(match[1])):
+                swath = match[2]
+            burst_key = None
+            burst_label = None
+            if isinstance(full, str) and full.strip():
+                burst_label = full.strip()
+                burst_key = ("full", burst_label)
+            elif (
+                isinstance(track, int)
+                and not isinstance(track, bool)
+                and 1 <= track <= 175
+                and isinstance(relative, int)
+                and not isinstance(relative, bool)
+                and relative >= 0
+                and isinstance(swath, str)
+                and re.fullmatch(r"(?:IW[1-3]|EW[1-5])", swath)
+            ):
+                burst_label = f"{track:03d}_{relative:06d}_{swath}"
+                burst_key = ("full", burst_label)
+            else:
+                absolute = _metadata_field(sources, "absoluteBurstID")
+                if (
+                    isinstance(absolute, (str, int))
+                    and not isinstance(absolute, bool)
+                    and str(absolute).strip()
+                ):
+                    burst_label = str(absolute).strip()
+                    burst_key = ("item", str(index))
+            if burst_key is not None:
+                burst_counts[burst_key] = burst_counts.get(burst_key, 0) + 1
+                burst_labels[burst_key] = burst_label
             geometry = getattr(item.acquisition, "geometry", None)
             if not geometry:
                 continue
             try:
-                geoms.append(shape(geometry))
+                geom = shape(geometry)
+                geoms.append(geom)
                 labels.append(_platform(item) or "?")
+                if burst_key is not None and not geom.is_empty:
+                    burst_geometries.setdefault(burst_key, geom)
             except Exception:  # skip malformed footprint
                 continue
         if geoms:
@@ -283,6 +355,14 @@ class S1Search:
             for platform, subset in gdf.groupby("platform"):
                 subset.boundary.plot(ax=ax, label=platform, linewidth=1.4)
             ax.legend(title="platform")
+            for burst_key, geom in burst_geometries.items():
+                centroid = geom.centroid
+                ax.annotate(
+                    f"{burst_labels[burst_key]} ({burst_counts[burst_key]})",
+                    xy=(centroid.x, centroid.y),
+                    ha="center",
+                    fontsize=8,
+                )
         if roi is not None:
             try:
                 if hasattr(roi, "left"):
