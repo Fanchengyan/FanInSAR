@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import zarr
+from pyproj import Transformer
 
 from faninsar.missions.s1.processing import (
     PreparedGeometryField,
@@ -499,6 +501,37 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
         "combine_offset_fields",
         lambda geometry_field, **_: geometry_field,
     )
+    # Geometry-mode geo coregistration solves the secondary by geo2rdr at the
+    # LUT ground points instead of composing the dense offsets; the mock scene
+    # has no orbit, so record the ground points and return the zero-offset
+    # solution on the cropped tile.
+    ground_calls: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    coregister_kwargs: dict[str, object] = {}
+
+    def solve_secondary(
+        _model: object,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        height: np.ndarray,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        ground_calls.append((np.array(latitude), np.array(longitude), np.array(height)))
+        shape = np.shape(latitude)
+        return SimpleNamespace(
+            azimuth_index=np.ones(shape, dtype=np.float64),
+            range_index=np.ones(shape, dtype=np.float64),
+            converged=np.ones(shape, dtype=bool),
+        )
+
+    def coregister_chunked(*_args: object, **kwargs: object) -> tuple[np.ndarray, ...]:
+        coregister_kwargs.update(kwargs)
+        return (
+            np.ones(lut_shape, dtype=np.complex64),
+            np.ones(lut_shape, dtype=np.complex64),
+            np.ones(lut_shape, dtype=bool),
+        )
+
+    monkeypatch.setattr(production_mod, "run_geo2rdr", solve_secondary)
     monkeypatch.setattr(
         production_mod,
         "build_geo2rdr_lut",
@@ -507,11 +540,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
     )
     monkeypatch.setattr(
         "faninsar.processing.geocoding.geo_modes.coregister_geocoded_slcs_chunked",
-        lambda *_args, **_kwargs: (
-            np.ones(lut_shape, dtype=np.complex64),
-            np.ones(lut_shape, dtype=np.complex64),
-            np.ones(lut_shape, dtype=bool),
-        ),
+        coregister_chunked,
     )
     monkeypatch.setattr(
         production_mod,
@@ -534,6 +563,27 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
     assert result.geo2rdr_lut is prepared_lut
     assert result.geo_bbox == (1, 3, 1, 3)
     assert result.coregistration_timings_s["geo2rdr_lut_reused"] == 0.0
+
+    # The secondary is solved once, at the world pixel centres of the cropped
+    # LUT tile (grid rows/cols 1..2), not at the grid-origin tile.
+    assert "secondary_geo2rdr" in result.coregistration_timings_s
+    assert len(ground_calls) == 1
+    latitude, longitude, height = ground_calls[0]
+    assert latitude.shape == lut_shape
+    assert np.isfinite(latitude).all()
+    assert np.isfinite(longitude).all()
+    easting, northing = Transformer.from_crs(
+        "EPSG:4326", grid.crs, always_xy=True
+    ).transform(longitude, latitude)
+    np.testing.assert_allclose(easting, [[15.0, 25.0], [15.0, 25.0]], atol=1e-3)
+    np.testing.assert_allclose(northing, [[25.0, 25.0], [15.0, 15.0]], atol=1e-3)
+    np.testing.assert_array_equal(height, prepared_lut.height_full)
+    # That solved field, finite and inside the operand, is what gets sampled.
+    solved = coregister_kwargs["secondary_coordinates"]
+    assert solved.shape == lut_shape
+    np.testing.assert_array_equal(np.asarray(solved.az), np.ones(lut_shape))
+    np.testing.assert_array_equal(np.asarray(solved.rg), np.ones(lut_shape))
+    assert np.asarray(solved.valid).all()
 
 
 def test_prepared_geometry_field_rejects_shape_or_dtype_mismatch() -> None:

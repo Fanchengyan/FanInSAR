@@ -160,6 +160,8 @@ def geocode_secondary_slc(
     device: str = "auto",
     dask_client: Any | None = None,
     source_valid: np.ndarray | None = None,
+    secondary_native_height: int | None = None,
+    secondary_coordinates: RadarCoordinates | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample one secondary SLC on the geographic grid of the Reference.
 
@@ -184,6 +186,19 @@ def geocode_secondary_slc(
         Explicitly trusted Dask client for remote CUDA reramp tasks.
     source_valid : numpy.ndarray, optional
         Native secondary sample validity aligned with ``secondary_deramped``.
+    secondary_native_height : int, optional
+        Azimuth height of the secondary array that was deramped. The TOPS
+        carrier centre is ``height // 2`` of that array, not a later
+        trailing-edge conform onto the Reference shape and not a geographic
+        chunk or crop. ``None`` uses ``secondary_deramped.shape[0]``.
+    secondary_coordinates : RadarCoordinates, optional
+        Pre-composed secondary radar coordinates for this destination frame.
+        Injection lets a caller that already solved the secondary position by
+        geo2rdr (for example the geometry-mode geographic stage) reuse that
+        one field for sampling, reramping, and flattening instead of
+        composing the dense offset field, whose rdr2geo-derived coverage
+        would veto pixels with otherwise valid ground solutions. ``None``
+        composes ``reference.minus_offsets(offsets)`` as before.
 
     Returns
     -------
@@ -191,19 +206,29 @@ def geocode_secondary_slc(
         Reramped secondary samples and that date's sampling validity.
 
     """
-    if tuple(np.shape(reference_valid)) != tuple(reference_lut.shape):
-        from faninsar.processing.errors import reject_invalid_state
+    from faninsar.processing.errors import reject_invalid_state
 
+    if tuple(np.shape(reference_valid)) != tuple(reference_lut.shape):
         reject_invalid_state("reference support does not match the geo LUT shape")
+    reramp_height = (
+        int(secondary_deramped.shape[0])
+        if secondary_native_height is None
+        else int(secondary_native_height)
+    )
+    if reramp_height <= 0:
+        reject_invalid_state("secondary_native_height must be positive")
     reference_coordinates = RadarCoordinates(
         reference_lut.az_full,
         reference_lut.rg_full,
         reference_lut.valid,
     )
-    secondary_coordinates = reference_coordinates.minus_offsets(
-        offsets,
-        device=device,
-    )
+    if secondary_coordinates is None:
+        secondary_coordinates = reference_coordinates.minus_offsets(
+            offsets,
+            device=device,
+        )
+    elif secondary_coordinates.shape != tuple(reference_lut.shape):
+        reject_invalid_state("secondary coordinates do not match the geo LUT shape")
     secondary_geo, secondary_valid = sample(
         secondary_deramped,
         secondary_coordinates,
@@ -216,7 +241,7 @@ def geocode_secondary_slc(
         secondary_carrier,
         secondary_coordinates.az,
         secondary_coordinates.rg,
-        native_height=secondary_deramped.shape[0],
+        native_height=reramp_height,
         device=device,
         dask_client=dask_client,
     )
@@ -236,6 +261,8 @@ def coregister_geocoded_slcs(
     dask_client: Any | None = None,
     reference_source_valid: np.ndarray | None = None,
     secondary_source_valid: np.ndarray | None = None,
+    secondary_native_height: int | None = None,
+    secondary_coordinates: RadarCoordinates | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Coregister two deramped SLCs directly on a geographic grid.
 
@@ -256,6 +283,13 @@ def coregister_geocoded_slcs(
         Explicitly trusted Dask client for remote CUDA reramp tasks.
     reference_source_valid, secondary_source_valid : numpy.ndarray, optional
         Native sample-validity masks aligned with each deramped SLC.
+    secondary_native_height : int, optional
+        Deramped secondary azimuth height used for the TOPS carrier centre.
+        Forwarded to :func:`geocode_secondary_slc`.
+    secondary_coordinates : RadarCoordinates, optional
+        Pre-composed secondary radar coordinates on the Reference geo frame.
+        Forwarded to :func:`geocode_secondary_slc`; the Reference stays on its
+        own LUT coordinates. ``None`` composes the dense offset field.
 
     Returns
     -------
@@ -288,6 +322,8 @@ def coregister_geocoded_slcs(
         device=device,
         dask_client=dask_client,
         source_valid=secondary_source_valid,
+        secondary_native_height=secondary_native_height,
+        secondary_coordinates=secondary_coordinates,
     )
     valid = np.asarray(reference_valid, dtype=bool) & np.asarray(
         secondary_valid, dtype=bool
@@ -407,6 +443,8 @@ def coregister_geocoded_slcs_chunked(
     watchdog: MemoryWatchdog | None = None,
     reference_source_valid: np.ndarray | None = None,
     secondary_source_valid: np.ndarray | None = None,
+    secondary_native_height: int | None = None,
+    secondary_coordinates: RadarCoordinates | None = None,
 ) -> tuple[np.memmap, np.memmap, np.memmap]:
     """Coregister geographic SLCs into disk-backed row tiles.
 
@@ -433,6 +471,13 @@ def coregister_geocoded_slcs_chunked(
         Memory guard sampled after every completed tile.
     reference_source_valid, secondary_source_valid : numpy.ndarray, optional
         Native sample-validity masks aligned with each deramped SLC.
+    secondary_native_height : int, optional
+        Deramped secondary azimuth height used for the TOPS carrier centre.
+        Forwarded to :func:`geocode_secondary_slc_chunked`.
+    secondary_coordinates : RadarCoordinates, optional
+        Full-frame secondary radar coordinates; each tile reuses its own row
+        slice instead of composing the dense offset field. Forwarded to
+        :func:`geocode_secondary_slc_chunked`.
 
     Returns
     -------
@@ -463,6 +508,8 @@ def coregister_geocoded_slcs_chunked(
         dask_client=dask_client,
         watchdog=watchdog,
         source_valid=secondary_source_valid,
+        secondary_native_height=secondary_native_height,
+        secondary_coordinates=secondary_coordinates,
     )
     for row_start in range(0, reference_lut.shape[0], row_chunk):
         rows = slice(row_start, min(row_start + row_chunk, reference_lut.shape[0]))
@@ -492,6 +539,8 @@ def geocode_secondary_slc_chunked(
     dask_client: Any | None = None,
     watchdog: MemoryWatchdog | None = None,
     source_valid: np.ndarray | None = None,
+    secondary_native_height: int | None = None,
+    secondary_coordinates: RadarCoordinates | None = None,
 ) -> tuple[np.memmap, np.memmap]:
     """Sample one secondary on the Reference geographic grid in row tiles.
 
@@ -499,6 +548,15 @@ def geocode_secondary_slc_chunked(
     -------
     secondary, valid : tuple[numpy.memmap, numpy.memmap]
         Disk-backed geographic secondary SLC and that date's sampling validity.
+
+    Notes
+    -----
+    ``secondary_native_height`` is the deramped secondary azimuth height used
+    for the TOPS carrier centre on every tile. It is not the geographic chunk
+    height. ``secondary_coordinates``, when given, is a full-frame field of
+    secondary radar coordinates: each tile reuses its own row slice instead of
+    composing the dense offset field, and ``None`` composes
+    ``reference.minus_offsets(offsets)`` per tile as before.
 
     """
     from faninsar.processing.errors import reject_invalid_state
@@ -510,6 +568,10 @@ def geocode_secondary_slc_chunked(
     shape = reference_lut.shape
     if tuple(np.shape(reference_valid)) != tuple(shape):
         reject_invalid_state("reference support does not match the geo LUT shape")
+    if secondary_coordinates is not None and secondary_coordinates.shape != tuple(
+        shape
+    ):
+        reject_invalid_state("secondary coordinates do not match the geo LUT shape")
     secondary_output = np.memmap(
         directory / "secondary_geo.complex64",
         mode="w+",
@@ -525,6 +587,13 @@ def geocode_secondary_slc_chunked(
     for row_start in range(0, shape[0], row_chunk):
         row_stop = min(row_start + row_chunk, shape[0])
         rows = slice(row_start, row_stop)
+        tile_coordinates = None
+        if secondary_coordinates is not None:
+            tile_coordinates = RadarCoordinates(
+                secondary_coordinates.az[rows],
+                secondary_coordinates.rg[rows],
+                np.asarray(secondary_coordinates.valid[rows], dtype=bool),
+            )
         secondary_tile, valid_tile = geocode_secondary_slc(
             secondary_deramped,
             secondary_carrier=secondary_carrier,
@@ -534,6 +603,8 @@ def geocode_secondary_slc_chunked(
             device=device,
             dask_client=dask_client,
             source_valid=source_valid,
+            secondary_native_height=secondary_native_height,
+            secondary_coordinates=tile_coordinates,
         )
         secondary_output[rows] = secondary_tile
         valid_output[rows] = valid_tile

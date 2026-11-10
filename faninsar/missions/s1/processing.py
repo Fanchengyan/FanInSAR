@@ -36,6 +36,7 @@ from faninsar.processing.coregistration import (
     resample_complex,
     resolve_ampcor_policy,
 )
+from faninsar.processing.coregistration.offsets import geometry_shift_offsets
 from faninsar.processing.coregistration.tops.carrier import carrier_from_swath
 from faninsar.processing.coregistration.tops.deramp import (
     TOPSCarrierModel,
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
     from faninsar.missions.s1.io import BurstArray
     from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.geocoding.coordinates import RadarCoordinates
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.geometry.prepared import PhaseState, PhaseTransitionRecord
     from faninsar.processing.mosaicking.grid import GeoGridSpec
@@ -999,6 +1001,147 @@ def stage_deramp(
     return state
 
 
+def _direct_secondary_geo_coordinates(
+    state: ProductionPairState,
+    lut: Geo2RdrLUT,
+    *,
+    grid: GeoGridSpec,
+    output_dir: Path,
+    source_shape: tuple[int, int],
+    chunk_size: int,
+    device: str,
+    azimuth_residual_px: float = 0.0,
+    range_residual_px: float = 0.0,
+    watchdog: MemoryWatchdog | None = None,
+    row0_offset: int = 0,
+    col0_offset: int = 0,
+) -> RadarCoordinates:
+    """Solve secondary radar coordinates at the Reference LUT ground points.
+
+    Every geographic pixel of ``lut`` already has a ground solution: its grid
+    longitude/latitude and the height geo2rdr used for the Reference. Solving
+    secondary geo2rdr at those same points locates the secondary sample
+    directly. It does not pass through the dense radar offset field, whose
+    rdr2geo inverse can fail (and drop coverage) on pixels that are perfectly
+    solvable from the ground side.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair state providing the secondary geometry and the DEM fallback.
+    lut : Geo2RdrLUT
+        Reference geographic-to-radar coordinates and heights.
+    grid : GeoGridSpec
+        Geographic grid defining the shared ground targets.
+    output_dir : pathlib.Path
+        Directory for the disk-backed coordinate fields.
+    source_shape : tuple[int, int]
+        Shape of the secondary operand that will be sampled.
+    chunk_size : int
+        Number of geographic rows solved per tile.
+    device : str
+        Geometry execution device.
+    azimuth_residual_px, range_residual_px : float, optional
+        Constant Reference-minus-secondary residuals (ESD, Ampcor, network
+        misregistration). They follow ``source = output - offset`` and are
+        subtracted from the solved coordinates.
+    watchdog : MemoryWatchdog, optional
+        Memory guard sampled after every completed tile.
+    row0_offset, col0_offset : int
+        Offset of the cropped LUT inside the full geographic grid.
+
+    Returns
+    -------
+    RadarCoordinates
+        Disk-backed secondary coordinates. Validity requires Reference LUT
+        support, a converged secondary solution, and a position inside the
+        secondary operand; native sample validity is applied at sampling.
+
+    """
+    from faninsar.processing.geocoding.coordinates import RadarCoordinates
+    from faninsar.processing.geocoding.geo_lut import grid_lonlat_rows
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shape = lut.shape
+    azimuth = np.memmap(
+        output_dir / "secondary_azimuth.float64",
+        mode="w+",
+        dtype=np.float64,
+        shape=shape,
+    )
+    range_index = np.memmap(
+        output_dir / "secondary_range.float64",
+        mode="w+",
+        dtype=np.float64,
+        shape=shape,
+    )
+    valid = np.memmap(
+        output_dir / "secondary_valid.bool",
+        mode="w+",
+        dtype=np.bool_,
+        shape=shape,
+    )
+    source_height, source_width = source_shape
+    col_stop = col0_offset + shape[1]
+    for row_start in range(0, shape[0], chunk_size):
+        row_stop = min(row_start + chunk_size, shape[0])
+        rows = slice(row_start, row_stop)
+        latitude, longitude = grid_lonlat_rows(
+            grid,
+            row_start + row0_offset,
+            row_stop + row0_offset,
+        )
+        if col0_offset > 0 or col_stop < grid.width:
+            latitude = latitude[:, col0_offset:col_stop]
+            longitude = longitude[:, col0_offset:col_stop]
+        if lut.height_full is None:
+            height = np.asarray(
+                state.dem.sample(latitude, longitude),
+                dtype=np.float64,
+            )
+        else:
+            height = np.asarray(lut.height_full[rows], dtype=np.float64)
+        # Same fallback height the Reference geo2rdr solved these pixels with.
+        height = np.where(np.isfinite(height), height, float(lut.height_m))
+        solved = run_geo2rdr(
+            state.secondary.geometry,
+            latitude,
+            longitude,
+            height,
+            device=device,
+        )
+        tile_azimuth = (
+            np.asarray(solved.azimuth_index, dtype=np.float64) - azimuth_residual_px
+        )
+        tile_range = (
+            np.asarray(solved.range_index, dtype=np.float64) - range_residual_px
+        )
+        azimuth[rows] = tile_azimuth
+        range_index[rows] = tile_range
+        valid[rows] = (
+            np.asarray(lut.valid[rows], dtype=bool)
+            & np.asarray(solved.converged, dtype=bool)
+            & np.isfinite(tile_azimuth)
+            & np.isfinite(tile_range)
+            & (tile_azimuth >= 0.0)
+            & (tile_azimuth <= source_height - 1.0)
+            & (tile_range >= 0.0)
+            & (tile_range <= source_width - 1.0)
+        )
+        del height, latitude, longitude, solved, tile_azimuth, tile_range
+        for array in (azimuth, range_index, valid):
+            release_memmap_pages(array)
+        for array in (lut.height_full, lut.valid):
+            if isinstance(array, np.memmap):
+                release_memmap_pages(array)
+        if watchdog is not None:
+            watchdog.sample(f"geo_secondary_geo2rdr:{row_start}:{row_stop}")
+    azimuth.flush()
+    range_index.flush()
+    valid.flush()
+    return RadarCoordinates(azimuth, range_index, valid)
+
+
 def _apply_geo_topographic_phase_chunked(
     state: ProductionPairState,
     lut: Geo2RdrLUT,
@@ -1015,6 +1158,7 @@ def _apply_geo_topographic_phase_chunked(
     col0_offset: int = 0,
     timings_out: dict[str, float] | None = None,
     device: str = "cpu",
+    secondary_coordinates: RadarCoordinates | None = None,
 ) -> tuple[np.memmap, np.ndarray]:
     """Apply geometric phase to disk-backed geographic SLC row tiles.
 
@@ -1048,6 +1192,10 @@ def _apply_geo_topographic_phase_chunked(
         Exclusive topographic substages (``compose``, ``phase``, ``apply``).
     device : str, optional
         Admitted compose device. CUDA uses Torch ``grid_sample``; CPU uses SciPy.
+    secondary_coordinates : RadarCoordinates, optional
+        Secondary radar coordinates the SLC was sampled at. When given, the
+        flattening reuses their azimuth and validity row by row and the dense
+        offset field is not composed again. ``None`` composes ``offsets``.
 
     Returns
     -------
@@ -1083,12 +1231,21 @@ def _apply_geo_topographic_phase_chunked(
             frame_coordinates.valid[rows],
         )
         compose_started = time.perf_counter()
-        secondary_coordinates = chunk_coordinates.minus_offsets(
-            offsets,
-            device=device,
-        )
-        secondary_azimuth = secondary_coordinates.az
-        coordinate_valid = secondary_coordinates.valid
+        if secondary_coordinates is None:
+            composed = chunk_coordinates.minus_offsets(
+                offsets,
+                device=device,
+            )
+            secondary_azimuth = composed.az
+            coordinate_valid = composed.valid
+            del composed
+        else:
+            # Flatten at the exact coordinates the SLC was sampled and
+            # reramped at; never recompose the dense field here.
+            secondary_azimuth = np.asarray(
+                secondary_coordinates.az[rows], dtype=np.float64
+            )
+            coordinate_valid = np.asarray(secondary_coordinates.valid[rows], dtype=bool)
         latitude, longitude = grid_lonlat_rows(
             grid,
             row_start + row0_offset,
@@ -1498,7 +1655,11 @@ def stage_coregister(
     # The reference grid is never cropped: one Reference payload is shared by
     # every secondary of a Stack. A secondary of another shape is conformed to
     # it; padded samples are zero, the deramp stage's invalid-sample value.
+    # TOPS reramp must keep the pre-conform secondary height (the array that
+    # was deramped). Conformed shape[0] is the Reference centre, not the
+    # secondary's.
     sec = state.secondary_deramped
+    secondary_native_height = int(sec.shape[0])
     if ref.shape != sec.shape:
         sec = _conform_to_shape(sec, ref.shape)
         state.secondary_deramped = sec
@@ -1543,6 +1704,18 @@ def stage_coregister(
     resolved_control_spacing = 8 if control_spacing is None else control_spacing
     if resolved_control_spacing < 1:
         reject_invalid_state("control_spacing must be >= 1")
+    # Geometry-mode geographic products locate the secondary by solving
+    # geo2rdr at the Reference LUT ground points. The dense radar field is an
+    # rdr2geo inverse; its coverage holes must not veto solved ground pixels,
+    # so it is not built here. Residual measurement (Ampcor/ESD) still needs
+    # it and keeps the composed-offset path. A prepared geometry field is
+    # radar-only (rejected above for geo), so it never reaches this mode.
+    direct_geo_coordinates = (
+        coregistration_grid == "geo"
+        and not residuals_only
+        and not amplitude_refinement_enabled
+        and not esd_enabled
+    )
     window: tuple[int, int, int, int] | None = (
         roi_window if coregistration_grid == "radar" else None
     )
@@ -1600,7 +1773,16 @@ def stage_coregister(
             state.secondary_deramped = sec
             state.radar_roi_origin = window_origin
         substage_started = _clock_start(device)
-        if prepared_geometry_field is None:
+        if direct_geo_coordinates:
+            # Zero geometry term: ``offsets`` then carries only the constant
+            # residuals, which are subtracted from the solved coordinates.
+            geometry_field = geometry_shift_offsets(
+                ref.shape,
+                range_shift_px=0.0,
+                azimuth_shift_px=0.0,
+            )
+            state.coregistration_timings_s["dense_geometry_offsets_skipped"] = 0.0
+        elif prepared_geometry_field is None:
             geometry_field = dense_geometry_offsets(
                 shape=ref.shape,
                 reference_model=state.primary.geometry,
@@ -1852,6 +2034,45 @@ def stage_coregister(
             burst_col0,
             burst_col0 + lut.shape[1],
         )
+        secondary_coordinates = None
+        if direct_geo_coordinates:
+            substage_started = _clock_start(device)
+            secondary_coordinates = _direct_secondary_geo_coordinates(
+                state,
+                lut,
+                grid=geo_grid,
+                output_dir=work_directory / "secondary_coordinates",
+                source_shape=sec.shape,
+                chunk_size=geo_chunk_size,
+                device=device,
+                azimuth_residual_px=float(offsets.azimuth_offset_px[0, 0]),
+                range_residual_px=float(offsets.range_offset_px[0, 0]),
+                watchdog=memory_watchdog,
+                row0_offset=burst_row0,
+                col0_offset=burst_col0,
+            )
+            state.coregistration_timings_s["secondary_geo2rdr"] = _clock_stop(
+                device, substage_started
+            )
+            # Report the applied Reference-minus-secondary shift once: the
+            # solved coordinates already hold geometry plus residuals.
+            solved = np.asarray(secondary_coordinates.valid, dtype=bool)
+            state.range_shift_px = float("nan")
+            state.azimuth_shift_px = float("nan")
+            if solved.any():
+                state.range_shift_px = float(
+                    np.median(
+                        np.asarray(lut.rg_full)[solved]
+                        - np.asarray(secondary_coordinates.rg)[solved]
+                    )
+                )
+                state.azimuth_shift_px = float(
+                    np.median(
+                        np.asarray(lut.az_full)[solved]
+                        - np.asarray(secondary_coordinates.az)[solved]
+                    )
+                )
+            del solved
         substage_started = _clock_start(device)
         if secondary_only:
             secondary_geo, valid = geocode_secondary_slc_chunked(
@@ -1866,6 +2087,8 @@ def stage_coregister(
                 dask_client=dask_client,
                 watchdog=memory_watchdog,
                 source_valid=sec_valid,
+                secondary_native_height=secondary_native_height,
+                secondary_coordinates=secondary_coordinates,
             )
             reference_geo = None
         else:
@@ -1892,6 +2115,8 @@ def stage_coregister(
                 watchdog=memory_watchdog,
                 reference_source_valid=reference_source_valid,
                 secondary_source_valid=sec_valid,
+                secondary_native_height=secondary_native_height,
+                secondary_coordinates=secondary_coordinates,
             )
         state.coregistration_timings_s["geo_slc_resample"] = _clock_stop(
             device, substage_started
@@ -1913,6 +2138,7 @@ def stage_coregister(
             col0_offset=burst_col0,
             timings_out=topo_timings,
             device=str(resolved_torch_device),
+            secondary_coordinates=secondary_coordinates,
         )
         state.coregistration_timings_s["geo_topographic_phase"] = _clock_stop(
             device, substage_started
