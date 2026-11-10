@@ -201,7 +201,7 @@ def carrier_phase_at_points_torch(
     rows: np.ndarray,
     cols: np.ndarray,
     *,
-    centre_row: float,
+    centre_row: float | None = None,
     dtype: np.dtype | type = np.float32,
     device: DeviceName = "auto",
     precision: PrecisionName = "auto",
@@ -271,6 +271,11 @@ def carrier_phase_at_points_torch(
     eta_ref = (f_dc_start / k_a_start) - (f_dc / k_a)
     k_s = model.azimuth_steering_rate_hz_s
     k_t = k_s / (1.0 - k_s / k_a)
+    from faninsar.processing.coregistration.tops.deramp import (
+        resolve_azimuth_centre_row,
+    )
+
+    centre_row = resolve_azimuth_centre_row(model, centre_row, None, None)
     eta = (rows_t - float(centre_row)) * model.azimuth_time_interval_s
     steering_phase = math.pi * k_t * (eta - eta_ref) ** 2
     doppler_phase = 2.0 * math.pi * f_dc * eta
@@ -402,7 +407,11 @@ def tops_carrier_multiply_torch(
     if samples.ndim != 2 or not np.iscomplexobj(samples):
         reject_invalid_state("TOPS carrier multiply requires a 2-D complex array")
     n_lines, n_samples = samples.shape
-    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
+    from faninsar.processing.coregistration.tops.deramp import (
+        resolve_azimuth_centre_row,
+    )
+
+    centre_row = resolve_azimuth_centre_row(model, None, native_height, n_lines)
     if row_chunk is None or row_chunk <= 0 or n_lines <= row_chunk:
         rows = np.arange(n_lines, dtype=np.float64)[:, None] + float(row0)
         cols = np.arange(n_samples, dtype=np.float64)[None, :] + float(col0)

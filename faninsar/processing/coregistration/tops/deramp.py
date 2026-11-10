@@ -29,6 +29,7 @@ class TOPSCarrierModel:
     burst_sensing_time_s: float
     burst_start_slant_range_time_s: float
     azimuth_steering_rate_hz_s: float
+    azimuth_centre_row: float | None = None
 
     def __post_init__(self) -> None:
         """Validate carrier model parameters."""
@@ -40,6 +41,67 @@ class TOPSCarrierModel:
             reject_invalid_state("Doppler and FM-rate polynomials are required")
         if self.azimuth_steering_rate_hz_s == 0.0:
             reject_invalid_state("TOPS azimuth steering rate must be non-zero")
+        if self.azimuth_centre_row is not None and not np.isfinite(
+            self.azimuth_centre_row
+        ):
+            reject_invalid_state(
+                "azimuth_centre_row must be a finite burst-local row when set"
+            )
+
+
+def resolve_azimuth_centre_row(
+    model: TOPSCarrierModel,
+    centre_row: float | None,
+    native_height: int | None,
+    n_lines: int | None = None,
+) -> float:
+    """Resolve the authoritative TOPS azimuth centre row for one carrier.
+
+    A carrier built with ``first_azimuth_line`` carries the physical mid-burst
+    row of the loaded array in ``azimuth_centre_row`` and that value wins:
+    callers inside geo crops pass a window-height-derived centre
+    (``height // 2``) that is knowingly legacy for a cropped origin and is
+    ignored, because a window cannot know where its burst starts. Without the
+    model property the legacy derivation applies unchanged: an explicit
+    ``centre_row`` argument if given, else ``native_height // 2``, else
+    ``n_lines // 2``.
+
+    Parameters
+    ----------
+    model : TOPSCarrierModel
+        Carrier model for the burst window.
+    centre_row : float or None
+        Explicit caller centre in the loaded-array frame; ignored when the
+        model property is set.
+    native_height : int or None
+        Native burst height used by the legacy derivation.
+    n_lines : int or None
+        Window height used by the legacy fallback derivation.
+
+    Returns
+    -------
+    float
+        Centre row in the loaded-array frame.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If no centre source is available.
+
+    """
+    if model.azimuth_centre_row is not None:
+        return float(model.azimuth_centre_row)
+    if centre_row is not None:
+        return float(centre_row)
+    if native_height is not None:
+        return float(native_height // 2)
+    if n_lines is None or n_lines <= 0:
+        reject_invalid_state(
+            "carrier centre requires the model property, an explicit centre_row, "
+            "or a positive window height"
+        )
+        raise AssertionError  # reject_invalid_state never returns
+    return float(n_lines // 2)
 
 
 def _poly_eval(coefficients: tuple[float, ...], x: np.ndarray) -> np.ndarray:
@@ -115,7 +177,7 @@ def tops_carrier_phase(
         reject_invalid_state("burst window dimensions must be positive")
     cols = (np.arange(n_samples, dtype=np.float64) + float(col0))[None, :]
     rows = (np.arange(n_lines, dtype=np.float64) + float(row0))[:, None]
-    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
+    centre_row = resolve_azimuth_centre_row(model, None, native_height, n_lines)
     phase = carrier_phase_at_points(
         model,
         np.broadcast_to(rows, (n_lines, n_samples)),
@@ -201,7 +263,7 @@ def _apply_carrier_tiled(
         return _apply_carrier_phase(samples, phase, sign=sign)
 
     out = np.empty_like(samples)
-    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
+    centre_row = resolve_azimuth_centre_row(model, None, native_height, n_lines)
     for row_start in range(0, n_lines, row_chunk):
         row_stop = min(row_start + row_chunk, n_lines)
         phase = _carrier_phase_rows(
@@ -370,7 +432,7 @@ def carrier_phase_at_points(
     rows: np.ndarray,
     cols: np.ndarray,
     *,
-    centre_row: float,
+    centre_row: float | None = None,
     dtype: np.dtype | type = np.float32,
 ) -> np.ndarray:
     """Analytical TOPS carrier phase at arbitrary fractional pixel coordinates.
@@ -386,9 +448,9 @@ def carrier_phase_at_points(
         Fractional pixel coordinates on the burst-local grid (row 0 = first
         burst line, col 0 = first range sample). Same convention as
         :func:`tops_carrier_phase`; must broadcast to a common shape.
-    centre_row : float
-        Integer azimuth centre ``n_lines // 2`` of the burst window used by
-        Sentinel-1 TOPS carrier evaluation.
+    centre_row : float or None, optional
+        Legacy explicit centre row in the loaded-array frame. Ignored when
+        the model carries ``azimuth_centre_row``; required when it does not.
     dtype : numpy.dtype, optional
         Output phase dtype. Default ``float32``.
 
@@ -400,6 +462,7 @@ def carrier_phase_at_points(
     """
     if rows.shape != cols.shape:
         reject_invalid_state("rows and cols must have the same shape")
+    centre_row = resolve_azimuth_centre_row(model, centre_row, None, None)
     rows64 = np.asarray(rows, dtype=np.float64)
     cols64 = np.asarray(cols, dtype=np.float64)
     tau = model.slant_range_time0_s + cols64 / model.range_sampling_rate_hz

@@ -587,7 +587,13 @@ def _load_burst_scene(
         aux_cal_path=aux_cal_path,
     )
     burst = swath.bursts[burst_index]
-    carrier = carrier_from_swath(swath, burst, first_range_sample=array.col0)
+    carrier = carrier_from_swath(
+        swath,
+        burst,
+        first_range_sample=array.col0,
+        first_azimuth_line=int(array.row0)
+        - int(burst.index) * int(swath.lines_per_burst),
+    )
     geometry = _radar_model(
         swath,
         burst,

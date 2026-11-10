@@ -429,7 +429,11 @@ def _schedule_carrier_multiply(
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
     n_lines, _ = samples.shape
-    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
+    from faninsar.processing.coregistration.tops.deramp import (
+        resolve_azimuth_centre_row,
+    )
+
+    centre_row = resolve_azimuth_centre_row(model, None, native_height, n_lines)
 
     def block(
         s_block: np.ndarray,

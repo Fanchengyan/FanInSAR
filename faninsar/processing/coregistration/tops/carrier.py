@@ -33,6 +33,7 @@ def carrier_from_swath(
     burst: S1Burst,
     *,
     first_range_sample: int = 0,
+    first_azimuth_line: int | None = None,
 ) -> TOPSCarrierModel:
     """Construct a TOPS carrier model from parsed SAFE annotation.
 
@@ -46,6 +47,16 @@ def carrier_from_swath(
         Absolute range sample index of column 0 in the complex array
         (``BurstArray.col0``).  The carrier range-time axis is shifted so
         local sample 0 maps to the correct slant-range time.
+    first_azimuth_line : int or None, optional
+        Burst-local line index of array row 0, i.e.
+        ``array.row0 - burst.index * swath.lines_per_burst`` (the same
+        local-line convention as ``_radar_model``). When given, the model
+        carries ``azimuth_centre_row = burst.lines // 2 - first_azimuth_line``,
+        the physical mid-burst row of the loaded array, and every phase
+        evaluation uses it regardless of a caller-supplied window centre.
+        Partial-SAFE bursts reset ``burst.index``; derive the burst-local line
+        against the parent burst grid of the loaded array. ``None`` leaves the
+        model without a centre and keeps the legacy window derivation.
 
     Returns
     -------
@@ -59,6 +70,10 @@ def carrier_from_swath(
         reject_invalid_state(f"swath {swath.swath} has no azimuth FM-rate estimates")
     if first_range_sample < 0:
         reject_invalid_state("first_range_sample must be >= 0")
+    if first_azimuth_line is not None and (
+        isinstance(first_azimuth_line, bool) or first_azimuth_line < 0
+    ):
+        reject_invalid_state("first_azimuth_line must be a non-negative line index")
 
     burst_time = burst.sensing_time or burst.azimuth_time
 
@@ -108,6 +123,11 @@ def carrier_from_swath(
         burst_sensing_time_s=burst_sensing_time_s,
         burst_start_slant_range_time_s=float(swath.slant_range_time_s),
         azimuth_steering_rate_hz_s=float(steering_rate_hz_s),
+        azimuth_centre_row=(
+            None
+            if first_azimuth_line is None
+            else float(int(burst.lines) // 2 - int(first_azimuth_line))
+        ),
     )
     logger.info(
         "Built TOPS carrier for %s burst %s (dc_idx=%s fm_idx=%s first_rg=%s "

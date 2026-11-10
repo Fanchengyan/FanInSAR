@@ -865,7 +865,13 @@ def load_production_scene(
     else:
         reject_invalid_state(f"unknown scope: {scope}")
 
-    carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
+    carrier = carrier_from_swath(
+        s1_swath,
+        burst,
+        first_range_sample=array.col0,
+        first_azimuth_line=int(array.row0)
+        - int(burst.index) * int(s1_swath.lines_per_burst),
+    )
     geometry = _radar_model(
         s1_swath,
         burst,
