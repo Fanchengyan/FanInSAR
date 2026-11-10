@@ -1030,6 +1030,7 @@ class Stack(NetworkContract, ABC):
         field(default_factory=dict, repr=False)
     )
     _dem_source: SourceDEM | None = field(default=None, repr=False)
+    _missing_recorded_dem: bool = field(default=False, repr=False)
     _dem_wgs84: RasterDEM | None = field(default=None, repr=False)
     repair_report: Any | None = field(default=None, repr=False)
 
@@ -1954,6 +1955,25 @@ class Stack(NetworkContract, ABC):
         from faninsar.processing.geometry import api as dem_api
 
         selected = dem or self.config.dem
+        if selected is None and self._missing_recorded_dem:
+            if self._dem_source is not None:
+                selected = self._dem_source
+            else:
+                from faninsar.processing.geometry.managed_dem import (
+                    DEMCoverageInsufficientError,
+                )
+
+                message = (
+                    "The recorded managed DEM is missing and no validated source "
+                    "recipe is available; provide a DEM or an explicit SourceDEM"
+                )
+                logger.error(message)
+                raise DEMCoverageInsufficientError(
+                    message,
+                    required_bounds=self._initial_dem_bounds() or (0.0, 0.0, 0.0, 0.0),
+                    actual_bounds=None,
+                    path=self._stack_dem_raster_path(),
+                )
         if selected is None:
             selected = dem_api.DEM.from_source("auto")
         self._capture_dem_source(selected)
@@ -2347,6 +2367,99 @@ class Stack(NetworkContract, ABC):
         """Return the source tile/geoid cache for this workspace."""
         return self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
 
+    def _restore_dem_source_recipe(self) -> None:
+        """Restore only a source recipe bound to this workspace's managed DEM.
+
+        Cache contents are never evidence of a raster's origin. Missing or
+        incompatible metadata leaves existing products inspectable, but cannot
+        authorize fetching terrain from an inferred source.
+        """
+        if self._dem_source is not None:
+            return
+        current = self.config.dem
+        path = self._stack_dem_raster_path()
+        if isinstance(current, RasterDEM) and (
+            current.path is None or current.path.resolve() != path.resolve()
+        ):
+            return
+        sidecar = self._stack_dem_sidecar_path()
+        if not sidecar.is_file():
+            return
+        try:
+            recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+            source = self._dem_source_from_record(recorded, sidecar, path)
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Cannot restore DEM source from %s: %s", sidecar, error)
+            return
+        if source is not None:
+            self._dem_source = source
+            if not path.is_file():
+                self.config.dem = source
+
+    def _dem_source_from_record(
+        self, recorded: object, sidecar: Path, path: Path
+    ) -> SourceDEM | None:
+        """Validate an existing source record against its managed raster header."""
+        if not isinstance(recorded, dict):
+            reject("DEM source record must be an object", TypeError, logger=logger)
+        if recorded.get("kind") not in (None, "source"):
+            return None
+        product = recorded.get("product")
+        provider = recorded.get("provider")
+        if not isinstance(product, str) or not product.strip():
+            reject("DEM source record has no product", ValueError, logger=logger)
+        if not isinstance(provider, str) or not provider.strip():
+            reject("DEM source record has no provider", ValueError, logger=logger)
+        recorded_path = recorded.get("path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            reject("DEM source record has no raster path", ValueError, logger=logger)
+        bound_path = Path(recorded_path)
+        if not bound_path.is_absolute():
+            bound_path = sidecar.parent / bound_path
+        if bound_path.resolve() != path.resolve():
+            reject(
+                "DEM source record names a different raster", ValueError, logger=logger
+            )
+        identity = recorded.get("identity")
+        datum = recorded.get("vertical_datum")
+        if not isinstance(identity, str) or not identity:
+            reject("DEM source record has no grid identity", ValueError, logger=logger)
+        if datum not in ("ellipsoidal", "egm96", "egm2008"):
+            reject(
+                "DEM source record has no valid vertical datum",
+                ValueError,
+                logger=logger,
+            )
+        if path.is_file():
+            from faninsar.processing.geometry.api import _identity
+            from faninsar.processing.geometry.managed_dem import read_raster_header
+
+            grid, header_datum = read_raster_header(path)
+            if header_datum != datum or _identity(grid, header_datum) != identity:
+                reject(
+                    "DEM source record does not match raster metadata",
+                    ValueError,
+                    logger=logger,
+                )
+        cache_dir = recorded.get("cache_dir")
+        if cache_dir is not None and not isinstance(cache_dir, str):
+            reject(
+                "DEM source cache path must be a string or null",
+                TypeError,
+                logger=logger,
+            )
+        cache_path = self._dem_cache_dir() if cache_dir is None else Path(cache_dir)
+        if cache_dir is not None and not cache_path.is_absolute():
+            cache_path = sidecar.parent / cache_path
+        source = SourceDEM(f"{product}:{provider}", cache_dir=cache_path)
+        if source.product != product or source.provider != provider:
+            reject(
+                "DEM source record must name a resolved source",
+                ValueError,
+                logger=logger,
+            )
+        return source
+
     def _dem_scratch_dir(self) -> Path:
         """Return workspace scratch used for atomic managed-DEM replacement."""
         from faninsar.stack.layout import TMP_DIRNAME
@@ -2359,6 +2472,7 @@ class Stack(NetworkContract, ABC):
         if source is None:
             return None
         return {
+            "kind": "source",
             "product": source.product,
             "provider": source.provider,
             "cache_dir": None if source.cache_dir is None else str(source.cache_dir),
@@ -2373,8 +2487,13 @@ class Stack(NetworkContract, ABC):
             **(self._source_record() or {"kind": "raster"}),
             "identity": raster.identity,
             "vertical_datum": raster.vertical_datum,
-            "path": str(path),
+            "path": os.path.relpath(path, sidecar.parent),
         }
+        cache_dir = record.get("cache_dir")
+        if isinstance(cache_dir, str) and Path(cache_dir).resolve().is_relative_to(
+            self.config.work_dir.resolve()
+        ):
+            record["cache_dir"] = os.path.relpath(cache_dir, sidecar.parent)
         source_path = getattr(raster, "path", None)
         if not path.is_file():
             raster.save(path)
@@ -2395,16 +2514,18 @@ class Stack(NetworkContract, ABC):
             recorded = json.loads(sidecar.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             recorded = {}
+        if not isinstance(recorded, dict):
+            recorded = {}
         source = self._source_record()
         if source is not None and (
             recorded.get("product") != source["product"]
             or recorded.get("provider") != source["provider"]
         ):
             return None
-        datum = recorded.get("vertical_datum") or "ellipsoidal"
-        if not isinstance(datum, str):
-            datum = "ellipsoidal"
         try:
+            from faninsar.processing.geometry.managed_dem import read_raster_header
+
+            _grid, datum = read_raster_header(path)
             return RasterDEM(path=path, vertical_datum=datum)
         except (OSError, ValueError):
             logger.warning("Persisted DEM %s is unreadable; rematerializing", path)
@@ -2596,6 +2717,13 @@ class Stack(NetworkContract, ABC):
     def _restore_local_inputs(self) -> None:
         """Restore persisted local DEMs without preparing missing inputs."""
         self._capture_dem_source()
+        current = self.config.dem
+        if isinstance(current, RasterDEM) and (
+            current.path is None
+            or current.path.resolve() != self._stack_dem_raster_path().resolve()
+        ):
+            return
+        self._restore_dem_source_recipe()
         from faninsar.processing.geometry.dem_view import is_geodetic_crs
         from faninsar.stack.preparation import unavailable_local_inputs
 
@@ -2807,9 +2935,25 @@ class Stack(NetworkContract, ABC):
             for date, entry in document["inputs"].get("aux_cal", {}).items()
         }
 
-        science = {
-            name: decode_value(value) for name, value in document["science"].items()
-        }
+        science = {}
+        missing_recorded_dem = False
+        from faninsar.stack.layout import dem_raster_path
+
+        for name, value in document["science"].items():
+            dem_record = value.get("faninsar:dem") if isinstance(value, dict) else None
+            if name == "dem" and isinstance(dem_record, dict):
+                recorded_path = dem_record.get("path")
+                managed_path = dem_raster_path(root)
+                if (
+                    dem_record.get("kind") == "raster"
+                    and isinstance(recorded_path, str)
+                    and Path(recorded_path).resolve() == managed_path.resolve()
+                    and not managed_path.is_file()
+                ):
+                    science[name] = None
+                    missing_recorded_dem = True
+                    continue
+            science[name] = decode_value(value)
         # Drop keys whose field was removed from StackConfig since the
         # document was written; an older stack.json records more science
         # than the current version owns.
@@ -2849,6 +2993,7 @@ class Stack(NetworkContract, ABC):
         stack.scene_provider = (
             runtime.get("scene_provider") or stack_cls._default_scene_provider()
         )
+        stack._missing_recorded_dem = missing_recorded_dem
         stack._restore_local_inputs()
         stack._prepared = not missing_inputs
         if (root / "inputs" / "request.json").is_file():
