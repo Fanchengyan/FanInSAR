@@ -4980,11 +4980,14 @@ class Stack(NetworkContract, ABC):
                             layout = layouts.get(polygon)
                             if layout is not None:
                                 window = layout.window
-                                first_i = (int(window[0]) + az_l - 1) // az_l
-                                first_j = (int(window[2]) + rg_l - 1) // rg_l
-                                row_origin = int(first_i * az_l)
-                                col_origin = int(first_j * rg_l)
-                                look_origin = (int(first_i), int(first_j))
+                                row_origin, col_origin, look_origin = (
+                                    _merged_ifg_origins(
+                                        window,
+                                        az_l,
+                                        rg_l,
+                                        geo=(primary_store.domain == "geo"),
+                                    )
+                                )
                             else:
                                 row_origin = 0
                                 col_origin = 0
@@ -6526,3 +6529,22 @@ class _RecoveredStack(Stack):
             "legacy Stack identity has no mission source recipe; "
             "reconstruct through a concrete mission"
         )
+
+
+def _merged_ifg_origins(
+    window: tuple[int, int, int, int], az_l: int, rg_l: int, *, geo: bool
+) -> tuple[int, int, tuple[int, int]]:
+    """Placement of the merged-IFG first look block on its look canvas.
+
+    The canvas transform carries the look-grid pitch with the base origin, so
+    the recorded row/col_origin is the base canvas origin (0 for the geo
+    global fine grid) and look_origin is the first full look block index.
+    ifg_sample_placement adds them once; persisting the block's native
+    offset in row/col_origin as well would double-count it.
+    """
+    first_i = (int(window[0]) + az_l - 1) // az_l
+    first_j = (int(window[2]) + rg_l - 1) // rg_l
+    look_origin = (int(first_i), int(first_j))
+    if geo:
+        return 0, 0, look_origin
+    return int(first_i * az_l), int(first_j * rg_l), look_origin
