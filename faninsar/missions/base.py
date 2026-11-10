@@ -38,6 +38,9 @@ class Sensor:
     # normalized acquisition facts (PROPOSAL-0072 section 7).  ``None`` means
     # the mission does not support constrained selection.
     decode_selection: ClassVar[SelectionDecoder | None] = None
+    # Optional: resolve scene-burst geographic footprints (PROPOSAL-0084).
+    # ``None`` means the mission does not support burst inspection.
+    resolve_scene_burst_footprints: ClassVar[Any] = None
 
     @staticmethod
     def select_acquisitions(

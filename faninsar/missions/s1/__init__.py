@@ -79,6 +79,13 @@ class Sentinel1Sensor(Sensor):
     decode_selection = staticmethod(decode_s1_selection)
     select_acquisitions = staticmethod(select_s1_acquisitions)
 
+    @staticmethod
+    def resolve_scene_burst_footprints(stack: Any, observations: Any) -> Any:
+        """Resolve source-coverage footprints for scene burst observations."""
+        from faninsar.missions.s1.scene_bursts import resolve_s1_scene_burst_footprints
+
+        return resolve_s1_scene_burst_footprints(stack, observations)
+
     def open_product(self, uri: str, **kwargs: Any) -> Any:
         """Open a SAFE directory or ZIP."""
         return open_safe_product(Path(uri), **kwargs)

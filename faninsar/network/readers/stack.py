@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         SceneLayers,
     )
     from faninsar.network.layers import InterferogramLayers, ProductLayer
+    from faninsar.network.readers.scene_bursts import SceneBurstCollection
     from faninsar.processing.mosaicking import MergeLayoutWindow
     from faninsar.stack.session import Stack
 
@@ -1340,6 +1341,25 @@ class StackSceneCollection(dict):
         self._merge_on_read = merge_on_read
         self._merge_layout = merge_layout
         self._layout_product = layout_product
+
+    @property
+    def bursts(self) -> SceneBurstCollection:
+        """Return committed scene-unit observations for this view.
+
+        ``len``, iteration, and integer indexing produce handles without
+        opening source annotation or reading SLC arrays. Geographic
+        footprints are resolved lazily on :attr:`SceneBurstCollection.footprints`.
+
+        Returns
+        -------
+        SceneBurstCollection
+            One observation per committed scene unit in date then tag order.
+
+        """
+        from faninsar.network.readers.scene_bursts import collect_scene_bursts
+
+        stores = self._selected_stores()
+        return collect_scene_bursts(self._stack, stores, self.dates)
 
     # ---- date axis -----------------------------------------------------
 

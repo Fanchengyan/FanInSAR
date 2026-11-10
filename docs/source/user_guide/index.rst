@@ -20,4 +20,5 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    remote
    transfer_completion
    scientific_lineage
+   scene_bursts
    workspace_recovery
