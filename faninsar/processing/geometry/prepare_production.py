@@ -1044,7 +1044,7 @@ def _radar_boundary_samples(
     return flat_az[index], flat_rg[index]
 
 
-def _require_rdr2geo_dem_coverage(
+def _rdr2geo_dem_required_bounds(
     model: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
@@ -1054,10 +1054,10 @@ def _require_rdr2geo_dem_coverage(
     max_iter: int,
     range_tol_m: float,
     doppler_tol_hz: float,
-) -> None:
-    """Raise when a raster DEM's extent cannot cover this radar query."""
+) -> tuple[float, float, float, float] | None:
+    """Return expanded WGS84 bounds one radar query needs from a raster DEM."""
     if not isinstance(dem, RasterDEM):
-        return
+        return None
     from faninsar.processing.geometry.dem_view import (
         is_geodetic_crs,
         native_spacing_deg,
@@ -1065,7 +1065,6 @@ def _require_rdr2geo_dem_coverage(
     from faninsar.processing.geometry.managed_dem import (
         expand_bounds,
         interpolation_margin_deg,
-        require_dem_coverage,
     )
 
     sample_az, sample_rg = _radar_boundary_samples(azimuth_index, range_index)
@@ -1089,7 +1088,7 @@ def _require_rdr2geo_dem_coverage(
             latitudes.append(lat[good])
             longitudes.append(lon[good])
     if not latitudes:
-        return
+        return None
     lat = np.concatenate(latitudes)
     lon = np.concatenate(longitudes)
     envelope = (
@@ -1104,9 +1103,36 @@ def _require_rdr2geo_dem_coverage(
         provenance = getattr(dem, "provenance", None)
         product = provenance.get("product") if isinstance(provenance, dict) else None
         spacing = native_spacing_deg(product)
-    require_dem_coverage(
-        dem, expand_bounds(envelope, interpolation_margin_deg(spacing))
+    return expand_bounds(envelope, interpolation_margin_deg(spacing))
+
+
+def _require_rdr2geo_dem_coverage(
+    model: RadarGeometryModel,
+    azimuth_index: np.ndarray,
+    range_index: np.ndarray,
+    dem: DEM | None,
+    *,
+    device: DeviceLike,
+    max_iter: int,
+    range_tol_m: float,
+    doppler_tol_hz: float,
+) -> None:
+    """Raise when a raster DEM's extent cannot cover this radar query."""
+    required = _rdr2geo_dem_required_bounds(
+        model,
+        azimuth_index,
+        range_index,
+        dem,
+        device=device,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
     )
+    if required is None:
+        return
+    from faninsar.processing.geometry.managed_dem import require_dem_coverage
+
+    require_dem_coverage(dem, required)
 
 
 def run_geo2rdr(
