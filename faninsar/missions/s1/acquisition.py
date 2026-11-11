@@ -44,6 +44,7 @@ Contract (PROPOSAL-0061):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import itertools
 import json
@@ -2544,23 +2545,270 @@ def _cdse_range_host(url: str) -> bool:
 def _fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     """Dispatch already-sized spans to remote fetch; CDSE OData uses Bearer.
 
-    Tests and fixture URLs keep the unauthenticated ``fetch_ranges_async``
-    path so existing patches still observe probe and measurement requests.
-    Live zipper/download OData nodes go through
-    :func:`faninsar.remote.providers.cdse.fetch_cdse_ranges`.
+    When a :class:`_CdseBurstTransfer` operation is active (set by
+    :func:`prepare_s1_inputs` or created per direct materialize call) every
+    CDSE batch rides that operation's provider-owned fetcher instead of
+    opening a fresh session, so the AIMD window, token, and connection pool
+    survive across probes, bursts, and dates.  Tests and fixture URLs keep
+    the unauthenticated ``fetch_ranges_async`` path so existing patches
+    still observe probe and measurement requests.  Live zipper/download
+    OData nodes without an operation go through
+    :func:`faninsar.remote.providers.cdse.fetch_cdse_ranges` as before.
     """
     span_tuple = tuple(spans)
     if not span_tuple:
         return {}
+    operation = _burst_transfer.get()
+    if operation is not None:
+        return operation.fetch_sync(span_tuple)
     if not _cdse_range_host(span_tuple[0].url):
         return run_sync(fetch_ranges_async(span_tuple))
     from faninsar.remote.providers.cdse import fetch_cdse_ranges
 
-    return run_sync(fetch_cdse_ranges(span_tuple))
+    policy_budget, policy_ledger = _preparation_remote_policy.get()
+    policy = (
+        {}
+        if policy_budget is None and policy_ledger is None
+        else {"budget": policy_budget, "ledger": policy_ledger}
+    )
+    return run_sync(fetch_cdse_ranges(span_tuple, **policy))
 
 
 _preparation_remote_policy: ContextVar[tuple[Any, Any]] = ContextVar(
     "s1_preparation_remote_policy", default=(None, None)
+)
+
+
+class _CdseBurstTransfer:
+    """Operation-scoped provider fetcher shared by one prepare/materialize call.
+
+    PROPOSAL-0061 D2 and the PROPOSAL-0070 amendment keep one remote
+    fetcher/window for the selected dates, bursts, and tracks.  The class
+    owns a dedicated event-loop thread (named ``faninsar-s1-range-fetch``,
+    the P0061 bridge thread) and lazily opens one provider
+    :class:`~faninsar.remote.fetch.RangeFetcher` on it — a rerun whose plan
+    is fully skipped performs zero network calls.  Sync call sites
+    (annotation fetch, TIFF probes, measurement spans) bridge onto that
+    loop through ``run_coroutine_threadsafe``; the aiohttp session is never
+    cached on a Stack, a module global, or any object outliving
+    :meth:`close`.
+
+    Auth boundary: every CDSE URL is validated through
+    :func:`faninsar.remote.providers.cdse.validate_cdse_range_urls` before
+    its first credentialed request (a runtime allow-list caches the
+    provider verdicts), and non-CDSE spans keep today's anonymous
+    per-batch path.  Mixed CDSE/non-CDSE batches are rejected.
+
+    Shutdown order is load-bearing: callers stop submitting work, join
+    their worker pool, and only then call :meth:`close`, which cancels any
+    still-pending bridge futures, closes the fetcher on the live loop, and
+    stops the loop thread.  Closing before the pool joins would strand
+    ``run_coroutine_threadsafe`` callers on a dead loop.
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._cm: Any = None
+        self._fetcher: Any = None
+        self._open_lock: asyncio.Lock | None = None
+        self._lock = threading.Lock()
+        self._validated: set[str] = set()
+        self._inflight: list[Any] = []
+        self._stop = threading.Event()
+        # Captured once on the constructing thread: worker threads and the
+        # loop thread do not share context variables, so the network budget
+        # must not be re-read from a worker's (possibly stale) context.
+        self._policy = _preparation_remote_policy.get()
+
+    @property
+    def stop_event(self) -> threading.Event:
+        """Event set on shutdown; workers must poll it between fetch waves."""
+        return self._stop
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """Start the dedicated bridge loop thread once, on demand."""
+        with self._lock:
+            if self._loop is not None:
+                return self._loop
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                name="faninsar-s1-range-fetch",
+                daemon=True,
+            )
+            thread.start()
+            self._loop = loop
+            self._loop_thread = thread
+            return loop
+
+    def _bridge(self, coro: Any) -> Any:
+        """Run one coroutine on the operation loop and await its result.
+
+        If the calling thread is interrupted while parked on
+        ``future.result()`` (SIGINT, cancel), the coroutine would keep
+        running on the operation loop unowned and later outlive the
+        session close.  The exception path therefore cancels the future
+        first and then unwinds; :meth:`close` still gathers the loop
+        tasks so the cancellation settles inside the loop.
+        """
+        loop = self._ensure_loop()
+        with self._lock:
+            if self._stop.is_set():
+                coro.close()
+                raise asyncio.CancelledError
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            self._inflight.append(future)
+        try:
+            return future.result()
+        except BaseException:
+            future.cancel()
+            raise
+        finally:
+            with self._lock, contextlib.suppress(ValueError):
+                self._inflight.remove(future)
+
+    async def _validate_and_open(self, new_urls: tuple[str, ...], policy: Any) -> None:
+        """Provider-validate new URLs, then open the fetcher with the token.
+
+        Single-flight: concurrent bridge callers queue on one loop-owned
+        lock and re-check inside it, so exactly one ``RangeFetcher`` is
+        opened.  Validation runs strictly before the token grant so a bad
+        origin can never receive a Bearer header.  ``policy`` is captured
+        at operation construction because worker threads and the loop
+        thread do not share context variables.
+        """
+        from faninsar.remote.providers.cdse import (
+            cdse_range_fetcher,
+            validate_cdse_range_urls,
+        )
+
+        if self._open_lock is None:
+            self._open_lock = asyncio.Lock()
+        async with self._open_lock:
+            if new_urls:
+                await validate_cdse_range_urls(new_urls)
+                self._validated.update(new_urls)
+            if self._fetcher is None:
+                policy_budget, policy_ledger = policy
+                kwargs = (
+                    {}
+                    if policy_budget is None and policy_ledger is None
+                    else {"budget": policy_budget, "ledger": policy_ledger}
+                )
+                cm = cdse_range_fetcher((), **kwargs)
+                try:
+                    self._fetcher = await cm.__aenter__()
+                except BaseException:
+                    self._cm = None
+                    raise
+                self._cm = cm
+                configure = getattr(self._fetcher, "configure_rate_limit_policy", None)
+                if configure is not None:
+                    configure(max_retries_per_object=10)
+
+    def configure_deferred_pass(self) -> None:
+        """Switch the opened fetcher to terminal, serial 429 handling."""
+        _reconfigure_deferred_pass_policy(self)
+
+    def cancel_pending(self) -> None:
+        """Stop bridge admission and release callers without stopping the loop."""
+        with self._lock:
+            self._stop.set()
+            pending = tuple(self._inflight)
+        for future in pending:
+            future.cancel()
+
+    def fetch_sync(self, spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+        """Fetch one batch from the calling thread via the shared fetcher."""
+        if self._stop.is_set():
+            reject(
+                "burst transfer operation is shutting down",
+                RuntimeError,
+                logger=logger,
+            )
+        span_tuple = tuple(spans)
+        cdse_spans = tuple(span for span in span_tuple if _cdse_range_host(span.url))
+        other_spans = tuple(
+            span for span in span_tuple if not _cdse_range_host(span.url)
+        )
+        if cdse_spans and other_spans:
+            reject(
+                "mixed CDSE and non-CDSE range origins in one fetch batch",
+                ValueError,
+                logger=logger,
+            )
+        if not cdse_spans:
+            return run_sync(fetch_ranges_async(other_spans))
+        new_urls = tuple(sorted({span.url for span in cdse_spans} - self._validated))
+        self._bridge(self._validate_and_open(new_urls, self._policy))
+        return self._bridge(self._fetcher.fetch(cdse_spans))
+
+    def close(self) -> None:
+        """Ordered shutdown: cancel bridges, drain, close fetcher, stop loop.
+
+        Every pending task owned by the dedicated loop — fetch streams,
+        cooldown timers, leftover bridges — is cancelled and gathered with
+        ``return_exceptions=True`` before the aiohttp session closes; the
+        dedicated loop has no other owners, so there is no fixed drain
+        wait and cancellation settles immediately.  The fetcher context is
+        read *inside* the loop coroutine, after the drain settles: the
+        lazy open runs on that loop, so a close racing an in-flight open
+        (e.g. SIGINT while the first synchronous token grant blocks the
+        loop) must not trust a snapshot taken on the caller thread.  The
+        provider ``__aexit__`` runs last, then the loop thread is joined
+        and the loop closed.
+        """
+        self.cancel_pending()
+        loop = self._loop
+        if loop is not None:
+
+            async def _drain_and_close() -> None:
+                tasks = [
+                    task
+                    for task in asyncio.all_tasks(loop)
+                    if task is not asyncio.current_task()
+                ]
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                cm = self._cm
+                self._cm = None
+                self._fetcher = None
+                if cm is not None:
+                    await cm.__aexit__(None, None, None)
+
+            closer = asyncio.run_coroutine_threadsafe(_drain_and_close(), loop)
+            try:
+                closer.result()
+            except Exception:
+                logger.warning("burst transfer fetcher closed with pending error")
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=30.0)
+            self._loop_thread = None
+        if loop is not None:
+            loop.close()
+            self._loop = None
+
+
+def _reconfigure_deferred_pass_policy(operation: _CdseBurstTransfer) -> None:
+    """Apply the final-pass policy on the fetcher's owning event loop."""
+    if getattr(operation._fetcher, "configure_rate_limit_policy", None) is None:
+        return
+
+    async def configure() -> None:
+        operation._fetcher.configure_rate_limit_policy(
+            max_retries_per_object=0, max_workers=1, reset_counters=True
+        )
+
+    operation._bridge(configure())
+
+
+_burst_transfer: ContextVar[_CdseBurstTransfer | None] = ContextVar(
+    "s1_burst_transfer", default=None
 )
 
 
@@ -3252,6 +3500,15 @@ def materialize_cdse_burst_safes(
     structure the ASF burst-extractor path produces, so the provider does
     not leak upward.
 
+    All CDSE requests (annotation, TIFF/IFD probes, measurement rows)
+    share one operation-scoped provider ``RangeFetcher`` (PROPOSAL-0061
+    D2, PROPOSAL-0070): when called under :func:`prepare_s1_inputs` the
+    fetcher spans every selected date; a direct call owns one temporarily
+    for this invocation only.  The fetcher's AIMD window — or
+    ``RemoteResourceBudget.max_workers`` when a budget is set — bounds the
+    total in-flight HTTP, so per-batch windows no longer reset to the
+    seed.  Bursts within an item are fetched serially.
+
     Parameters
     ----------
     roi : BoundingBox, Points, or Polygons, optional
@@ -3341,102 +3598,160 @@ def materialize_cdse_burst_safes(
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir, key
 
+    def _binding_origin_kind() -> str:
+        """Reject mixed-origin bindings; return ``"cdse"`` or ``"other"``."""
+        kinds: set[str] = set()
+        for binding in items:
+            binding_kinds = {
+                "cdse"
+                if _cdse_range_host(str(binding.get("annotation_url", "")))
+                else "other",
+                "cdse"
+                if _cdse_range_host(str(binding.get("measurement_url", "")))
+                else "other",
+            }
+            if len(binding_kinds) > 1:
+                reject(
+                    "mixed CDSE and non-CDSE range origins within one "
+                    "measurement binding; split the pools by provider",
+                    ValueError,
+                    logger=logger,
+                )
+            kinds |= binding_kinds
+        if len(kinds) > 1:
+            reject(
+                "mixed CDSE and non-CDSE range origins in one burst "
+                "materialization; one credentialed session cannot serve "
+                "both pools",
+                ValueError,
+                logger=logger,
+            )
+        return kinds.pop() if kinds else "other"
+
+    origin_kind = _binding_origin_kind()
+
+    operation = _burst_transfer.get()
+    owner = None
+    owner_token = None
+    if origin_kind == "cdse" and operation is None:
+        owner = _CdseBurstTransfer()
+        owner_token = _burst_transfer.set(owner)
+        operation = owner
     paths: list[Path] = []
-    for item in items:
-        out_dir, track_key = _out_dir_for(item)
-        product_id = str(item.get("product_id", "S1_ROI"))
-        fetch_context = _RoiFetchContext()
-        xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
-        if roi is not None and not _roi_overlaps_geolocation(xml_text, roi):
-            logger.warning(
-                "Skipping CDSE measurement %s %s %s: "
-                "ROI is outside the geolocation envelope",
-                item.get("product_id", "?"),
-                item.get("swath", "?"),
-                item.get("polarization", "?"),
+    try:
+        for item in items:
+            out_dir, track_key = _out_dir_for(item)
+            product_id = str(item.get("product_id", "S1_ROI"))
+            fetch_context = _RoiFetchContext()
+            xml_text = _fetch_annotation_xml(item, fetch_context=fetch_context)
+            if roi is not None and not _roi_overlaps_geolocation(xml_text, roi):
+                logger.warning(
+                    "Skipping CDSE measurement %s %s %s: "
+                    "ROI is outside the geolocation envelope",
+                    item.get("product_id", "?"),
+                    item.get("swath", "?"),
+                    item.get("polarization", "?"),
+                )
+                continue
+            swath = parse_annotation_xml(
+                xml_text,
+                annotation_path=str(
+                    item.get("annotation_url", "cdse://annotation.xml")
+                ),
+                measurement_path=str(
+                    item.get("measurement_url", "cdse://measurement.tiff")
+                ),
+                _original_parent=True,
             )
-            continue
-        swath = parse_annotation_xml(
-            xml_text,
-            annotation_path=str(item.get("annotation_url", "cdse://annotation.xml")),
-            measurement_path=str(
-                item.get("measurement_url", "cdse://measurement.tiff")
-            ),
-            _original_parent=True,
-        )
-        hints = item.get("_asf_burst_hints")
-        if hints is not None:
-            selected_ids = [int(burst_id) for burst_id, _time in hints]
-            selected_times = [time for _burst_id, time in hints]
-        else:
-            selected_ids = absolute_burst_ids
-            selected_times = catalog_sensing_times
-        indices = _resolve_burst_indices(
-            swath,
-            absolute_burst_ids=selected_ids,
-            catalog_sensing_times=selected_times,
-        )
-        if roi is not None:
-            # Drop resolved bursts outside the ROI's line envelope so an
-            # explicit id selection can still be bounded spatially.
-            l0, l1, _c0, _c1 = invert_geolocation_grid(xml_text, roi)
-            lpb = int(swath.lines_per_burst)
-            indices = tuple(
-                index
-                for index in indices
-                if (index * lpb) < l1 and ((index + 1) * lpb) > l0
-            )
-        if not indices:
-            logger.warning(
-                "Skipping CDSE measurement %s: no resolved burst intersects the ROI",
-                product_id,
-            )
-            continue
-        payloads: list[PathBurstPayload] = []
-        id_by_index = _associate_catalog_absolute_ids(
-            swath,
-            absolute_burst_ids=selected_ids,
-            catalog_sensing_times=selected_times,
-        )
-        for index in indices:
-            block, line_valid = _fetch_burst_block(
-                item,
+            hints = item.get("_asf_burst_hints")
+            if hints is not None:
+                selected_ids = [int(burst_id) for burst_id, _time in hints]
+                selected_times = [time for _burst_id, time in hints]
+            else:
+                selected_ids = absolute_burst_ids
+                selected_times = catalog_sensing_times
+            indices = _resolve_burst_indices(
                 swath,
-                index,
-                fetch_context=fetch_context,
+                absolute_burst_ids=selected_ids,
+                catalog_sensing_times=selected_times,
             )
-            catalog_id = id_by_index.get(int(index))
-            parsed_id = swath.bursts[int(index)].absolute_burst_id
-            if (
-                catalog_id is not None
-                and parsed_id is not None
-                and int(catalog_id) != int(parsed_id)
-            ):
-                reject_product(
-                    f"conflicting official absolute burst IDs {parsed_id} vs "
-                    f"{catalog_id} for burst index {index}"
+            if roi is not None:
+                # Drop resolved bursts outside the ROI's line envelope so an
+                # explicit id selection can still be bounded spatially.
+                l0, l1, _c0, _c1 = invert_geolocation_grid(xml_text, roi)
+                lpb = int(swath.lines_per_burst)
+                indices = tuple(
+                    index
+                    for index in indices
+                    if (index * lpb) < l1 and ((index + 1) * lpb) > l0
                 )
-            payloads.append(
-                PathBurstPayload(
-                    burst_index=int(index),
-                    samples=block,
-                    line_valid=line_valid,
-                    absolute_burst_id=(
-                        int(catalog_id) if catalog_id is not None else parsed_id
-                    ),
-                    number=getattr(swath.bursts[int(index)], "number", None),
+            if not indices:
+                logger.warning(
+                    "Skipping CDSE measurement %s: "
+                    "no resolved burst intersects the ROI",
+                    product_id,
                 )
+                continue
+            id_by_index = _associate_catalog_absolute_ids(
+                swath,
+                absolute_burst_ids=selected_ids,
+                catalog_sensing_times=selected_times,
             )
-        result = write_path_safe(
-            swath,
-            payloads,
-            track_key or "000?",
-            out_dir,
-            annotation_xml=xml_text,
-            product_id=None,
-            ipf_version=item.get("ipf_version"),
-        )
-        paths.append(result.safe_root)
+            payloads: list[PathBurstPayload] = []
+            for index in indices:
+                block, line_valid = _fetch_burst_block(
+                    item,
+                    swath,
+                    index,
+                    fetch_context=fetch_context,
+                )
+                catalog_id = id_by_index.get(int(index))
+                parsed_id = swath.bursts[int(index)].absolute_burst_id
+                if (
+                    catalog_id is not None
+                    and parsed_id is not None
+                    and int(catalog_id) != int(parsed_id)
+                ):
+                    reject_product(
+                        f"conflicting official absolute burst IDs {parsed_id} vs "
+                        f"{catalog_id} for burst index {index}"
+                    )
+                payloads.append(
+                    PathBurstPayload(
+                        burst_index=int(index),
+                        samples=block,
+                        line_valid=line_valid,
+                        absolute_burst_id=(
+                            int(catalog_id) if catalog_id is not None else parsed_id
+                        ),
+                        number=getattr(swath.bursts[int(index)], "number", None),
+                    )
+                )
+            result = write_path_safe(
+                swath,
+                payloads,
+                track_key or "000?",
+                out_dir,
+                annotation_xml=xml_text,
+                product_id=None,
+                ipf_version=item.get("ipf_version"),
+            )
+            useful_bytes = (
+                sum(len(body) for body in fetch_context.bodies.values())
+                + fetch_context.probed_bytes
+            )
+            logger.info(
+                "cdse burst materialized %s: bursts=%d useful_bytes=%d",
+                product_id,
+                len(payloads),
+                useful_bytes,
+            )
+            paths.append(result.safe_root)
+    finally:
+        if owner_token is not None:
+            _burst_transfer.reset(owner_token)
+        if owner is not None:
+            owner.close()
     if not paths:
         message = "Sentinel-1 CDSE search produced no burst SAFEs"
         reject(message, ValueError, logger=logger)

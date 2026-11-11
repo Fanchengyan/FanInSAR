@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
@@ -15,6 +19,7 @@ from faninsar.logging import reject, setup_logger
 from faninsar.remote.errors import (
     RemoteAccessError,
     RemoteIntegrityError,
+    RemoteLimitError,
     _fail,
 )
 from faninsar.remote.protocols import _CallLedger
@@ -36,6 +41,7 @@ _CONNECT_ATTEMPTS = 10
 _CONNECT_BACKOFF_S = 2.0
 _RATE_LIMIT_ATTEMPTS = 5
 _RATE_LIMIT_BACKOFF_S = 1.5
+_RETRY_AFTER_MAX_S = 300.0
 # After a cut, leftover 429s from the same wave keep arriving at the new
 # window. Ignore them — and do not probe up — until this hold elapses.
 _AIMD_HOLD_S = 15.0
@@ -47,6 +53,44 @@ _STREAM_CHUNK_BYTES = 16 * 1024
 # Exact match against the requested span is required; anything looser would
 # admit a prefix/suffix window that silently corrupts offset assembly.
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+_ACTIVE_RANGE: ContextVar[_RangeAttempt | None] = ContextVar(
+    "range_fetcher", default=None
+)
+
+
+class _RateLimitError(RemoteAccessError):
+    """Carry a server delay without exposing response headers or URLs."""
+
+    def __init__(self, retry_after: float = 0.0) -> None:
+        self.retry_after = retry_after
+        super().__init__("range_unavailable", "range request was rate-limited")
+
+
+def _retry_after_seconds(value: str) -> float:
+    """Parse Retry-After seconds or an HTTP date; invalid values use backoff."""
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        return float(value)
+    try:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=UTC)
+        return max(0.0, date.timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 0.0
+
+
+@dataclass(slots=True)
+class _RangeAttempt:
+    """Task-local admission bookkeeping without changing getter signatures."""
+
+    fetcher: RangeFetcher
+    attempt: int = 0
+    origin: int | None = None
+    sent: int = 0
+    cooldown_started: bool = False
+    metadata: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,8 +105,9 @@ class RangeSpan:
     start, end : int
         Inclusive byte offsets (HTTP ``Range: bytes=start-end``).
     label : str
-        Caller-owned identity for resume/assembly; the fetcher does not
-        interpret it.
+        Caller-owned identity for resume/assembly. With metadata admission
+        enabled, ``annotation`` and ``annotation-*`` identify metadata work;
+        every other label is payload. Object URLs are never used to classify.
 
     """
 
@@ -91,8 +136,11 @@ class RangeFetcher:
 
     The AIMD window stays at ``_AIMD_SEED`` until a 429. With no climb path
     it drops to 3/4, then 1/2 of that origin; after a climb it walks back
-    the same steps. ``TCPConnector.limit`` tracks the same integer. 401 is
-    auth refresh, not a window event.
+    the same steps. ``TCPConnector.limit`` tracks the same integer; queued
+    requests also wait for in-flight work to drain below that window. A 429
+    pauses every new attempt until the shared backoff/``Retry-After`` deadline.
+    Server delays above 300 seconds fail this context closed rather than retry
+    early. 401 is auth refresh, not a window event.
     """
 
     def __init__(
@@ -114,9 +162,14 @@ class RangeFetcher:
             responses share one in-flight refresh; each span is requeued
             once after that result.
         budget : RemoteResourceBudget, optional
-            Network guards shared by all spans in this context. Item-count and
-            disk/cache quotas do not apply to range transfer. Omission retains
-            the existing AIMD and socket defaults.
+            Network guards shared by all spans in this context. ``max_workers``
+            caps all active HTTP requests; ``max_ranges_per_file`` optionally
+            caps each exact URL within that same pool, including metadata URLs.
+            ``max_metadata_files`` enables distinct active-URL admission bounded
+            by ``max_active_files``, reserving metadata slots while annotation
+            spans are pending. In-flight payload is never preempted. Item-count
+            and disk/cache quotas remain outside range transfer. Omission retains
+            the AIMD and socket defaults; this is client policy, not a server quota.
         ledger : _CallLedger, optional
             Existing operation accounting. Its budget is authoritative; a
             conflicting explicit budget is rejected.
@@ -154,6 +207,211 @@ class RangeFetcher:
         self._cool: asyncio.Event | None = None
         self._cool_task: asyncio.Task[None] | None = None
         self._cool_waiters = 0
+        self._cool_until = 0.0
+        self._rate_limit_error: RemoteAccessError | None = None
+        self._inflight = 0
+        self._by_url_inflight: dict[str, int] = {}
+        self._max_ranges_per_file = (
+            self._budget.max_ranges_per_file if self._budget is not None else None
+        )
+        self._metadata_limit = (
+            self._budget.max_metadata_files if self._budget is not None else None
+        )
+        self._metadata_pending = 0
+        self._metadata_inflight: dict[str, int] = {}
+        self._available = asyncio.Event()
+        self._max_retries_per_object: int | None = None
+        self._url_429_counts: dict[str, int] = {}
+        self._active_spans = 0
+        self._active_batches = 0
+
+    def configure_rate_limit_policy(
+        self,
+        *,
+        max_retries_per_object: int | None = None,
+        max_workers: int | None = None,
+        reset_counters: bool = False,
+    ) -> None:
+        """Configure an operation-owned URL retry stage without reopening HTTP.
+
+        Parameters
+        ----------
+        max_retries_per_object : int or None, optional
+            Retry allowance shared by every span on an exact URL. Ten allows
+            ten retries; its eleventh actual 429 exhausts that URL. Zero makes
+            its first 429 terminal. None retains five attempts per span.
+        max_workers : int or None, optional
+            Lower the shared HTTP concurrency ceiling; never increase the
+            original budget or a previously lowered ceiling.
+        reset_counters : bool, optional
+            Clear URL 429 counts when entering a new stage. The caller must
+            first drain every span from the preceding stage. Session, ledger,
+            AIMD history and any current Retry-After cooldown are retained.
+
+        Raises
+        ------
+        RuntimeError
+            If any active, queued or cooling span has not drained.
+        ValueError
+            If a retry allowance or worker ceiling is invalid.
+
+        Notes
+        -----
+        An exhausted URL raises ``RemoteAccessError`` with reason
+        ``rate_limit_exhausted`` without stopping other URLs. Only actual 429
+        responses consume its allowance; metadata URLs have separate counts.
+
+        """
+        if self._active_spans or self._active_batches:
+            reject(
+                "drain all range spans before changing retry stage",
+                RuntimeError,
+                logger=logger,
+            )
+        if max_retries_per_object is not None and (
+            isinstance(max_retries_per_object, bool)
+            or not isinstance(max_retries_per_object, int)
+            or max_retries_per_object < 0
+        ):
+            reject(
+                "object retry allowance must be a non-negative integer",
+                ValueError,
+                logger=logger,
+            )
+        if max_workers is not None and (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, int)
+            or max_workers < 1
+        ):
+            reject(
+                "range worker ceiling must be a positive integer",
+                ValueError,
+                logger=logger,
+            )
+        self._max_retries_per_object = max_retries_per_object
+        if reset_counters:
+            self._url_429_counts.clear()
+        if max_workers is not None:
+            self._ceiling = min(self._ceiling, max_workers)
+            self._hi = min(self._hi, self._ceiling + 1)
+            self._set_window(self._window)
+
+    def _check_object_rate_limit(self, url: str) -> None:
+        """Reject exhausted exact URLs without logging credentials or recounting."""
+        maximum = self._max_retries_per_object
+        if maximum is not None and self._url_429_counts.get(url, 0) > maximum:
+            reason = "rate_limit_exhausted"
+            raise RemoteAccessError(
+                reason, "range object exhausted its 429 retry allowance"
+            )
+
+    def _rate_limit_delay(self, attempt: int, retry_after: float) -> float:
+        """Bound enabled-policy client backoff, never the server's Retry-After."""
+        if self._max_retries_per_object is None:
+            backoff = _RATE_LIMIT_BACKOFF_S * (2**attempt)
+        else:
+            backoff = min(60.0, _RATE_LIMIT_BACKOFF_S * (2 ** min(attempt, 6)))
+        return max(backoff, retry_after)
+
+    async def _wait_event(self, event: asyncio.Event) -> None:
+        """Bound this waiter by the operation deadline, not the shared task."""
+        ledger = self._ledger
+        if ledger is None:
+            await event.wait()
+        else:
+            ledger.check_elapsed()
+            remaining = ledger.budget.max_elapsed_seconds - (
+                time.monotonic() - ledger.started
+            )
+            try:
+                async with asyncio.timeout(max(0.0, remaining)):
+                    await event.wait()
+            except TimeoutError:
+                _fail(RemoteLimitError, "max_elapsed_seconds")
+            ledger.check_elapsed()
+        if self._rate_limit_error is not None:
+            logger.error("range session stopped after an excessive Retry-After")
+            raise self._rate_limit_error
+
+    def _metadata_span(self, span: RangeSpan) -> bool:
+        """Classify opt-in metadata by public label, never by secret object URL."""
+        return self._metadata_limit is not None and (
+            span.label == "annotation" or span.label.startswith("annotation-")
+        )
+
+    def _finish_metadata(self) -> None:
+        """Release a pending reservation on success, failure or cancellation."""
+        self._metadata_pending -= 1
+        self._available.set()
+
+    def _file_available(self, url: str, metadata: bool) -> bool:
+        """Reserve client file slots while metadata is pending; never preempt."""
+        limit = self._metadata_limit
+        if limit is None:
+            return True
+        assert self._budget is not None
+        files = self._by_url_inflight
+        annotations = self._metadata_inflight
+        if not metadata and self._metadata_pending:
+            payload_http = self._inflight - sum(annotations.values())
+            if payload_http >= max(0, self._window - limit):
+                return False
+        if url not in files and len(files) >= self._budget.max_active_files:
+            return False
+        if metadata:
+            return url in annotations or len(annotations) < limit
+        payload_limit = self._budget.max_active_files - (
+            limit if self._metadata_pending else 0
+        )
+        payloads = files.keys() - annotations.keys()
+        return len(payloads) < payload_limit or (
+            url in payloads and len(payloads) == payload_limit
+        )
+
+    async def _acquire(self, url: str) -> int:
+        """Admit below HTTP, URL and optional file caps, outside cooldown."""
+        state = _ACTIVE_RANGE.get()
+        metadata = state.metadata if state is not None else False
+        while True:
+            self._check_object_rate_limit(url)
+            if self._rate_limit_error is not None:
+                logger.error("range session stopped after an excessive Retry-After")
+                raise self._rate_limit_error
+            if self._cool is not None:
+                await self._wait_event(self._cool)
+                continue
+            by_url = self._by_url_inflight.get(url, 0)
+            if (
+                self._inflight < self._window
+                and self._file_available(url, metadata)
+                and (
+                    self._max_ranges_per_file is None
+                    or by_url < self._max_ranges_per_file
+                )
+            ):
+                self._inflight += 1
+                self._by_url_inflight[url] = by_url + 1
+                if metadata:
+                    annotations = self._metadata_inflight
+                    annotations[url] = annotations.get(url, 0) + 1
+                return self._window
+            self._available.clear()
+            await self._wait_event(self._available)
+
+    def _release(self, url: str) -> None:
+        """Release global and exact-URL slots and wake every eligible waiter."""
+        self._inflight -= 1
+        remaining = self._by_url_inflight[url] - 1
+        if remaining:
+            self._by_url_inflight[url] = remaining
+        else:
+            del self._by_url_inflight[url]
+        state = _ACTIVE_RANGE.get()
+        if state is not None and state.metadata:
+            self._metadata_inflight[url] -= 1
+            if not self._metadata_inflight[url]:
+                del self._metadata_inflight[url]
+        self._available.set()
 
     @property
     def window(self) -> int:
@@ -256,10 +514,23 @@ class RangeFetcher:
                 self._ladder.append(nxt)
         self._set_window(nxt)
 
-    async def _wait_rate_limit(self, sent: int, attempt: int) -> None:
-        """Decrease once, then share one backoff so a 429 wave retries together."""
+    def _start_rate_limit(self, sent: int, delay: float) -> asyncio.Event:
+        """Publish a shared cooldown before releasing a rate-limited response."""
         self._on_rate_limit(sent)
-        delay = _RATE_LIMIT_BACKOFF_S * (2**attempt)
+        if delay > _RETRY_AFTER_MAX_S:
+            self._rate_limit_error = _RateLimitError(delay)
+            self._available.set()
+            if self._cool is not None:
+                self._cool.set()
+                self._cool = None
+            if self._cool_task is not None:
+                self._cool_task.cancel()
+            cool = asyncio.Event()
+            cool.set()
+            return cool
+        self._cool_until = max(
+            self._cool_until, asyncio.get_running_loop().time() + delay
+        )
         self._cool_waiters += 1
         cool = self._cool
         if cool is None:
@@ -272,7 +543,11 @@ class RangeFetcher:
                     while prev != self._cool_waiters:
                         prev = self._cool_waiters
                         await asyncio.sleep(0)
-                    await asyncio.sleep(delay)
+                    while True:
+                        remaining = self._cool_until - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(remaining)
                 finally:
                     if self._cool is cool:
                         self._cool = None
@@ -281,7 +556,16 @@ class RangeFetcher:
                     cool.set()
 
             self._cool_task = asyncio.create_task(_release())
-        await cool.wait()
+        return cool
+
+    async def _wait_rate_limit(
+        self, sent: int, attempt: int, retry_after: float = 0.0
+    ) -> None:
+        """Decrease once, then wait for the shared congestion deadline."""
+        cool = self._start_rate_limit(
+            sent, self._rate_limit_delay(attempt, retry_after)
+        )
+        await self._wait_event(cool)
 
     async def __aenter__(self) -> Self:
         """Open one ClientSession; live streams have no total timeout."""
@@ -341,7 +625,23 @@ class RangeFetcher:
             msg = "RangeFetcher must be used as an async context manager"
             reject(msg, RuntimeError, logger=logger)
         span_list = tuple(spans)
-        bodies = await asyncio.gather(*(_get_span(self, span) for span in span_list))
+        tasks: list[asyncio.Task[bytes]] = []
+        self._active_batches += 1
+        self._metadata_pending += sum(self._metadata_span(span) for span in span_list)
+        try:
+            for span in span_list:
+                task = asyncio.create_task(_get_span(self, span))
+                if self._metadata_span(span):
+                    task.add_done_callback(lambda _: self._finish_metadata())
+                tasks.append(task)
+            bodies = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            self._active_batches -= 1
         return {span.label: body for span, body in zip(span_list, bodies, strict=True)}
 
     async def fetch_into(
@@ -429,11 +729,15 @@ class RangeFetcher:
             etag=etag.strip() if etag and not etag.strip().startswith("W/") else None,
             on_etag=on_etag,
         )
+        metadata = self._metadata_span(span)
+        self._metadata_pending += metadata
         try:
             await _attempt_span_stream(
                 self, span, write, received, allow_refresh=True, revision=revision
             )
         finally:
+            if metadata:
+                self._finish_metadata()
             close()
         return span.end - span.start + 1
 
@@ -537,22 +841,60 @@ async def _attempt_span_stream(
     allow_refresh: bool,
     revision: _Revision | None = None,
 ) -> None:
+    """Track the entire span lifetime, including admission, refresh and cooldown."""
+    fetcher._active_spans += 1
+    try:
+        await _retry_span_stream(
+            fetcher,
+            span,
+            write,
+            received,
+            allow_refresh=allow_refresh,
+            revision=revision,
+        )
+    finally:
+        fetcher._active_spans -= 1
+
+
+async def _retry_span_stream(
+    fetcher: RangeFetcher,
+    span: RangeSpan,
+    write: Callable[[bytes], object],
+    received: Callable[[], int],
+    *,
+    allow_refresh: bool,
+    revision: _Revision | None = None,
+) -> None:
     """Drive the streaming span through 429 requeue and shared 401 refresh."""
     last_access_error: RemoteAccessError | None = None
-    origin_window = fetcher._window
-    for attempt in range(_RATE_LIMIT_ATTEMPTS):
+    state = _RangeAttempt(fetcher, metadata=fetcher._metadata_span(span))
+    maximum = fetcher._max_retries_per_object
+    attempts = _RATE_LIMIT_ATTEMPTS if maximum is None else maximum + 1
+    for attempt in range(attempts):
+        state.attempt = attempt
+        state.sent = fetcher._window
+        state.cooldown_started = False
         generation = fetcher._generation
-        sent_window = fetcher._window
         try:
-            await _stream_span(
-                fetcher._session,
-                span,
-                write,
-                received,
-                token=fetcher._token,
-                revision=revision,
-                ledger=fetcher._ledger,
-            )
+            context = _ACTIVE_RANGE.set(state)
+            try:
+                fetcher._check_object_rate_limit(span.url)
+                if fetcher._rate_limit_error is not None:
+                    logger.error("range session stopped after an excessive Retry-After")
+                    raise fetcher._rate_limit_error
+                if fetcher._cool is not None:
+                    await fetcher._wait_event(fetcher._cool)
+                await _stream_span(
+                    fetcher._session,
+                    span,
+                    write,
+                    received,
+                    token=fetcher._token,
+                    revision=revision,
+                    ledger=fetcher._ledger,
+                )
+            finally:
+                _ACTIVE_RANGE.reset(context)
         except RemoteAccessError as error:
             last_access_error = error
             if (
@@ -574,16 +916,26 @@ async def _attempt_span_stream(
                 return
             if error.reason != "range_unavailable":
                 raise
+            retry_after = (
+                error.retry_after if isinstance(error, _RateLimitError) else 0.0
+            )
+            if retry_after > _RETRY_AFTER_MAX_S:
+                raise
             # Rate-limited: pin the window this span first sent at. Retries
             # after a cut would otherwise look like the new window 429'd.
-            if attempt < _RATE_LIMIT_ATTEMPTS - 1:
+            origin_window = state.origin if state.origin is not None else state.sent
+            if attempt < attempts - 1:
                 if fetcher._ledger is not None:
                     fetcher._ledger.retry()
-                await fetcher._wait_rate_limit(origin_window, attempt)
-            else:
-                fetcher._on_rate_limit(origin_window)
+                if state.cooldown_started:
+                    if fetcher._cool is not None:
+                        await fetcher._wait_event(fetcher._cool)
+                else:
+                    await fetcher._wait_rate_limit(origin_window, attempt, retry_after)
+            elif not state.cooldown_started:
+                fetcher._start_rate_limit(origin_window, retry_after)
         else:
-            fetcher._on_success(sent_window)
+            fetcher._on_success(state.sent)
             return
     assert last_access_error is not None
     raise last_access_error
@@ -643,16 +995,25 @@ async def _stream_span(
             await asyncio.sleep(_CONNECT_BACKOFF_S * (attempt - 1))
         if received() >= expected:
             return
+        state = _ACTIVE_RANGE.get()
+        if state is not None:
+            state.sent = await state.fetcher._acquire(span.url)
+            if state.origin is None:
+                state.origin = state.sent
         try:
-            await _request_span_once(
-                session,
-                span,
-                write,
-                received(),
-                token=token,
-                revision=revision,
-                ledger=ledger,
-            )
+            try:
+                await _request_span_once(
+                    session,
+                    span,
+                    write,
+                    received(),
+                    token=token,
+                    revision=revision,
+                    ledger=ledger,
+                )
+            finally:
+                if state is not None:
+                    state.fetcher._release(span.url)
         except retryable as error:
             if ledger is not None:
                 ledger.check_elapsed()
@@ -750,11 +1111,19 @@ async def _request_span_once(
                 "range request was rate-limited",
                 extra={"label": span.label},
             )
-            _fail(
-                RemoteAccessError,
-                "range_unavailable",
-                "range request was rate-limited",
-            )
+            delay = _retry_after_seconds(response.headers.get("Retry-After", ""))
+            state = _ACTIVE_RANGE.get()
+            if state is not None:
+                state.fetcher._start_rate_limit(
+                    state.origin if state.origin is not None else state.sent,
+                    state.fetcher._rate_limit_delay(state.attempt, delay),
+                )
+                state.cooldown_started = True
+                if state.fetcher._max_retries_per_object is not None:
+                    counts = state.fetcher._url_429_counts
+                    counts[span.url] = counts.get(span.url, 0) + 1
+                    state.fetcher._check_object_rate_limit(span.url)
+            raise _RateLimitError(delay)
         content_range = response.headers.get("Content-Range", "")
         parsed = _CONTENT_RANGE_RE.match(content_range.strip())
         if (

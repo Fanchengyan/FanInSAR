@@ -315,13 +315,22 @@ async def cdse_range_fetcher(
         yield fetcher
 
 
-async def fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+async def fetch_cdse_ranges(
+    spans: Sequence[RangeSpan],
+    *,
+    budget: RemoteResourceBudget | None = None,
+    ledger: _CallLedger | None = None,
+) -> dict[str, bytes]:
     """Fetch OData byte ranges after validating each URL, then attach Bearer.
 
     Parameters
     ----------
     spans : sequence of RangeSpan
         Already-sized inclusive byte intervals on CDSE OData ``$value`` URLs.
+    budget : RemoteResourceBudget, optional
+        Network guards for the range transfer. Omission retains defaults.
+    ledger : _CallLedger, optional
+        Existing operation meter; its budget must match an explicit budget.
 
     Returns
     -------
@@ -337,8 +346,47 @@ async def fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
     span_tuple = tuple(spans)
     if not span_tuple:
         return {}
-    async with cdse_range_fetcher(span_tuple) as fetcher:
+    async with cdse_range_fetcher(span_tuple, budget=budget, ledger=ledger) as fetcher:
         return await fetch_ranges_async(span_tuple, fetcher=fetcher)
+
+
+async def validate_cdse_range_urls(urls: Sequence[str]) -> None:
+    """Validate OData range URLs for a shared provider-owned fetcher.
+
+    Applies exactly the same rules as :func:`fetch_cdse_ranges` applies at
+    fetch time — catalog registration, ``_validate_url`` allow-listing, and
+    the OData ``Nodes(...)/$value`` + Bearer-origin checks — so an
+    operation-scoped fetcher opened once can be reused across batches while
+    every new URL is still provider-validated before its first credentialed
+    request.  This is a private seam for
+    ``faninsar.missions.s1.acquisition``; per-call transfers should keep
+    using :func:`fetch_cdse_ranges`.
+
+    Parameters
+    ----------
+    urls : sequence of str
+        Candidate range URLs to validate.  Duplicates collapse silently.
+
+    Raises
+    ------
+    RemoteAccessError
+        If any URL is not a registered OData origin.
+
+    """
+    url_tuple = tuple(dict.fromkeys(str(url) for url in urls))
+    if not url_tuple:
+        return
+    ensure_cdse_catalog()
+    with _REGISTRY_LOCK:
+        adapter = _ADAPTERS.get(CDSE_CATALOG)
+    if adapter is None:
+        message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
+        _fail(RemoteAccessError, "unknown_catalog", message)
+    for url in url_tuple:
+        _validate_url(url, adapter)
+        if not _is_odata_value(url) or not _needs_cdse_bearer(url):
+            message = "CDSE range URL is not an OData Nodes(...)/$value href"
+            _fail(RemoteAccessError, "invalid_endpoint", message)
 
 
 @dataclass(slots=True)

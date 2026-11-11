@@ -10,12 +10,16 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
+from faninsar.logging import setup_logger
+
 from .errors import RemoteQueryError, _fail
+
+logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class RemoteResourceBudget:
-    """Resource guards for remote search and complete-file transfer.
+    """Resource guards for remote search, transfer, and acquisition tasks.
 
     Parameters
     ----------
@@ -30,6 +34,24 @@ class RemoteResourceBudget:
         generated asset.  This limit is separate from ordinary retries.
     max_poll_interval_seconds : float
         Maximum delay between observations of a provider generated asset.
+    max_workers : int
+        Shared HTTP concurrency ceiling across every URL in a range fetcher.
+        The live AIMD window may impose a lower limit.
+    max_active_files : int
+        Maximum active file or measurement tasks in acquisition orchestration.
+        With ``max_metadata_files`` enabled, range admission also bounds distinct
+        active URLs by this value. Defaults to 4.
+    max_ranges_per_file : int or None
+        Maximum simultaneous range requests for each exact URL, including
+        metadata URLs. None preserves global-only admission. This cap shares
+        ``max_workers``; the limits never multiply into a larger HTTP pool.
+    max_metadata_files : int or None
+        Optional client-side metadata reservation, at most ``max_active_files``.
+        Labels ``annotation`` and ``annotation-*`` identify metadata, not URLs.
+        While metadata is pending, reserve these file slots plus up to that
+        many live HTTP slots; after it drains, payload may use every slot.
+        Existing requests are never preempted. None keeps prior admission rules.
+        This scheduling policy makes no claim about provider quotas.
     max_response_bytes : int
         Maximum bytes accepted from one response.
     max_output_bytes : int
@@ -54,9 +76,29 @@ class RemoteResourceBudget:
     max_output_bytes: int = 2**31
     max_temporary_bytes: int = 2**33
     max_cache_bytes: int = 2**33
+    max_active_files: int = 4
+    max_ranges_per_file: int | None = None
+    max_metadata_files: int | None = None
 
     def __post_init__(self) -> None:
         """Reject non-finite or non-positive resource limits."""
+        for name in ("max_active_files", "max_ranges_per_file", "max_metadata_files"):
+            value = getattr(self, name)
+            if name != "max_active_files" and value is None:
+                continue
+            if type(value) is not int or value <= 0:
+                msg = f"{name} must be a positive integer"
+                if name != "max_active_files":
+                    msg += " or None"
+                logger.error(msg)
+                raise ValueError(msg)
+        if (
+            self.max_metadata_files is not None
+            and self.max_metadata_files > self.max_active_files
+        ):
+            msg = "max_metadata_files must not exceed max_active_files"
+            logger.error(msg)
+            raise ValueError(msg)
         if self.max_items is not None and (
             type(self.max_items) is not int or self.max_items <= 0
         ):

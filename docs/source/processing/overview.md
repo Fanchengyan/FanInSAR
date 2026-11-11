@@ -56,6 +56,51 @@ A complete matching request is a local no-op; a partial request retries missing
 inputs. `Stack.open(work_dir)` is local and read-only, including request-only
 recovery and product inspection after original raw sources disappear.
 
+### CDSE burst transfer concurrency
+
+Pass runtime resource guards to `prepare_data()` to control measurement tasks,
+Range requests per exact object URL, and their shared HTTP request ceiling:
+
+```python
+from faninsar.remote.records import RemoteResourceBudget
+
+report = stack.prepare_data(
+    budget=RemoteResourceBudget(
+        max_active_files=4,
+        max_ranges_per_file=4,
+        max_workers=4,
+        max_metadata_files=2,
+    ),
+)
+```
+
+These are client policy ceilings, not provider quota claims. Per-file limits do
+not multiply the shared `max_workers` ceiling. For eligible CDSE burst requests
+with one selected item per acquisition date, independent acquisition tasks share
+one provider-owned RangeFetcher, authentication refresh, adaptive window and
+cooldown for the entire preparation call. Other acquisition shapes retain their
+existing serial scheduling. The runtime budget does not change scientific Stack
+identity. Choose an HTTP ceiling allowed by your account; CDSE documents four
+concurrent connections for General Users in its
+[quota table](https://documentation.dataspace.copernicus.eu/Quotas.html).
+
+`max_ranges_per_file=None` preserves global-only Range admission. Metadata
+reservation is opt-in: with `max_metadata_files=2`, pending annotation XML work
+uses at most two of the four shared file slots while payload files use the other
+two. When pending metadata drains, payloads may use all file slots. Existing
+transfers are not interrupted when new metadata arrives. XML and payload Range
+requests still share the same HTTP ceiling and provider backoff; this is a
+client-side scheduling policy, not a claim about CDSE's internal file accounting.
+
+CDSE burst preparation permits ten shared 429 retries per exact object URL.
+Exhaustion defers that acquisition until every regular acquisition task in the
+preparation call has drained. Deferred acquisitions run serially with one shared
+HTTP request and no further 429 retry; another 429 becomes a reported failure.
+This final pass retains the same session, operation ledger and server cooldown.
+Authentication, integrity and other failures are not reclassified as rate limits.
+Requested acquisitions and failed membership remain in the preparation report;
+strict `on_error="raise"` does not silently drop dates or interferogram pairs.
+
 `Stack.unwrap()` uses SNAPHU by default. The Torch-native `SpatialIRLS`
 backend remains available as an explicit developer/experimental strategy:
 
