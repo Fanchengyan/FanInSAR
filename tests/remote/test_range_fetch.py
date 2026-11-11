@@ -1270,7 +1270,9 @@ def test_metadata_slots_respect_a_small_live_http_window(workers: int) -> None:
 
 
 @pytest.mark.parametrize("workers", [4, 16])
-def test_late_metadata_waits_for_payload_to_drain_without_preemption(workers: int) -> None:
+def test_late_metadata_waits_for_payload_to_drain_without_preemption(
+    workers: int,
+) -> None:
     """Four in-flight payload URLs drain naturally before two XMLs are admitted."""
     from faninsar.remote import RemoteResourceBudget
     from faninsar.remote.fetch import RangeFetcher, RangeSpan
@@ -1279,7 +1281,7 @@ def test_late_metadata_waits_for_payload_to_drain_without_preemption(workers: in
         session = _HeldRangeSession()
         fetcher = RangeFetcher(
             budget=RemoteResourceBudget(
-                max_workers=16,
+                max_workers=workers,
                 max_active_files=4,
                 max_metadata_files=2,
                 max_ranges_per_file=4,
