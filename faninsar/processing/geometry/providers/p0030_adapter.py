@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -327,41 +328,139 @@ def _sample_dataset(
 
 
 def _sample_paths(paths: list[Path], entry: DemSource, grid: GridSpec) -> np.ndarray:
-    """Sample all native source files directly onto one target grid."""
+    """Sample compatible native tile lattices in bounded source windows."""
     import rasterio
     from affine import Affine
+    from pyproj import CRS, Transformer
+    from rasterio.windows import Window
 
-    columns, rows = np.meshgrid(
-        np.arange(grid.width, dtype=np.float64) + 0.5,
-        np.arange(grid.height, dtype=np.float64) + 0.5,
-    )
-    target_x, target_y = Affine(*grid.transform) * (columns, rows)
-    output = np.full(grid.shape, np.nan, dtype=np.float64)
+    from faninsar.processing.geometry.api import _sample_biquintic
+
+    output = np.full(grid.shape, np.nan, dtype=np.float32)
     recipe = entry.mosaic_recipe()
-    for path in paths:
-        with rasterio.open(_source_path(path, recipe)) as dataset:
-            source_crs = (
+    with ExitStack() as stack:
+        groups: list[dict] = []
+        for path in sorted(set(paths)):
+            dataset = stack.enter_context(rasterio.open(_source_path(path, recipe)))
+            crs = CRS.from_user_input(
                 dataset.crs or getattr(recipe, "source_crs", None) or "EPSG:4326"
             )
-            sampled = _sample_dataset(
-                dataset,
-                np.asarray(target_x),
-                np.asarray(target_y),
-                target_crs=grid.crs,
-                source_crs=source_crs,
-                source_nodata=(
-                    getattr(recipe, "nodata", None)
-                    if getattr(recipe, "nodata", None) is not None
-                    else dataset.nodata
-                ),
+            transform = Affine(*dataset.transform)
+            for group in groups:
+                base = group["transform"]
+                if crs != group["crs"] or not np.allclose(
+                    (transform.a, transform.b, transform.d, transform.e),
+                    (base.a, base.b, base.d, base.e),
+                    rtol=1e-10,
+                    atol=1e-12,
+                ):
+                    continue
+                x = transform.c
+                if crs.is_geographic:
+                    x += 360.0 * round((base.c - x) / 360.0)
+                col, row = (~base) * (x, transform.f)
+                if abs(col - round(col)) < 1e-5 and abs(row - round(row)) < 1e-5:
+                    break
+            else:
+                group = {"transform": transform, "crs": crs, "tiles": []}
+                groups.append(group)
+                col = row = 0
+            nodata = getattr(recipe, "nodata", None)
+            group["tiles"].append(
+                (
+                    path,
+                    dataset,
+                    round(row),
+                    round(col),
+                    nodata if nodata is not None else dataset.nodata,
+                )
             )
-            overlap = np.isfinite(output) & np.isfinite(sampled)
-            if np.any(overlap & ~np.isclose(output, sampled, atol=1e-3, rtol=1e-6)):
-                message = f"overlapping DEM source files disagree: {path.name}"
-                reject(message, RuntimeError)
-            fill = np.isnan(output) & np.isfinite(sampled)
-            output[fill] = sampled[fill]
-    return output.astype(np.float32)
+
+        target = Affine(*grid.transform)
+        for group in groups:
+            base = group["transform"]
+            crs = group["crs"]
+            transformer = Transformer.from_crs(grid.crs, crs, always_xy=True)
+            tiles = group["tiles"]
+            source_center = base.c + base.a * tiles[0][1].width * 0.5
+            pending = [
+                (r, min(r + 128, grid.height), c, min(c + 128, grid.width))
+                for r in range(0, grid.height, 128)
+                for c in range(0, grid.width, 128)
+            ]
+            while pending:
+                r0, r1, c0, c1 = pending.pop()
+                cols, rows = np.meshgrid(
+                    np.arange(c0, c1, dtype=np.float64) + 0.5,
+                    np.arange(r0, r1, dtype=np.float64) + 0.5,
+                )
+                x, y = target * (cols, rows)
+                x, y = transformer.transform(x, y)
+                x = np.asarray(x, dtype=np.float64)
+                if crs.is_geographic:
+                    x += 360.0 * np.round((source_center - x) / 360.0)
+                cols, rows = (~base) * (x, np.asarray(y, dtype=np.float64))
+                finite = np.isfinite(rows) & np.isfinite(cols)
+                if not finite.any():
+                    continue
+                row_min = math.floor(float(np.min(rows[finite]))) - 2
+                col_min = math.floor(float(np.min(cols[finite]))) - 2
+                row_max = math.floor(float(np.max(rows[finite]))) + 4
+                col_max = math.floor(float(np.max(cols[finite]))) + 4
+                shape = (row_max - row_min + 1, col_max - col_min + 1)
+                if shape[0] * shape[1] > 1024 * 1024 and (r1 - r0 > 1 or c1 - c0 > 1):
+                    if r1 - r0 >= c1 - c0 and r1 - r0 > 1:
+                        mid = (r0 + r1) // 2
+                        pending.extend(((r0, mid, c0, c1), (mid, r1, c0, c1)))
+                    else:
+                        mid = (c0 + c1) // 2
+                        pending.extend(((r0, r1, c0, mid), (r0, r1, mid, c1)))
+                    continue
+                values = np.full(shape, np.nan, dtype=np.float64)
+                for path, dataset, tile_row, tile_col, nodata in tiles:
+                    top = max(row_min, tile_row)
+                    left = max(col_min, tile_col)
+                    bottom = min(row_max + 1, tile_row + dataset.height)
+                    right = min(col_max + 1, tile_col + dataset.width)
+                    if top >= bottom or left >= right:
+                        continue
+                    read = dataset.read(
+                        1,
+                        window=Window(
+                            left - tile_col, top - tile_row, right - left, bottom - top
+                        ),
+                        masked=True,
+                    )
+                    incoming = np.asarray(read.data, dtype=np.float64)
+                    valid = ~np.ma.getmaskarray(read) & np.isfinite(incoming)
+                    if nodata is not None:
+                        valid &= ~np.isclose(incoming, nodata)
+                    view = values[
+                        top - row_min : bottom - row_min,
+                        left - col_min : right - col_min,
+                    ]
+                    existing_valid = np.isfinite(view)
+                    conflict = existing_valid & valid & (view != incoming)
+                    if np.any(conflict):
+                        message = f"overlapping DEM source files disagree: {path.name}"
+                        reject(message, RuntimeError)
+                    fill = ~existing_valid & valid
+                    view[fill] = incoming[fill]
+                safe_rows = np.where(finite, rows - row_min, -1.0)
+                safe_cols = np.where(finite, cols - col_min, -1.0)
+                sampled = _sample_biquintic(values, safe_rows, safe_cols)
+                current = output[r0:r1, c0:c1]
+                overlap = np.isfinite(current) & np.isfinite(sampled)
+                if np.any(
+                    overlap & ~np.isclose(current, sampled, atol=1e-3, rtol=1e-6)
+                ):
+                    message = (
+                        "overlapping DEM source files disagree across source grids"
+                    )
+                    reject(message, RuntimeError)
+                fill = np.isnan(current) & np.isfinite(sampled)
+                current[fill] = sampled[fill]
+    return output
 
 
 def _materialize_entry(
