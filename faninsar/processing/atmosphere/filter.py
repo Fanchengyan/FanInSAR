@@ -146,26 +146,8 @@ def smooth_inverse_variance(
     w = weights.to(torch.float64).clamp(min=0.0) * finite_v
     vw = v * w
 
-    def separable(img: torch.Tensor, kernel: torch.Tensor, axis: int) -> torch.Tensor:
-        radius = (kernel.numel() - 1) // 2
-        moved = img.unsqueeze(0).unsqueeze(0)
-        # F.pad flattens as (W_left, W_right, H_top, H_bottom)
-        padded = (
-            torch.nn.functional.pad(moved, (0, 0, radius, radius))
-            if axis == 0
-            else torch.nn.functional.pad(moved, (radius, radius, 0, 0))
-        )
-        weight4d = (
-            kernel.reshape(1, 1, -1, 1) if axis == 0 else kernel.reshape(1, 1, 1, -1)
-        )
-        out = torch.nn.functional.conv2d(padded, weight4d)
-        return out.squeeze(0).squeeze(0)
+    from faninsar.core.algorithms.filtering._local import _normalized_convolution
 
     ky = gaussian_kernel_1d(float(sigma_y)).to(values.device)
     kx = gaussian_kernel_1d(float(sigma_x)).to(values.device)
-    num = separable(separable(vw, ky, 0), kx, 1)
-    den = separable(separable(w, ky, 0), kx, 1)
-
-    fill = float("nan")
-    smoothed = torch.where(den > 0, num / den, torch.full_like(num, fill))
-    return smoothed.to(values.dtype)
+    return _normalized_convolution(vw, w, ky, kx).to(values.dtype)

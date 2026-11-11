@@ -48,23 +48,9 @@ def _weighted_polyfit2d(
     degree: int = 2,
 ) -> torch.Tensor:
     """Weighted degree-``degree`` polynomial surface fit over a [x, y] grid."""
-    orig_shape = y.shape
-    xn = x_norm[..., 0].reshape(-1).to(torch.float64)
-    yn = x_norm[..., 1].reshape(-1).to(torch.float64)
-    flat_y = y.reshape(-1).to(torch.float64)
-    w = weight.reshape(-1).to(torch.float64)
+    from faninsar.core.algorithms.fitting import _compat
 
-    columns = []
-    for total in range(degree + 1):
-        for py in range(total + 1):
-            px = total - py
-            columns.append((yn**py) * (xn**px))
-    design = torch.stack(columns, dim=-1)
-
-    sqrt_w = torch.sqrt(w.clamp(min=0.0))
-    theta = torch.linalg.lstsq(design * sqrt_w.unsqueeze(-1), flat_y * sqrt_w).solution
-    surface = design @ theta
-    return surface.reshape(orig_shape).to(y.dtype)
+    return _compat._weighted_total_degree_surface(y, x_norm, weight, degree)
 
 
 def solve_2x2_low_high(

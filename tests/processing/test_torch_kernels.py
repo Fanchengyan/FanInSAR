@@ -421,6 +421,43 @@ def test_multilook_real_torch_matches_numpy() -> None:
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("nonfinite", [None, np.nan, np.inf, -np.inf])
+def test_multilook_real_preserves_legacy_tails_nonfinite_and_dtype(
+    dtype: type,
+    nonfinite: float | None,
+) -> None:
+    """The runtime mean propagates infinities rather than converting them to NaN."""
+    import torch
+
+    array = np.arange(198, dtype=dtype).reshape(9, 22)[:, ::2]
+    if nonfinite is not None:
+        array[0, 0] = nonfinite
+    # Remainders must not affect a complete look or its admission decision.
+    array[-1] = np.nan
+    array[:, -2:] = np.inf
+    before = array.copy()
+    tensor = torch.as_tensor(np.ascontiguousarray(array[:8, :9]), dtype=torch.float64)
+    expected = tensor.reshape(4, 2, 3, 3).mean(dim=(1, 3)).numpy().astype(dtype)
+    actual = multilook_real_torch(array, 2, 3, device="cpu")
+    assert actual.dtype == dtype
+    assert actual.shape == (4, 3)
+    np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+    np.testing.assert_array_equal(np.isposinf(actual), np.isposinf(expected))
+    np.testing.assert_array_equal(np.isneginf(actual), np.isneginf(expected))
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-10)
+    np.testing.assert_array_equal(array, before)
+
+
+@pytest.mark.parametrize("shape", [(1, 3), (3, 1), (0, 5)])
+def test_multilook_real_preserves_empty_dropped_outputs(shape: tuple[int, int]) -> None:
+    """A look larger than either input axis keeps the legacy empty shape."""
+    array = np.ones(shape, dtype=np.float32)
+    actual = multilook_real_torch(array, 4, 2, device="cpu")
+    assert actual.shape == (shape[0] // 4, shape[1] // 2)
+    assert actual.dtype == array.dtype
+
+
 def _dual_tone_reference(
     shape: tuple[int, int],
     rng: np.random.Generator,

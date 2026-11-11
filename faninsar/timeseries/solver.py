@@ -25,13 +25,6 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
     from torch._tensor import Tensor
 
-#: Minimum Cholesky pivot ratio accepted by the fast (SPD) solve path.
-#: Floating-point Cholesky can slip through near-zero pivots, so pixels
-#: with a smaller ratio fall back to the minimum-norm eigendecomposition.
-_PIVOT_RATIO_MIN = 1e-6
-#: Null-space column mass below which a parameter counts as constrained.
-_NULL_MASS_TOL = 1e-8
-
 
 @dataclass
 class LstsqResult:
@@ -1200,88 +1193,22 @@ def censored_lstsq(
     if d.ndim == 1:
         d = d[:, None]
 
-    d_nan = torch.isnan(d)
-    valid = ~d_nan
-    values = torch.where(d_nan, torch.zeros((), dtype=dtype, device=device), d)
+    # Keep historical Gram/eigenvalue decisions separate from public SVD OLS.
+    from faninsar.core.algorithms.linalg._censored_compat import _censored_lstsq_kernel
 
-    n_param = G.shape[-1]
-    n_pt = d.shape[-1]
-    n_obs = valid.sum(dim=0)
-
-    x = torch.full((n_param, n_pt), torch.nan, dtype=dtype, device=device)
+    x, constrained, rank, count, condition = _censored_lstsq_kernel(G, d, rcond=rcond)
     diag = LstsqResult(
         solution=x,
-        is_constrained=torch.zeros((n_param, n_pt), dtype=torch.bool, device=device),
-        rank=torch.zeros(n_pt, dtype=torch.int64, device=device),
-        n_observations=n_obs.to(torch.int64),
-        condition_number=torch.full((n_pt,), torch.nan, dtype=dtype, device=device),
+        is_constrained=constrained,
+        rank=rank,
+        n_observations=count,
+        condition_number=condition,
     )
-
-    solvable = torch.nonzero(n_obs > 0).flatten()
-    gw = None
-    t_mat = None
-    rhs = None
-    if solvable.numel() > 0:
-        m_sel = valid[:, solvable]
-        d_sel = values[:, solvable]
-        if G.ndim == 2:
-            gw = m_sel.T.unsqueeze(2) * G.unsqueeze(0)
-        else:
-            gw = G[solvable] * m_sel.T.unsqueeze(-1)
-        t_mat = torch.matmul(gw.mT, gw)
-        rhs = torch.matmul(gw.mT, d_sel.T.unsqueeze(2))
-
-        ell, info = torch.linalg.cholesky_ex(t_mat)
-        pivots = torch.diagonal(ell, dim1=1, dim2=2)
-        pivot_ratio = torch.where(
-            info == 0,
-            pivots.amin(dim=1) / pivots.amax(dim=1).clamp_min(torch.finfo(dtype).tiny),
-            torch.full((solvable.numel(),), torch.inf, dtype=dtype, device=device),
-        )
-        spd = (info == 0) & (pivot_ratio > _PIVOT_RATIO_MIN)
-
-        n_sel = solvable.numel()
-        x_sel = torch.empty((n_param, n_sel), dtype=dtype, device=device)
-        rank_sel = torch.empty(n_sel, dtype=torch.int64, device=device)
-        cond_sel = torch.empty(n_sel, dtype=dtype, device=device)
-        constrained_sel = torch.ones((n_param, n_sel), dtype=torch.bool, device=device)
-
-        if bool(spd.any()):
-            x_spd = torch.cholesky_solve(rhs[spd], ell[spd]).squeeze(-1).T
-            x_sel[:, spd] = x_spd
-            rank_sel[spd] = n_param
-            cond_sel[spd] = pivot_ratio[spd]
-
-        deficient = ~spd
-        if bool(deficient.any()):
-            w_e, v_e = torch.linalg.eigh(t_mat[deficient])
-            lam_max = w_e[:, -1:]
-            keep = w_e > lam_max * rcond
-            rank_sel[deficient] = keep.sum(dim=1).to(torch.int64)
-            lam_min = torch.where(keep, w_e, torch.full_like(w_e, torch.inf)).amin(
-                dim=1
-            )
-            cond_sel[deficient] = lam_max[:, 0] / lam_min
-            w_inv = torch.where(keep, 1.0 / w_e, torch.zeros_like(w_e))
-            x_def = torch.matmul(
-                v_e,
-                w_inv.unsqueeze(-1) * torch.matmul(v_e.mT, rhs[deficient]),
-            )
-            x_sel[:, deficient] = x_def.squeeze(-1).T
-            # column mass of the null-space eigenvectors: a parameter j is
-            # constrained iff e_j has no projection onto the null space
-            null_mass = (v_e * v_e * (~keep).unsqueeze(1)).sum(dim=2)
-            constrained_sel[:, deficient] = (null_mass < _NULL_MASS_TOL).T
-
-        x[:, solvable] = x_sel
-        diag.rank[solvable] = rank_sel
-        diag.condition_number[solvable] = cond_sel
-        diag.is_constrained[:, solvable] = constrained_sel
 
     device_type = device.type
     if device_type != "cpu":
         # clear cache manually to avoid memory overflow
-        del G, d, values, gw, t_mat, rhs, x
+        del G, d, x
         if device_type == "cuda":
             torch.cuda.empty_cache()
         elif device_type == "mps":

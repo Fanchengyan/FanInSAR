@@ -77,6 +77,76 @@ class TestRemoveSmallComponents:
             remove_small_components(torch.ones(4, 4, dtype=torch.bool), -1)
 
 
+def _legacy_smooth(
+    values: torch.Tensor,
+    weights: torch.Tensor,
+    sigma_y: float,
+    sigma_x: float,
+) -> torch.Tensor:
+    """Frozen pre-P0087 smoothing, independent of production kernel helpers."""
+    values64 = values.to(torch.float64)
+    finite = torch.isfinite(values64)
+    clean = torch.where(finite, values64, torch.zeros_like(values64))
+    weight = weights.to(torch.float64).clamp(min=0.0) * finite
+
+    def convolve(image: torch.Tensor, sigma: float, axis: int) -> torch.Tensor:
+        if sigma <= 0.0:
+            kernel = torch.ones(1, dtype=torch.float64)
+        else:
+            radius = max(1, int(3.0 * sigma + 0.5))
+            offsets = torch.arange(-radius, radius + 1, dtype=torch.float64)
+            kernel = torch.exp(-(offsets**2) / (2.0 * sigma**2))
+            kernel = kernel / kernel.sum()
+        kernel = kernel.to(values.device)
+        radius = (kernel.numel() - 1) // 2
+        padded = torch.nn.functional.pad(
+            image[None, None],
+            (0, 0, radius, radius) if axis == 0 else (radius, radius, 0, 0),
+        )
+        shape = (1, 1, -1, 1) if axis == 0 else (1, 1, 1, -1)
+        return torch.nn.functional.conv2d(padded, kernel.reshape(shape))[0, 0]
+
+    numerator = convolve(convolve(clean * weight, sigma_y, 0), sigma_x, 1)
+    denominator = convolve(convolve(weight, sigma_y, 0), sigma_x, 1)
+    return torch.where(denominator > 0, numerator / denominator, math.nan).to(
+        values.dtype
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("sigma_y", "sigma_x"),
+    [(0.1, 0.1), (0.16, 0.16), (2.0, 3.0), (0.0, 0.0), (0.0, 1.0), (-1.0, 0.16)],
+)
+@pytest.mark.parametrize("nonfinite_weight", [False, True])
+def test_smoothing_preserves_frozen_legacy_profiles(
+    dtype: torch.dtype,
+    sigma_y: float,
+    sigma_x: float,
+    nonfinite_weight: bool,
+) -> None:
+    """Small support, identity axes and invalid weights keep legacy semantics."""
+    values = torch.arange(49, dtype=dtype).reshape(7, 7)
+    values[3, 3] = math.nan
+    values[1, 5] = math.inf
+    weights = torch.ones_like(values)
+    weights[0, 0] = -3.0
+    weights[5, 1] = 0.0
+    if nonfinite_weight:
+        weights[1, 1] = math.inf
+        weights[5, 5] = math.nan
+    before_values, before_weights = values.clone(), weights.clone()
+    expected = _legacy_smooth(values, weights, sigma_y, sigma_x)
+    actual = smooth_inverse_variance(values, weights, sigma_y=sigma_y, sigma_x=sigma_x)
+    assert actual.dtype == dtype
+    assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-10, equal_nan=True)
+    torch.testing.assert_close(values, before_values, equal_nan=True)
+    torch.testing.assert_close(weights, before_weights, equal_nan=True)
+    if not nonfinite_weight and sigma_y in (0.1, 0.16) and sigma_x == sigma_y:
+        assert torch.isfinite(actual[3, 3])
+
+
 class TestSmoothInverseVariance:
     def test_constant_field_invariant(self) -> None:
         values = torch.full((32, 48), 1.7)

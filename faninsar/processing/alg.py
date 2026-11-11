@@ -400,65 +400,21 @@ def detrend_surface(
         )
         reject(msg, ValueError)
 
-    acc = torch.float64
-    y_lin = torch.arange(height, dtype=acc, device=target.device)
-    x_lin = torch.arange(width, dtype=acc, device=target.device)
-    max_pow = 2 * max(x_degree, y_degree, 1)
-    y_pow = [torch.ones(height, dtype=acc, device=target.device)]
-    x_pow = [torch.ones(width, dtype=acc, device=target.device)]
-    for _ in range(max_pow):
-        y_pow.append(y_pow[-1] * y_lin)
-        x_pow.append(x_pow[-1] * x_lin)
+    from faninsar.core.algorithms.fitting import _compat
 
-    values = slices.to(acc)
-    valid_f = valid.to(acc)
-    masked = torch.where(
-        valid, values, torch.zeros((), dtype=acc, device=target.device)
-    )
-
-    moments = torch.empty(n_param, n_slice, dtype=acc, device=target.device)
-    for idx, (i, j) in enumerate(basis):
-        row = torch.einsum("h,ehw->ew", y_pow[i], masked)
-        moments[idx] = torch.einsum("w,ew->e", x_pow[j], row)
-
-    rows_valid: dict[int, torch.Tensor] = {}
-    normal = torch.empty(n_param, n_param, n_slice, dtype=acc, device=target.device)
-    for ai, (i1, j1) in enumerate(basis):
-        for bi, (i2, j2) in enumerate(basis):
-            power = i1 + i2
-            if power not in rows_valid:
-                rows_valid[power] = torch.einsum("h,ehw->ew", y_pow[power], valid_f)
-            normal[ai, bi] = torch.einsum("w,ew->e", x_pow[j1 + j2], rows_valid[power])
-
-    # diagonal over the (n_param, n_param) axes -> (n_slice, n_param)
-    scale = torch.sqrt(
-        torch.diagonal(normal, dim1=0, dim2=1).clamp_min(torch.finfo(acc).tiny)
-    )
-    normal_scaled = normal / (scale.T[:, None, :] * scale.T[None, :, :])
-    moments_scaled = moments / scale.T
     try:
-        coef_scaled = torch.linalg.solve(
-            normal_scaled.permute(2, 0, 1),
-            moments_scaled.T.unsqueeze(-1),
-        ).squeeze(-1)
+        coef, y_pow, x_pow = _compat._separable_polynomial_fit(
+            slices, valid, basis, 2 * max(x_degree, y_degree, 1)
+        )
     except torch.linalg.LinAlgError as exc:
         msg = (
             "The detrend surface system is singular for at least one slice; "
             "the valid pixels may not constrain the requested degrees."
         )
         reject(msg, ValueError, cause=exc)
-    coef = coef_scaled / scale
-
-    y_eval = [tensor.to(out_dtype) for tensor in y_pow]
-    x_eval = [tensor.to(out_dtype) for tensor in x_pow]
-    coef_eval = coef.to(out_dtype)
-    surface = torch.zeros(n_slice, height, width, dtype=out_dtype, device=target.device)
-    for idx, (i, j) in enumerate(basis):
-        surface += (
-            coef_eval[:, idx, None, None]
-            * y_eval[i][None, :, None]
-            * x_eval[j][None, None, :]
-        )
+    surface = _compat._evaluate_separable_polynomial(
+        coef, y_pow, x_pow, basis, out_dtype
+    )
     detrended = target.to(out_dtype) - surface
 
     out_shape = (*lead_shape, height, width)

@@ -132,43 +132,19 @@ def _orbit_state(
 
 
 def _spline_six_weights(fraction: Any) -> Any:
-    """Return closed-form natural-spline weights for six samples."""
-    import torch
+    """Delegate the qualified six-sample weights to the core tensor leaf."""
+    from faninsar.core.algorithms.sampling._spline_six import _spline_six_weights
 
-    second_one = (
-        1.6076555023923444,
-        -3.6459330143540667,
-        2.5837320574162677,
-        -0.6889952153110048,
-        0.1722488038277512,
-        -0.0287081339712919,
-    )
-    second_two = (
-        -0.4306220095693780,
-        2.5837320574162677,
-        -4.3349282296650715,
-        2.7559808612440193,
-        -0.6889952153110048,
-        0.1148325358851674,
-    )
-    fraction2 = fraction * fraction
-    fraction3 = fraction2 * fraction
-    weights = [
-        fraction * (-one / 3.0 - two / 6.0)
-        + fraction2 * (one / 2.0)
-        + fraction3 * (two - one) / 6.0
-        for one, two in zip(second_one, second_two, strict=True)
-    ]
-    weights[1] = weights[1] + 1.0 - fraction
-    weights[2] = weights[2] + fraction
-    return torch.stack(weights, dim=-1)
+    return _spline_six_weights(fraction)
 
 
 def _natural_spline_six(values: Any, fraction: Any) -> Any:
-    """Evaluate the local six-sample natural spline on Torch tensors."""
-    import torch
+    """Delegate the qualified weighted spline without changing evaluation order."""
+    from faninsar.core.algorithms.sampling._spline_six import (
+        _natural_spline_six_weighted,
+    )
 
-    return torch.sum(values * _spline_six_weights(fraction), dim=-1)
+    return _natural_spline_six_weighted(values, fraction)
 
 
 def _sample_dem_six(
@@ -180,45 +156,12 @@ def _sample_dem_six(
     latitude_spacing_deg: float,
     longitude_spacing_deg: float,
 ) -> Any:
-    """Sample a device-resident DEM with the native six-point spline."""
-    import torch
+    """Convert physical DEM coordinates and delegate the qualified tensor sample."""
+    from faninsar.core.algorithms.sampling._spline_six import _sample_six
 
     row = (latitude - latitude_start_deg) / latitude_spacing_deg
     column = (longitude - longitude_start_deg) / longitude_spacing_deg
-    row_base = torch.floor(row).to(torch.int64)
-    column_base = torch.floor(column).to(torch.int64)
-    rows, columns = dem_samples.shape[-2:]
-    # A six-point stencil has no valid base when either raster dimension is
-    # smaller than six.  Return the public invalid sentinel before clamping;
-    # otherwise ``clamp(1, rows - 5)`` can produce a negative gather index for
-    # a degenerate tile.
-    if rows < 6 or columns < 6:
-        return torch.full_like(row, torch.nan)
-    valid = (
-        torch.isfinite(row)
-        & torch.isfinite(column)
-        & (row_base >= 1)
-        & (row_base <= rows - 5)
-        & (column_base >= 1)
-        & (column_base <= columns - 5)
-    )
-    safe_row = row_base.clamp(1, rows - 5)
-    safe_column = column_base.clamp(1, columns - 5)
-    column_fraction = column - safe_column
-    row_fraction = row - safe_row
-    column_weights = _spline_six_weights(column_fraction)
-    # ``unfold`` exposes every six-by-six stencil as a view.  Indexing that
-    # view avoids constructing two broadcasted integer index tensors and a
-    # flattened gather for every active lane while preserving the exact
-    # row-major sample window used by the native kernel.
-    windows = dem_samples.unfold(0, 6, 1).unfold(1, 6, 1)
-    window = windows[safe_row - 1, safe_column - 1]
-    row_values = torch.sum(window * column_weights.unsqueeze(-2), dim=-1)
-    row_weights = _spline_six_weights(row_fraction)
-    sampled = torch.sum(row_values * row_weights, dim=-1)
-    return torch.where(
-        valid & torch.isfinite(sampled), sampled, torch.full_like(sampled, torch.nan)
-    )
+    return _sample_six(dem_samples, row, column)
 
 
 def _guarded_aitken_height(

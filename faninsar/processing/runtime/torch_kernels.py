@@ -289,13 +289,9 @@ def _poly_eval_torch(
     x: torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate polynomial ``c0 + c1*x + c2*x^2 + ...`` in Torch."""
-    torch = _import_torch()
-    result = torch.zeros_like(x)
-    power = torch.ones_like(x)
-    for coeff in coefficients:
-        result = result + float(coeff) * power
-        power = power * x
-    return result
+    from faninsar.core.algorithms.fitting._compat import _explicit_power_polynomial
+
+    return _explicit_power_polynomial(coefficients, x)
 
 
 @_cleanup_after_kernel
@@ -965,13 +961,9 @@ def multilook_real_torch(
         dtype=_float_dtype(resolved, "multilook_real", precision),
         device=resolved,
     )
-    reshaped = tensor.reshape(
-        h // az_looks,
-        az_looks,
-        w // rg_looks,
-        rg_looks,
-    )
-    out = reshaped.mean(dim=(1, 3))
+    from faninsar.core.algorithms.reduction._block import _complete_block_mean
+
+    out = _complete_block_mean(tensor, az_looks, rg_looks)
     return np.asarray(out.cpu().numpy(), dtype=array.dtype)
 
 
