@@ -362,6 +362,68 @@ def test_safe_all_match_gains_members_fact_container_unverifiable(
     assert "checksum" not in verification
 
 
+@pytest.mark.parametrize("prefix", ["././", "./././"])
+def test_safe_repeated_current_directory_paths_verify_every_declared_member(
+    tmp_path: Path, prefix: str
+) -> None:
+    """Equivalent leading ./ segments must not make present members look absent."""
+    name = "p0060-safe-repeated-dot-" + str(prefix.count("./"))
+    members = {
+        "measurement/data.tiff": b"measurement",
+        "annotation/data.xml": b"annotation",
+        "preview/map-overlay.kml": b"map overlay",
+        "preview/product-preview.html": b"product preview",
+    }
+    manifest = _manifest_for(members).replace('href="./', f'href="{prefix}')
+    payload = _safe_zip_bytes(members, manifest)
+    _register_safe(name, payload)
+    asset = _asset(name)
+    destination = tmp_path / "burst.zip"
+
+    remote.download(asset, destination)
+
+    verification = json.loads(_manifest_path(destination, asset).read_text())[
+        "verification"
+    ]
+    assert destination.read_bytes() == payload
+    assert verification["status"] == "unverifiable"
+    assert verification["members"] == {"checked": 4, "matched": 4, "status": "verified"}
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["measurement/data.tiff", "annotation/data.xml", "preview/map-overlay.kml"],
+)
+def test_safe_missing_declared_member_still_fails(tmp_path: Path, missing: str) -> None:
+    """Path normalization never excuses absent science or preview members."""
+    name = "p0060-safe-missing-" + missing.split("/")[0]
+    members = {
+        "measurement/data.tiff": b"measurement",
+        "annotation/data.xml": b"annotation",
+        "preview/map-overlay.kml": b"map overlay",
+    }
+    manifest = _manifest_for(members).replace('href="./', 'href="././')
+    payload = _safe_zip_bytes(
+        {path: data for path, data in members.items() if path != missing}, manifest
+    )
+    _register_safe(name, payload)
+    asset = _asset(name)
+    destination = tmp_path / "burst.zip"
+
+    with pytest.raises(remote.RemoteIntegrityError, match="checksum_mismatch"):
+        remote.download(asset, destination)
+
+    record = json.loads(_manifest_path(destination, asset).read_text())
+    assert record["complete"] is False
+    assert record["verification"]["status"] == "failed"
+    assert record["verification"]["members"] == {
+        "checked": 3,
+        "matched": 2,
+        "status": "failed",
+    }
+    assert not destination.exists()
+
+
 def test_safe_corrupted_member_records_failed_and_excludes(tmp_path: Path) -> None:
     """A SAFE member that mismatches its manifest MD5 records failed and raises."""
     name = "p0060-safe-corrupt"

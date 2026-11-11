@@ -7,6 +7,8 @@ import io
 import json
 import urllib.request
 from dataclasses import dataclass, field
+from email.message import Message
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Self
 
 import pytest
@@ -31,6 +33,8 @@ from faninsar.remote.fetch.complete import (
     _RedirectHandler,
     _stream_download,
     _write_part_state,
+    download,
+    probe,
     read_verification,
 )
 from faninsar.remote.protocols import _CallLedger
@@ -359,6 +363,489 @@ def test_asf_burst_download_returns_pending_without_sleep(
     assert ledger.retries == 0
     assert ledger.response_bytes_total == len(b"pending")
     assert delays == []
+
+
+class _BurstDeliveryAdapter:
+    """Registered burst gateway without a delivery-host allowlist."""
+
+    provider = "ASF"
+    origins = ("https://sentinel1-burst.asf.alaska.edu",)
+    path_prefixes = ("/",)
+    redirect_origins = origins
+    profiles = ("earthdata-asf",)
+
+
+class _BurstDeliveryTransport(requests.adapters.BaseAdapter):
+    """Capture real requests preparation without making network requests."""
+
+    def __init__(self, responses: list[tuple[int, dict[str, str], bytes]]) -> None:
+        self.responses = iter(responses)
+        self.requests: list[requests.PreparedRequest] = []
+
+    def send(
+        self, request: requests.PreparedRequest, **_kwargs: Any
+    ) -> requests.Response:
+        self.requests.append(request)
+        status, headers, body = next(self.responses)
+        response = requests.Response()
+        response.status_code = status
+        response.url = request.url
+        response.request = request
+        response.headers.update(headers)
+        response.raw = io.BytesIO(body)
+        if "Set-Cookie" in headers:
+            message = Message()
+            message["Set-Cookie"] = headers["Set-Cookie"]
+            response.raw._original_response = SimpleNamespace(msg=message)
+        return response
+
+    def close(self) -> None:
+        return None
+
+
+def _burst_delivery_asset(catalog: str) -> remote.RemoteAsset:
+    return remote.RemoteAsset(
+        "ASF",
+        catalog,
+        "SLC-BURST",
+        "burst-1",
+        "safe",
+        "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
+        auth_profile="earthdata-asf",
+    )
+
+
+@pytest.mark.parametrize("status", [200, 202])
+def test_asf_authenticated_probe_keeps_anonymous_delivery_handoff(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Ready and pending observations preserve runtime URLs after gateway redirects."""
+    asset = _burst_delivery_asset(f"asf-probe-delivery-{status}")
+    _register_adapter(asset.catalog, _BurstDeliveryAdapter())
+    delivery = "https://new-storage.example/layout/item.zip"
+    signed = delivery + "?X-Amz-Signature=fixture-capability"
+    # A pending response can be returned by the anonymous hop itself, with a
+    # relative Location resolved against that hop, not the original gateway.
+    target = signed if status == 200 else delivery
+    transport = _BurstDeliveryTransport(
+        [
+            (307, {"Location": target}, b"handoff"),
+            (
+                status,
+                {
+                    "Location": "item.zip?X-Amz-Signature=fixture-capability",
+                    "Retry-After": "3",
+                },
+                b"queued" if status == 202 else b"",
+            ),
+        ]
+    )
+    session = requests.Session()
+    session.mount("https://", transport)
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        lambda *_args: (session, "fixture-token"),
+    )
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    observation = probe(asset, budget=ledger.budget, ledger=ledger)
+
+    assert observation.state == ("ready" if status == 200 else "pending")
+    assert observation.url == signed
+    assert observation.delay_seconds == (0.0 if status == 200 else 3.0)
+    assert ledger.requests == 2
+    assert ledger.redirects == 1
+    assert ledger.response_bytes_total == len(b"handoff") + (
+        len(b"queued") if status == 202 else 0
+    )
+    assert transport.requests[0].headers["Authorization"] == "Bearer fixture-token"
+    assert "Authorization" not in transport.requests[1].headers
+    assert "Cookie" not in transport.requests[1].headers
+    assert "?" not in asset.href
+
+
+def test_asf_pending_delivery_is_observed_anonymously_on_the_next_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 202 Location can hand off to an unregistered object without reauthentication."""
+    asset = _burst_delivery_asset("asf-pending-delivery-next-probe")
+    _register_adapter(asset.catalog, _BurstDeliveryAdapter())
+    delivery = "https://pending-object.example/result.zip?X-Amz-Signature=fixture"
+    transport = _BurstDeliveryTransport(
+        [(202, {"Location": delivery, "Retry-After": "30"}, b"pending"), (200, {}, b"")]
+    )
+    authenticated = requests.Session()
+    authenticated.mount("https://", transport)
+    anonymous = requests.Session()
+    anonymous.mount("https://", transport)
+    auth_calls: list[bool] = []
+
+    def authenticate(*_args: Any) -> tuple[requests.Session, str]:
+        auth_calls.append(True)
+        assert len(auth_calls) == 1
+        return authenticated, "fixture-token"
+
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session", authenticate
+    )
+    monkeypatch.setattr(requests, "Session", lambda: anonymous)
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    pending = probe(asset, budget=ledger.budget, ledger=ledger)
+    assert pending.state == "pending"
+    assert pending.url == delivery
+    assert pending.delay_seconds == 10.0
+    ready = probe(asset, url=pending.url, budget=ledger.budget, ledger=ledger)
+
+    assert ready.state == "ready"
+    assert ready.url == delivery
+    assert len(transport.requests) == 2
+    assert transport.requests[1].url == delivery
+    assert "Authorization" not in transport.requests[1].headers
+    assert "Cookie" not in transport.requests[1].headers
+    assert auth_calls == [True]
+    assert ledger.requests == 2
+    assert ledger.retries == 0
+    assert ledger.response_bytes_total == len(b"pending")
+
+
+@pytest.mark.parametrize("session_auth", [False, True])
+def test_asf_prepared_delivery_never_prepares_account_credentials(
+    monkeypatch: pytest.MonkeyPatch, session_auth: bool
+) -> None:
+    """Prepared delivery strips explicit/default credentials before real preparation."""
+    asset = _burst_delivery_asset("asf-prepared-credentials")
+    delivery = "https://unlisted-object.example/new/item.zip?X-Amz-Signature=fixture"
+    transport = _BurstDeliveryTransport([(200, {}, b"PK\x03\x04payload")])
+    session = requests.Session()
+    session.mount("https://", transport)
+    session.headers.update(
+        {
+            "aUtHoRiZaTiOn": "Bearer session-default",
+            "cOoKiE": "default=secret",
+            "Proxy-Authorization": "Basic origin-header-secret",
+            "X-Api-Key": "session-key",
+        }
+    )
+    if session_auth:
+        session.auth = requests.auth.HTTPBasicAuth("fixture-user", "fixture-password")
+    session.cookies.set("account", "secret", domain="unlisted-object.example")
+    netrc_calls: list[str] = []
+
+    def netrc_auth(url: str) -> tuple[str, str]:
+        netrc_calls.append(url)
+        return "implicit-user", "implicit-password"
+
+    monkeypatch.setattr("requests.sessions.get_netrc_auth", netrc_auth)
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    response = _asf_request(
+        session,
+        "GET",
+        delivery,
+        adapter=_BurstDeliveryAdapter(),
+        asset=asset,
+        budget=ledger.budget,
+        ledger=ledger,
+        headers={
+            "authorization": "Bearer explicit-secret",
+            "COOKIE": "explicit=secret",
+            "x-credential": "explicit-secret",
+            "Accept-Encoding": "identity",
+            "Range": "bytes=4-",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(transport.requests) == 1
+    outgoing = transport.requests[0]
+    assert outgoing.url == delivery
+    assert outgoing.headers["Range"] == "bytes=4-"
+    assert outgoing.headers["Accept-Encoding"] == "identity"
+    assert not any(
+        name.lower()
+        in {
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-api-key",
+            "x-credential",
+        }
+        for name in outgoing.headers
+    )
+    assert netrc_calls == []
+    assert not session.cookies
+    assert ledger.requests == 1
+    response.close()
+    session.close()
+
+
+def test_asf_prepared_download_resumes_without_reauth_or_persisting_capability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A prepared signed object resumes and publishes with only canonical identity."""
+    payload = b"PK\x03\x04prepared-burst-payload"
+    asset = _burst_delivery_asset("asf-prepared-resume")
+    object.__setattr__(asset, "size_bytes", len(payload))
+    object.__setattr__(
+        asset, "checksum", "sha256:" + hashlib.sha256(payload).hexdigest()
+    )
+    _register_adapter(asset.catalog, _BurstDeliveryAdapter())
+    delivery = "https://unlisted-object.example/layout/item.zip?X-Amz-Signature=fixture"
+    transport = _BurstDeliveryTransport(
+        [
+            (
+                206,
+                {"Content-Range": f"bytes 4-{len(payload) - 1}/{len(payload)}"},
+                payload[4:],
+            )
+        ]
+    )
+    session = requests.Session()
+    session.mount("https://", transport)
+    monkeypatch.setattr(requests, "Session", lambda: session)
+
+    def no_reauthentication(*_args: Any) -> Any:
+        pytest.fail("A prepared anonymous object must not resolve account credentials")
+
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session", no_reauthentication
+    )
+    destination = tmp_path / "item.zip"
+    identity = _identity(asset)
+    _part_path(destination, identity).write_bytes(payload[:4])
+    _write_part_state(
+        _part_state_path(destination, identity),
+        _PartState(identity, len(payload), asset.href, "p70.1"),
+    )
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    result = download(asset, destination, transfer_url=delivery, ledger=ledger)
+
+    assert result == destination
+    assert destination.read_bytes() == payload
+    assert transport.requests[0].url == delivery
+    assert transport.requests[0].headers["Range"] == "bytes=4-"
+    assert "Authorization" not in transport.requests[0].headers
+    assert ledger.requests == 1
+    assert ledger.response_bytes_total == len(payload) - 4
+    manifest_text = next(tmp_path.glob("*.json")).read_text()
+    manifest = json.loads(manifest_text)
+    assert manifest["complete"] is True
+    assert manifest["verification"]["status"] == "verified"
+    assert "X-Amz" not in manifest_text
+    assert "unlisted-object" not in manifest_text
+    assert not _part_state_path(destination, identity).exists()
+
+
+def test_asf_anonymous_delivery_stays_cookieless_when_redirect_returns_to_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anonymous Set-Cookie and default headers never revive account state."""
+    asset = _burst_delivery_asset("asf-anonymous-return")
+    delivery = "https://cdn-return.example/item.zip"
+    transport = _BurstDeliveryTransport(
+        [
+            (
+                302,
+                {
+                    "Location": delivery,
+                    "Set-Cookie": "login=secret; Domain=.asf.alaska.edu; Path=/",
+                },
+                b"gateway",
+            ),
+            (
+                302,
+                {
+                    "Location": asset.href,
+                    "Set-Cookie": "object=secret; Domain=.asf.alaska.edu; Path=/",
+                },
+                b"cdn",
+            ),
+            (200, {"Set-Cookie": "final=secret; Path=/"}, b"payload"),
+        ]
+    )
+    session = requests.Session()
+    session.mount("https://", transport)
+    session.headers["authorization"] = "Bearer session-default"
+    session.headers["COOKIE"] = "default=secret"
+    monkeypatch.setattr(
+        "requests.sessions.get_netrc_auth",
+        lambda _url: ("fixture-user", "fixture-password"),
+    )
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    response = _asf_request(
+        session,
+        "GET",
+        asset.href,
+        adapter=_BurstDeliveryAdapter(),
+        asset=asset,
+        budget=ledger.budget,
+        ledger=ledger,
+        headers={"authorization": "Bearer explicit", "cookie": "explicit=secret"},
+    )
+
+    assert response.status_code == 200
+    assert len(transport.requests) == 3
+    for outgoing in transport.requests[1:]:
+        assert "Authorization" not in outgoing.headers
+        assert "Cookie" not in outgoing.headers
+    assert not session.cookies
+    assert ledger.requests == 3
+    assert ledger.redirects == 2
+    response.close()
+    session.close()
+
+
+def test_asf_prepared_signed_delivery_rejects_redirect_before_second_request() -> None:
+    """A signed object capability is terminal even on a prepared first hop."""
+    asset = _burst_delivery_asset("asf-prepared-terminal")
+    delivery = "https://terminal-object.example/item.zip?X-Amz-Signature=fixture"
+    transport = _BurstDeliveryTransport(
+        [(307, {"Location": "https://other-object.example/item.zip"}, b"redirect")]
+    )
+    session = requests.Session()
+    session.mount("https://", transport)
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    with pytest.raises(remote.RemoteAccessError, match="signed_redirect"):
+        _asf_request(
+            session,
+            "GET",
+            delivery,
+            adapter=_BurstDeliveryAdapter(),
+            asset=asset,
+            budget=ledger.budget,
+            ledger=ledger,
+        )
+
+    assert len(transport.requests) == 1
+    assert "Authorization" not in transport.requests[0].headers
+    assert ledger.requests == 1
+    assert ledger.redirects == 0
+    assert ledger.response_bytes_total == len(b"redirect")
+    session.close()
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        "http://object.example/item.zip",
+        "https://user:password@object.example/item.zip",
+        "https://object.example/item.zip#fragment",
+        "https://object.example/%2e%2e/item.zip",
+        "https://object.example/a%2fb.zip",
+        "https://object.example:invalid/item.zip",
+    ],
+)
+def test_asf_prepared_delivery_rejects_invalid_url_before_request(
+    delivery: str,
+) -> None:
+    """Prepared delivery admission still applies the structural HTTPS gate."""
+    asset = _burst_delivery_asset("asf-prepared-invalid")
+    transport = _BurstDeliveryTransport([])
+    session = requests.Session()
+    session.mount("https://", transport)
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    with pytest.raises(remote.RemoteAccessError, match="invalid_endpoint"):
+        _asf_request(
+            session,
+            "GET",
+            delivery,
+            adapter=_BurstDeliveryAdapter(),
+            asset=asset,
+            budget=ledger.budget,
+            ledger=ledger,
+        )
+
+    assert transport.requests == []
+    assert ledger.requests == 0
+    session.close()
+
+
+def test_asf_prepared_delivery_does_not_admit_unregistered_asset_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anonymous runtime admission never relaxes the canonical asset registry."""
+    asset = _burst_delivery_asset("asf-invalid-canonical")
+    object.__setattr__(asset, "href", "https://unregistered.example/item.zip")
+    _register_adapter(asset.catalog, _BurstDeliveryAdapter())
+    session = requests.Session()
+    transport = _BurstDeliveryTransport([])
+    session.mount("https://", transport)
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        lambda *_args: pytest.fail("Invalid identity must fail before authentication"),
+    )
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        probe(asset, ledger=ledger)
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        _asf_request(
+            session,
+            "GET",
+            "https://delivery.example/item.zip",
+            adapter=_BurstDeliveryAdapter(),
+            asset=asset,
+            budget=ledger.budget,
+            ledger=ledger,
+        )
+
+    assert transport.requests == []
+    assert ledger.requests == 0
+    session.close()
+
+
+def test_asf_prepared_registered_auth_origin_cannot_bypass_route_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A registered authentication hostname does not authorize every route."""
+    adapter = _BurstDeliveryAdapter()
+    adapter.redirect_origins = (
+        *adapter.redirect_origins,
+        "https://urs.earthdata.nasa.gov",
+    )
+    adapter.redirect_path_prefixes = {
+        "https://urs.earthdata.nasa.gov": ("/oauth/authorize",)
+    }
+    asset = _burst_delivery_asset("asf-prepared-forbidden-auth-route")
+    delivery = "https://urs.earthdata.nasa.gov/unregistered-route"
+    transport = _BurstDeliveryTransport([(200, {}, b"PK\x03\x04payload")])
+    session = requests.Session()
+    session.mount("https://", transport)
+    monkeypatch.setattr(
+        "faninsar.remote.fetch.complete._asf_authenticated_session",
+        lambda *_args: pytest.fail("An unregistered auth route must fail before login"),
+    )
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        _asf_request(
+            session,
+            "GET",
+            delivery,
+            adapter=adapter,
+            asset=asset,
+            budget=ledger.budget,
+            ledger=ledger,
+            headers={"Authorization": "Bearer fixture-secret"},
+        )
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        _stream_download(
+            asset,
+            adapter,
+            ledger.budget,
+            ledger,
+            tmp_path / "item.zip",
+            transfer_url_override=delivery,
+        )
+
+    assert transport.requests == []
+    assert ledger.requests == 0
+    session.close()
 
 
 class _LPDAACSession:

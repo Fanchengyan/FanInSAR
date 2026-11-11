@@ -24,6 +24,7 @@ import requests
 from faninsar.logging import setup_logger
 from faninsar.remote.access import (
     _SECRET_KEY,
+    _asf_redirect_url,
     _has_signed_query,
     _redirect_headers,
     _registered_origin,
@@ -470,6 +471,8 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
         redirected = super().redirect_request(req, fp, code, msg, headers, target)
         if redirected is None:
             return None
+        if req.get_method() == "HEAD":
+            redirected.method = "HEAD"
         # A signed query is deliberately preserved on an approved redirect,
         # but ordinary request credentials must not cross origins.  The
         # standard urllib handler copies headers verbatim, including custom
@@ -718,25 +721,30 @@ def _stream_and_verify(
                         rehash_prefix(range_start)
 
             if result is None and asset.auth_profile == "earthdata-asf":
-                authenticated_session = _facade_hook(
-                    "_asf_authenticated_session", _asf_authenticated_session
+                _validate_url(asset.href, adapter)
+                request_url = _asf_redirect_url(
+                    asset.href, transfer_url, asset, adapter
                 )
-                session, token = authenticated_session(
-                    asset,
-                    adapter,
-                    budget,
-                    ledger,
-                )
+                request_headers = {"Accept-Encoding": "identity"}
+                if _registered_origin(request_url, adapter, redirect=True):
+                    _validate_url(request_url, adapter, redirect=True)
+                    authenticated_session = _facade_hook(
+                        "_asf_authenticated_session", _asf_authenticated_session
+                    )
+                    session, token = authenticated_session(
+                        asset,
+                        adapter,
+                        budget,
+                        ledger,
+                    )
+                    request_headers["Authorization"] = f"Bearer {token}"
+                else:
+                    session = requests.Session()
                 response: requests.Response | None = None
                 try:
                     asf_request = _facade_hook("_asf_request", _asf_request)
-                    request_url = transfer_url
                     if poll_scheduler is not None:
                         poll_scheduler.set_state(poll_token, "submitted")
-                    request_headers = {
-                        "Accept-Encoding": "identity",
-                        "Authorization": f"Bearer {token}",
-                    }
                     if range_start:
                         request_headers["Range"] = f"bytes={range_start}-"
                     response = asf_request(
@@ -1004,14 +1012,22 @@ def probe(
     if adapter is None or adapter.provider != asset.provider:
         _fail(RemoteAccessError, "unknown_catalog")
     ledger = ledger or _CallLedger(budget)
+    _validate_url(asset.href, adapter)
     current = url or asset.href
-    if asset.auth_profile == "earthdata-asf" and "sentinel1-burst.asf.alaska.edu" in (
-        urllib.parse.urlsplit(current).hostname or ""
+    if asset.auth_profile == "earthdata-asf" and (
+        urllib.parse.urlsplit(asset.href).hostname == "sentinel1-burst.asf.alaska.edu"
     ):
-        authenticated_session = _facade_hook(
-            "_asf_authenticated_session", _asf_authenticated_session
-        )
-        session, token = authenticated_session(asset, adapter, budget, ledger)
+        current = _asf_redirect_url(asset.href, current, asset, adapter)
+        request_headers = {"Accept-Encoding": "identity"}
+        if _registered_origin(current, adapter, redirect=True):
+            _validate_url(current, adapter, redirect=True)
+            authenticated_session = _facade_hook(
+                "_asf_authenticated_session", _asf_authenticated_session
+            )
+            session, token = authenticated_session(asset, adapter, budget, ledger)
+            request_headers["Authorization"] = f"Bearer {token}"
+        else:
+            session = requests.Session()
         response: requests.Response | None = None
         try:
             asf_request = _facade_hook("_asf_request", _asf_request)
@@ -1023,10 +1039,7 @@ def probe(
                 asset=asset,
                 budget=budget,
                 ledger=ledger,
-                headers={
-                    "Accept-Encoding": "identity",
-                    "Authorization": f"Bearer {token}",
-                },
+                headers=request_headers,
             )
             if response.status_code == 202:
                 pending_bytes = 0
@@ -1036,10 +1049,21 @@ def probe(
                     if pending_bytes > budget.max_response_bytes:
                         _fail(RemoteLimitError, "max_response_bytes")
                 location = response.headers.get("Location")
+                response_url = getattr(response, "url", current)
                 next_url = (
-                    urllib.parse.urljoin(current, location) if location else current
+                    urllib.parse.urljoin(response_url, location)
+                    if location
+                    else response_url
                 )
-                next_url = _validate_url(next_url, adapter, redirect=True)
+                next_url = _asf_redirect_url(
+                    response_url,
+                    next_url,
+                    asset,
+                    adapter,
+                    anonymous=not _registered_origin(
+                        response_url, adapter, redirect=True
+                    ),
+                )
                 delay = _poll_delay_seconds(
                     response.headers.get("Retry-After"),
                     attempt,
@@ -1049,8 +1073,14 @@ def probe(
             if response.status_code == 200:
                 return _RemotePollObservation(
                     "ready",
-                    _validate_url(
-                        getattr(response, "url", current), adapter, redirect=True
+                    _asf_redirect_url(
+                        current,
+                        getattr(response, "url", current),
+                        asset,
+                        adapter,
+                        anonymous=not _registered_origin(
+                            current, adapter, redirect=True
+                        ),
                     ),
                 )
             _fail(RemoteAccessError, "unexpected_status")
@@ -1160,7 +1190,9 @@ def parse_safe_manifest_checksums(manifest_xml: str | bytes) -> dict[str, str]:
                     if value:
                         md5 = value
         if href and md5:
-            member = href.strip().removeprefix("./")
+            member = href.strip()
+            while member.startswith("./"):
+                member = member.removeprefix("./")
             pairs[member] = md5
     return pairs
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -595,6 +596,93 @@ def test_asf_burst_transfer_performs_one_probe(
     assert ledger.requests == 1
     assert ledger.retries == 0
     assert ledger.response_bytes_total == len(b"queued")
+
+
+@pytest.mark.parametrize("status", [200, 202])
+def test_asf_legacy_head_probe_keeps_anonymous_delivery_handoff(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """The HEAD compatibility path accepts the same runtime delivery URLs."""
+    delivery = "https://changed-head-object.example/layout/item.zip"
+    signed = delivery + "?X-Amz-Signature=fixture"
+    response = _PollingResponse(
+        status, location="item.zip?X-Amz-Signature=fixture", retry_after="4"
+    )
+    response.geturl = lambda: signed if status == 200 else delivery
+
+    class _Opener:
+        def open(self, request: Any, *, timeout: float) -> _PollingResponse:
+            assert request.method == "HEAD"
+            assert timeout > 0
+            return response
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: _Opener())
+    adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    observation = _probe_burst_safe_url(
+        "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
+        adapter,
+        ledger.budget,
+        ledger,
+    )
+
+    assert observation.state == ("ready" if status == 200 else "pending")
+    assert observation.url == signed
+    assert observation.delay_seconds == (0.0 if status == 200 else 4.0)
+    assert ledger.requests == 1
+    assert ledger.response_bytes_total == (len(b"queued") if status == 202 else 0)
+    assert response.closed
+
+
+def test_asf_legacy_head_probe_follows_unregistered_https_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual urllib redirect policy admits a gateway-to-object HEAD handoff."""
+    delivery = (
+        "https://unlisted-head-object.example/new/item.zip?X-Amz-Signature=fixture"
+    )
+    response = _PollingResponse(200)
+    response.geturl = lambda: delivery
+
+    class _Opener:
+        def __init__(self, handler: Any) -> None:
+            self.handler = handler
+
+        def open(self, request: Any, *, timeout: float) -> _PollingResponse:
+            assert timeout > 0
+            redirected = self.handler.redirect_request(
+                request,
+                io.BytesIO(b"handoff"),
+                307,
+                "Temporary Redirect",
+                {"Location": delivery},
+                delivery,
+            )
+            assert redirected.full_url == delivery
+            assert redirected.get_method() == "HEAD"
+            assert not any(
+                name.lower() in {"authorization", "cookie"}
+                for name, _value in redirected.header_items()
+            )
+            return response
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda handler: _Opener(handler))
+    adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
+    ledger = _CallLedger(remote.RemoteResourceBudget())
+
+    observation = _probe_burst_safe_url(
+        "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
+        adapter,
+        ledger.budget,
+        ledger,
+    )
+
+    assert observation.state == "ready"
+    assert observation.url == delivery
+    assert ledger.requests == 2
+    assert ledger.redirects == 1
+    assert ledger.response_bytes_total == len(b"handoff")
 
 
 def test_asf_burst_poll_budget_and_backoff_are_dedicated(

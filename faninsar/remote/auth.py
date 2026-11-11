@@ -17,6 +17,7 @@ from .access import (
     _ASF_EDL_ORIGIN,
     _ASF_REDIRECT_CODES,
     _LPDAAC_DATA_ORIGIN,
+    _SECRET_KEY,
     _asf_redirect_url,
     _has_signed_query,
     _lpdaac_redirect_url,
@@ -93,15 +94,31 @@ def _asf_request(
 ) -> requests.Response:
     """Issue one metered ASF request while following redirects explicitly."""
     current_method = method.upper()
-    current_url = url
+    # Prepared delivery URLs remain request-local; the asset itself must still
+    # identify a registered provider gateway before anonymous admission.
+    _validate_url(asset.href, adapter)
+    current_url = _asf_redirect_url(asset.href, url, asset, adapter)
     current_headers = dict(headers or {})
     current_data = data
-    first_request = True
-    anonymous = False
+    anonymous = not _registered_origin(current_url, adapter, redirect=True)
     while True:
-        if first_request:
-            current_url = _validate_url(current_url, adapter, redirect=True)
-            first_request = False
+        if anonymous:
+            current_headers = {
+                key: value
+                for key, value in current_headers.items()
+                if not _SECRET_KEY.search(key)
+            }
+            # requests merges session defaults and cookies after call-site
+            # headers.  Discard those credentials before request preparation,
+            # including cookies returned by a prior anonymous response.
+            for name in list(getattr(session, "headers", {})):
+                if _SECRET_KEY.search(name):
+                    del session.headers[name]
+            with contextlib.suppress(AttributeError):
+                session.cookies.clear()
+            current_data = None
+        else:
+            _validate_url(current_url, adapter, redirect=True)
         ledger.request()
         ledger.begin_response()
         response = session.request(
@@ -154,10 +171,6 @@ def _asf_request(
             )
         if not _registered_origin(target, adapter, redirect=True):
             anonymous = True
-            current_headers.pop("Authorization", None)
-            current_headers.pop("Cookie", None)
-            with contextlib.suppress(AttributeError):
-                session.cookies.clear()
         if response.status_code == 303 or (
             response.status_code in {301, 302} and current_method == "POST"
         ):

@@ -324,7 +324,11 @@ def _probe_burst_safe_url(
     from urllib.error import HTTPError
     from urllib.request import Request, build_opener
 
-    from faninsar.remote.access import _validate_url
+    from faninsar.remote.access import (
+        _registered_origin,
+        _validate_anonymous_delivery_url,
+        _validate_url,
+    )
     from faninsar.remote.fetch.complete import (
         _poll_delay_seconds,
         _RedirectHandler,
@@ -352,8 +356,20 @@ def _probe_burst_safe_url(
             body = response.read(budget.max_response_bytes + 1)
             ledger.response_bytes(len(body))
             location = response.headers.get("Location")
-            next_url = urllib.parse.urljoin(current, location) if location else current
-            next_url = _validate_url(next_url, adapter, redirect=True)
+            response_url = response.geturl()
+            next_url = (
+                urllib.parse.urljoin(response_url, location)
+                if location
+                else response_url
+            )
+            next_url = _validate_anonymous_delivery_url(
+                response_url,
+                next_url,
+                adapter,
+                source_is_anonymous=not _registered_origin(
+                    response_url, adapter, redirect=True
+                ),
+            )
             delay = _poll_delay_seconds(
                 response.headers.get("Retry-After"),
                 attempt,
@@ -362,7 +378,8 @@ def _probe_burst_safe_url(
             return _RemotePollObservation("pending", next_url, delay)
         if status == 200:
             return _RemotePollObservation(
-                "ready", _validate_url(response.geturl(), adapter, redirect=True)
+                "ready",
+                _validate_anonymous_delivery_url(current, response.geturl(), adapter),
             )
         _fail(RemoteAccessError, "unexpected_status")
     finally:
@@ -1088,6 +1105,7 @@ class ASFSearchAdapter:
     origins: tuple[str, ...] = field(init=False)
     redirect_origins: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ("anonymous", "earthdata-asf")
+    _allow_anonymous_delivery: bool = field(default=True, init=False, repr=False)
     engine: str = "asf-search"
     query_collection: str = field(init=False)
 
