@@ -186,6 +186,11 @@ def export_swath_bursts(
         If ``burst_indices`` is empty or out of range.
 
     """
+    if swath.burst_source_swaths:
+        reject_product(
+            "export from multiple source annotations is not supported; "
+            "export each original source separately"
+        )
     if not burst_indices:
         reject_product("burst_indices must be non-empty for export")
     for i in burst_indices:

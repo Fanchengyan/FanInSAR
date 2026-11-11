@@ -88,16 +88,16 @@ def qualified_absolute_burst_id(
 ) -> int | None:
     """Return the source official ID, failing closed on a qualified conflict.
 
-    The source observation's own identifier is persisted. A Reference ID is
-    never copied onto a secondary that lacks one. When both sides carry an
-    official ID they must agree.
+    Compare only two qualified claims for the same source observation and
+    identifier namespace. Cross-date Reference IDs are not counterpart claims
+    for this purpose and must not be substituted for the source ID.
 
     Parameters
     ----------
     source_id : int or None
         Official ID of the burst being published.
     other_id : int or None
-        Official ID of the qualified counterpart (Reference for a secondary).
+        Another qualified ID claim for the same source and namespace.
     tag : str
         Scene unit tag used in the rejection message.
 
@@ -246,11 +246,8 @@ def _match_secondary_burst(
     *,
     absolute_burst_id: int | None,
 ) -> S1Burst | None:
-    """Bind a secondary burst by official ID or qualified pair matching."""
-    if absolute_burst_id is not None:
-        for burst in secondary_swath.bursts:
-            if burst.absolute_burst_id == absolute_burst_id:
-                return burst
+    """Bind a secondary burst through qualified ANX matching."""
+    _ = absolute_burst_id
     pairs = _common_burst_pairs(reference_swath, secondary_swath)
     matched = pairs.get(int(reference_burst_index))
     if matched is None:
@@ -383,13 +380,12 @@ def _bind_observation(  # noqa: PLR0911
         )
         return None
     _product, swath = found
-    del _product
     reference_id = getattr(stack, "reference", None)
-    if observation.absolute_burst_id is not None:
-        for burst in swath.bursts:
-            if burst.absolute_burst_id == observation.absolute_burst_id:
-                return swath, burst
     if reference_id is None or observation.date == reference_id:
+        if observation.absolute_burst_id is not None:
+            for burst in swath.bursts:
+                if burst.absolute_burst_id == observation.absolute_burst_id:
+                    return swath.source_for_burst(burst.index), burst
         if burst_index < 0 or burst_index >= len(swath.bursts):
             logger.warning(
                 "burst %s %s: burst index %s out of range",
@@ -398,7 +394,7 @@ def _bind_observation(  # noqa: PLR0911
                 burst_index,
             )
             return None
-        return swath, swath.bursts[burst_index]
+        return swath.source_for_burst(burst_index), swath.bursts[burst_index]
     reference_products = _products_for_date(stack, str(reference_id), products)
     if reference_products is None:
         logger.warning(
@@ -418,22 +414,49 @@ def _bind_observation(  # noqa: PLR0911
             swath_name,
         )
         return None
-    _reference_product, reference_swath = reference_found
-    del _reference_product
-    burst = _match_secondary_burst(
-        reference_swath,
-        swath,
-        burst_index,
-        absolute_burst_id=observation.absolute_burst_id,
-    )
-    if burst is None:
+    reference_product, reference_swath = reference_found
+    from faninsar.missions.s1.track_map import track_key_for_product
+
+    reference_track = track_key_for_product(reference_product)
+    if reference_track is None:
         logger.warning(
-            "burst %s %s: secondary source did not bind qualified",
+            "burst %s %s: Reference track is unknown",
             observation.date,
             observation.burst,
         )
         return None
-    return swath, burst
+    matches = []
+    for candidate_product in date_products:
+        if track_key_for_product(candidate_product) != reference_track:
+            logger.warning(
+                "burst %s %s: secondary track differs or is unknown",
+                observation.date,
+                observation.burst,
+            )
+            return None
+        candidate = candidate_product.find_swath(
+            swath_name, reference_swath.polarization
+        )
+        if candidate is None:
+            continue
+        candidate_burst = _match_secondary_burst(
+            reference_swath,
+            candidate,
+            burst_index,
+            absolute_burst_id=observation.absolute_burst_id,
+        )
+        if candidate_burst is not None:
+            matches.append((candidate, candidate_burst))
+    if len(matches) != 1:
+        logger.warning(
+            "burst %s %s: secondary source match count is %d",
+            observation.date,
+            observation.burst,
+            len(matches),
+        )
+        return None
+    swath, burst = matches[0]
+    return swath.source_for_burst(burst.index), burst
 
 
 def _polygons_from_groups(

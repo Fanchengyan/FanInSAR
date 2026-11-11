@@ -230,6 +230,7 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     scene.scene_id = scene_id
     scene.path = path
     product = _product(path)
+    scene.product = product
     scene.burst = product.swaths[0].bursts[0]
     scene.swath = product.swaths[0]
     scene.geometry = _geometry(path)
@@ -356,6 +357,34 @@ def test_reference_is_read_and_deramped_once_across_dates(
         assert "amplitude_refinement_enabled" not in kwargs
         assert kwargs["misreg_az_px"] == pytest.approx(0.05)
         assert kwargs["misreg_rg_px"] == pytest.approx(-0.02)
+
+
+def test_secondary_keeps_its_own_different_source_absolute_id(
+    tmp_path: Path, fake_s1: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct source observations retain their own IDs after ANX matching."""
+    from dataclasses import replace
+
+    original = coreg_module.load_production_scene
+
+    def load(path: Path, **kwargs: object) -> MagicMock:
+        scene = original(path, **kwargs)
+        identifier = 111 if Path(path).name == REFERENCE else 222
+        scene.burst = replace(scene.burst, absolute_burst_id=identifier)
+        return scene
+
+    monkeypatch.setattr(coreg_module, "load_production_scene", load)
+    context = _prepare(tmp_path)
+    product = coregister_s1_secondary(
+        context,
+        tmp_path / SECONDARIES[0],
+        output_scene=tmp_path / "coreg" / "20200113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert context.product.units[0].absolute_burst_id == 111
+    assert product.units[0].absolute_burst_id == 222
+    assert product.units[0].burst_id == context.product.units[0].burst_id
 
 
 def test_secondary_persists_signed_scene_baseline(

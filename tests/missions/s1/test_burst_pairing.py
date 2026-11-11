@@ -181,8 +181,104 @@ def _with_absolute_ids(swath: S1Swath, first_id: int) -> S1Swath:
     )
 
 
-def test_absolute_id_pairs_across_shifted_grids() -> None:
-    """Same ids pair exactly even when ANX positions disagree."""
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_anx_matching_rejects_missing_or_nonfinite_time(value: float) -> None:
+    """An invalid ANX time is never replaced with an ordinal guess."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    primary = _offset_swath(
+        1,
+        first_burst=0,
+        azimuth_origin=datetime(2020, 1, 1, tzinfo=UTC),
+        anx_origin=100.0,
+    )
+    secondary = replace(
+        primary, bursts=(replace(primary.bursts[0], azimuth_anx_time_s=value),)
+    )
+    with pytest.raises(InvalidProcessingStateError, match="finite ANX"):
+        _common_burst_pairs(primary, secondary)
+
+
+def test_anx_matching_rejects_ambiguous_secondary_candidates() -> None:
+    """More than one in-tolerance candidate is an error, not a nearest guess."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    primary = _offset_swath(
+        1,
+        first_burst=0,
+        azimuth_origin=datetime(2020, 1, 1, tzinfo=UTC),
+        anx_origin=100.0,
+    )
+    secondary = replace(
+        primary,
+        bursts=(
+            primary.bursts[0],
+            replace(primary.bursts[0], index=1, azimuth_anx_time_s=100.1),
+        ),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="ambiguous ANX"):
+        _common_burst_pairs(primary, secondary)
+
+
+def test_anx_matching_rejects_multiple_primaries_for_one_secondary() -> None:
+    """A secondary burst must not be reused for two Reference bursts."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    primary = _offset_swath(
+        1,
+        first_burst=0,
+        azimuth_origin=datetime(2020, 1, 1, tzinfo=UTC),
+        anx_origin=100.0,
+    )
+    primary = replace(
+        primary,
+        bursts=(
+            primary.bursts[0],
+            replace(primary.bursts[0], index=1, azimuth_anx_time_s=100.1),
+        ),
+    )
+    secondary = replace(primary, bursts=(primary.bursts[0],))
+    with pytest.raises(InvalidProcessingStateError, match="one-to-one"):
+        _common_burst_pairs(primary, secondary)
+
+
+def test_anx_matching_excludes_other_swath_or_polarization() -> None:
+    """ANX proximity cannot bridge different channels or sub-swaths."""
+    primary = _offset_swath(
+        1,
+        first_burst=0,
+        azimuth_origin=datetime(2020, 1, 1, tzinfo=UTC),
+        anx_origin=100.0,
+    )
+    assert _common_burst_pairs(primary, replace(primary, swath="IW1")) == {}
+    assert _common_burst_pairs(primary, replace(primary, polarization="VH")) == {}
+
+
+def test_repeat_pass_uses_anx_not_acquisition_id() -> None:
+    """Repeat-pass pairing uses ANX even when catalog IDs differ."""
+    primary = _with_absolute_ids(
+        _offset_swath(
+            2,
+            first_burst=0,
+            azimuth_origin=datetime(2018, 3, 6, tzinfo=UTC),
+            anx_origin=1000.0,
+        ),
+        21282964,
+    )
+    secondary = _with_absolute_ids(
+        _offset_swath(
+            2,
+            first_burst=0,
+            azimuth_origin=datetime(2018, 3, 18, tzinfo=UTC),
+            anx_origin=999.99,
+        ),
+        21658852,
+    )
+    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1}
+
+
+def test_matching_ignores_equal_ids_when_anx_grids_shift() -> None:
+    """ANX position, not an equal metadata identifier, selects each pair."""
     primary = _with_absolute_ids(
         _offset_swath(
             4,
@@ -192,8 +288,7 @@ def test_absolute_id_pairs_across_shifted_grids() -> None:
         ),
         5000,
     )
-    # Secondary bursts carry the same ids but sit two grid steps later on
-    # the orbit axis — ANX alone would offset the pairing; ids resolve it.
+    # Equal IDs must not override a two-step shift in the ANX grid.
     secondary = _with_absolute_ids(
         _offset_swath(
             4,
@@ -203,12 +298,11 @@ def test_absolute_id_pairs_across_shifted_grids() -> None:
         ),
         5000,
     )
-    # primary[i] and secondary[i] share id 5000+i → identity pairing by id.
-    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert _common_burst_pairs(primary, secondary) == {2: 0, 3: 1}
 
 
-def test_absolute_id_leaves_unmatched_primary_unpaired() -> None:
-    """An id-carrying primary without the same id is never guessed."""
+def test_different_ids_do_not_block_anx_matches() -> None:
+    """Different metadata identifiers do not block matching ANX positions."""
     primary = _with_absolute_ids(
         _offset_swath(
             3,
@@ -227,11 +321,11 @@ def test_absolute_id_leaves_unmatched_primary_unpaired() -> None:
         ),
         7000,
     )
-    assert _common_burst_pairs(primary, secondary) == {}
+    assert _common_burst_pairs(primary, secondary) == {0: 0, 1: 1, 2: 2}
 
 
 def test_mixed_id_presence_falls_back_per_burst() -> None:
-    """Id-less primaries still resolve through ANX beside exact id pairs."""
+    """ID presence does not affect ANX pairing."""
     primary = _with_absolute_ids(
         _offset_swath(
             3,
@@ -262,8 +356,7 @@ def test_mixed_id_presence_falls_back_per_burst() -> None:
 
 
 def test_id_primary_against_idless_secondary_falls_back() -> None:
-    """Backward compat: an id-carrying primary still pairs with an
-    annotation-only secondary through ANX — legacy products carry no ids."""
+    """An ID-bearing primary pairs with an ID-less secondary through ANX."""
     primary = _with_absolute_ids(
         _offset_swath(
             3,
@@ -303,6 +396,8 @@ def _unit_for(
         ),
         first_id,
     )
+    scene.swath = replace(scene.swath, swath=swath_name)
+    scene.product = _product_for("reference.SAFE", (scene.swath,))
     return S1ReferenceUnit(
         tag=f"f{frame_index}_{swath_name}_b{burst_index}",
         frame_index=frame_index,
@@ -319,7 +414,7 @@ def _product_for(name: str, swaths: tuple[S1Swath, ...]) -> object:
 
     return S1Product(
         product_id=name,
-        source_path=Path(name),
+        source_path=Path("tracks/1A/acquisitions") / name,
         mission_id="S1A",
         product_type="SLC",
         mode="IW",

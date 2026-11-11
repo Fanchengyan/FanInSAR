@@ -401,6 +401,41 @@ def _assemble_product(
     filtered = tuple(swath for swath in swaths if swath.polarization in requested)
     if not filtered:
         reject_product(f"no swaths remain after polarization filter for {source_path}")
+    grouped: dict[tuple[str, str], list[S1Swath]] = defaultdict(list)
+    for swath in filtered:
+        grouped[(swath.swath, swath.polarization)].append(swath)
+    normalized: list[S1Swath] = []
+    for group in grouped.values():
+        if len(group) == 1:
+            normalized.append(group[0])
+            continue
+        if any(len(swath.bursts) != 1 for swath in group):
+            reject_product(f"duplicate multi-burst swath annotations in {source_path}")
+        ordered = sorted(group, key=lambda swath: swath.bursts[0].azimuth_time)
+        template = ordered[0]
+        if any(
+            (swath.lines_per_burst, swath.samples_per_burst)
+            != (template.lines_per_burst, template.samples_per_burst)
+            for swath in ordered
+        ):
+            reject_product(f"incompatible burst annotation dimensions in {source_path}")
+        bursts = tuple(
+            replace(
+                swath.bursts[0], index=index, measurement_path=swath.measurement_path
+            )
+            for index, swath in enumerate(ordered)
+        )
+        normalized.append(
+            replace(
+                template,
+                lines=len(bursts) * template.lines_per_burst,
+                bursts=bursts,
+                sensing_start=min(swath.sensing_start for swath in ordered),
+                sensing_stop=max(swath.sensing_stop for swath in ordered),
+                burst_source_swaths=tuple(ordered),
+            )
+        )
+    filtered = tuple(normalized)
 
     product_id, mission_id = _product_identity(
         source_path,
@@ -591,6 +626,7 @@ def _merge_burst_segment_products(products: Sequence[S1Product]) -> S1Product:
                 template,
                 lines=len(bursts) * template.lines_per_burst,
                 bursts=tuple(bursts),
+                burst_source_swaths=tuple(swath for _product, swath in ordered),
                 sensing_start=min(swath.sensing_start for _product, swath in ordered),
                 sensing_stop=max(swath.sensing_stop for _product, swath in ordered),
                 orbit=replace(

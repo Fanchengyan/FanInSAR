@@ -72,6 +72,47 @@ def _one_burst_xml(azimuth_time: str, *, lines: int = 40) -> str:
     )
 
 
+def test_path_safe_multiple_annotations_share_one_swath(tmp_path: Path) -> None:
+    """A multi-burst path SAFE exposes every burst and its own TIFF."""
+    root = (
+        tmp_path
+        / "S1A_IW_SLC__1SSV_20161207T111852_20161207T111855_014273_01716D_67BC.SAFE"
+    )
+    (root / "annotation").mkdir(parents=True)
+    (root / "measurement").mkdir()
+    for index, time in enumerate(
+        ("2016-12-07T11:18:53.426276", "2016-12-07T11:18:53.467387")
+    ):
+        stem = (
+            f"s1a-iw1-slc-vv-20161207t111852-20161207t111855-014273-01716d-{index:03d}"
+        )
+        (root / "annotation" / f"{stem}.xml").write_text(
+            _one_burst_xml(time), encoding="utf-8"
+        )
+        (root / "measurement" / f"{stem}.tiff").write_bytes(b"tiff")
+    product = open_safe_product(root)
+    swath = product.swath("IW1")
+    assert len(swath.bursts) == 2
+    assert len({burst.measurement_path for burst in swath.bursts}) == 2
+    assert [burst.index for burst in swath.bursts] == [0, 1]
+    assert swath.source_for_burst(0).annotation_path.endswith("000.xml")
+    assert swath.source_for_burst(1).annotation_path.endswith("001.xml")
+    from faninsar.missions.s1.io.read import _burst_line_offset
+
+    assert [
+        _burst_line_offset(swath.source_for_burst(i), burst)
+        for i, burst in enumerate(swath.bursts)
+    ] == [0, 0]
+    from faninsar.missions.s1.errors import Sentinel1ProductError
+    from faninsar.missions.s1.io.canvas import write_roi_safe_canvas
+    from faninsar.missions.s1.io.export import export_swath_bursts
+
+    with pytest.raises(Sentinel1ProductError, match="multiple source annotations"):
+        export_swath_bursts(swath, [0, 1], tmp_path / "export")
+    with pytest.raises(Sentinel1ProductError, match="multiple source annotations"):
+        write_roi_safe_canvas(swath, [], tmp_path / "canvas")
+
+
 def test_same_date_one_burst_safes_merge_into_one_swath(tmp_path: Path) -> None:
     """ASF one-burst ZIPs of one date become adjacent bursts of one swath."""
     import zipfile

@@ -66,6 +66,8 @@ def _burst_line_offset(swath: S1Swath, burst: S1Burst) -> int:
     One-burst ASF extracts store the burst at line 0 of their own TIFF.
     A full-scene measurement still places burst ``i`` at ``i * lines_per_burst``.
     """
+    if swath.burst_source_swaths:
+        return 0
     if _burst_measurement_path(swath, burst) != swath.measurement_path:
         return 0
     return int(burst.index * swath.lines_per_burst)

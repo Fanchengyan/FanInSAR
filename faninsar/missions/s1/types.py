@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -23,11 +23,10 @@ class S1Burst:
     ``measurement_path`` is set when a merged one-burst extract keeps its
     own TIFF instead of sharing the parent swath measurement.
 
-    ``absolute_burst_id`` is the mission-independent ESA burst identifier
-    when it is known (e.g. from the ASF ``BURST_ID_ABSOLUTE`` catalog
-    attribute).  SAFE annotation XML does not carry it, so annotation
-    parsing leaves it ``None``; ``azimuth_anx_time_s`` and
-    ``sensing_time`` remain the annotation-derived matching keys.
+    ``absolute_burst_id`` is optional source catalog metadata; its namespace
+    depends on the provider and it is not used for repeat-pass pairing.
+    ``azimuth_anx_time_s`` is used for qualified cross-date pairing, while
+    ``sensing_time`` associates observations within a parent acquisition.
 
     Adding ``number`` does not add selection by original parent ordinal.
 
@@ -112,6 +111,25 @@ class S1Swath:
     azimuth_steering_rate_rad_s: float
     ascending_node_time: datetime | None = None
     elevation_angle_records: tuple[ElevationAngleRecord, ...] = ()
+    burst_source_swaths: tuple[S1Swath, ...] = ()
+
+    def source_for_burst(self, index: int) -> S1Swath:
+        """Return the source annotation model for a local burst index.
+
+        Returns
+        -------
+        S1Swath
+            The source-specific model, retaining the logical burst sequence.
+
+        """
+        if not self.burst_source_swaths:
+            return self
+        return replace(
+            self.burst_source_swaths[index],
+            bursts=self.bursts,
+            lines=self.lines,
+            burst_source_swaths=self.burst_source_swaths,
+        )
 
 
 @dataclass(frozen=True, slots=True)

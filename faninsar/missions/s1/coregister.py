@@ -32,6 +32,7 @@ from faninsar.missions.s1.processing import (
     _as_frame_paths,
     _common_burst_pairs,
     _first_swath,
+    _normalize_burst_selection,
     _phase_state_manifest,
     _roi_burst_window,
     _scene_id,
@@ -1100,6 +1101,18 @@ def coregister_s1_secondary(
     work_root = output_scene.parent / f".{output_scene.name}.work"
     wrote = 0
     unit_baselines: list[tuple[float, float]] = []
+    matches = {
+        tag: _secondary_burst_match(unit, secondary_products, tag, date_id)
+        for tag, unit in context.units.items()
+    }
+    identities = [
+        (id(product), context.units[tag].swath, index)
+        for tag, match in matches.items()
+        if match is not None
+        for index, product in (match,)
+    ]
+    if len(set(identities)) != len(identities):
+        reject_invalid_state("secondary burst is matched to multiple Reference units")
     try:
         with SceneWriter(
             output_scene,
@@ -1112,7 +1125,7 @@ def coregister_s1_secondary(
             **header,
         ) as writer:
             for tag, unit in context.units.items():
-                match = _secondary_burst_match(unit, secondary_products, tag, date_id)
+                match = matches[tag]
                 if match is None:
                     continue
                 secondary_burst_index, secondary_product = match
@@ -1141,10 +1154,7 @@ def coregister_s1_secondary(
                         f"{tag}: Reference unit is missing physical burst_id"
                     )
 
-                from faninsar.missions.s1.scene_bursts import (
-                    official_absolute_burst_id,
-                    qualified_absolute_burst_id,
-                )
+                from faninsar.missions.s1.scene_bursts import official_absolute_burst_id
 
                 _stage_scene_unit(
                     writer,
@@ -1156,12 +1166,8 @@ def coregister_s1_secondary(
                     burst_id=placed.burst_id,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
-                    absolute_burst_id=qualified_absolute_burst_id(
-                        official_absolute_burst_id(
-                            getattr(state.secondary, "burst", None)
-                        ),
-                        placed.absolute_burst_id,
-                        tag=tag,
+                    absolute_burst_id=official_absolute_burst_id(
+                        getattr(state.secondary, "burst", None)
                     ),
                 )
                 unit_baselines.append(_unit_scene_baseline(state))
@@ -1256,37 +1262,38 @@ def _secondary_burst_match(
     own burst grid by along-track position, so products clipped to different
     start lines (e.g. Sentinel-1C vs Sentinel-1D) still resolve.
 
-    The secondary swath is searched across *every* product in
-    ``secondary_products`` rather than indexed by ``unit.frame_index``:
-    same-date products may hold disjoint swaths or single-burst groups of
-    one frame (stage-3 path-SAFEs list one burst per annotation file), so
-    the product at the unit's frame slot can legitimately lack
-    ``unit.swath`` while a sibling product carries it.  The preferred
-    ``unit.frame_index`` slot is tried first so multi-frame products keep
-    their original same-frame correspondence.
+    The secondary swath is searched across all products. Every candidate must
+    belong to the Reference track and channel, and the ANX match must be
+    unique across products. Frame ordering is not evidence of correspondence.
     """
-    candidates = list(secondary_products)
-    if 0 <= unit.frame_index < len(candidates):
-        candidates.insert(0, candidates.pop(unit.frame_index))
-    secondary_swath = None
-    secondary_product: S1Product | None = None
-    for product in candidates:
-        candidate = next(
-            (item for item in product.swaths if item.swath == unit.swath), None
-        )
-        if candidate is not None:
-            secondary_swath = candidate
-            secondary_product = product
-            break
-    if secondary_swath is None or secondary_product is None:
-        logger.info("%s: secondary %s has no sub-swath %s", tag, date_id, unit.swath)
-        return None
-    pairs = _common_burst_pairs(unit.scene.swath, secondary_swath)
-    secondary_index = pairs.get(unit.burst_index)
-    if secondary_index is None:
+    from faninsar.missions.s1.track_map import track_key_for_product
+
+    reference_track = track_key_for_product(unit.scene.product)
+    if reference_track is None:
+        reject_invalid_state(f"{tag}: Reference track is unknown")
+    matches: list[tuple[int, S1Product]] = []
+    for product in secondary_products:
+        track = track_key_for_product(product)
+        if track is None:
+            reject_invalid_state(f"{tag}: secondary track is unknown")
+        if track != reference_track:
+            reject_invalid_state(
+                f"{tag}: secondary track {track} differs from "
+                f"Reference {reference_track}"
+            )
+        candidate = product.find_swath(unit.swath, unit.scene.swath.polarization)
+        if candidate is None:
+            continue
+        pairs = _common_burst_pairs(unit.scene.swath, candidate)
+        secondary_index = pairs.get(unit.burst_index)
+        if secondary_index is not None:
+            matches.append((secondary_index, product))
+    if len(matches) > 1:
+        reject_invalid_state(f"{tag}: ambiguous secondary burst across products")
+    if not matches:
         logger.info("%s: secondary %s does not cover this burst", tag, date_id)
         return None
-    return secondary_index, secondary_product
+    return matches[0]
 
 
 def _coregister_unit(
@@ -1761,6 +1768,39 @@ def _resolve_apply_selection(
     fall inside that crop; the burst set is the one already resolved by
     the caller (or ROI footprints when the caller omitted ``bursts``).
     """
+    same_acquisition = len(primary_products) == len(secondary_products) and all(
+        left is right
+        for left, right in zip(primary_products, secondary_products, strict=True)
+    )
+    if same_acquisition:
+        swath_tuple = (
+            _union_swath_names(primary_products) if swaths is None else tuple(swaths)
+        )
+        if bursts is None and swaths is None and roi is not None:
+            resolved = _select_bursts_by_roi(
+                roi, list(primary_paths), swath_tuple, orbits=ref_orbits, dem=dem
+            )
+        else:
+            counts = {
+                (frame, swath): len(found.bursts)
+                if (found := product.find_swath(swath))
+                else 0
+                for frame, product in enumerate(primary_products)
+                for swath in swath_tuple
+            }
+            resolved = _normalize_burst_selection(
+                bursts, len(primary_products), swath_tuple, counts
+            )
+        kept = tuple(
+            name
+            for name in swath_tuple
+            if any(
+                indices for (frame, swath), indices in resolved.items() if swath == name
+            )
+        )
+        if not kept:
+            reject_invalid_state("Reference selection contains no bursts")
+        return kept, resolved
     if bursts is not None or swaths is not None:
         swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
         resolved, _ = _resolve_common_bursts(
@@ -1779,25 +1819,14 @@ def _resolve_apply_selection(
             orbits=ref_orbits,
             dem=dem,
         )
-        common: dict[tuple[int, str], list[int]] = {}
-        for frame_index in range(len(primary_products)):
-            for swath in swath_tuple:
-                primary_swath = primary_products[frame_index].find_swath(swath)
-                secondary_swath = (
-                    secondary_products[frame_index].find_swath(swath)
-                    if frame_index < len(secondary_products)
-                    else None
-                )
-                if primary_swath is None or secondary_swath is None:
-                    continue
-                shared = set(_common_burst_pairs(primary_swath, secondary_swath))
-                selected = [
-                    index
-                    for index in resolved.get((frame_index, swath), [])
-                    if index in shared
-                ]
-                if selected:
-                    common[(frame_index, swath)] = selected
+        all_common, _ = _resolve_common_bursts(
+            primary_products, secondary_products, swath_tuple, None
+        )
+        common = {
+            key: [index for index in indices if index in all_common.get(key, ())]
+            for key, indices in resolved.items()
+        }
+        common = {key: indices for key, indices in common.items() if indices}
         if not any(common.values()):
             reject_invalid_state("ROI selection contains no common bursts")
         kept = tuple(

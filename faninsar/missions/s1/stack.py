@@ -1492,11 +1492,12 @@ class S1Stack(Stack):
 
         reference_track = self._date_track_key(self.reference)
         secondary_track = self._date_track_key(date_id)
-        if (
-            reference_track is not None
-            and secondary_track is not None
-            and secondary_track != reference_track
-        ):
+        if reference_track is None or secondary_track is None:
+            reject_invalid_state(
+                f"cannot coregister {date_id}: Reference and secondary "
+                "tracks must be known"
+            )
+        if secondary_track != reference_track:
             reject_invalid_state(
                 f"cannot coregister {date_id} onto Reference {self.reference}: "
                 f"{date_id} lies on track {secondary_track!r} but the "

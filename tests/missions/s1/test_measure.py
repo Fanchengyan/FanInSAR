@@ -49,7 +49,7 @@ def _burst(index: int, *, start_line: int) -> S1Burst:
         index=index,
         azimuth_time=azimuth_time,
         sensing_time=azimuth_time,
-        azimuth_anx_time_s=0.0,
+        azimuth_anx_time_s=float(start_line),
         byte_offset=index * _LINES * _SAMPLES * 4,
         lines=_LINES,
         samples=_SAMPLES,
@@ -107,7 +107,7 @@ def _product(path: Path, *bursts: S1Burst) -> S1Product:
     """Build a one-swath product whose date id is taken from ``path``."""
     return S1Product(
         product_id=path.stem,
-        source_path=path,
+        source_path=path.parent / "tracks" / "1A" / "acquisitions" / path.name,
         mission_id="S1A",
         product_type="SLC",
         mode="IW",
@@ -204,7 +204,7 @@ def test_resolve_common_bursts_skips_frames_missing_a_swath() -> None:
     """Frame 0 lacking IW2 does not raise; only the parent that has IW2 is kept."""
     from dataclasses import replace
 
-    iw1_only = _product(Path("frame0.SAFE"), _burst(0, start_line=0))
+    iw1_only = _product(Path("frame0.SAFE"), _burst(0, start_line=500))
     iw2 = replace(
         _swath(_burst(0, start_line=0), _burst(1, start_line=80)),
         swath="IW2",
@@ -230,6 +230,21 @@ def test_resolve_common_bursts_skips_frames_missing_a_swath() -> None:
     assert (1, "IW1") in aligned
     assert (1, "IW2") in aligned
     assert mapping[(1, "IW2")]
+
+
+def test_resolve_common_bursts_across_reordered_parent_frames() -> None:
+    """ANX matching returns the secondary frame as well as its burst index."""
+    primary = [
+        _product(Path("p0.SAFE"), _burst(0, start_line=0)),
+        _product(Path("p1.SAFE"), _burst(0, start_line=300)),
+    ]
+    secondary = [
+        _product(Path("s0.SAFE"), _burst(0, start_line=300)),
+        _product(Path("s1.SAFE"), _burst(0, start_line=0)),
+    ]
+    aligned, mapping = _resolve_common_bursts(primary, secondary, ("IW1",), None)
+    assert aligned == {(0, "IW1"): [0], (1, "IW1"): [0]}
+    assert mapping == {(0, "IW1"): {0: (1, 0)}, (1, "IW1"): {0: (0, 0)}}
 
 
 def test_measure_s1_pair_misreg_empty_ampcor_omits_range_keeps_azimuth(

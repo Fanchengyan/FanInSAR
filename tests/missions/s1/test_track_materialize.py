@@ -467,7 +467,11 @@ class TestAsfBurstPath:
             == tmp_path / "tracks" / "88A" / "acquisitions"
         )
         product = open_safe_product(safe_root)
-        assert len(product.swaths) == 2  # one swath per burst file pair
+        assert len(product.swaths) == 1
+        assert len(product.swaths[0].bursts) == 2
+        assert (
+            len({s.annotation_path for s in product.swaths[0].burst_source_swaths}) == 2
+        )
         burst_ids = sorted(
             burst.absolute_burst_id
             for swath in product.swaths

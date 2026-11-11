@@ -138,6 +138,32 @@ def _prepare_source(tmp_path: Path, name: str, swath: object) -> tuple[Path, S1P
     return path, product
 
 
+def test_secondary_observation_matches_across_parent_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspection binds the ANX-matching secondary, not the same frame slot."""
+    from faninsar.missions.s1.scene_bursts import _bind_observation
+
+    reference = _swath()
+    reference = replace(
+        reference, bursts=(replace(reference.bursts[0], azimuth_anx_time_s=100.0),)
+    )
+    wrong = replace(
+        reference, bursts=(replace(reference.bursts[0], azimuth_anx_time_s=300.0),)
+    )
+    ref_product = _product(Path("tracks/88A/ref.SAFE"), reference)
+    wrong_product = _product(Path("tracks/88A/wrong.SAFE"), wrong)
+    matching_product = _product(Path("tracks/88A/matching.SAFE"), reference)
+    monkeypatch.setattr(
+        "faninsar.missions.s1.track_map.track_key_for_product", lambda _product: "88A"
+    )
+    stack = _Stack(_Catalog({}))
+    cache = {"20240101": [ref_product], "20240113": [wrong_product, matching_product]}
+    found = _bind_observation(stack, _obs("20240113", "f0_IW1_b0"), products=cache)
+    assert found is not None
+    assert found[0] is reference
+
+
 def test_annotation_minmax_bbox_is_not_used_as_footprint_geometry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

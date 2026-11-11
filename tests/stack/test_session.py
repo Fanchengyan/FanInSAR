@@ -65,6 +65,7 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
         multilook=(1, 1),
     )
     stack.prepare_data()
+    stack._date_track_key = lambda _date: "1A"  # type: ignore[method-assign]
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     return stack
 
@@ -361,9 +362,11 @@ def test_coregister_scenes_prepares_reference_once_for_all_dates(
         message = "S1 coregister_scenes must not call _produce_pair"
         raise AssertionError(message)
 
+    context = SimpleNamespace(dem=None, marker="context")
+
     def fake_prepare(
         _reference_path: object, *, output_scene: Path, **_k: object
-    ) -> str:
+    ) -> SimpleNamespace:
         prepare_calls.append(Path(output_scene))
         write_test_scene(
             stack.config.work_dir,
@@ -371,7 +374,7 @@ def test_coregister_scenes_prepares_reference_once_for_all_dates(
             reference_id=stack.reference,
             payload=np.ones((2, 2), dtype=np.complex64),
         )
-        return "context"
+        return context
 
     def fake_secondary(
         context: object,
@@ -380,7 +383,8 @@ def test_coregister_scenes_prepares_reference_once_for_all_dates(
         output_scene: Path,
         **_kwargs: object,
     ) -> None:
-        assert context == "context"
+        assert isinstance(context, SimpleNamespace)
+        assert context.marker == "context"
         date_id = Path(str(secondary_path)).name.split("_")[5][:8]
         apply_dates.append(date_id)
         assert Path(output_scene) == stack.config.work_dir / "coreg" / date_id

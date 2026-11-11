@@ -37,6 +37,7 @@ def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
         pair_max_days=60,
     )
     stack.prepare_data()
+    stack._date_track_key = lambda _date: "1A"  # type: ignore[method-assign]
     # Dummy SAFE directories have no annotation products.
     stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
     return stack

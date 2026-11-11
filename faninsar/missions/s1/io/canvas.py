@@ -487,6 +487,10 @@ def write_roi_safe_canvas(
     True
 
     """
+    if swath.burst_source_swaths:
+        reject_product(
+            "canvas creation from multiple source annotations is not supported"
+        )
     if not windows:
         reject_product("write_roi_safe_canvas requires at least one fetched window")
     by_index = {int(window.burst_index): window for window in windows}

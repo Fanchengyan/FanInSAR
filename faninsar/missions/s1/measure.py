@@ -134,11 +134,6 @@ def measure_s1_pair_misreg(
 
     primary_paths = _as_frame_paths(primary_path, "primary_path")
     secondary_paths = _as_frame_paths(secondary_path, "secondary_path")
-    if len(primary_paths) != len(secondary_paths):
-        reject_invalid_state(
-            "reference/secondary frame counts differ: "
-            f"{len(primary_paths)} vs {len(secondary_paths)}"
-        )
     primary_id = _scene_id(primary_paths[0])
     secondary_id = _scene_id(secondary_paths[0])
     primary_products = open_acquisition_products(primary_paths)
@@ -175,12 +170,16 @@ def measure_s1_pair_misreg(
     esd_records: list[OverlapESDRecord] = []
     ampcor_results: list[PatchAmplitudeShiftResult] = []
     for frame_index, swath_name, window in windows:
+        pairing = secondary_map[(frame_index, swath_name)]
+        top_frame, _ = pairing[window.top_index]
+        bottom_frame, _ = pairing[window.bottom_index]
         esd, ampcor = _observe_overlap_window(
             window,
-            primary_path=primary_paths[frame_index],
-            secondary_path=secondary_paths[frame_index],
+            primary_path=primary_products[frame_index].source_path,
+            secondary_path=secondary_products[top_frame].source_path,
             primary_product=primary_products[frame_index],
-            secondary_product=secondary_products[frame_index],
+            secondary_product=secondary_products[top_frame],
+            secondary_bottom_product=secondary_products[bottom_frame],
             swath_name=swath_name,
             dem=dem,
             coherence_threshold=coherence_threshold,
@@ -236,15 +235,22 @@ def _resolve_common_bursts(
     bursts: BurstSelection | None,
 ) -> tuple[
     dict[tuple[int, str], list[int]],
-    dict[tuple[int, str], dict[int, int]],
+    dict[tuple[int, str], dict[int, tuple[int, int]]],
 ]:
     """Intersect the requested burst selection with common primary/secondary indices.
 
-    Returns the selected primary indices per ``(frame, swath)`` plus the
-    ``primary_index -> secondary_index`` ground match for each.  The two may
-    differ when products clip the burst grid to different start lines (e.g.
-    Sentinel-1C vs Sentinel-1D).
+    Returns the selected primary indices per ``(frame, swath)`` plus a
+    ``primary_index -> (secondary_frame, secondary_index)`` ground match.
+    Frame positions and burst indices may both differ across acquisitions.
     """
+    from faninsar.missions.s1.track_map import track_key_for_product
+
+    tracks = [
+        track_key_for_product(product)
+        for product in (*primary_products, *secondary_products)
+    ]
+    if any(track is None for track in tracks) or len(set(tracks)) != 1:
+        reject_invalid_state(f"burst pairing requires one known track; got {tracks}")
     frame_count = len(primary_products)
     burst_counts: dict[tuple[int, str], int] = {}
     for frame_index in range(frame_count):
@@ -257,28 +263,44 @@ def _resolve_common_bursts(
         bursts, frame_count, swath_tuple, burst_counts
     )
     common_aligned: dict[tuple[int, str], list[int]] = {}
-    secondary_map: dict[tuple[int, str], dict[int, int]] = {}
+    secondary_map: dict[tuple[int, str], dict[int, tuple[int, int]]] = {}
+    used: set[tuple[int, str, int]] = set()
     for frame_index in range(frame_count):
         for swath in swath_tuple:
             primary_swath = primary_products[frame_index].find_swath(swath)
-            secondary_swath = (
-                secondary_products[frame_index].find_swath(swath)
-                if frame_index < len(secondary_products)
-                else None
-            )
-            if primary_swath is None or secondary_swath is None:
+            if primary_swath is None:
                 continue
             selected_indices = resolved.get((frame_index, swath), [])
-            if not selected_indices:
-                continue
-            pairs = _common_burst_pairs(primary_swath, secondary_swath)
-            selected = [index for index in selected_indices if index in pairs]
-            if not selected:
-                continue
-            common_aligned[(frame_index, swath)] = selected
-            secondary_map[(frame_index, swath)] = {
-                index: pairs[index] for index in selected
+            candidates: dict[int, list[tuple[int, int]]] = {
+                index: [] for index in selected_indices
             }
+            for secondary_frame, product in enumerate(secondary_products):
+                secondary_swath = product.find_swath(swath, primary_swath.polarization)
+                if secondary_swath is None:
+                    continue
+                pairs = _common_burst_pairs(primary_swath, secondary_swath)
+                for index in selected_indices:
+                    if index in pairs:
+                        candidates[index].append((secondary_frame, pairs[index]))
+            mapping: dict[int, tuple[int, int]] = {}
+            for index, matches in candidates.items():
+                if len(matches) > 1:
+                    reject_invalid_state(
+                        f"ambiguous secondary burst for frame {frame_index} "
+                        f"{swath} burst {index}"
+                    )
+                if matches:
+                    target = matches[0]
+                    identity = (target[0], swath, target[1])
+                    if identity in used:
+                        reject_invalid_state(
+                            "secondary burst matched to multiple Reference bursts"
+                        )
+                    used.add(identity)
+                    mapping[index] = target
+            if mapping:
+                common_aligned[(frame_index, swath)] = list(mapping)
+                secondary_map[(frame_index, swath)] = mapping
     if not common_aligned:
         reject_invalid_state("no common bursts between reference and secondary")
     return common_aligned, secondary_map
@@ -289,7 +311,7 @@ def _collect_overlap_windows(
     *,
     primary_orbit_path: Path | None,
     resolved: dict[tuple[int, str], list[int]],
-    secondary_map: dict[tuple[int, str], dict[int, int]],
+    secondary_map: dict[tuple[int, str], dict[int, tuple[int, int]]],
     swath_tuple: tuple[str, ...],
 ) -> tuple[tuple[int, str, BurstOverlapWindow], ...]:
     """Return overlap windows of the selected bursts, tagged by frame and swath.
@@ -318,12 +340,8 @@ def _collect_overlap_windows(
                     swath_name,
                     replace(
                         window,
-                        secondary_top_index=pairing.get(
-                            window.top_index, window.top_index
-                        ),
-                        secondary_bottom_index=pairing.get(
-                            window.bottom_index, window.bottom_index
-                        ),
+                        secondary_top_index=pairing[window.top_index][1],
+                        secondary_bottom_index=pairing[window.bottom_index][1],
                     ),
                 )
                 for window in burst_overlap_windows(swath, burst_indices=selected)
@@ -345,6 +363,7 @@ def _observe_overlap_window(
     secondary_path: Path,
     primary_product: S1Product,
     secondary_product: S1Product,
+    secondary_bottom_product: S1Product | None = None,
     swath_name: str,
     dem: DEM,
     coherence_threshold: float,
@@ -365,6 +384,7 @@ def _observe_overlap_window(
         secondary_path=secondary_path,
         primary_product=primary_product,
         secondary_product=secondary_product,
+        secondary_bottom_product=secondary_bottom_product,
         swath_name=swath_name,
         dem=dem,
         primary_orbit_path=primary_orbit_path,
@@ -391,6 +411,7 @@ def _geometry_resampled_overlap(
     secondary_path: Path,
     primary_product: S1Product,
     secondary_product: S1Product,
+    secondary_bottom_product: S1Product | None = None,
     swath_name: str,
     dem: DEM,
     primary_orbit_path: Path | None,
@@ -425,9 +446,10 @@ def _geometry_resampled_overlap(
             secondary_orbit_path,
             secondary_aux_cal_path,
         )
+        bottom_product = secondary_bottom_product or secondary_product
         sec_bot = _load_burst_scene(
-            secondary_path,
-            secondary_product,
+            bottom_product.source_path,
+            bottom_product,
             swath_name,
             int(window.secondary_bottom_index),
             secondary_orbit_path,
@@ -579,7 +601,9 @@ def _load_burst_scene(
     aux_cal_path: Path | None = None,
 ) -> ProductionScene:
     """Load one full-range burst with carrier and radar geometry."""
-    swath = _swath_with_orbit(product.swath(swath_name), orbit_path)
+    swath = _swath_with_orbit(
+        product.swath(swath_name).source_for_burst(burst_index), orbit_path
+    )
     (array,) = correct_eap_phase(
         product,
         swath,

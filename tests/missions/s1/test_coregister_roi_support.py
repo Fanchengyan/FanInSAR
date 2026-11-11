@@ -199,7 +199,8 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     scene.burst.footprint = _BURST_FOOTPRINT
     scene.burst.first_valid_sample = tuple([0] * _LINES)
     scene.burst.last_valid_sample = tuple([_SAMPLES - 1] * _LINES)
-    scene.swath = _product(path).swaths[0]
+    scene.product = _product(path)
+    scene.swath = scene.product.swaths[0]
     scene.geometry = _geometry()
     samples = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
     samples[_INTERIOR_ZERO] = np.complex64(0.0)

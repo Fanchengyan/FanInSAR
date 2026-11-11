@@ -9,7 +9,7 @@ import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
@@ -818,6 +818,8 @@ def load_production_scene(
     _ = dem
     product = open_safe_product(path) if product is None else product
     s1_swath = product.swath(swath)
+    if scope == "burst":
+        s1_swath = s1_swath.source_for_burst(burst_index)
     phase_binding = source_phase_binding(product, aux_cal_path=aux_cal_path)
     annotation_orbit = s1_swath.orbit
     source_orbits: dict[str, object] = {
@@ -3399,8 +3401,11 @@ def _auto_dem_bounds(
         shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
         for burst_index in indices:
             burst = s1_swath.bursts[burst_index]
+            burst_swath = s1_swath.source_for_burst(burst_index)
+            if orbit_path is not None:
+                burst_swath = _replace(burst_swath, orbit=s1_swath.orbit)
             geometry = _radar_model(
-                s1_swath,
+                burst_swath,
                 burst,
                 shape=shape,
                 row0=burst.index * s1_swath.lines_per_burst,
@@ -3558,8 +3563,11 @@ def _select_bursts_by_roi(
             indices: list[int] = []
             shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
             for burst in s1_swath.bursts:
+                burst_swath = s1_swath.source_for_burst(burst.index)
+                if orbit_path is not None:
+                    burst_swath = _replace(burst_swath, orbit=s1_swath.orbit)
                 geometry = _radar_model(
-                    s1_swath,
+                    burst_swath,
                     burst,
                     shape=shape,
                     row0=burst.index * s1_swath.lines_per_burst,
@@ -3698,11 +3706,6 @@ def _roi_burst_window(
     return row0, row1, col0, col1
 
 
-def _seconds_of_day(value: datetime) -> float:
-    midnight = value.replace(hour=0, minute=0, second=0, microsecond=0)
-    return (value - midnight).total_seconds()
-
-
 def _burst_anx_time_s(burst: S1Burst) -> float | None:
     """Return the burst along-track ascending-node time, or ``None``."""
     value = getattr(burst, "azimuth_anx_time_s", None)
@@ -3716,117 +3719,43 @@ def _burst_window_seconds(swath: S1Swath) -> float:
     return float(swath.lines_per_burst) * float(swath.azimuth_time_interval_s)
 
 
-def _burst_time_axis(
-    primary_swath: S1Swath,
-    secondary_swath: S1Swath,
-) -> tuple[list[float], list[float], bool]:
-    """Return per-burst along-track times for both swaths.
-
-    Prefers ``azimuth_anx_time_s`` (orbit position), which is identical for the
-    same ground strip across Sentinel-1 units.  Falls back to
-    ``azimuth_time`` seconds-of-day when either side lacks ANX times; in that
-    case the returned flag requests circular (same-day) comparison.
-    """
-    primary_anx = [_burst_anx_time_s(burst) for burst in primary_swath.bursts]
-    secondary_anx = [_burst_anx_time_s(burst) for burst in secondary_swath.bursts]
-    anx = [value for value in primary_anx + secondary_anx if value is not None]
-    # Use ANX times only when they carry per-burst discrimination: real
-    # products set them from the annotation, while stubs may leave a single
-    # constant (e.g. 0.0) on every burst.
-    if len(primary_anx + secondary_anx) == len(anx) and len(set(anx)) > 1:
-        return (
-            [float(value) for value in primary_anx],
-            [float(value) for value in secondary_anx],
-            False,
-        )
-    primary_tod = [
-        _seconds_of_day(burst.azimuth_time) if burst.azimuth_time is not None else None
-        for burst in primary_swath.bursts
-    ]
-    secondary_tod = [
-        _seconds_of_day(burst.azimuth_time) if burst.azimuth_time is not None else None
-        for burst in secondary_swath.bursts
-    ]
-    return (
-        [value if value is not None else np.nan for value in primary_tod],
-        [value if value is not None else np.nan for value in secondary_tod],
-        True,
-    )
-
-
-def _burst_absolute_id_map(swath: S1Swath) -> dict[int, int]:
-    """Return ``{absolute_burst_id: burst_index}`` for bursts that carry one.
-
-    ``absolute_burst_id`` is the mission-independent ESA identifier (stage-1
-    ``S1Burst.absolute_burst_id``): identical numbers on Sentinel-1A/B/C/D
-    mark the same along-track ground strip, so it is the exact pairing key
-    whenever the catalog supplied it.  Bursts parsed from annotation XML
-    alone keep ``None`` and are not mapped.
-    """
-    mapping: dict[int, int] = {}
-    for index, burst in enumerate(swath.bursts):
-        if burst.absolute_burst_id is None:
-            continue
-        mapping.setdefault(int(burst.absolute_burst_id), index)
-    return mapping
-
-
 def _common_burst_pairs(
     primary_swath: S1Swath,
     secondary_swath: S1Swath,
 ) -> dict[int, int]:
-    """Return ``{primary_index: secondary_index}`` for bursts sharing ground.
+    """Return unique ANX matches within half a burst window.
 
-    Two-tier matching:
-
-    1. **Exact ``absolute_burst_id`` match** — when a primary burst carries
-       a catalog absolute id *and* the secondary carries any ids, the same
-       id on the secondary is its pair, unconditionally (the id already
-       encodes the shared ground strip across S1A/B/C/D).  A primary *with*
-       an id but no same-id secondary is left unpaired rather than guessed.
-    2. **ANX/time-axis fallback** — reached whenever exact matching is
-       impossible: a primary burst whose ``absolute_burst_id`` is ``None``,
-       or a secondary product that carries no ids at all.  The primary is
-       matched to the nearest secondary burst in along-track position
-       (ISCE2 ``getBurstOffset`` model), accepted when the position gap is
-       within half of one burst's azimuth extent.  Products clipped to
-       different start lines — e.g. Sentinel-1C vs Sentinel-1D — still
-       resolve this way.
+    Callers must establish common track before calling. Absolute identifiers
+    remain source metadata and do not participate in repeat-pass matching.
+    Missing ANX values and ambiguous candidate assignments fail closed.
     """
-    secondary_by_id = _burst_absolute_id_map(secondary_swath)
-    pairs: dict[int, int] = {}
-    primary_axis, secondary_axis, circular = _burst_time_axis(
-        primary_swath, secondary_swath
+    if (primary_swath.swath, primary_swath.polarization) != (
+        secondary_swath.swath,
+        secondary_swath.polarization,
+    ):
+        return {}
+    tolerance = 0.5 * min(
+        _burst_window_seconds(primary_swath), _burst_window_seconds(secondary_swath)
     )
-    window_s = _burst_window_seconds(primary_swath)
-    tolerance = 0.5 * window_s
-    for primary_index, primary_time in enumerate(primary_axis):
-        primary_absolute = primary_swath.bursts[primary_index].absolute_burst_id
-        if primary_absolute is not None and secondary_by_id:
-            # Exact id pairing: the absolute id is the shared-ground key.
-            # Only enforced when the secondary carries ids too — an
-            # annotation-only secondary product falls back to ANX below so
-            # id-bearing path-SAFEs still pair with legacy products.
-            match = secondary_by_id.get(int(primary_absolute))
-            if match is not None:
-                pairs[primary_index] = match
-            continue
-        if not np.isfinite(primary_time):
-            pairs[primary_index] = primary_index
-            continue
-        best_index = -1
-        best_gap = np.inf
-        for secondary_index, secondary_time in enumerate(secondary_axis):
-            if not np.isfinite(secondary_time):
-                continue
-            gap = abs(primary_time - secondary_time)
-            if circular and gap > 12 * 3600:
-                gap = 24 * 3600 - gap
-            if gap < best_gap:
-                best_gap = gap
-                best_index = secondary_index
-        if best_index >= 0 and best_gap <= tolerance:
-            pairs[primary_index] = best_index
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        reject_invalid_state("burst matching requires a positive finite ANX tolerance")
+    primary_axis = [_burst_anx_time_s(burst) for burst in primary_swath.bursts]
+    secondary_axis = [_burst_anx_time_s(burst) for burst in secondary_swath.bursts]
+    if any(value is None for value in primary_axis + secondary_axis):
+        reject_invalid_state("burst matching requires finite ANX times")
+    candidates = {
+        index: [
+            other_index
+            for other_index, other_time in enumerate(secondary_axis)
+            if abs(float(time) - float(other_time)) <= tolerance
+        ]
+        for index, time in enumerate(primary_axis)
+    }
+    if any(len(matches) > 1 for matches in candidates.values()):
+        reject_invalid_state("ambiguous ANX burst matching")
+    pairs = {index: matches[0] for index, matches in candidates.items() if matches}
+    if len(set(pairs.values())) != len(pairs):
+        reject_invalid_state("ANX burst matching is not one-to-one")
     return pairs
 
 
