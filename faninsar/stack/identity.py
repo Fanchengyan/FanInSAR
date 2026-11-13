@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -48,14 +49,20 @@ from faninsar.stack.layout import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from faninsar.stack.session import Stack
 
 logger = setup_logger(__name__)
 
 STACK_IDENTITY_SCHEMA = "faninsar.stack.v1"
 STACK_JSON_NAME = "stack.json"
+WORKSPACE_SCHEMA_VERSION = 2
+"""Durable intent schema version (PROPOSAL-0088).
+
+Version 1 documents persisted resolved inputs/products only. Version 2 adds
+the normalized source request, mission targets, and an intent revision token.
+A version-1 document is adopted in place; a newer version is rejected rather
+than downgraded.
+"""
 
 # StackConfig fields that never enter ``stack.json``: runtime values
 # supplied per process at ``Stack.open`` and derived values recomputed
@@ -105,6 +112,7 @@ SAVED_EXTRA_KEYS = frozenset(
         "height",
         "height_m",
         "track_metadata",
+        "selected_footprints",
         "preparation_report",
         "preparation_dem_scope",
         "preparation_local_inputs",
@@ -438,8 +446,86 @@ def _input_record(path: Path, identity_dir: Path) -> dict[str, object]:
     }
 
 
+def endpoint_source_identity(stack: Stack, date_id: str) -> dict[str, object]:
+    """Return the cheap local identity of one NESD measurement endpoint.
+
+    The record names the actual source publication(s) of one date plus any
+    mission-owned source correction revision. It deliberately omits the Stack
+    date catalog, global Reference and every payload byte, so adding an
+    unrelated date or re-pinning the global Reference cannot invalidate an
+    already measured pair edge.
+
+    Parameters
+    ----------
+    stack : Stack
+        Prepared Stack owning the resolved catalog.
+    date_id : str
+        Endpoint date id.
+
+    Returns
+    -------
+    dict
+        Strict-JSON endpoint source identity.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the Stack inputs are not prepared or the endpoint is missing.
+
+    """
+    state = stack._inputs_state
+    if state is None:
+        reject_invalid_state("NESD endpoint identity requires prepared Stack inputs")
+    identity_dir = Path(stack.config.work_dir)
+    paths = tuple(state.catalog.paths_for(date_id))
+    if not paths:
+        reject_invalid_state(f"NESD endpoint {date_id} has no resolved source")
+    sources = []
+    for path in paths:
+        record = _input_record(Path(path), identity_dir)
+        record["name"] = Path(path).name
+        record.pop("path", None)
+        sources.append(record)
+    return {
+        "date": str(date_id),
+        "sources": sources,
+        "source_processing": dict(stack._source_processing_identity(date_id)),
+    }
+
+
+def auxiliary_input_identity(path: str | Path) -> dict[str, object]:
+    """Return the cheap identity of one orbit or AUX_CAL measurement input.
+
+    A missing auxiliary file is recorded by path only: the caller already
+    owns the prerequisite decision, and this helper never opens or hashes the
+    file.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Orbit or AUX_CAL path used by the measurement.
+
+    Returns
+    -------
+    dict
+        Strict-JSON identity with the path and, when present, its size.
+
+    """
+    target = Path(path)
+    try:
+        size = int(target.stat().st_size)
+    except OSError:
+        return {"path": str(target)}
+    return {"path": str(target), "size": size}
+
+
 def stack_identity(stack: Stack) -> dict[str, object]:
     """Build the ``stack.json`` document for one Stack.
+
+    The document carries the durable intent (normalized-like source request,
+    mission targets, and intent revision) alongside resolved inputs and planned
+    networks. A configured Stack whose inputs are not yet resolved writes empty
+    input and network sections rather than fabricating a catalog.
 
     Parameters
     ----------
@@ -450,7 +536,7 @@ def stack_identity(stack: Stack) -> dict[str, object]:
     -------
     dict
         The identity document: schema, mission, Reference, inputs, planned
-        Pair networks, and science configuration.
+        Pair networks, science configuration, and durable intent.
 
     Raises
     ------
@@ -461,16 +547,33 @@ def stack_identity(stack: Stack) -> dict[str, object]:
     """
     identity_dir = Path(stack.config.work_dir)
     science, extra = _science_and_extra(stack, identity_dir=identity_dir)
+    requested_science, requested_extra = _requested_science_and_extra(
+        stack._request_config, identity_dir=identity_dir
+    )
     config = stack.config
+    state = stack._inputs_state
+    resolved = state is not None
+    sources = (
+        {
+            date: [_input_record(Path(path), identity_dir) for path in paths]
+            for date, paths in state.catalog.paths.items()
+        }
+        if state is not None
+        else {}
+    )
     document = {
         "schema": STACK_IDENTITY_SCHEMA,
+        "schema_version": WORKSPACE_SCHEMA_VERSION,
+        "intent_revision": int(getattr(stack, "intent_revision", 0) or 0),
         "mission": type(stack).__name__,
-        "reference": stack.reference,
+        "identity_status": "resolved" if resolved else "configured",
+        "reference": (
+            state.reference if state is not None else _request_reference(stack)
+        ),
+        "request": _encode_request(stack.request, identity_dir=identity_dir),
+        "targets": _intent_targets(stack, identity_dir=identity_dir),
         "inputs": {
-            "sources": {
-                date: [_input_record(Path(path), identity_dir) for path in paths]
-                for date, paths in stack.catalog.paths.items()
-            },
+            "sources": sources,
             "orbits": {
                 date: _input_record(Path(path), identity_dir)
                 for date, path in _orbit_inputs(config).items()
@@ -480,15 +583,102 @@ def stack_identity(stack: Stack) -> dict[str, object]:
                 for date, path in _aux_cal_inputs(config).items()
             },
         },
-        "pairs": [f"{first}_{second}" for first, second in _pair_dates(stack.pairs)],
-        "misreg_pairs": [
-            f"{first}_{second}" for first, second in _pair_dates(stack.misreg_pairs)
-        ],
+        "pairs": (
+            [f"{first}_{second}" for first, second in _pair_dates(state.pairs)]
+            if state is not None
+            else []
+        ),
+        "misreg_pairs": (
+            [f"{first}_{second}" for first, second in _pair_dates(state.misreg_pairs)]
+            if state is not None
+            else []
+        ),
         "science": science,
         "science_extra": extra,
+        "requested_science": requested_science,
+        "requested_science_extra": requested_extra,
     }
     relativize_identity_paths(document, identity_dir)
     return document
+
+
+def _encode_request(request: Mapping[str, object], *, identity_dir: Path) -> object:
+    """Encode one mission source request as strict JSON.
+
+    The request is an intent value, not a result view: it must round-trip
+    without live provider sessions or filesystem handles.
+    """
+    from faninsar.stack.preparation import thaw
+
+    if not request:
+        return {}
+    return encode_value(thaw(request), identity_dir=identity_dir)
+
+
+def _requested_science_and_extra(
+    config: object, *, identity_dir: Path | None = None
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Encode the construction snapshot fixed by a factory.
+
+    Resolved values (automatic grid selection, a materialized DEM) appear in
+    ``science``; this snapshot keeps the caller's requested contract so a
+    repeated factory call compares against the same intent.
+    """
+    science: dict[str, object] = {}
+    for field in fields(config):
+        if field.name in UNSAVED_FIELDS:
+            continue
+        science[field.name] = encode_value(
+            getattr(config, field.name), identity_dir=identity_dir
+        )
+    extra = {
+        key: encode_value(config.extra[key], identity_dir=identity_dir)
+        for key in sorted(getattr(config, "extra", {}))
+        if key in SAVED_EXTRA_KEYS
+    }
+    from faninsar.remote.records import _sanitize
+
+    return _sanitize(science), _sanitize(extra)
+
+
+def _intent_targets(stack: Stack, *, identity_dir: Path) -> dict[str, object]:
+    """Encode mission-neutral selection targets independent of provider order."""
+    config = stack._request_config
+    return {
+        "roi": _encode_target(config.roi, identity_dir=identity_dir),
+        "swaths": _encode_target(config.swaths, identity_dir=identity_dir),
+        "bursts": _encode_target(
+            _plain_bursts(config.bursts), identity_dir=identity_dir
+        ),
+    }
+
+
+def _encode_target(value: object, *, identity_dir: Path) -> object:
+    """Encode one optional target value; ``None`` means the mission default."""
+    if value is None:
+        return None
+    return encode_value(value, identity_dir=identity_dir)
+
+
+def _plain_bursts(value: object) -> object:
+    """Replace ``range`` burst selectors with explicit lists for JSON."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_bursts(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_bursts(item) for item in value]
+    if isinstance(value, range):
+        return list(value)
+    return value
+
+
+def _request_reference(stack: Stack) -> str | None:
+    """Return the explicit request reference without resolving a catalog."""
+    request = stack.request
+    topology = request.get("topology") if isinstance(request, Mapping) else None
+    value = topology.get("reference") if isinstance(topology, Mapping) else None
+    if value is None and isinstance(request, Mapping):
+        value = request.get("reference")
+    return None if value is None else str(value)
 
 
 def _science_and_extra(
@@ -589,21 +779,53 @@ def save_stack_identity(stack: Stack) -> Path:
                 sub_document,
             )
         science, extra = _science_and_extra(stack, identity_dir=work_dir)
+        requested_science, requested_extra = _requested_science_and_extra(
+            stack._request_config, identity_dir=work_dir
+        )
         for field_name in TRACK_OWNED_SCIENCE_FIELDS:
             science.pop(field_name, None)
+            requested_science.pop(field_name, None)
         document = {
             "schema": STACK_IDENTITY_SCHEMA,
+            "schema_version": WORKSPACE_SCHEMA_VERSION,
+            "intent_revision": int(getattr(stack, "intent_revision", 0) or 0),
             "mission": type(stack).__name__,
             "tracks": list(track_keys),
+            "request": _encode_request(stack.request, identity_dir=work_dir),
+            "targets": _intent_targets(stack, identity_dir=work_dir),
             "science": science,
             "science_extra": extra,
+            "requested_science": requested_science,
+            "requested_science_extra": requested_extra,
         }
         relativize_identity_paths(document, work_dir)
     else:
         document = stack_identity(stack)
+    _normalize_saved_request(stack, document)
     target = _write_stack_document(work_dir / STACK_JSON_NAME, document)
     logger.info("Saved Stack identity %s", target)
     return target
+
+
+def _normalize_saved_request(stack: Stack, document: dict[str, object]) -> None:
+    """Store the durable source request as plain normalized JSON intent.
+
+    Preparation installs cumulative snapshots through this writer rather than
+    the factory publication path. Both must expose the same authoritative
+    request shape so a later reopen cannot compare an encoded tuple envelope
+    against a decoded current request.
+    """
+    from faninsar.stack.workspace import normalize_request
+
+    request = document.get("request")
+    if not isinstance(request, Mapping):
+        return
+    try:
+        document["request"] = normalize_request(
+            type(stack).__name__, decode_value(dict(request))
+        )
+    except (TypeError, ValueError):
+        return
 
 
 def _write_stack_document(path: Path, document: dict[str, object]) -> Path:
@@ -753,6 +975,18 @@ def read_stack_identity(work_dir: str | Path) -> dict[str, object]:
         message = (
             f"{path} is not a FanInSAR Stack identity; rebuild this work "
             "directory with the current FanInSAR version"
+        )
+        reject_invalid_state(message)
+    version = document.get("schema_version")
+    if (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version > WORKSPACE_SCHEMA_VERSION
+    ):
+        message = (
+            f"{path} records workspace schema version {version}, newer than "
+            f"this FanInSAR supports ({WORKSPACE_SCHEMA_VERSION}); use a matching "
+            "FanInSAR version instead of downgrading the workspace"
         )
         reject_invalid_state(message)
     return merge_track_documents(Path(work_dir), document, strict=True)

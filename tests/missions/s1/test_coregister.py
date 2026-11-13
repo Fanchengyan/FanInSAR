@@ -241,9 +241,8 @@ def _fake_scene(path: Path, scene_id: str) -> MagicMock:
     return scene
 
 
-@pytest.fixture
-def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
-    """Patch SAFE access and the numerical stages with deterministic fakes."""
+def _install_fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
+    """Patch SAFE access and numerical stages with deterministic fixtures."""
     recorder = _Recorder()
     names = (REFERENCE, *SECONDARIES)
     products = {tmp_path / name: _product(tmp_path / name) for name in names}
@@ -298,6 +297,12 @@ def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
         _linear_rdr2geo,
     )
     return recorder
+
+
+@pytest.fixture
+def fake_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
+    """Patch SAFE access and the numerical stages with deterministic fakes."""
+    return _install_fake_s1(tmp_path, monkeypatch)
 
 
 def _prepare(tmp_path: Path, **kwargs: object) -> S1ReferenceContext:
@@ -359,10 +364,51 @@ def test_reference_is_read_and_deramped_once_across_dates(
         assert kwargs["misreg_rg_px"] == pytest.approx(-0.02)
 
 
+def test_committed_scene_unit_is_replayed_without_recomputation(
+    tmp_path: Path, fake_s1: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed per-burst unit is reused instead of resampled again."""
+    del fake_s1
+    context = _prepare(tmp_path)
+    checkpoint_root = tmp_path / "unit-checkpoints"
+    output = tmp_path / "coreg" / "20200113"
+    first = coregister_s1_secondary(
+        context,
+        tmp_path / SECONDARIES[0],
+        output_scene=output,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+        checkpoint_root=checkpoint_root,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("recomputed a committed scientific unit")
+
+    monkeypatch.setattr(coreg_module, "_coregister_unit", forbidden)
+    second = coregister_s1_secondary(
+        context,
+        tmp_path / SECONDARIES[0],
+        output_scene=output,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+        overwrite=True,
+        checkpoint_root=checkpoint_root,
+    )
+
+    assert first.write_id != second.write_id
+    np.testing.assert_array_equal(
+        first.read("f0_IW1_b0")[0], second.read("f0_IW1_b0")[0]
+    )
+    committed = list(checkpoint_root.glob("20200113*_IW1_b0_*"))
+    assert len(committed) == 1
+    assert (committed[0] / "item.json").is_file()
+
+
 def test_secondary_keeps_its_own_different_source_absolute_id(
     tmp_path: Path, fake_s1: _Recorder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Distinct source observations retain their own IDs after ANX matching."""
+    del fake_s1
     from dataclasses import replace
 
     original = coreg_module.load_production_scene

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -27,8 +28,13 @@ from faninsar.io.storage.scene_store import (
     scene_grid_identity,
     valid_samples,
 )
+from faninsar.io.storage.unit_checkpoint import (
+    UnitCheckpointStore,
+    UnitPayloads,
+)
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import (
+    InvalidProcessingStateError,
     reject_invalid_state,
     reject_pair_configuration,
 )
@@ -42,6 +48,7 @@ from faninsar.stack.provider import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
+    from faninsar.io.storage.unit_checkpoint import UnitCheckpoint
     from faninsar.processing.geocoding.geocoder import Geocoder
     from faninsar.processing.geometry import DEM
     from faninsar.processing.slc.products import SLCProduct
@@ -58,12 +65,14 @@ def _source_id(path: Path) -> str:
 def _dem_identity(dem: object) -> str:
     """Return a stable, human-readable identity for a geometry DEM."""
     qualified_name = f"{type(dem).__module__}.{type(dem).__qualname__}"
-    height = getattr(dem, "height_m", None)
+    height = getattr(dem, "height_m", getattr(dem, "height", None))
     if height is not None:
+        datum = getattr(dem, "vertical_datum", None)
+        suffix = "" if datum is None else f":datum={datum}"
         try:
-            return f"{qualified_name}:height_m={float(height):.17g}"
+            return f"{qualified_name}:height_m={float(height):.17g}{suffix}"
         except (TypeError, ValueError):
-            return f"{qualified_name}:height_m={height!r}"
+            return f"{qualified_name}:height_m={height!r}{suffix}"
     for name in ("content_digest", "source_digest", "sha256"):
         digest = getattr(dem, name, None)
         if isinstance(digest, str) and digest:
@@ -730,6 +739,201 @@ def _tile_resume_identity(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _require_checkpoint_policy(
+    checkpoint_root: Path | None,
+    verification: str,
+    integrity_root: Path | None,
+) -> None:
+    """Validate the opt-in NISAR tile checkpoint policy."""
+    if verification not in {"fast", "strict"}:
+        reject_invalid_state(
+            f"verification must be 'fast' or 'strict', got {verification!r}"
+        )
+    if verification == "strict" and (checkpoint_root is None or integrity_root is None):
+        reject_invalid_state(
+            "strict NISAR checkpoint verification requires both checkpoint_root "
+            "and integrity_root"
+        )
+
+
+def _checkpoint_token(value: object) -> str:
+    """Return a safe single-component checkpoint locator token."""
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return text or "unit"
+
+
+def _tile_unit_locator(
+    role: str,
+    date_id: str,
+    channel: tuple[str, str],
+    window: tuple[int, int, int, int],
+) -> str:
+    """Return the stable locator for one absolute source window.
+
+    The local tile index is deliberately absent: extending a request can shift
+    that index while the physical source window stays unchanged.
+    """
+    row_start, row_stop, col_start, col_stop = window
+    return _checkpoint_token(
+        f"nisar-{role}-{date_id}-{channel[0]}{channel[1]}-"
+        f"r{row_start}_{row_stop}-c{col_start}_{col_stop}"
+    )
+
+
+def _orbit_metadata_identity(orbit: object) -> dict[str, object] | None:
+    """Return cheap orbit provenance for one source without payload hashing."""
+    if orbit is None:
+        return None
+    vectors = tuple(getattr(orbit, "vectors", ()) or ())
+    first = getattr(vectors[0], "time", None) if vectors else None
+    last = getattr(vectors[-1], "time", None) if vectors else None
+    return {
+        "reference_frame": getattr(orbit, "reference_frame", None),
+        "source": getattr(orbit, "source", None),
+        "vector_count": len(vectors),
+        "first_time": None if first is None else first.isoformat(),
+        "last_time": None if last is None else last.isoformat(),
+    }
+
+
+def _tile_checkpoint_specification(
+    *,
+    role: str,
+    date_id: str,
+    reference_id: str,
+    domain: str,
+    tile_bounds: tuple[int, int, int, int],
+    tile_output_shape: tuple[int, int],
+    tile_shape: tuple[int, int] | None,
+    grid_shape: tuple[int, int],
+    grid_identity: str,
+    channel: tuple[str, str],
+    dem_identity: str,
+    geometry: str,
+    flatten_stage: str,
+    source: str,
+    admission: Mapping[str, object],
+    orbit: Mapping[str, object] | None,
+    reference_unit: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the small scientific specification of one NISAR tile unit."""
+    specification: dict[str, object] = {
+        "schema": "nisar_scene_tile_checkpoint_v1",
+        "role": role,
+        "date": date_id,
+        "reference_id": reference_id,
+        "domain": domain,
+        "tile_window": list(tile_bounds),
+        "tile_output_shape": list(tile_output_shape),
+        "tile_shape": None if tile_shape is None else list(tile_shape),
+        "grid_shape": list(grid_shape),
+        "grid_identity": grid_identity,
+        "channel": list(channel),
+        "dem_identity": dem_identity,
+        "geometry": geometry,
+        "source": source,
+        "admission": dict(admission),
+        "orbit": None if orbit is None else dict(orbit),
+        "correction": {
+            "range_offset_flatten": "nisar_ellipsoidal_v1",
+            "flatten_stage": flatten_stage,
+        },
+    }
+    if reference_unit is not None:
+        specification["reference_unit"] = dict(reference_unit)
+    return specification
+
+
+def _specification_identity(payload: Mapping[str, object]) -> str:
+    """Return the canonical small-metadata identity of one tile specification."""
+    return _tile_resume_identity(payload)
+
+
+def _checkpoint_lineage(entry: Mapping[str, object]) -> dict[str, str]:
+    """Return one checkpoint lineage record with only string values."""
+    lineage: dict[str, str] = {}
+    for key, value in entry.items():
+        if value is None:
+            continue
+        lineage[str(key)] = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, sort_keys=True, separators=(",", ":"))
+        )
+    return lineage
+
+
+def _load_reusable_checkpoint(
+    store: UnitCheckpointStore,
+    unit_id: str,
+    specification: Mapping[str, object],
+) -> UnitCheckpoint | None:
+    """Load one committed tile, treating a structural rejection as a miss."""
+    try:
+        return store.load(unit_id, specification)
+    except InvalidProcessingStateError as error:
+        logger.warning(
+            "%s: committed NISAR checkpoint is not reusable (%s); recomputing",
+            unit_id,
+            error,
+        )
+        return None
+
+
+def _verify_committed_checkpoint(
+    checkpoint: UnitCheckpoint,
+    *,
+    integrity_root: Path,
+) -> bool:
+    """Return whether strict bytes match this checkpoint's own baseline."""
+    from faninsar.stack.integrity import verify_integrity
+
+    verdict = verify_integrity(
+        integrity_root,
+        checkpoint.path,
+        strict=True,
+        write_id=checkpoint.write_id,
+    )
+    return verdict.status == "verified"
+
+
+def _establish_committed_checkpoint(
+    checkpoint: UnitCheckpoint,
+    *,
+    integrity_root: Path,
+) -> None:
+    """Record a strict baseline immediately after a new checkpoint commit."""
+    from faninsar.stack.integrity import establish_integrity
+
+    establish_integrity(integrity_root, checkpoint.path, write_id=checkpoint.write_id)
+
+
+def _replay_tile_checkpoint(
+    writer: SceneWriter,
+    checkpoint: UnitCheckpoint,
+    *,
+    tag: str,
+    row_origin: int,
+    col_origin: int,
+) -> None:
+    """Replay committed NISAR arrays at the current scene placement."""
+    phase_state = checkpoint.phase_state or {}
+    phase_screen = (
+        checkpoint.read_phase()
+        if phase_state.get("flatten_stage") == "interferogram"
+        else None
+    )
+    writer.add_unit(
+        tag=tag,
+        payload=checkpoint.read_slc(),
+        row_origin=int(row_origin),
+        col_origin=int(col_origin),
+        scientific_lineage=checkpoint.scientific_lineage,
+        phase_state=checkpoint.phase_state,
+        phase_screen=phase_screen,
+    )
+
+
 def _read_padded_window(
     sensor: Any,
     handle: object,
@@ -1070,6 +1274,9 @@ def make_nisar_scene_provider(
     configured_height: float | None = None,
     flatten_stage: str = "coregistration",
     admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
+    checkpoint_root: Path | None = None,
+    integrity_root: Path | None = None,
+    verification: str = "fast",
     **legacy: object,
 ) -> SceneProductionCallback:
     """Build a callback that publishes one bounded or full NISAR pair scene.
@@ -1102,6 +1309,15 @@ def make_nisar_scene_provider(
         Date-keyed source identity and optional inventory metadata.  It is
         copied into the scene manifest so canonical source id, channel, and
         policy survive stack publication.  It is not a content snapshot.
+    checkpoint_root : pathlib.Path, optional
+        Local root of committed NISAR tile checkpoints. ``None`` keeps the
+        previous recompute-only behavior.
+    integrity_root : pathlib.Path, optional
+        Strict integrity baselines owned by the Stack workspace. Required only
+        when ``verification="strict"``.
+    verification : {"fast", "strict"}, optional
+        Checkpoint reuse policy. ``strict`` rereads committed tile payloads
+        against their baselines and is never the default.
     **legacy : object
         Removed keyword arguments. The old ``master`` keyword is rejected with
         a migration error.
@@ -1124,6 +1340,14 @@ def make_nisar_scene_provider(
         reject_invalid_state(
             "NISAR flatten_stage must be 'coregistration' or 'interferogram'"
         )
+    _require_checkpoint_policy(
+        None if checkpoint_root is None else Path(checkpoint_root),
+        verification,
+        None if integrity_root is None else Path(integrity_root),
+    )
+    checkpoint_store = (
+        None if checkpoint_root is None else UnitCheckpointStore(Path(checkpoint_root))
+    )
 
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
     admission_lineage = dict(admission_lineage or {})
@@ -1290,35 +1514,14 @@ def make_nisar_scene_provider(
             np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
         )
         pair_valid_pixels = 0
+        geometry_method = (
+            "per_pixel_rdr2geo_geo2rdr_lanczos4" if full_scene else "bounded_window"
+        )
+        reuse_checkpoints = checkpoint_store is not None and not bool(
+            options.get("overwrite", False)
+        )
         for tile_index, tile_bounds in enumerate(tiles):
-            dense_mapping: _DenseRadarMapping | None = None
-            if full_scene:
-                dense_mapping = _dense_secondary_mapping(
-                    primary_product,
-                    secondary_product,
-                    tile_bounds,
-                    device=device,
-                    dem=mapping_dem,
-                )
-                secondary_bounds = dense_mapping.source_bounds
-            else:
-                secondary_bounds = _shared_radar_window(
-                    primary_product.grid,
-                    secondary_product.grid,
-                    tile_bounds,
-                    primary_product=primary_product,
-                    secondary_product=secondary_product,
-                    device=device,
-                    dem=mapping_dem,
-                    height_m=mapping_height,
-                )
             row_start, row_stop, col_start, col_stop = tile_bounds
-            if secondary_bounds is None:
-                sec_row_start = sec_row_stop = sec_col_start = sec_col_stop = 0
-            else:
-                sec_row_start, sec_row_stop, sec_col_start, sec_col_stop = (
-                    secondary_bounds
-                )
             tag = "NISAR_b0" if not full_scene else f"NISAR_b{tile_index:06d}"
             if domain == "radar":
                 local_target = None
@@ -1340,6 +1543,158 @@ def make_nisar_scene_provider(
                     row_origin = 0
                     col_origin = 0
                 tile_output_shape = local_target.shape
+            reference_locator = _tile_unit_locator(
+                "reference", primary_date, channel, tile_bounds
+            )
+            secondary_locator = _tile_unit_locator(
+                "secondary", secondary_date, channel, tile_bounds
+            )
+            reference_specification = _tile_checkpoint_specification(
+                role="reference",
+                date_id=primary_date,
+                reference_id=reference,
+                domain=domain,
+                tile_bounds=tile_bounds,
+                tile_output_shape=tile_output_shape,
+                tile_shape=resolved_tile_shape,
+                grid_shape=tuple(grid_shape),
+                grid_identity=grid_identity,
+                channel=channel,
+                dem_identity=dem_identity,
+                geometry=geometry_method,
+                flatten_stage=requested_flatten_stage,
+                source=admitted_sources[primary_date],
+                admission=admission_lineage.get(primary_date, {}),
+                orbit=_orbit_metadata_identity(primary_product.orbit),
+            )
+            secondary_specification = _tile_checkpoint_specification(
+                role="secondary",
+                date_id=secondary_date,
+                reference_id=reference,
+                domain=domain,
+                tile_bounds=tile_bounds,
+                tile_output_shape=tile_output_shape,
+                tile_shape=resolved_tile_shape,
+                grid_shape=tuple(grid_shape),
+                grid_identity=grid_identity,
+                channel=channel,
+                dem_identity=dem_identity,
+                geometry=geometry_method,
+                flatten_stage=requested_flatten_stage,
+                source=admitted_sources[secondary_date],
+                admission=admission_lineage.get(secondary_date, {}),
+                orbit=_orbit_metadata_identity(secondary_product.orbit),
+                reference_unit={
+                    "locator": reference_locator,
+                    "specification_id": _specification_identity(
+                        reference_specification
+                    ),
+                },
+            )
+            reference_checkpoint = None
+            secondary_checkpoint = None
+            if reuse_checkpoints:
+                assert checkpoint_store is not None
+                reference_checkpoint = _load_reusable_checkpoint(
+                    checkpoint_store,
+                    reference_locator,
+                    reference_specification,
+                )
+                if (
+                    reference_checkpoint is not None
+                    and verification == "strict"
+                    and not _verify_committed_checkpoint(
+                        reference_checkpoint,
+                        integrity_root=Path(integrity_root),  # type: ignore[arg-type]
+                    )
+                ):
+                    logger.warning(
+                        "%s: strict integrity did not verify the committed tile; "
+                        "recomputing it",
+                        reference_locator,
+                    )
+                    reference_checkpoint = None
+                secondary_checkpoint = _load_reusable_checkpoint(
+                    checkpoint_store,
+                    secondary_locator,
+                    secondary_specification,
+                )
+                if (
+                    secondary_checkpoint is not None
+                    and verification == "strict"
+                    and not _verify_committed_checkpoint(
+                        secondary_checkpoint,
+                        integrity_root=Path(integrity_root),  # type: ignore[arg-type]
+                    )
+                ):
+                    logger.warning(
+                        "%s: strict integrity did not verify the committed tile; "
+                        "recomputing it",
+                        secondary_locator,
+                    )
+                    secondary_checkpoint = None
+            if reference_checkpoint is not None and secondary_checkpoint is not None:
+                primary_array = reference_checkpoint.read_slc()
+                if reference_writer is not None:
+                    _replay_tile_checkpoint(
+                        reference_writer,
+                        reference_checkpoint,
+                        tag=tag,
+                        row_origin=row_origin,
+                        col_origin=col_origin,
+                    )
+                if domain == "geo":
+                    assert reference_claimed is not None
+                    row_slice = slice(row_origin, row_origin + tile_output_shape[0])
+                    col_slice = slice(col_origin, col_origin + tile_output_shape[1])
+                    reference_claimed[row_slice, col_slice] |= valid_samples(
+                        primary_array
+                    )
+                _replay_tile_checkpoint(
+                    secondary_writer,
+                    secondary_checkpoint,
+                    tag=tag,
+                    row_origin=row_origin,
+                    col_origin=col_origin,
+                )
+                pair_valid_pixels += int(
+                    np.sum(
+                        valid_samples(primary_array)
+                        & valid_samples(secondary_checkpoint.read_slc())
+                    )
+                )
+                continue
+            # A secondary unit is bound to the Reference unit it consumed, so
+            # it is only replayed together with that Reference tile.  A
+            # Reference recomputation recomputes this secondary locally.
+            secondary_checkpoint = None
+            dense_mapping: _DenseRadarMapping | None = None
+            if full_scene:
+                dense_mapping = _dense_secondary_mapping(
+                    primary_product,
+                    secondary_product,
+                    tile_bounds,
+                    device=device,
+                    dem=mapping_dem,
+                )
+                secondary_bounds = dense_mapping.source_bounds
+            else:
+                secondary_bounds = _shared_radar_window(
+                    primary_product.grid,
+                    secondary_product.grid,
+                    tile_bounds,
+                    primary_product=primary_product,
+                    secondary_product=secondary_product,
+                    device=device,
+                    dem=mapping_dem,
+                    height_m=mapping_height,
+                )
+            if secondary_bounds is None:
+                sec_row_start = sec_row_stop = sec_col_start = sec_col_stop = 0
+            else:
+                sec_row_start, sec_row_stop, sec_col_start, sec_col_stop = (
+                    secondary_bounds
+                )
             resume_payload = {
                 "schema": "nisar_scene_tile_v2",
                 "primary_date": primary_date,
@@ -1360,11 +1715,7 @@ def make_nisar_scene_provider(
                     "python": ".".join(str(item) for item in sys.version_info[:3]),
                     "numpy": np.__version__,
                 },
-                "geometry": (
-                    "per_pixel_rdr2geo_geo2rdr_lanczos4"
-                    if full_scene
-                    else "bounded_window"
-                ),
+                "geometry": geometry_method,
                 "secondary_source_bounds": (
                     None if secondary_bounds is None else list(secondary_bounds)
                 ),
@@ -1376,13 +1727,20 @@ def make_nisar_scene_provider(
                 slice(row_start, row_stop),
                 slice(col_start, col_stop),
             )
+            reference_from_checkpoint = reference_checkpoint is not None
+            # Geo still needs the Reference radar samples for its solve; the
+            # committed Geo payload replaces the recomputed Geo pixels.
+            needs_primary_samples = not reference_from_checkpoint or domain == "geo"
             try:
-                primary_samples = sensor.read_slc_window(
-                    handles[primary_source],
-                    primary_window,
-                    frequency=channel[0],
-                    polarization=channel[1],
-                )
+                if needs_primary_samples:
+                    primary_samples = sensor.read_slc_window(
+                        handles[primary_source],
+                        primary_window,
+                        frequency=channel[0],
+                        polarization=channel[1],
+                    )
+                else:
+                    primary_samples = None
                 if secondary_bounds is not None:
                     secondary_samples = _read_padded_window(
                         sensor,
@@ -1395,7 +1753,17 @@ def make_nisar_scene_provider(
                     secondary_samples = None
             except KeyError as error:
                 reject_invalid_state(f"NISAR source handle is unavailable: {error}")
-            primary_radar = _radar_crop(primary_product, primary_samples, tile_bounds)
+            if primary_samples is not None:
+                primary_radar = _radar_crop(
+                    primary_product, primary_samples, tile_bounds
+                )
+            else:
+                assert reference_checkpoint is not None
+                primary_radar = _radar_crop(
+                    primary_product,
+                    np.asarray(reference_checkpoint.read_slc(), dtype=np.complex64),
+                    tile_bounds,
+                )
             if full_scene:
                 assert dense_mapping is not None
                 if secondary_samples is None:
@@ -1534,6 +1902,11 @@ def make_nisar_scene_provider(
                         dem=mapping_dem,
                         geocoder=tile_geocoder,
                     )
+                    if reference_from_checkpoint:
+                        assert reference_checkpoint is not None
+                        primary_array = np.asarray(
+                            reference_checkpoint.read_slc(), dtype=np.complex64
+                        )
                     if requested_flatten_stage == "interferogram":
                         phase_factor = np.exp(1j * range_offset_phase).astype(
                             np.complex64,
@@ -1555,12 +1928,18 @@ def make_nisar_scene_provider(
                         )
                         range_offset_phase = _sanitize_phase_screen(range_offset_phase)
                 else:
-                    primary_array = primary_radar.rdr2geo(
-                        device=device,
-                        dem=mapping_dem,
-                        geo_grid=local_target,
-                        use_cache=False,
-                    ).samples
+                    if reference_from_checkpoint:
+                        assert reference_checkpoint is not None
+                        primary_array = np.asarray(
+                            reference_checkpoint.read_slc(), dtype=np.complex64
+                        )
+                    else:
+                        primary_array = primary_radar.rdr2geo(
+                            device=device,
+                            dem=mapping_dem,
+                            geo_grid=local_target,
+                            use_cache=False,
+                        ).samples
                     secondary_array = secondary_radar.rdr2geo(
                         device=device,
                         dem=mapping_dem,
@@ -1591,7 +1970,7 @@ def make_nisar_scene_provider(
                 col_slice = slice(col_origin, col_origin + tile_output_shape[1])
                 # Ownership is decided by the Reference alone, so its tiles are
                 # identical for every secondary; the secondary follows them.
-                if reference_store is not None:
+                if reference_store is not None and not reference_from_checkpoint:
                     primary_array = _persisted_reference_tile(
                         reference_store, tag, tile_output_shape
                     )
@@ -1612,7 +1991,11 @@ def make_nisar_scene_provider(
                     np.complex64(np.nan + 1j * np.nan),
                 )
                 reference_claimed[row_slice, col_slice] |= reference_owner
-            if domain == "radar" and reference_store is not None:
+            if (
+                domain == "radar"
+                and reference_store is not None
+                and not reference_from_checkpoint
+            ):
                 primary_array = _persisted_reference_tile(
                     reference_store, tag, tile_output_shape
                 )
@@ -1621,54 +2004,39 @@ def make_nisar_scene_provider(
             coverage_policy = (
                 NISAR_GEO_COVERAGE_POLICY if domain == "geo" else "nan_mask_v1"
             )
-            reference_lineage = (
-                {
-                    "stage": "nisar_rslc_tile" if full_scene else "nisar_rslc_window",
-                    "source": str(primary_source),
-                    "source_id": admitted_sources[primary_date],
-                    "admission_policy": admission_lineage.get(primary_date, {}).get(
-                        "policy"
-                    ),
-                    "channel": f"{channel[0]}/{channel[1]}",
-                    "lineage": "primary",
-                    "dem_identity": dem_identity,
-                    "tile_grid": (
-                        None
-                        if local_target is None
-                        else {
-                            "crs": str(local_target.crs),
-                            "transform": [
-                                float(value) for value in local_target.transform
-                            ],
-                        }
-                    ),
-                    "window": f"{row_start}:{row_stop},{col_start}:{col_stop}",
-                },
+            tile_grid = (
+                None
+                if local_target is None
+                else {
+                    "crs": str(local_target.crs),
+                    "transform": [float(value) for value in local_target.transform],
+                }
             )
-            if reference_writer is not None:
-                reference_writer.add_unit(
-                    tag=tag,
-                    payload=primary_array,
-                    row_origin=row_origin,
-                    col_origin=col_origin,
-                    scientific_lineage=reference_lineage,
-                    phase_state={
-                        "coverage_policy": coverage_policy,
-                        "geometry_method": resume_payload["geometry"],
-                        "flatten_stage": requested_flatten_stage,
-                        "valid_pixels": int(np.sum(valid_samples(primary_array))),
-                    },
-                )
-            secondary_writer.add_unit(
-                tag=tag,
-                payload=secondary_array,
-                row_origin=row_origin,
-                col_origin=col_origin,
-                scientific_lineage=(
+            reference_lineage = (
+                _checkpoint_lineage(
                     {
-                        "stage": "nisar_rslc_tile"
-                        if full_scene
-                        else "nisar_rslc_window",
+                        "stage": (
+                            "nisar_rslc_tile" if full_scene else "nisar_rslc_window"
+                        ),
+                        "source": str(primary_source),
+                        "source_id": admitted_sources[primary_date],
+                        "admission_policy": admission_lineage.get(primary_date, {}).get(
+                            "policy"
+                        ),
+                        "channel": f"{channel[0]}/{channel[1]}",
+                        "lineage": "primary",
+                        "dem_identity": dem_identity,
+                        "tile_grid": tile_grid,
+                        "window": f"{row_start}:{row_stop},{col_start}:{col_stop}",
+                    }
+                ),
+            )
+            secondary_lineage = (
+                _checkpoint_lineage(
+                    {
+                        "stage": (
+                            "nisar_rslc_tile" if full_scene else "nisar_rslc_window"
+                        ),
                         "source": str(secondary_source),
                         "source_id": admitted_sources[secondary_date],
                         "admission_policy": admission_lineage.get(
@@ -1677,16 +2045,7 @@ def make_nisar_scene_provider(
                         "channel": f"{channel[0]}/{channel[1]}",
                         "lineage": "secondary",
                         "dem_identity": dem_identity,
-                        "tile_grid": (
-                            None
-                            if local_target is None
-                            else {
-                                "crs": str(local_target.crs),
-                                "transform": [
-                                    float(value) for value in local_target.transform
-                                ],
-                            }
-                        ),
+                        "tile_grid": tile_grid,
                         "range_offset_flatten": "nisar_ellipsoidal_v1",
                         "flatten_stage": requested_flatten_stage,
                         "window": (
@@ -1697,33 +2056,117 @@ def make_nisar_scene_provider(
                                 f"{sec_col_start}:{sec_col_stop}"
                             )
                         ),
-                    },
-                ),
-                phase_state={
-                    "tile_identity": resume_identity,
-                    "coverage_policy": coverage_policy,
-                    "geometry_method": resume_payload["geometry"],
-                    "range_offset_flatten": "nisar_ellipsoidal_v1",
-                    "flatten_stage": requested_flatten_stage,
-                    "range_offset_phase_sign": "ifg_exp_minus_j_phase",
-                    "range_offset_phase_model": (
-                        "phase=4*pi*range_spacing/wavelength*(secondary-reference)"
-                    ),
-                    "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
-                    "valid_pixels": int(np.sum(valid_samples(secondary_array))),
-                    "pair_valid_pixels": int(
-                        np.sum(
-                            valid_samples(primary_array)
-                            & valid_samples(secondary_array)
-                        )
-                    ),
-                },
-                phase_screen=(
-                    range_offset_phase
-                    if requested_flatten_stage == "interferogram"
-                    else None
+                    }
                 ),
             )
+            reference_phase_state = {
+                "coverage_policy": coverage_policy,
+                "geometry_method": resume_payload["geometry"],
+                "flatten_stage": requested_flatten_stage,
+                "valid_pixels": int(np.sum(valid_samples(primary_array))),
+            }
+            secondary_phase_state = {
+                "tile_identity": resume_identity,
+                "coverage_policy": coverage_policy,
+                "geometry_method": resume_payload["geometry"],
+                "range_offset_flatten": "nisar_ellipsoidal_v1",
+                "flatten_stage": requested_flatten_stage,
+                "range_offset_phase_sign": "ifg_exp_minus_j_phase",
+                "range_offset_phase_model": (
+                    "phase=4*pi*range_spacing/wavelength*(secondary-reference)"
+                ),
+                "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
+                "valid_pixels": int(np.sum(valid_samples(secondary_array))),
+                "pair_valid_pixels": int(
+                    np.sum(
+                        valid_samples(primary_array) & valid_samples(secondary_array)
+                    )
+                ),
+            }
+            if checkpoint_store is not None:
+                if reference_checkpoint is None:
+                    reference_checkpoint = checkpoint_store.commit(
+                        reference_locator,
+                        reference_specification,
+                        payloads=UnitPayloads(
+                            slc=primary_array,
+                            row_origin=row_origin,
+                            col_origin=col_origin,
+                            scientific_lineage=reference_lineage,
+                            phase_state=reference_phase_state,
+                        ),
+                        properties={"tag": tag},
+                    )
+                    if verification == "strict":
+                        _establish_committed_checkpoint(
+                            reference_checkpoint,
+                            integrity_root=Path(integrity_root),  # type: ignore[arg-type]
+                        )
+                if reference_writer is not None:
+                    _replay_tile_checkpoint(
+                        reference_writer,
+                        reference_checkpoint,
+                        tag=tag,
+                        row_origin=row_origin,
+                        col_origin=col_origin,
+                    )
+                secondary_checkpoint = checkpoint_store.commit(
+                    secondary_locator,
+                    secondary_specification,
+                    payloads=UnitPayloads(
+                        slc=secondary_array,
+                        row_origin=row_origin,
+                        col_origin=col_origin,
+                        phase=(
+                            np.asarray(range_offset_phase, dtype=np.float32)
+                            if np.shape(range_offset_phase) == secondary_array.shape
+                            else None
+                        ),
+                        scientific_lineage=secondary_lineage,
+                        phase_state=secondary_phase_state,
+                    ),
+                    properties={
+                        "tag": tag,
+                        "secondary_source_bounds": (
+                            None if secondary_bounds is None else list(secondary_bounds)
+                        ),
+                    },
+                )
+                if verification == "strict":
+                    _establish_committed_checkpoint(
+                        secondary_checkpoint,
+                        integrity_root=Path(integrity_root),  # type: ignore[arg-type]
+                    )
+                _replay_tile_checkpoint(
+                    secondary_writer,
+                    secondary_checkpoint,
+                    tag=tag,
+                    row_origin=row_origin,
+                    col_origin=col_origin,
+                )
+            else:
+                if reference_writer is not None:
+                    reference_writer.add_unit(
+                        tag=tag,
+                        payload=primary_array,
+                        row_origin=row_origin,
+                        col_origin=col_origin,
+                        scientific_lineage=reference_lineage,
+                        phase_state=reference_phase_state,
+                    )
+                secondary_writer.add_unit(
+                    tag=tag,
+                    payload=secondary_array,
+                    row_origin=row_origin,
+                    col_origin=col_origin,
+                    scientific_lineage=secondary_lineage,
+                    phase_state=secondary_phase_state,
+                    phase_screen=(
+                        range_offset_phase
+                        if requested_flatten_stage == "interferogram"
+                        else None
+                    ),
+                )
             pair_valid_pixels += int(
                 np.sum(valid_samples(primary_array) & valid_samples(secondary_array))
             )

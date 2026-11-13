@@ -537,7 +537,9 @@ def test_stack_formation_validates_coherence_before_scene_io(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="odd integers >= 3"):
         stack.form_interferograms(coherence_window=(2, 5))
 
-    assert not (tmp_path / "out").exists()
+    # PROPOSAL-0088 publishes the configured intent at construction, so the
+    # work directory exists; invalid support still creates no formation output.
+    assert not (tmp_path / "out" / "ifg").exists()
 
 
 def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
@@ -822,7 +824,7 @@ def test_network_analysis_binds_timeseries_product_to_unwrap_write_ids(
     from faninsar.io.storage.product import open_product
 
     item = open_product(stack.config.work_dir / "timeseries")
-    assert item.properties["faninsar:phase_source"] == "unwrap"
+    assert item.properties["faninsar:phase_source"] == "unwrapped"
     assert set(item.inputs) == set(phases)
     assert item.inputs == stack.network.interferograms.unwrap_write_ids()
     subset = Pairs.from_names(["20240101_20240113", "20240113_20240125"])
@@ -1299,7 +1301,13 @@ def test_coreg_reuse_rejects_changed_burst_request(tmp_path: Path) -> None:
 def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
     tmp_path: Path,
 ) -> None:
-    """Interpolation and nested geoid samplers must invalidate scene reuse."""
+    """DEM sampling metadata invalidates reuse; pixel content does not.
+
+    P0079/P0082 keep the DEM identity a cheap grid/datum descriptor and
+    forbid content hashing.  A changed grid descriptor or a changed nested
+    sampler recipe therefore changes the resume identity, while a same-grid
+    array-only change is governed by an explicit rerun instead.
+    """
     from affine import Affine
 
     from faninsar.processing.geometry import DEM, GridSpec, RasterDEM
@@ -1324,6 +1332,17 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
     second_identity = stack._coreg_resume_identity(
         date_id, misreg_az_px=0.0, misreg_rg_px=0.0
     )
+    shifted_grid = GridSpec(
+        "EPSG:4326",
+        Affine(0.1, 0.0, 13.0, 0.0, -0.1, 42.0),
+        shape=(8, 8),
+    )
+    stack.config.dem = RasterDEM(
+        array=np.full(grid.shape, 10.0, dtype=np.float32), grid=shifted_grid
+    )
+    shifted_identity = stack._coreg_resume_identity(
+        date_id, misreg_az_px=0.0, misreg_rg_px=0.0
+    )
     stack.config.dem = GeoidAdjustedDEM(
         DEM.from_constant(10.0),
         DEM.from_constant(2.0),
@@ -1343,7 +1362,8 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
         misreg_rg_px=0.0,
     )
 
-    assert first_identity != second_identity
+    assert first_identity == second_identity
+    assert first_identity != shifted_identity
     assert first_nested_identity != second_nested_identity
 
 

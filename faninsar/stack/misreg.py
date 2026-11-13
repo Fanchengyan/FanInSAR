@@ -12,9 +12,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from faninsar.io.storage.product import open_product, publish_product
-from faninsar.processing.coregistration.misreg_network import DateMisreg, MisregArc
+from faninsar.processing.coregistration.misreg_network import (
+    DateMisreg,
+    MisregArc,
+    OmissionReason,
+)
+from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from faninsar.io.storage.product import Product
@@ -22,6 +28,8 @@ if TYPE_CHECKING:
 __all__ = [
     "MISREG_KIND",
     "MisregRecord",
+    "misreg_arc_from_properties",
+    "misreg_arc_to_properties",
     "read_misreg",
     "write_misreg",
 ]
@@ -57,7 +65,30 @@ def _optional_shift(value: object) -> float | None:
     return None if value is None else float(value)  # type: ignore[arg-type]
 
 
-def _arc_record(arc: MisregArc) -> dict[str, object]:
+def _optional_omission(value: object) -> OmissionReason | None:
+    """Return a validated omission reason, or ``None`` for legacy records."""
+    if value is None:
+        return None
+    if value not in {"no_overlap", "quality_rejected", "method_omitted"}:
+        reject_invalid_state(f"unsupported misreg omission reason: {value!r}")
+    return value  # type: ignore[return-value]
+
+
+def misreg_arc_to_properties(arc: MisregArc) -> dict[str, object]:
+    """Return the persisted metadata fields of one measured pair arc.
+
+    Parameters
+    ----------
+    arc : MisregArc
+        Measured pair residual.
+
+    Returns
+    -------
+    dict of str to object
+        Strict JSON-compatible arc fields. An omitted axis is ``None`` and is
+        never converted to ``0.0``.
+
+    """
     return {
         "primary": arc.primary,
         "secondary": arc.secondary,
@@ -67,10 +98,25 @@ def _arc_record(arc: MisregArc) -> dict[str, object]:
         "range_sigma_px": float(arc.range_sigma_px),
         "method": arc.method,
         "n_valid": int(arc.n_valid),
+        "azimuth_omission": arc.azimuth_omission,
+        "range_omission": arc.range_omission,
     }
 
 
-def _arc_from_record(row: dict[str, object]) -> MisregArc:
+def misreg_arc_from_properties(row: Mapping[str, object]) -> MisregArc:
+    """Restore one pair arc from persisted metadata.
+
+    Parameters
+    ----------
+    row : mapping of str to object
+        Persisted arc fields from :func:`misreg_arc_to_properties`.
+
+    Returns
+    -------
+    MisregArc
+        The restored pair arc.
+
+    """
     return MisregArc(
         primary=str(row["primary"]),
         secondary=str(row["secondary"]),
@@ -80,6 +126,8 @@ def _arc_from_record(row: dict[str, object]) -> MisregArc:
         range_sigma_px=float(row.get("range_sigma_px", 1.0)),  # type: ignore[arg-type]
         method=str(row.get("method", "unknown")),
         n_valid=int(row.get("n_valid", 0)),  # type: ignore[call-overload]
+        azimuth_omission=_optional_omission(row.get("azimuth_omission")),
+        range_omission=_optional_omission(row.get("range_omission")),
     )
 
 
@@ -124,7 +172,7 @@ def write_misreg(
             "metadata": dict(date_misreg.metadata),
         }
     properties = {
-        "faninsar:arcs": [_arc_record(arc) for arc in arcs],
+        "faninsar:arcs": [misreg_arc_to_properties(arc) for arc in arcs],
         "faninsar:date_misreg": constants,
         "faninsar:nesd_skipped_no_windows": bool(skipped_no_windows),
     }
@@ -189,7 +237,10 @@ def read_misreg(root: str | Path) -> MisregRecord | None:
         )
     return MisregRecord(
         write_id=product.write_id,
-        arcs=[_arc_from_record(row) for row in properties.get("faninsar:arcs", [])],
+        arcs=[
+            misreg_arc_from_properties(row)
+            for row in properties.get("faninsar:arcs", [])
+        ],
         date_misreg=date_misreg,
         skipped_no_windows=bool(properties.get("faninsar:nesd_skipped_no_windows")),
     )

@@ -245,6 +245,7 @@ class S1Stack(Stack):
         coreg_mode: CoregMode = "geometry",
         swaths: tuple[str, ...] | None = None,
         bursts: BurstSelection | None = None,
+        _defer_persistence: bool = False,
         **kwargs: Any,
     ) -> Self:
         """Build an S1 Stack and optionally select its reference acquisition.
@@ -313,6 +314,7 @@ class S1Stack(Stack):
             coreg_mode=coreg_mode,
             swaths=swaths,
             bursts=bursts,
+            _defer_persistence=True,
             **kwargs,
         )
         stack.scene_provider = cls._default_scene_provider()
@@ -324,6 +326,8 @@ class S1Stack(Stack):
         request.update({"orbit_paths": orbit_paths, "aux_cal_paths": aux_cal_paths})
         stack.request = freeze(request)
         stack._request_config.extra = dict(stack.config.extra)
+        if not _defer_persistence:
+            stack._establish_workspace()
         return stack  # type: ignore[return-value]
 
     @classmethod
@@ -458,6 +462,7 @@ class S1Stack(Stack):
             coreg_mode=coreg_mode,
             orbit_paths=orbit_paths,
             aux_cal_paths=aux_cal_paths,
+            _defer_persistence=True,
             **kwargs,
         )
         request = thaw(stack.request)
@@ -471,7 +476,61 @@ class S1Stack(Stack):
             }
         )
         stack.request = freeze(request)
+        stack._establish_workspace()
         return stack
+
+    def _extend_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        search: Any = None,
+        paths: Sequence[str | Path] | None = None,
+    ) -> dict[str, Any]:
+        """Union additional Sentinel-1 search items or local paths.
+
+        A search union keeps the existing provider and granularity. A
+        local-path workspace cannot silently become a remote search
+        workspace, and vice versa.
+        """
+        if search is None:
+            return super()._extend_request(request, search=None, paths=paths)
+        from faninsar.missions.s1.preparation import (
+            restore_search,
+            serialize_search,
+        )
+        from faninsar.missions.s1.s1search import S1Search
+        from faninsar.stack.workspace import WorkspaceConflictError
+
+        if not isinstance(search, S1Search):
+            message = "S1Stack.extend expects an S1Search search result"
+            reject(message, TypeError, logger=logger)
+        current = dict(request)
+        if current.get("kind") != "search" and current.get("paths"):
+            message = (
+                "this workspace was configured from local paths; start a "
+                "search workspace to add remote acquisitions"
+            )
+            reject(message, WorkspaceConflictError, logger=logger)
+        existing = None
+        if current.get("kind") == "search" and isinstance(
+            current.get("search"), Mapping
+        ):
+            existing = restore_search(current["search"], self._request_config.roi)
+        union = search if existing is None else existing + search
+        provider = current.get("provider") or (
+            "asf" if search.catalog == "sentinel1-asf" else "cdse"
+        )
+        granularity = (
+            "burst" if provider == "asf" else (current.get("granularity") or "roi")
+        )
+        return {
+            **current,
+            "kind": "search",
+            "search": serialize_search(union),
+            "provider": provider,
+            "granularity": granularity,
+            "orbit_group": current.get("orbit_group"),
+        }
 
     @classmethod
     def _materialize_from_search(
@@ -551,6 +610,8 @@ class S1Stack(Stack):
                     effective_roi,
                     datetime_range=frame_window,
                     polarizations=selected_polarizations,
+                    parent_ids=parent_ids,
+                    budget=kwargs.get("budget"),
                 )
                 if frame_tracks:
                     rediscovered = [
@@ -620,6 +681,7 @@ class S1Stack(Stack):
                 work_dir=work_dir,
                 polarizations=selected_polarizations,
                 coreg_mode=coreg_mode,
+                _defer_persistence=True,
                 **kwargs,
             )
 
@@ -665,6 +727,7 @@ class S1Stack(Stack):
             work_dir=work_dir,
             polarizations=selected_polarizations,
             coreg_mode=coreg_mode,
+            _defer_persistence=True,
             **kwargs,
         )
 
@@ -723,6 +786,7 @@ class S1Stack(Stack):
             local_paths,
             work_dir=root,
             polarizations=selected_polarizations,
+            _defer_persistence=True,
             **kwargs,
         )
 
@@ -979,6 +1043,7 @@ class S1Stack(Stack):
             local_paths,
             work_dir=root,
             polarizations=selected_polarizations,
+            _defer_persistence=True,
             **filters,
         )
 
@@ -1068,16 +1133,34 @@ class S1Stack(Stack):
             budget=getattr(self, "_preparation_budget", None),
         )
 
-    def _local_mission_inputs(self) -> MissionPreparedInputs:
-        """Return SAFE-derived S1 footprints and local mission bindings."""
+    def _restore_preparation_metadata(self) -> bool:
+        """Recover legacy footprints locally without preparing any inputs."""
+        if (
+            self._sensor_registry_key != "sentinel1"
+            or "selected_footprints" in self.config.extra
+        ):
+            return True
+        from faninsar.missions.s1.errors import Sentinel1ProductError
+
+        try:
+            footprints = self._selected_local_footprints()
+        except (OSError, ValueError, Sentinel1ProductError) as error:
+            logger.warning(
+                "Cannot restore selected SAFE footprints: %s; product inspection "
+                "remains available, but processing requires prepare_data()",
+                error,
+            )
+            return False
+        self.config.extra["selected_footprints"] = footprints
+        return True
+
+    def _selected_local_footprints(self) -> tuple[object, ...]:
+        """Return annotation footprints in the original preparation order."""
         from faninsar.missions.s1.safe import open_safe_product
 
-        self._ensure_aux_cal()
         footprints: list[object] = []
-        input_paths: list[Path] = []
         for date_id in self.catalog.dates:
             for path in self.catalog.paths_for(date_id):
-                input_paths.append(Path(path))
                 product = open_safe_product(
                     path,
                     polarizations=(
@@ -1092,9 +1175,20 @@ class S1Stack(Stack):
                     for burst in swath.bursts
                     if burst.footprint
                 )
+        return tuple(footprints)
+
+    def _local_mission_inputs(self) -> MissionPreparedInputs:
+        """Return SAFE-derived S1 footprints and local mission bindings."""
+        self._ensure_aux_cal()
+        footprints = self._selected_local_footprints()
+        input_paths = [
+            Path(path)
+            for date_id in self.catalog.dates
+            for path in self.catalog.paths_for(date_id)
+        ]
         excluded = self.config.extra.get("excluded_acquisitions", ())
         return MissionPreparedInputs(
-            selected_footprints=tuple(footprints),
+            selected_footprints=footprints,
             orbit_paths_by_acquisition=dict(self.config.extra.get("orbit_paths", {})),
             aux_cal_paths_by_acquisition=dict(
                 self.config.extra.get("aux_cal_paths", {})
@@ -1363,6 +1457,31 @@ class S1Stack(Stack):
         self._s1_nesd_selection = result
         return result
 
+    def _misreg_overlap_support(
+        self, primary: str, secondary: str
+    ) -> Mapping[str, object]:
+        """Return the actual S1 burst-overlap support of one measured edge.
+
+        The record names the resolved swaths/bursts, effective ROI and
+        measurement thresholds. It deliberately omits the Stack date catalog
+        and global Reference so an unrelated addition reuses a committed edge.
+        """
+        from faninsar.stack.identity import encode_value
+        from faninsar.stack.session import _plain_selection
+
+        del primary, secondary
+        swaths, bursts = self._resolve_s1_nesd_selection()
+        roi = self._effective_roi_with_mask().roi
+        return {
+            "kind": "s1-burst-overlap",
+            "swaths": None if swaths is None else [str(item) for item in swaths],
+            "bursts": _plain_selection(bursts),
+            "roi": encode_value(roi),
+            "coherence_threshold": float(self.config.esd_coherence_threshold),
+            "ampcor_snr_threshold": float(self.config.ampcor_snr_threshold),
+            "polarizations": _plain_selection(self.config.extra.get("polarizations")),
+        }
+
     def _measure_pair_misreg(self, primary: str, secondary: str) -> Any:
         """Measure one pair with overlap ESD + overlap Ampcor (not the pair engine)."""
         from faninsar.missions.s1.measure import measure_s1_pair_misreg
@@ -1447,6 +1566,13 @@ class S1Stack(Stack):
         swaths, bursts = self._resolve_s1_roi_burst_selection(polygon=polygon)
 
         def _run() -> Any:
+            options = {
+                "checkpoint_root": self.config.work_dir
+                / "unit-checkpoints"
+                / "reference",
+                "verification": self.verification,
+                "integrity_root": self.config.work_dir / "integrity",
+            }
             return prepare_s1_reference(
                 _source_input(self.catalog.paths_for(self.reference)),
                 output_scene=self._scene_dir(self.reference, polygon),
@@ -1462,6 +1588,7 @@ class S1Stack(Stack):
                 polarizations=self.config.extra.get("polarizations"),
                 device=self.config.device,
                 overwrite=overwrite,
+                **supported_kwargs(prepare_s1_reference, options),
             )
 
         return self._call_with_dem_coverage(
@@ -1527,6 +1654,14 @@ class S1Stack(Stack):
                 inputs=inputs,
                 properties=properties,
                 overwrite=overwrite,
+                checkpoint_root=self.config.work_dir / "unit-checkpoints" / "coreg",
+                **supported_kwargs(
+                    coregister_s1_secondary,
+                    {
+                        "verification": self.verification,
+                        "integrity_root": self.config.work_dir / "integrity",
+                    },
+                ),
             )
 
         roi = self._effective_roi_with_mask().roi
@@ -1566,6 +1701,20 @@ def _cap_per_mission(
         ranked = sorted(products.items(), key=lambda kv: kv[1], reverse=True)
         keep.update(product_id for product_id, _ in ranked[:limit])
     return [b for b in bindings if str(b.get("product_id", "")) in keep]
+
+
+def supported_kwargs(function: Any, options: Mapping[str, object]) -> dict[str, object]:
+    """Return the optional keywords one imported callable actually declares.
+
+    Recovery and strict-integrity hooks are added to the mission coregistration
+    entry points in a separate slice. Filtering here keeps the Stack wiring
+    valid before and after those keywords land, without silently dropping a
+    science option the callee does declare.
+    """
+    import inspect
+
+    parameters = inspect.signature(function).parameters
+    return {name: value for name, value in options.items() if name in parameters}
 
 
 def _source_input(paths: tuple[Path, ...]) -> Path | tuple[Path, ...]:

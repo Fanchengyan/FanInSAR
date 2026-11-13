@@ -113,6 +113,12 @@ def restore_provider(stack: Any) -> None:
     handles = LazyHandles(
         sensor, extra.get("nisar_admission", extra.get("admission_policy"))
     )
+    # Workspace roots are runtime state, never part of the persisted source
+    # recipe, so a copied workspace keeps its local recovery evidence.
+    work_dir = Path(stack.config.work_dir)
+    checkpoint_root = work_dir / "unit-checkpoints" / "nisar"
+    integrity_root = work_dir / "integrity"
+    verification = getattr(stack, "verification", "fast")
     # Defer provider stat checks until actual processing.
     callback = None
 
@@ -132,6 +138,9 @@ def restore_provider(stack: Any) -> None:
                 configured_height=extra.get("height_m", extra.get("height")),
                 admission_lineage=extra.get("source_admission", {}),
                 flatten_stage=stack.config.flatten_stage,
+                checkpoint_root=checkpoint_root,
+                integrity_root=integrity_root,
+                verification=verification,
             )
         return callback(*args, **kwargs)
 

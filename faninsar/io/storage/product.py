@@ -91,14 +91,57 @@ def _strict_json(payload: Mapping[str, Any]) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
-    """Flush a directory entry so a rename survives a crash."""
+    """Flush a directory entry so a rename or new child survives a crash."""
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
     finally:
         os.close(descriptor)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    """Flush one staged payload file so its bytes survive a crash."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_staging_tree(staging: Path) -> None:
+    """Flush staged payload bytes, then directory entries, before completion.
+
+    Regular files are flushed before directories, and directories are flushed
+    deepest-first with the staging root last, so a crash cannot expose the
+    ``item.json`` completion receipt while payload bytes or directory entries
+    are still volatile (PROPOSAL-0088). A symlink inside staging is refused
+    because it could escape the product. Local filesystem errors propagate to
+    the caller instead of silently claiming durability.
+    """
+    files: list[Path] = []
+    directories: list[Path] = [staging]
+    pending = [staging]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if entry.is_symlink():
+                    reject_invalid_state(
+                        f"product staging contains a symbolic link: {path}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(path)
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append(path)
+    for path in files:
+        _fsync_regular_file(path)
+    for directory in sorted(
+        directories, key=lambda path: len(path.parts), reverse=True
+    ):
+        _fsync_directory(directory)
 
 
 def _remove_sibling(path: Path) -> None:
@@ -333,10 +376,12 @@ class ProductWriter:
                 "links": [],
             }
             text = _strict_json(item)
+            _fsync_staging_tree(self.staging)
             with (self.staging / ITEM_NAME).open("w", encoding="utf-8") as stream:
                 stream.write(text)
                 stream.flush()
                 os.fsync(stream.fileno())
+            _fsync_directory(self.staging)
             if self.target.exists():
                 if not self.overwrite:
                     reject_invalid_state(f"product already exists: {self.target}")

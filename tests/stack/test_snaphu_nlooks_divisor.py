@@ -317,10 +317,11 @@ def test_default_unwrap_is_fresh_snaphu_and_custom_subclass_is_kept(
     import inspect
 
     assert inspect.signature(Stack.unwrap).parameters["unwrapper"].default is None
-    ids: list[int] = []
+    seen: list[SpatialUnwrapper] = []
 
     def fake_unwrap(self, wrapped_phase, *, coherence=None, valid_mask=None):
-        ids.append(id(self))
+        # Keep the instances alive so CPython cannot recycle an id().
+        seen.append(self)
         return _IdentityUnwrapper().unwrap(
             wrapped_phase, coherence=coherence, valid_mask=valid_mask
         )
@@ -329,8 +330,8 @@ def test_default_unwrap_is_fresh_snaphu_and_custom_subclass_is_kept(
     stack = _stack_with_ifg(tmp_path)
     stack.unwrap()
     stack.unwrap(overwrite=True)
-    assert len(ids) == 2
-    assert ids[0] != ids[1]
+    assert len(seen) == 2
+    assert seen[0] is not seen[1]
 
     custom = _CustomSnaphu()
     stack.unwrap(custom, overwrite=True)

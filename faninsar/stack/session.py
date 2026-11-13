@@ -17,6 +17,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
@@ -91,6 +92,7 @@ from faninsar.stack.config import (
 from faninsar.stack.mask_plan import MaskPlan, StageName
 from faninsar.stack.preparation import (
     PreparationContext,
+    PreparationFailure,
     PreparationReport,
     PreparedInputs,
     PreparedStackData,
@@ -106,7 +108,7 @@ from faninsar.stack.search import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pair import Pairs
@@ -631,6 +633,20 @@ def _reclaim_after_stage(
     return wrapped
 
 
+def _writer_stage(
+    method: Callable[_P, _R],
+) -> Callable[_P, _R]:
+    """Hold the one workspace writer lock across one public stage method."""
+
+    @wraps(method)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        self = args[0]
+        with self._writer_locked(stage=method.__name__):
+            return method(*args, **kwargs)
+
+    return wrapped
+
+
 def _atomic_write_array(path: Path, array: np.ndarray) -> None:
     """Publish one binary array only after its bytes are durable."""
     temporary = path.with_name(f".{path.name}.tmp")
@@ -1005,10 +1021,22 @@ class Stack(NetworkContract, ABC):
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
     _nesd_skipped_no_windows: bool = False
+    _misreg_solution: Any | None = field(default=None, repr=False)
+    _misreg_solution_key: str | None = field(default=None, repr=False)
+    _misreg_quality: Any | None = field(default=None, repr=False)
+    _misreg_measure_failures: dict[str, str] = field(default_factory=dict, repr=False)
+    _misreg_strict: bool = field(default=False, repr=False)
+    _writer_lock_depth: int = field(default=0, repr=False)
+    _interrupted_reports: tuple[str, ...] = field(default=(), repr=False)
     pair_states: dict[str, Any] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
     timeseries: TimeSeries | None = None
     _prepared: bool = False
+    intent_revision: int = 0
+    verification: Literal["fast", "strict"] = field(default="fast", repr=False)
+    _verified_source_identities: dict[str, str] = field(
+        default_factory=dict, repr=False
+    )
     _mission_prepared: MissionPreparedInputs | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
@@ -1162,6 +1190,456 @@ class Stack(NetworkContract, ABC):
         return prepare_stack_data(
             self, on_error=on_error, offline=offline, budget=budget
         )
+
+    def _establish_workspace(self) -> None:
+        """Publish the fully enriched configured intent before factory return.
+
+        Mission factories call this once, after their own request enrichment,
+        so the returned Stack is immediately reopenable. No transfer, catalog
+        query or scientific stage runs here.
+        """
+        from faninsar.stack.workspace import publish_intent
+
+        state = publish_intent(self, on_error="raise")
+        self.intent_revision = state.revision
+        if state.conflicts:
+            self._prepared = False
+
+    @contextmanager
+    def _writer_locked(self, *, stage: str) -> Iterator[None]:
+        """Hold one OS-owned workspace writer lock for one stage call.
+
+        The lock is re-entrant within one Stack object so a public stage may
+        call another stage without opening a second OS lock on the same file.
+        Only the outermost acquisition reconciles a durable report left
+        unfinished by a previous process, because OS lock ownership is the
+        only evidence that no writer is still alive.
+
+        Parameters
+        ----------
+        stage : str
+            Stage name used for diagnostics.
+
+        Yields
+        ------
+        None
+            While this Stack owns the workspace writer lock.
+
+        """
+        if self._writer_lock_depth:
+            self._writer_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._writer_lock_depth -= 1
+            return
+        from faninsar.stack.preparation import reentrant_writer_guard
+
+        with reentrant_writer_guard(Path(self.config.work_dir)):
+            self._writer_lock_depth = 1
+            try:
+                self._reconcile_interrupted_report(stage=stage)
+                yield
+            finally:
+                self._writer_lock_depth = 0
+
+    def _reconcile_interrupted_report(self, *, stage: str) -> None:
+        """Mark an unfinished prior attempt interrupted while holding the lock."""
+        from faninsar.stack.reporting import ReportWriter
+
+        try:
+            report = ReportWriter.load_latest(
+                self.config.work_dir, reconcile_interrupted=True
+            )
+        except Exception as error:  # pragma: no cover - local report I/O failure
+            logger.warning("Coregistration report could not be inspected: %s", error)
+            return
+        if report is None or not report.interrupted:
+            return
+        logger.warning(
+            "Coregistration attempt %s did not finish; %s reconciles it as interrupted",
+            report.attempt_id,
+            stage,
+        )
+        self._interrupted_reports = (*self._interrupted_reports, report.attempt_id)
+
+    def _reconciliation_scope(self) -> dict[str, object] | None:
+        """Return the durable evidence of attempts reconciled by this process."""
+        if not self._interrupted_reports:
+            return None
+        return {
+            "reconciled_interrupted_attempts": list(self._interrupted_reports),
+        }
+
+    def extend(
+        self,
+        *,
+        search: Any = None,
+        paths: Sequence[str | Path] | None = None,
+        roi: object | None = None,
+        bursts: object | None = None,
+        swaths: Sequence[str] | None = None,
+        on_error: Literal["warn", "raise"] = "warn",
+    ) -> Any:
+        """Add targets to the existing workspace intent by union.
+
+        Source additions accept either a mission search result (Sentinel-1)
+        or additional local paths, never both. ``roi`` is a union with the
+        existing region, not a replacement. Reference, grid/CRS/resolution,
+        alignment and scientific method stay fixed.
+
+        Parameters
+        ----------
+        search : Any, optional
+            Mission search result to union.
+        paths : sequence of path-like, optional
+            Additional local source paths.
+        roi : spatial, optional
+            Additional region of interest.
+        bursts : BurstSelection, optional
+            Additional burst selection.
+        swaths : sequence of str, optional
+            Additional sub-swaths.
+        on_error : {"warn", "raise"}, default="warn"
+            Legacy adoption policy.
+
+        Returns
+        -------
+        ExtensionReport
+            Accepted additions and the resulting intent revision.
+
+        """
+        from faninsar.stack.workspace import extend_intent
+
+        return extend_intent(
+            self,
+            search=search,
+            paths=paths,
+            roi=roi,
+            bursts=bursts,
+            swaths=swaths,
+            on_error=on_error,
+        )
+
+    def _extend_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        search: Any = None,
+        paths: Sequence[str | Path] | None = None,
+    ) -> dict[str, Any]:
+        """Return one mission source request extended by additive selectors.
+
+        The base implementation supports local path unions for local source
+        modes. Remote search extension belongs to the mission adapter.
+        """
+        if search is not None:
+            message = f"{type(self).__name__} does not support search extension"
+            reject(message, ValueError, logger=logger)
+        if paths is not None:
+            kind = request.get("kind")
+            if kind not in ("safes", "rslc"):
+                message = (
+                    f"{type(self).__name__} cannot add local paths to a "
+                    f"{kind!r} workspace; start a new work_dir"
+                )
+                reject(message, ValueError, logger=logger)
+            current = tuple(str(path) for path in request.get("paths") or ())
+            additions = tuple(str(Path(path).absolute()) for path in paths)
+            return {**dict(request), "paths": [*current, *additions]}
+        return dict(request)
+
+    @property
+    def coregistration_report(self) -> Any:
+        """Return the newest persisted coregistration diagnostic view.
+
+        The report is a diagnostic snapshot, never completion authority. A
+        missing or unreadable attempt returns ``None``.
+        """
+        from faninsar.stack.reporting import ReportWriter
+
+        return ReportWriter.load_latest(self.config.work_dir)
+
+    def _new_report_writer(self) -> Any:
+        """Create one durable attempt writer, tolerating report I/O failure."""
+        from faninsar.stack.reporting import ReportWriter
+
+        grid = self.config.grid
+        grid_text = grid if isinstance(grid, str) else str(getattr(grid, "crs", grid))
+        reference = None if self._inputs_state is None else self._inputs_state.reference
+        try:
+            writer = ReportWriter(
+                self.config.work_dir,
+                intent_revision=self.intent_revision,
+                mode=self.config.coreg_mode,
+                grid=grid_text,
+                reference=reference,
+                verification=self.verification,
+                scope=self._reconciliation_scope(),
+            )
+        except Exception as error:  # pragma: no cover - local report I/O failure
+            logger.warning("Coregistration report could not be created: %s", error)
+            return None
+        self._coregistration_report = writer.report
+        return writer
+
+    def _finish_report_failed(
+        self,
+        writer: Any,
+        error: BaseException,
+        *,
+        unit_id: str,
+        stage: str = "coregistration",
+        finalize: bool = True,
+    ) -> None:
+        """Persist one failed unit without ever masking ``error``.
+
+        ``finalize=False`` records the unit failure but leaves the attempt
+        open, so a nested stage that shares the parent's writer never closes
+        the combined attempt. The outer owner finalizes it exactly once. A
+        report write or finalization failure is logged and swallowed: the
+        original exception stays the caller's failure.
+        """
+        if writer is None:
+            return
+        if writer.report.finished_at is not None:
+            logger.debug(
+                "Coregistration report is already finalized; not recording %s",
+                type(error).__name__,
+            )
+            return
+        try:
+            writer.record(
+                stage=stage,
+                unit_id=unit_id,
+                status="failed",
+                reason_code=type(error).__name__,
+                message=error,
+            )
+        except Exception as report_error:  # pragma: no cover - report I/O
+            logger.warning(
+                "Coregistration report could not record the failure: %s",
+                report_error,
+            )
+        if finalize:
+            try:
+                writer.finish(outcome="failed")
+            except Exception as report_error:  # pragma: no cover - report I/O
+                logger.warning(
+                    "Coregistration report could not be finalized: %s",
+                    report_error,
+                )
+                return
+        self._coregistration_report = writer.report
+
+    @_writer_stage
+    def prepare_and_coregister(
+        self,
+        *,
+        on_error: Literal["warn", "raise"] = "warn",
+        offline: bool = False,
+        budget: RemoteResourceBudget | None = None,
+        dates: Sequence[str] | None = None,
+        overwrite: bool = False,
+        merge: bool = False,
+        verification: Literal["fast", "strict"] | None = None,
+        strict: bool = False,
+    ) -> Any:
+        """Prepare inputs and coregister under one diagnostic attempt.
+
+        The returned report includes preparation dispositions and the final
+        coregistration records. Preparation and processing remain distinct
+        stages; this entry point authorizes both in one call.
+
+        Parameters
+        ----------
+        on_error : {"warn", "raise"}, default="warn"
+            Preparation policy for unavailable independent targets.
+        offline : bool, default=False
+            Require local preparation dependencies without acquisition.
+        budget : RemoteResourceBudget, optional
+            Remote execution policy for preparation.
+        dates : sequence of str, optional
+            Secondary dates to coregister; defaults to every non-Reference.
+            The streaming callback and the terminal pass both honour this
+            selection.
+        overwrite : bool, default=False
+            Recompute selected coregistration products. A date already
+            computed by the streaming callback is not recomputed by the
+            terminal pass.
+        merge : bool, default=False
+            Publish merged scene products after coregistration.
+        verification : {"fast", "strict"}, optional
+            Override the session reuse-integrity policy for this call.
+        strict : bool, default=False
+            Require every planned NESD edge and every published target to
+            succeed instead of warning about reference-connected omissions.
+
+        Returns
+        -------
+        CoregistrationReport
+            The finished combined diagnostic attempt.
+
+        """
+        from faninsar.stack.reporting import ReportWriter
+
+        if verification is not None:
+            if verification not in ("fast", "strict"):
+                message = (
+                    f"verification must be 'fast' or 'strict'; got {verification!r}"
+                )
+                reject(message, ValueError, logger=logger)
+            self.verification = verification
+        writer = self._new_report_writer()
+        requested = None if dates is None else [str(date) for date in dates]
+        # Do not resolve the Reference here: a configured Stack has no
+        # prepared inputs yet. The callback excludes it after qualification.
+        selected = None if requested is None else set(requested)
+        completed: list[str] = []
+        # Default to preparation; the streaming callback switches this so a
+        # scene failure is classified as coregistration, not preparation.
+        failure_stage = ["preparation", "prepare_data"]
+
+        def _on_ready(ready_stack: Stack, ready_dates: tuple[str, ...]) -> None:
+            """Coregister or measure only dates preparation just qualified."""
+            del ready_stack
+            failure_stage[:] = ["coregistration", "coregister_scenes"]
+            usable = tuple(str(date) for date in ready_dates)
+            if self.config.coreg_mode == "nesd":
+                self._measure_ready_misreg(
+                    usable, overwrite=overwrite, _report_writer=writer
+                )
+                return
+            if selected is not None and not selected:
+                # An explicit empty selection authorizes no scene work at all.
+                return
+            secondary = tuple(
+                date
+                for date in usable
+                if date != self.reference and (selected is None or date in selected)
+            )
+            if not secondary:
+                return
+            self.coregister_scenes(
+                dates=secondary,
+                overwrite=overwrite,
+                merge=False,
+                _report_writer=writer,
+                _finish_report=False,
+            )
+            completed.extend(date for date in secondary if date not in completed)
+
+        try:
+            from faninsar.stack.preparation_pipeline import run_preparation_pipeline
+
+            preparation = run_preparation_pipeline(
+                self,
+                on_error=on_error,
+                offline=offline,
+                budget=budget,
+                on_ready=_on_ready,
+            )
+        except BaseException as error:
+            # The nested stage may have recorded its own unit without closing
+            # the attempt. This outer owner records the summary and finalizes
+            # once; report failures never replace the original exception.
+            self._finish_report_failed(
+                writer,
+                error,
+                unit_id=failure_stage[1],
+                stage=failure_stage[0],
+            )
+            raise
+        if writer is not None:
+            self._record_preparation(writer, preparation)
+        try:
+            if self.config.coreg_mode == "nesd":
+                # The measurement attempt is now terminal: close it with one
+                # solve before the final corrected products.
+                self.measure_misreg(overwrite=False, strict=strict)
+                self._ensure_misreg_solution(strict=strict)
+            if overwrite and completed:
+                # The streaming callbacks already forced these products. The
+                # final pass finishes only requested dates they did not reach.
+                finished = set(completed)
+                remaining = (
+                    [
+                        date
+                        for date in self.catalog.dates
+                        if date != self.reference and date not in finished
+                    ]
+                    if requested is None
+                    else [date for date in requested if date not in finished]
+                )
+                self.coregister_scenes(
+                    dates=remaining,
+                    overwrite=True,
+                    merge=merge,
+                    _report_writer=writer,
+                    _finish_report=False,
+                )
+                if merge:
+                    # Merged products are published per pass; cover the dates
+                    # the callback already coregistered without recomputing.
+                    polygon_rois = self._roi_polygon_rois()
+                    polygons = (
+                        list(range(len(polygon_rois)))
+                        if polygon_rois is not None
+                        else [None]
+                    )
+                    self._publish_merged_scenes(completed, polygons, overwrite=True)
+            else:
+                self.coregister_scenes(
+                    dates=dates,
+                    overwrite=overwrite,
+                    merge=merge,
+                    _report_writer=writer,
+                    _finish_report=False,
+                )
+        except BaseException as error:
+            # The nested pass records its own unit and leaves finalization to
+            # this outer owner, so the combined attempt closes exactly once.
+            self._finish_report_failed(
+                writer,
+                error,
+                unit_id="coregister_scenes",
+                stage="coregistration",
+            )
+            raise
+        if writer is None:
+            return ReportWriter.load_latest(self.config.work_dir)
+        report = writer.finish()
+        self._coregistration_report = report
+        return report
+
+    @staticmethod
+    def _record_preparation(writer: Any, report: PreparationReport) -> None:
+        """Record preparation dispositions in one diagnostic attempt."""
+        reused = set(report.reused)
+        for target in report.ready:
+            writer.record(
+                stage="preparation",
+                unit_id=str(target),
+                status="reused" if target in reused else "completed",
+                acquisition=str(target),
+            )
+        for failure in report.failed:
+            writer.record(
+                stage="preparation",
+                unit_id=str(failure.target),
+                status="failed",
+                acquisition=str(failure.target),
+                reason_code=failure.reason,
+                message=failure.cause,
+            )
+        for prerequisite in report.prerequisites:
+            writer.record(
+                stage="preparation",
+                unit_id=str(prerequisite),
+                status="blocked",
+                reason_code="blocked_prerequisite",
+                message=str(prerequisite),
+            )
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -2714,6 +3192,15 @@ class Stack(NetworkContract, ABC):
             return self._bind_live_dem(raster)
         return raster
 
+    def _restore_preparation_metadata(self) -> bool:
+        """Restore local mission metadata, returning whether processing is safe.
+
+        Mission adapters may recover omitted legacy metadata without preparing
+        inputs or writing artifacts. A false result preserves product inspection
+        while requiring explicit preparation before scientific processing.
+        """
+        return True
+
     def _restore_local_inputs(self) -> None:
         """Restore persisted local DEMs without preparing missing inputs."""
         self._capture_dem_source()
@@ -2836,7 +3323,14 @@ class Stack(NetworkContract, ABC):
         return prepared
 
     @classmethod
-    def open(cls, work_dir: str | Path, **runtime: Any) -> Stack:
+    def open(
+        cls,
+        work_dir: str | Path,
+        *,
+        verification: Literal["fast", "strict"] = "fast",
+        on_error: Literal["warn", "raise"] = "warn",
+        **runtime: Any,
+    ) -> Stack:
         """Reopen a Stack from ``stack.json`` in an existing work directory.
 
         The method performs no remote search. Local inputs are checked by
@@ -2849,6 +3343,12 @@ class Stack(NetworkContract, ABC):
         ----------
         work_dir : str or pathlib.Path
             Work directory holding ``stack.json``.
+        verification : {"fast", "strict"}, default="fast"
+            Reuse-integrity policy for this session. Fast is the hash-free
+            default; strict can report unverifiable products without a real
+            baseline. The policy is runtime-only and never persisted.
+        on_error : {"warn", "raise"}, default="warn"
+            Whether an ambiguous supported legacy adoption warns or raises.
         **runtime : Any
             Runtime-only :class:`StackConfig` values
             (``device``, ``invert_device``, ``executor``, ``n_jobs``,
@@ -2876,15 +3376,10 @@ class Stack(NetworkContract, ABC):
             read_stack_identity,
             read_stack_identity_lenient,
         )
+        from faninsar.stack.workspace import open_intent
 
         root = Path(work_dir)
-        if (
-            not (root / "stack.json").exists()
-            and (root / "inputs" / "request.json").is_file()
-        ):
-            from faninsar.stack.preparation import restore_request
-
-            return restore_request(root, runtime)
+        intent = open_intent(root, verification=verification, on_error=on_error)
         runtime_fields = UNSAVED_FIELDS - {"extra"}
         unknown = set(runtime) - runtime_fields - {"scene_provider"}
         if unknown:
@@ -2908,6 +3403,7 @@ class Stack(NetworkContract, ABC):
             recovered = _recover_document(root, document, runtime, cls)
             stack = recovered._stack
             stack.repair_report = recovered._report
+            stack.verification = verification
             return stack
 
         mission = str(document["mission"])
@@ -2923,23 +3419,29 @@ class Stack(NetworkContract, ABC):
                 missing_inputs = True
                 return Path(str(entry["path"]))
 
+        inputs = document.get("inputs")
+        inputs = inputs if isinstance(inputs, dict) else {}
+        source_records = inputs.get("sources")
+        source_records = source_records if isinstance(source_records, dict) else {}
         sources: dict[str, list[Path]] = {}
-        for date, entries in document["inputs"]["sources"].items():
-            sources[date] = [local_input(entry) for entry in entries]
+        for date, entries in source_records.items():
+            sources[str(date)] = [local_input(entry) for entry in entries]
         orbits = {
             date: local_input(entry)
-            for date, entry in document["inputs"].get("orbits", {}).items()
+            for date, entry in (inputs.get("orbits") or {}).items()
         }
         aux_cal = {
             date: local_input(entry)
-            for date, entry in document["inputs"].get("aux_cal", {}).items()
+            for date, entry in (inputs.get("aux_cal") or {}).items()
         }
 
         science = {}
         missing_recorded_dem = False
         from faninsar.stack.layout import dem_raster_path
 
-        for name, value in document["science"].items():
+        science_records = document.get("science")
+        science_records = science_records if isinstance(science_records, dict) else {}
+        for name, value in science_records.items():
             dem_record = value.get("faninsar:dem") if isinstance(value, dict) else None
             if name == "dem" and isinstance(dem_record, dict):
                 recorded_path = dem_record.get("path")
@@ -2970,10 +3472,9 @@ class Stack(NetworkContract, ABC):
         science.update(
             {name: value for name, value in runtime.items() if name != "scene_provider"}
         )
-        extra = {
-            key: decode_value(value)
-            for key, value in document.get("science_extra", {}).items()
-        }
+        recorded_extra = document.get("science_extra")
+        recorded_extra = recorded_extra if isinstance(recorded_extra, dict) else {}
+        extra = {key: decode_value(value) for key, value in recorded_extra.items()}
         if orbits:
             extra["orbit_paths"] = orbits
         if aux_cal:
@@ -2982,36 +3483,122 @@ class Stack(NetworkContract, ABC):
         config = StackConfig(**science)
 
         from faninsar import Pairs
+        from faninsar.stack.preparation import PreparationFailure, restore_request
 
-        stack = stack_cls(
-            catalog=SceneCatalog(sources),
-            config=config,
-            pairs=Pairs.from_names(document["pairs"]),
-            misreg_pairs=Pairs.from_names(document["misreg_pairs"]),
-            reference=str(document["reference"]),
-        )
+        pairs_document = document.get("pairs") or []
+        misreg_document = document.get("misreg_pairs") or []
+        recorded_reference = document.get("reference")
+        if sources:
+            stack = stack_cls(
+                catalog=SceneCatalog(sources),
+                config=config,
+                pairs=Pairs.from_names(pairs_document),
+                misreg_pairs=Pairs.from_names(misreg_document),
+                reference=str(recorded_reference or next(iter(sources))),
+            )
+        else:
+            # A configured intent may have no resolved inputs yet; it is still
+            # a valid local workspace and must reopen without source I/O.
+            stack = stack_cls(config=config)
         stack.scene_provider = (
             runtime.get("scene_provider") or stack_cls._default_scene_provider()
         )
+        stack.intent_revision = 0 if intent is None else intent.revision
+        stack.verification = verification
         stack._missing_recorded_dem = missing_recorded_dem
-        stack._restore_local_inputs()
-        stack._prepared = not missing_inputs
-        if (root / "inputs" / "request.json").is_file():
-            from faninsar.stack.preparation import PreparationFailure, restore_request
+        if sources:
+            stack._restore_local_inputs()
+            stack._prepared = (
+                not missing_inputs and stack._restore_preparation_metadata()
+            )
+        else:
+            stack._prepared = False
+        strict_source_blocked = False
+        if sources and verification == "strict":
+            from faninsar.stack.preparation import strict_source_failure
 
+            strict_failures: list[PreparationFailure] = []
+            verified_targets: list[str] = []
+            for target, paths in stack.catalog.paths.items():
+                reason = strict_source_failure(stack, paths)
+                if reason is None:
+                    verified_targets.append(target)
+                else:
+                    strict_failures.append(
+                        PreparationFailure(
+                            target,
+                            "source_integrity",
+                            "strict_source_unverifiable",
+                            RuntimeError(reason),
+                        )
+                    )
+                    logger.warning(
+                        "Strict reopen found an unverified source for %s: %s",
+                        target,
+                        reason,
+                    )
+            if strict_failures:
+                strict_source_blocked = True
+                stack._prepared = False
+                reference = (
+                    None
+                    if stack._inputs_state is None
+                    else stack._inputs_state.reference
+                )
+                prerequisites = (
+                    ()
+                    if reference is None or reference in verified_targets
+                    else (f"reference {reference} failed strict source verification",)
+                )
+                stack.preparation_report = PreparationReport(
+                    tuple(stack.catalog.dates),
+                    tuple(sorted(verified_targets)),
+                    tuple(strict_failures),
+                    prerequisites=prerequisites,
+                )
+        request_record = document.get("request")
+        legacy_request = root / "inputs" / "request.json"
+        if intent is not None and intent.request:
+            # ``stack.json`` is the single authoritative intent. A legacy
+            # inputs/request.json compatibility view must not roll an
+            # extended target back during in-memory reopen, but it is still
+            # decoded so legacy datum validation stays fail-closed.
+            stack.request = freeze(dict(intent.request))
+            requested = _requested_stack_config(document, root, runtime)
+            legacy = (
+                restore_request(root, runtime) if legacy_request.is_file() else None
+            )
+            if requested is not None:
+                stack._request_config = requested
+            elif legacy is not None:
+                stack._request_config = legacy._request_config
+            else:
+                stack._request_config = replace(config, extra=dict(config.extra))
+        elif legacy_request.is_file():
+            # Legacy workspaces without an authoritative intent still use the
+            # explicit original preparation science snapshot.
             configured = restore_request(root, runtime)
             stack.request = configured.request
             stack._request_config = configured._request_config
-            report = config.extra.get("preparation_report")
-            if isinstance(report, dict):
-                stack.preparation_report = PreparationReport(
-                    tuple(report["requested"]),
-                    tuple(report["ready"]),
-                    tuple(PreparationFailure(**item) for item in report["failed"]),
-                    tuple(report.get("reused", ())),
-                    tuple(report.get("prerequisites", ())),
-                )
-        stack._refresh_network()
+        elif isinstance(request_record, Mapping) and request_record:
+            stack.request = freeze(decode_value(dict(request_record)))
+            requested = _requested_stack_config(document, root, runtime)
+            stack._request_config = requested or replace(
+                config, extra=dict(config.extra)
+            )
+        if intent is not None and intent.conflicts:
+            stack._prepared = False
+        report = config.extra.get("preparation_report")
+        if isinstance(report, dict) and not strict_source_blocked:
+            stack.preparation_report = PreparationReport(
+                tuple(report["requested"]),
+                tuple(report["ready"]),
+                tuple(PreparationFailure(**item) for item in report["failed"]),
+                tuple(report.get("reused", ())),
+                tuple(report.get("prerequisites", ())),
+            )
+        if sources:
+            stack._refresh_network()
         return stack
 
     @classmethod
@@ -3094,6 +3681,7 @@ class Stack(NetworkContract, ABC):
         record_scientific_lineage: bool = False,
         gpu_memory_reclaim: GpuMemoryReclaim = "adaptive",
         resource_budget: ResourceBudget | None = None,
+        _defer_persistence: bool = False,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         config = StackConfig(
@@ -3142,6 +3730,8 @@ class Stack(NetworkContract, ABC):
             },
         )
         stack.dask_client = dask_client
+        if not _defer_persistence:
+            stack._establish_workspace()
         return stack
 
     @classmethod
@@ -3149,7 +3739,31 @@ class Stack(NetworkContract, ABC):
         """Return the mission's default scene provider, if it defines one."""
         return None
 
+    def _strict_source_failures(self) -> tuple[str, ...]:
+        """Return strict original-source qualification failures for this Stack.
+
+        Only ``verification="strict"`` calls this. Fast sessions perform no
+        source walk or payload read; a source without a trusted baseline is
+        reported as unverifiable instead of being silently certified from its
+        current bytes.
+        """
+        from faninsar.stack.preparation import strict_source_failure
+
+        failures: list[str] = []
+        for target, paths in self.catalog.paths.items():
+            reason = strict_source_failure(self, paths)
+            if reason is not None:
+                failures.append(f"{target}: {reason}")
+        return tuple(failures)
+
     def _ensure_prepared(self) -> None:
+        if self.verification == "strict":
+            failures = self._strict_source_failures()
+            if failures:
+                reject_invalid_state(
+                    "strict source qualification blocked science: "
+                    + "; ".join(failures)
+                )
         if not self.data_ready:
             reject_invalid_state("Stack inputs are not prepared; call prepare_data()")
         if self.reference not in self.catalog.paths:
@@ -4159,9 +4773,9 @@ class Stack(NetworkContract, ABC):
             "science": self._coreg_science_config(),
             "misreg_az_px": float(misreg_az_px),
             "misreg_rg_px": float(misreg_rg_px),
+            "misreg_correction": self._date_correction_signature(date_id),
             "inputs": {
                 "reference": None if reference is None else reference.write_id,
-                **self._scene_misreg_inputs(),
             },
         }
         return digest_payload(payload)
@@ -4208,6 +4822,241 @@ class Stack(NetworkContract, ABC):
         """Return the misreg product directory."""
         return self.config.work_dir / "misreg"
 
+    def _misreg_store(self) -> Any:
+        """Return the independent per-edge NESD measurement store.
+
+        The aggregate ``misreg`` product is replaced as one directory, so the
+        per-edge commits live beside it under ``unit-checkpoints/misreg`` and
+        survive aggregate republication.
+        """
+        from faninsar.stack.nesd_recovery import PairMeasurementStore
+
+        return PairMeasurementStore(
+            self.config.work_dir / "unit-checkpoints" / "misreg"
+        )
+
+    def _misreg_overlap_support(
+        self, primary: str, secondary: str
+    ) -> Mapping[str, object]:
+        """Return the actual measurement support identity of one pair.
+
+        The base implementation records the Stack-selected swaths/bursts/ROI.
+        Missions with a richer overlap selection override this hook. The
+        record is pair-local: it never names the whole date catalog or the
+        global Reference.
+        """
+        del primary, secondary
+        from faninsar.stack.identity import encode_value
+
+        return {
+            "kind": "stack-selection",
+            "swaths": (
+                None
+                if self.config.swaths is None
+                else [str(item) for item in self.config.swaths]
+            ),
+            "bursts": _plain_selection(self.config.bursts),
+            "roi": encode_value(self.config.roi),
+        }
+
+    def _misreg_edge_spec(self, primary: str, secondary: str) -> Any:
+        """Return the stable per-edge measurement specification.
+
+        Only the two endpoint sources, their mission-owned source corrections,
+        the orbit/AUX_CAL inputs, and the actual overlap support enter the
+        fingerprint. Adding an unrelated date, solving a new network or
+        re-pinning the global Reference cannot invalidate this edge.
+        """
+        from faninsar.stack.identity import (
+            auxiliary_input_identity,
+            endpoint_source_identity,
+        )
+        from faninsar.stack.nesd_recovery import measurement_spec
+
+        orbits: dict[str, object] = {}
+        aux_cal: dict[str, object] = {}
+        for date_id in (primary, secondary):
+            orbit = self._orbit_path_for(date_id)
+            if orbit is not None:
+                orbits[date_id] = auxiliary_input_identity(orbit)
+            aux = self._aux_cal_path_for(date_id)
+            if aux is not None:
+                aux_cal[date_id] = auxiliary_input_identity(aux)
+        support = {
+            "primary": endpoint_source_identity(self, primary),
+            "secondary": endpoint_source_identity(self, secondary),
+            "overlap": self._misreg_overlap_support(primary, secondary),
+            "orbits": orbits,
+            "aux_cal": aux_cal,
+        }
+        return measurement_spec(primary, secondary, support=support)
+
+    def _misreg_planned_pairs(
+        self, pairs: Any | None = None
+    ) -> tuple[tuple[str, str], ...]:
+        """Return planned misreg edges whose endpoints are in the catalog."""
+        use_pairs = pairs if pairs is not None else self.misreg_pairs
+        known = set(self.catalog.dates)
+        return tuple(
+            (primary, secondary)
+            for primary, secondary in _iter_pair_dates(use_pairs)
+            if primary in known and secondary in known
+        )
+
+    def _misreg_quality_policy(
+        self, min_n_valid: int = 0, max_sigma_px: float = 1e3
+    ) -> Any:
+        """Return the enforced per-axis quality policy for NESD solves."""
+        from faninsar.stack.nesd_recovery import NESDQualityPolicy
+
+        return NESDQualityPolicy.uniform(
+            min_n_valid=int(min_n_valid), max_sigma_px=float(max_sigma_px)
+        )
+
+    def _misreg_graph_key(
+        self,
+        planned: Sequence[tuple[str, str]],
+        quality: Any,
+        strict: bool,
+    ) -> str:
+        """Return the exact graph inputs of one pending network solve."""
+        from faninsar.stack.misreg import misreg_arc_to_properties
+
+        payload = {
+            "reference": self.reference,
+            "dates": list(self.catalog.dates),
+            "planned_pairs": [
+                f"{primary}_{secondary}" for primary, secondary in planned
+            ],
+            "quality": quality.document(),
+            "strict": bool(strict),
+            "arcs": [
+                misreg_arc_to_properties(arc)
+                for arc in sorted(self.arcs, key=lambda item: item.pair_id)
+            ],
+        }
+        try:
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError) as error:
+            reject_invalid_state(
+                f"NESD solution identity cannot be canonicalized: {error}"
+            )
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _ensure_misreg_solution(
+        self,
+        *,
+        strict: bool | None = None,
+        min_n_valid: int = 0,
+        max_sigma_px: float = 1e3,
+        persist: bool = True,
+    ) -> Any | None:
+        """Qualify the current graph and solve one network before final apply.
+
+        A changed graph, quality policy or completeness policy forces a fresh
+        solve; an unchanged graph reuses the in-memory solution. Successful
+        edges already committed by earlier runs are reused. Blocked dates and
+        components are reported by the solution and are never published as
+        zero corrections.
+        """
+        if self.config.coreg_mode != "nesd":
+            return None
+        if strict is not None:
+            self._misreg_strict = bool(strict)
+        if self._nesd_skipped_no_windows:
+            if self.date_misreg is None:
+                self.date_misreg = self._zero_date_misreg(reason="no_overlap_windows")
+                if persist:
+                    self._persist_misreg()
+            return None
+        if not self.arcs:
+            return None
+        quality = self._misreg_quality_policy(min_n_valid, max_sigma_px)
+        planned = self._misreg_planned_pairs()
+        key = self._misreg_graph_key(planned, quality, self._misreg_strict)
+        if self._misreg_solution is not None and self._misreg_solution_key == key:
+            return self._misreg_solution
+        from faninsar.stack.nesd_recovery import solve_misreg
+
+        solution = solve_misreg(
+            self.arcs,
+            reference=self.reference,
+            dates=list(self.catalog.dates),
+            planned_pairs=planned,
+            quality=quality,
+            strict_completeness=self._misreg_strict,
+            no_overlap=False,
+        )
+        self._misreg_solution = solution
+        self._misreg_solution_key = key
+        self._misreg_quality = quality
+        self.date_misreg = solution.date_misreg
+        if persist:
+            self._persist_misreg()
+        return solution
+
+    def _misreg_blocked_dates(self) -> tuple[str, ...]:
+        """Return dates the current qualified solve excludes from publication."""
+        solution = self._misreg_solution
+        return () if solution is None else tuple(solution.blocked_dates)
+
+    def _misreg_blocked_reason(self, date_id: str) -> tuple[str, str] | None:
+        """Return the first blocked component and reason recorded for a date.
+
+        A wholly quality-rejected axis has no usable observation, so the
+        report keeps the measured ``quality_rejected`` cause rather than the
+        generic aggregation label.
+        """
+        solution = self._misreg_solution
+        if solution is None:
+            return None
+        for date, component, reason in solution.blocked_components:
+            if date != date_id:
+                continue
+            if reason == "no_usable_observations" and any(
+                item.component == component and item.reason == "quality_rejected"
+                for item in solution.exclusions
+            ):
+                return str(component), "quality_rejected"
+            return str(component), str(reason)
+        return None
+
+    def _date_correction_signature(self, date_id: str) -> str | None:
+        """Return the effective local correction signature of one date."""
+        if self.date_misreg is None:
+            return None
+        if (
+            date_id not in self.date_misreg.azimuth_px
+            or date_id not in self.date_misreg.range_px
+        ):
+            return None
+        from faninsar.stack.nesd_recovery import effective_correction_signature
+
+        return effective_correction_signature(self.date_misreg, dates=[date_id])
+
+    def _misreg_solution_provenance(self, date_id: str) -> dict[str, object] | None:
+        """Return the exact persisted solution provenance consumed by one date."""
+        if self.date_misreg is None:
+            return None
+        metadata = self.date_misreg.metadata
+        provenance = metadata.get("nesd_recovery")
+        document: dict[str, object] = {
+            "schema": 1,
+            "date": date_id,
+            "reference": self.date_misreg.reference,
+        }
+        if isinstance(provenance, Mapping):
+            document.update(dict(provenance))
+        else:
+            document["provider"] = "external"
+            document["correction_signature"] = self._date_correction_signature(date_id)
+        return document
+
     def _persist_misreg(self) -> None:
         """Commit arcs, constants, and the NESD skip outcome as one product."""
         from faninsar.stack.misreg import write_misreg
@@ -4227,8 +5076,44 @@ class Stack(NetworkContract, ABC):
         if record is None:
             return False
         self.arcs = list(record.arcs)
+        self._nesd_skipped_no_windows = (
+            record.skipped_no_windows and _certifies_no_overlap(self.arcs)
+        )
+        if record.skipped_no_windows and not self._nesd_skipped_no_windows:
+            logger.warning(
+                "Ignoring a legacy NESD no-window skip whose arcs carry no "
+                "measured omission reasons; the affected edges will be "
+                "re-measured or reported blocked"
+            )
+            self.date_misreg = None
+        else:
+            self.date_misreg = record.date_misreg
+        return True
+
+    def _adopt_persisted_constants(self, arcs: Sequence[MisregArc]) -> bool:
+        """Adopt persisted constants only while their committed arcs still match.
+
+        A restored solution is a reusable view, not a completion authority: a
+        changed edge set leaves ``date_misreg`` unset so the next solve cannot
+        publish stale constants.
+        """
+        from faninsar.stack.misreg import misreg_arc_to_properties, read_misreg
+
+        record = read_misreg(self._misreg_dir())
+        if record is None or record.date_misreg is None:
+            return False
+
+        def key(items: Sequence[MisregArc]) -> list[dict[str, object]]:
+            return [
+                misreg_arc_to_properties(arc)
+                for arc in sorted(items, key=lambda item: item.pair_id)
+            ]
+
+        if key(record.arcs) != key(arcs):
+            return False
         self.date_misreg = record.date_misreg
-        self._nesd_skipped_no_windows = record.skipped_no_windows
+        self._misreg_solution = None
+        self._misreg_solution_key = None
         return True
 
     @property
@@ -4429,33 +5314,80 @@ class Stack(NetworkContract, ABC):
         *,
         pairs: Pairs | None = None,
         overwrite: bool = False,
+        strict: bool | None = None,
     ) -> Self:
         """Measure per-pair NESD misreg arcs (no full IFG products).
 
-        ``coreg_mode="geometry"`` is a no-op. ``nesd`` measures each misreg
-        pair through :meth:`_measure_pair_misreg`. A campaign whose every
-        component is omitted warns and skips NESD so apply does not see
-        ``date_misreg is None``.
+        ``coreg_mode="geometry"`` is a no-op. ``nesd`` measures each planned
+        misreg pair and commits each completed edge independently under
+        ``misreg/measurements/<primary>_<secondary>``. A repeated call reuses
+        every edge whose endpoint sources, orbit/AUX_CAL inputs and actual
+        overlap support are unchanged, so an interrupted campaign resumes
+        instead of remeasuring committed work.
+
+        A failed edge is retained as a retryable exclusion; already committed
+        edges and their independent successes are preserved. ``strict=True``
+        re-raises the first measurement failure instead. A campaign whose
+        every measured component is omitted warns and skips NESD so apply does
+        not see ``date_misreg is None``.
+
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            Measurement network; defaults to :attr:`misreg_pairs`.
+        overwrite : bool, default=False
+            Remeasure selected edges even when a matching commit exists.
+        strict : bool, optional
+            Require every planned edge and component to succeed.
+
+        Returns
+        -------
+        Stack
+            This Stack with the committed arcs installed.
+
         """
         self._ensure_prepared()
         if self.config.coreg_mode == "geometry":
             logger.info("measure_misreg skipped (coreg_mode=geometry)")
             return self
+        if strict is not None:
+            self._misreg_strict = bool(strict)
         self._ensure_precise_orbits()
         self._ensure_raster_dem()
-        use_pairs = pairs or self.misreg_pairs
-        if not overwrite and self._restore_misreg():
-            logger.info("Loaded %s misreg arcs from the misreg product", len(self.arcs))
-            return self
+        with self._writer_locked(stage="measure_misreg"):
+            return self._measure_misreg_locked(pairs=pairs, overwrite=overwrite)
 
+    def _measure_misreg_locked(self, *, pairs: Pairs | None, overwrite: bool) -> Self:
+        """Measure or reuse each planned edge while the writer lock is held."""
+        store = self._misreg_store()
         arcs: list[MisregArc] = []
-        for primary, secondary in _iter_pair_dates(use_pairs):
-            if primary not in self.catalog.paths or secondary not in self.catalog.paths:
+        reused = 0
+        failures: dict[str, str] = {}
+        for primary, secondary in self._misreg_planned_pairs(pairs):
+            pair_id = f"{primary}_{secondary}"
+            spec = self._misreg_edge_spec(primary, secondary)
+            if not overwrite:
+                saved = store.load(pair_id, spec)
+                if saved is not None:
+                    arcs.append(saved)
+                    reused += 1
+                    continue
+            try:
+                arc = self._measure_pair_misreg(primary, secondary)
+            except Exception as error:
+                if self._misreg_strict:
+                    raise
+                failures[pair_id] = f"{type(error).__name__}: {error}"
+                logger.warning(
+                    "NESD pair %s measurement failed; retaining earlier edges "
+                    "and retrying this edge on the next call: %s",
+                    pair_id,
+                    error,
+                )
                 continue
-            arcs.append(self._measure_pair_misreg(primary, secondary))
-        skipped = not arcs or all(
-            arc.azimuth_shift_px is None and arc.range_shift_px is None for arc in arcs
-        )
+            store.commit(pair_id, spec, arc)
+            arcs.append(arc)
+        skipped = not failures and (not arcs or _certifies_no_overlap(arcs))
         if skipped:
             logger.warning(
                 "No burst-overlap windows in the resolved NESD selection; "
@@ -4463,9 +5395,99 @@ class Stack(NetworkContract, ABC):
             )
         self._nesd_skipped_no_windows = skipped
         self.arcs = arcs
+        self._misreg_measure_failures = failures
+        self._misreg_solution = None
+        self._misreg_solution_key = None
         self.date_misreg = None
-        self._persist_misreg()
-        logger.info("Measured %s misreg arcs (method=overlap)", len(arcs))
+        if not overwrite and not failures:
+            self._adopt_persisted_constants(arcs)
+        logger.info(
+            "Measured %s misreg arcs, reused %s (method=overlap)",
+            len(arcs) - reused,
+            reused,
+        )
+        if failures and not arcs:
+            reject_invalid_state(
+                f"no NESD pair measurement succeeded; failed edges: {sorted(failures)}"
+            )
+        return self
+
+    def _measure_ready_misreg(
+        self,
+        ready_dates: Sequence[str],
+        *,
+        overwrite: bool = False,
+        _report_writer: Any = None,
+    ) -> Self:
+        """Measure only edges whose two endpoints preparation has qualified.
+
+        Runs on the controlling thread while the remaining preparation futures
+        continue. Each finished edge is committed immediately; edges that stay
+        blocked on a not-yet-ready endpoint are left for a later callback or
+        the terminal attempt. No network solve runs here.
+        """
+        if self.config.coreg_mode != "nesd":
+            return self
+        ready = {str(date) for date in ready_dates}
+        planned = tuple(
+            (primary, secondary)
+            for primary, secondary in self._misreg_planned_pairs()
+            if primary in ready and secondary in ready
+        )
+        if not planned:
+            return self
+        with self._writer_locked(stage="measure_misreg_ready"):
+            store = self._misreg_store()
+            existing = {arc.pair_id: arc for arc in self.arcs}
+            failures = dict(self._misreg_measure_failures)
+            for primary, secondary in planned:
+                pair_id = f"{primary}_{secondary}"
+                spec = self._misreg_edge_spec(primary, secondary)
+                saved = None if overwrite else store.load(pair_id, spec)
+                if saved is None:
+                    try:
+                        saved = self._measure_pair_misreg(primary, secondary)
+                    except Exception as error:
+                        if self._misreg_strict:
+                            raise
+                        failures[pair_id] = f"{type(error).__name__}: {error}"
+                        logger.warning(
+                            "NESD pair %s measurement failed during preparation: %s",
+                            pair_id,
+                            error,
+                        )
+                        if _report_writer is not None:
+                            _report_writer.record(
+                                stage="measurement",
+                                unit_id=pair_id,
+                                status="failed",
+                                pair=pair_id,
+                                reason_code="measurement_failed",
+                                message=error,
+                                retry="rerun the combined entry to retry this edge",
+                            )
+                        continue
+                    store.commit(pair_id, spec, saved)
+                    if _report_writer is not None:
+                        _report_writer.record(
+                            stage="measurement",
+                            unit_id=pair_id,
+                            status="completed",
+                            pair=pair_id,
+                        )
+                elif _report_writer is not None:
+                    _report_writer.record(
+                        stage="measurement",
+                        unit_id=pair_id,
+                        status="reused",
+                        pair=pair_id,
+                    )
+                existing[pair_id] = saved
+                failures.pop(pair_id, None)
+            self.arcs = [existing[key] for key in sorted(existing)]
+            self._misreg_measure_failures = failures
+            self._misreg_solution = None
+            self._misreg_solution_key = None
         return self
 
     @_reclaim_after_stage
@@ -4475,43 +5497,70 @@ class Stack(NetworkContract, ABC):
         reference: str | None = None,
         min_n_valid: int = 0,
         max_sigma_px: float = 1e3,
+        strict: bool | None = None,
     ) -> Self:
         """Invert optional az/rg arcs to per-date constants (Reference = 0).
 
         ``coreg_mode="geometry"`` is a no-op. A measure campaign that warned
-        and skipped NESD writes geometry zeros for every date.
+        and skipped NESD writes geometry zeros for every date. The declared
+        quality limits are applied before inversion; the final apply always
+        re-qualifies the current graph with
+        :func:`~faninsar.stack.nesd_recovery.solve_misreg`.
         """
         self._ensure_prepared()
         if self.config.coreg_mode == "geometry":
             logger.info("invert_misreg skipped (coreg_mode=%s)", self.config.coreg_mode)
             return self
-        _ = min_n_valid, max_sigma_px
-        if not self.arcs and not self._nesd_skipped_no_windows:
-            self.measure_misreg()
-        if self._nesd_skipped_no_windows:
-            self.date_misreg = self._zero_date_misreg(reason="no_overlap_windows")
-            self._persist_misreg()
-            return self
-        ref = reference or self.reference
-        try:
-            self.date_misreg = invert_optional_pair_misregistration(
+        if strict is not None:
+            self._misreg_strict = bool(strict)
+        with self._writer_locked(stage="invert_misreg"):
+            if not self.arcs and not self._nesd_skipped_no_windows:
+                self.measure_misreg()
+            if self._nesd_skipped_no_windows:
+                self.date_misreg = self._zero_date_misreg(reason="no_overlap_windows")
+                self._persist_misreg()
+                return self
+            ref = reference or self.reference
+            quality = self._misreg_quality_policy(min_n_valid, max_sigma_px)
+            from faninsar.stack.nesd_recovery import qualify_arcs
+
+            eligible = qualify_arcs(
                 self.arcs,
                 reference=ref,
                 dates=list(self.catalog.dates),
+                planned_pairs=self._misreg_planned_pairs(),
+                quality=quality,
+                strict_completeness=self._misreg_strict,
             )
-        except Exception:
-            logger.exception("misreg network inversion failed; aborting Stack")
-            raise
-        self._persist_misreg()
+            if not eligible.arcs:
+                reject_invalid_state(
+                    "no quality-qualified NESD arcs remain for inversion"
+                )
+            try:
+                self.date_misreg = invert_optional_pair_misregistration(
+                    list(eligible.arcs),
+                    reference=ref,
+                    dates=list(self.catalog.dates),
+                )
+            except Exception:
+                logger.exception("misreg network inversion failed; aborting Stack")
+                raise
+            self._misreg_quality = quality
+            self._misreg_solution = None
+            self._misreg_solution_key = None
+            self._persist_misreg()
         return self
 
     @_reclaim_after_stage
+    @_writer_stage
     def coregister_scenes(
         self,
         *,
         dates: Sequence[str] | None = None,
         overwrite: bool = False,
         merge: bool = False,
+        _report_writer: Any = None,
+        _finish_report: bool = True,
     ) -> Self:
         """Coregister each non-Reference date onto the Reference scene.
 
@@ -4533,6 +5582,22 @@ class Stack(NetworkContract, ABC):
         self._ensure_prepared()
         self._ensure_precise_orbits()
         self._ensure_raster_dem()
+        self._ensure_misreg_solution()
+        writer = (
+            _report_writer if _report_writer is not None else self._new_report_writer()
+        )
+        if writer is not None and self._misreg_measure_failures:
+            for pair_id, failure in sorted(self._misreg_measure_failures.items()):
+                writer.record(
+                    stage="measurement",
+                    unit_id=pair_id,
+                    status="failed",
+                    pair=pair_id,
+                    reason_code="measurement_failed",
+                    message=failure,
+                    retry="rerun measure_misreg to retry only this edge",
+                )
+        blocked_dates = set(self._misreg_blocked_dates())
         target_dates = (
             list(dates)
             if dates is not None
@@ -4554,9 +5619,12 @@ class Stack(NetworkContract, ABC):
         )
         for polygon in polygons:
             try:
+                # The default selection always commits the Reference anchor,
+                # even when no secondary is ready yet. An explicit empty
+                # ``dates=[]`` selection authorizes no scene work at all.
                 reference_context = (
                     self._prepare_reference_scene(overwrite=overwrite, polygon=polygon)
-                    if target_dates
+                    if target_dates or dates is None
                     else None
                 )
             except InvalidProcessingStateError as error:
@@ -4568,7 +5636,21 @@ class Stack(NetworkContract, ABC):
                         "ROI polygon %d produced no scene units; skipped",
                         polygon,
                     )
+                    if writer is not None:
+                        writer.record(
+                            stage="coregistration",
+                            unit_id=f"reference_p{polygon}",
+                            status="skipped",
+                            reason_code="no_scene_units",
+                            message=error,
+                        )
                     continue
+                self._finish_report_failed(
+                    writer,
+                    error,
+                    unit_id="reference",
+                    finalize=_finish_report,
+                )
                 raise
             except RuntimeError as error:
                 # A multi-polygon part may fall between every Reference burst;
@@ -4579,10 +5661,60 @@ class Stack(NetworkContract, ABC):
                         "ROI polygon %d selects no Reference burst; skipped",
                         polygon,
                     )
+                    if writer is not None:
+                        writer.record(
+                            stage="coregistration",
+                            unit_id=f"reference_p{polygon}",
+                            status="skipped",
+                            reason_code="no_reference_burst",
+                            message=error,
+                        )
                     continue
+                self._finish_report_failed(
+                    writer,
+                    error,
+                    unit_id="reference",
+                    finalize=_finish_report,
+                )
                 raise
+            if writer is not None and reference_context is not None:
+                writer.record(
+                    stage="reference",
+                    unit_id=str(self.reference),
+                    status="completed",
+                    acquisition=str(self.reference),
+                    output=str(self._reference_scene_for(polygon)),
+                )
             for date_id in target_dates:
                 out = self._scene_dir(date_id, polygon)
+                if date_id in blocked_dates:
+                    component, reason = self._misreg_blocked_reason(date_id) or (
+                        "network",
+                        "blocked",
+                    )
+                    logger.warning(
+                        "NESD date %s is not reference-connected/identifiable "
+                        "(%s: %s); excluded from publication",
+                        date_id,
+                        component,
+                        reason,
+                    )
+                    if writer is not None:
+                        writer.record(
+                            stage="coregistration",
+                            unit_id=str(date_id),
+                            status="blocked",
+                            acquisition=str(date_id),
+                            date=str(date_id),
+                            reason_code=f"nesd_{reason}",
+                            dependency=str(component),
+                            message=(
+                                "date is outside the qualified reference-connected "
+                                "NESD component"
+                            ),
+                            retry="provide the missing connecting measurement edge",
+                        )
+                    continue
                 misreg_az, misreg_rg = self._apply_misreg_constants(date_id)
                 coreg_identity = self._coreg_resume_identity(
                     date_id,
@@ -4593,6 +5725,14 @@ class Stack(NetworkContract, ABC):
                 if not overwrite and self._reuse_scene(
                     date_id, coreg_identity, polygon=polygon
                 ):
+                    if writer is not None:
+                        writer.record(
+                            stage="coregistration",
+                            unit_id=str(date_id),
+                            status="reused",
+                            acquisition=str(date_id),
+                            output=str(out),
+                        )
                     continue
                 self._reject_nesd_apply_without_constants()
                 properties: dict[str, object] = {
@@ -4602,6 +5742,12 @@ class Stack(NetworkContract, ABC):
                         "topo" if self.config.dem is not None else "flat"
                     ),
                     "faninsar:mask_lineage": self._mask_lineage_record(),
+                    "faninsar:misreg_solution": self._misreg_solution_provenance(
+                        date_id
+                    ),
+                    "faninsar:misreg_correction": self._date_correction_signature(
+                        date_id
+                    ),
                 }
                 inputs = self._scene_misreg_inputs()
                 try:
@@ -4626,7 +5772,30 @@ class Stack(NetworkContract, ABC):
                             date_id,
                             polygon,
                         )
+                        if writer is not None:
+                            writer.record(
+                                stage="coregistration",
+                                unit_id=str(date_id),
+                                status="skipped",
+                                acquisition=str(date_id),
+                                reason_code="covers_no_reference_unit",
+                                message=error,
+                            )
                         continue
+                    self._finish_report_failed(
+                        writer,
+                        error,
+                        unit_id=str(date_id),
+                        finalize=_finish_report,
+                    )
+                    raise
+                except BaseException as error:
+                    self._finish_report_failed(
+                        writer,
+                        error,
+                        unit_id=str(date_id),
+                        finalize=_finish_report,
+                    )
                     raise
                 reference = self._reference_scene_for(polygon)
                 if reference is None:
@@ -4634,6 +5803,9 @@ class Stack(NetworkContract, ABC):
                         "scene provider did not publish the Reference scene product"
                     )
                 validate_reference_binding(reference, CoregisteredSceneStore.open(out))
+                self._establish_scene_integrity(
+                    out, CoregisteredSceneStore.open(out).write_id
+                )
                 if state is not None and self.config.retain_pair_states:
                     key = f"{self.reference}_{date_id}"
                     if polygon is not None:
@@ -4645,11 +5817,21 @@ class Stack(NetworkContract, ABC):
                     self.reference,
                     "" if polygon is None else f" (polygon {polygon})",
                 )
+                if writer is not None:
+                    writer.record(
+                        stage="coregistration",
+                        unit_id=str(date_id),
+                        status="completed",
+                        acquisition=str(date_id),
+                        output=str(out),
+                    )
                 del state
                 gc.collect()
                 self._reclaim_accelerator("persist")
         if merge:
             self._publish_merged_scenes(target_dates, polygons, overwrite=overwrite)
+        if writer is not None and _finish_report:
+            self._coregistration_report = writer.finish()
         return self
 
     def _require_scene_merge_kernel(self) -> None:
@@ -4842,7 +6024,21 @@ class Stack(NetworkContract, ABC):
     def _reuse_scene(
         self, date_id: str, coreg_identity: str, *, polygon: int | None = None
     ) -> bool:
-        """Return whether the persisted secondary scene is current."""
+        """Return whether the persisted secondary scene is current.
+
+        A changed global NESD solution alone does not stale a scene whose
+        effective per-date correction is unchanged: the historical receipt
+        keeps the solution it actually consumed. A changed correction, source,
+        Reference binding or science identity does stale it.
+        """
+        if self.verification == "strict":
+            from faninsar.stack.preparation import strict_source_failure
+
+            reason = strict_source_failure(self, self.catalog.paths_for(date_id))
+            if reason is not None:
+                reject_invalid_state(
+                    "strict source qualification blocks cached scene reuse: " + reason
+                )
         out = self._scene_dir(date_id, polygon)
         if not (out / "item.json").is_file():
             return False
@@ -4851,18 +6047,76 @@ class Stack(NetworkContract, ABC):
             return False
         store = CoregisteredSceneStore.open(out)
         current = {"reference": reference.write_id, **self._scene_misreg_inputs()}
+        stale = store.stale_inputs(current)
+        if stale == ["misreg"] and self._stored_correction_matches(store, date_id):
+            stale = []
         if (
             store.date_id != date_id
             or store.reference_id != self.reference
             or store.domain != self.config.coregistration_grid
             or store.properties.get("faninsar:coreg_identity") != coreg_identity
-            or store.stale_inputs(current)
+            or stale
+            or not self._scene_integrity_reusable(out, store.write_id)
         ):
             logger.info("Scene %s is stale; recoregistering", date_id)
             return False
         validate_reference_binding(reference, store)
         logger.info("Reusing coregistered scene %s", date_id)
         return True
+
+    def _scene_integrity_reusable(self, out: Path, write_id: str) -> bool:
+        """Return whether the current integrity policy permits scene reuse.
+
+        Fast mode accepts a product without a historical baseline, per P0082.
+        Strict mode reuses only a product with a trusted baseline or verified
+        provider evidence; an unverifiable product is recomputed when that is
+        authorized. Verification never creates a baseline from current bytes.
+        """
+        from faninsar.stack.integrity import verify_integrity
+
+        verdict = verify_integrity(
+            Path(self.config.work_dir) / "integrity",
+            out,
+            strict=self.verification == "strict",
+            write_id=write_id,
+        )
+        if verdict.status in {"metadata_verified", "verified"}:
+            return True
+        if verdict.status == "integrity_unverifiable" and self.verification != "strict":
+            return True
+        logger.warning(
+            "Scene %s cannot be reused under %s verification (%s: %s)",
+            out,
+            self.verification,
+            verdict.status,
+            verdict.detail or verdict.basis or "no trusted baseline",
+        )
+        return False
+
+    def _establish_scene_integrity(self, out: Path, write_id: str) -> None:
+        """Record a strict baseline for a scene this process just published."""
+        if self.verification != "strict":
+            return
+        from faninsar.stack.integrity import establish_integrity
+
+        try:
+            establish_integrity(
+                Path(self.config.work_dir) / "integrity", out, write_id=write_id
+            )
+        except Exception as error:  # pragma: no cover - local integrity I/O
+            logger.warning(
+                "Strict scene baseline could not be established for %s: %s",
+                out,
+                error,
+            )
+
+    def _stored_correction_matches(
+        self, store: CoregisteredSceneStore, date_id: str
+    ) -> bool:
+        """Return whether a scene consumed this date's effective correction."""
+        stored = store.properties.get("faninsar:misreg_correction")
+        current = self._date_correction_signature(date_id)
+        return stored is not None and current is not None and stored == current
 
     def _bind_multilook(self, looks: tuple[int, int]) -> None:
         """Adopt one look pair as the session default and persist it.
@@ -6317,6 +7571,17 @@ class Stack(NetworkContract, ABC):
         return stores
 
 
+def _plain_selection(value: object) -> object:
+    """Replace range selectors with explicit lists for strict JSON."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_selection(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_selection(item) for item in value]
+    if isinstance(value, range):
+        return list(value)
+    return value
+
+
 def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
     """Yield chronological ``(primary, secondary)`` IDs from ``Pairs``.
 
@@ -6510,6 +7775,52 @@ def _optional_shift(value: object) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _certifies_no_overlap(arcs: Sequence[MisregArc]) -> bool:
+    """Return True only when every arc explicitly records no overlap windows."""
+    return bool(arcs) and all(
+        arc.azimuth_shift_px is None
+        and arc.azimuth_omission == "no_overlap"
+        and arc.range_shift_px is None
+        and arc.range_omission == "no_overlap"
+        for arc in arcs
+    )
+
+
+def _requested_stack_config(
+    document: Mapping[str, object], root: Path, runtime: Mapping[str, Any]
+) -> StackConfig | None:
+    """Rebuild the construction snapshot recorded by a supported factory.
+
+    ``_request_config`` must describe the caller's requested science, not the
+    automatically resolved grid or materialized DEM. Using the requested
+    snapshot keeps a repeated preparation request equal after reopen.
+    """
+    from faninsar.stack.identity import decode_value
+    from faninsar.stack.workspace import requested_extras
+
+    source = document.get("requested_science")
+    if not isinstance(source, Mapping):
+        return None
+    values = {str(key): decode_value(value) for key, value in source.items()}
+    known = {item.name for item in fields(StackConfig)}
+    values = {key: value for key, value in values.items() if key in known}
+    values["work_dir"] = root
+    values.update(
+        {name: value for name, value in runtime.items() if name != "scene_provider"}
+    )
+    extra_record = requested_extras(document.get("requested_science_extra"))
+    if not extra_record:
+        # A document adopted by an earlier durable-workspace build records no
+        # requested extras; the persisted science extra still carries the
+        # mission-owned request values (for example ``polarizations``). Never
+        # fall back to an empty request config: preparation needs them.
+        extra_record = requested_extras(document.get("science_extra"))
+    values["extra"] = {
+        str(key): decode_value(value) for key, value in extra_record.items()
+    }
+    return StackConfig(**values)
 
 
 def _stack_json_schema(work_dir: Path) -> str | None:

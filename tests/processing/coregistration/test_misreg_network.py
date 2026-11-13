@@ -168,6 +168,32 @@ def test_optional_invert_never_treats_none_as_zero_observation() -> None:
     assert result.range_px["20160125"] == pytest.approx(0.15, abs=1e-6)
 
 
+def test_omission_metadata_defaults_to_none_and_does_not_change_inversion() -> None:
+    """Old constructors stay valid; reasons are additive observation metadata."""
+    legacy = MisregArc(
+        primary="20160101",
+        secondary="20160113",
+        azimuth_shift_px=None,
+        range_shift_px=0.1,
+        n_valid=50,
+    )
+    assert legacy.azimuth_omission is None
+    assert legacy.range_omission is None
+
+    reasoned = MisregArc(
+        primary="20160101",
+        secondary="20160113",
+        azimuth_shift_px=None,
+        range_shift_px=0.1,
+        azimuth_omission="quality_rejected",
+        n_valid=50,
+    )
+    for arc in (legacy, reasoned):
+        result = invert_optional_pair_misregistration([arc], reference="20160101")
+        assert result.azimuth_px["20160113"] == 0.0
+        assert result.range_px["20160113"] == pytest.approx(0.1, abs=1e-6)
+
+
 def test_combine_offset_fields_includes_misreg_constants() -> None:
     """Network constants enter the combined dense offset field."""
     geo = OffsetFieldResult(

@@ -163,6 +163,8 @@ def measure_s1_pair_misreg(
             secondary=secondary_id,
             azimuth_shift_px=None,
             range_shift_px=None,
+            azimuth_omission="no_overlap",
+            range_omission="no_overlap",
             method="overlap",
             n_valid=0,
         )
@@ -893,17 +895,21 @@ def _aggregate_pair_arc(
     if esd is None:
         azimuth_shift_px: float | None = None
         azimuth_sigma_px = 1.0
+        azimuth_omission: Literal["quality_rejected"] | None = "quality_rejected"
         n_valid = 0
     else:
         azimuth_shift_px = float(esd.azimuth_shift_px)
         azimuth_sigma_px = float(esd.sigma_px)
+        azimuth_omission = None
         n_valid = int(esd.n_valid)
 
     valid_ampcor = [item for item in ampcor_results if _is_valid_ampcor(item)]
     if not valid_ampcor:
         range_shift_px: float | None = None
+        range_omission: Literal["quality_rejected"] | None = "quality_rejected"
         range_sigma_px = 1.0
     else:
+        range_omission = None
         dx = np.asarray(
             [item.range_shift_px for item in valid_ampcor],
             dtype=np.float64,
@@ -923,4 +929,6 @@ def _aggregate_pair_arc(
         range_sigma_px=range_sigma_px,
         method="overlap",
         n_valid=n_valid,
+        azimuth_omission=azimuth_omission,
+        range_omission=range_omission,
     )

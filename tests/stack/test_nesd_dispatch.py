@@ -299,6 +299,8 @@ def test_nesd_no_windows_warns_skips_and_zeros_dates(
             secondary="20160113",
             azimuth_shift_px=None,
             range_shift_px=None,
+            azimuth_omission="no_overlap",
+            range_omission="no_overlap",
             method="overlap",
             n_valid=0,
         )
@@ -440,6 +442,8 @@ def test_measure_lists_parent_slots_apply_keeps_roi_bursts(
             secondary="20160113",
             azimuth_shift_px=None,
             range_shift_px=None,
+            azimuth_omission="no_overlap",
+            range_omission="no_overlap",
             method="overlap",
             n_valid=0,
         )
@@ -541,6 +545,8 @@ def test_reopened_stack_restores_nesd_skip_without_remeasuring(
             secondary="20160113",
             azimuth_shift_px=None,
             range_shift_px=None,
+            azimuth_omission="no_overlap",
+            range_omission="no_overlap",
             method="overlap",
             n_valid=0,
         )

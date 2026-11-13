@@ -167,6 +167,7 @@ class NISARStack(Stack):
             },
         )
         stack._nisar_channel = channel
+        stack._establish_workspace()
         return stack
 
     def _prepare_inputs(self, context: PreparationContext) -> PreparedInputs:
@@ -182,6 +183,7 @@ class NISARStack(Stack):
             work_dir=self.config.work_dir,
             frequency=context.request["frequency"],
             polarization=context.request["polarization"],
+            verification=self.verification,
             extra=thaw(self._request_config.extra),
             **kwargs,
         )
@@ -229,6 +231,7 @@ class NISARStack(Stack):
         frequency: str = "B",
         polarization: str = "HH",
         reference: object | None = None,
+        verification: str = "fast",
         **config_kwargs: Any,
     ) -> Self:
         """Construct a mission-neutral Stack from admitted NISAR RSLCs.
@@ -246,6 +249,8 @@ class NISARStack(Stack):
         reference : date-like, optional
             Reference acquisition.  Defaults to the earliest source date, as in
             :meth:`NISARStack.from_safes`.
+        verification : {"fast", "strict"}, default="fast"
+            Tile checkpoint reuse policy supplied by the owning Stack.
         pairs, misreg_pairs : Pairs, optional
             Explicit pair graphs.  If omitted, shared short-baseline graphs
             are generated from the discovered dates.
@@ -421,6 +426,9 @@ class NISARStack(Stack):
             configured_height=extra.get("height_m", extra.get("height")),
             admission_lineage=admission_lineage,
             flatten_stage=config.flatten_stage,
+            checkpoint_root=config.work_dir / "unit-checkpoints" / "nisar",
+            integrity_root=config.work_dir / "integrity",
+            verification=verification,
         )
         from faninsar.missions.nisar.preparation import encode_product
 

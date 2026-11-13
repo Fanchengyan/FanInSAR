@@ -19,6 +19,14 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+OmissionReason = Literal["no_overlap", "quality_rejected", "method_omitted"]
+"""Why one arc component has no finite observation.
+
+``no_overlap`` is a known structural absence of measurement windows;
+``quality_rejected`` means measurement or QC produced no usable sample;
+``method_omitted`` means the selected method does not observe that axis.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class MisregArc:
@@ -36,6 +44,10 @@ class MisregArc:
     range_sigma_px: float = 1.0
     method: str = "unknown"
     n_valid: int = 0
+    azimuth_omission: OmissionReason | None = None
+    """Why azimuth is omitted; ``None`` preserves legacy unscoped omission."""
+    range_omission: OmissionReason | None = None
+    """Why range is omitted; ``None`` preserves legacy unscoped omission."""
 
     @property
     def pair_id(self) -> str:

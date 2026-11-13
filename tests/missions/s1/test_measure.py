@@ -173,6 +173,8 @@ def test_measure_s1_pair_misreg_no_windows_omits_both_axes(
     assert arc.secondary == "20200113"
     assert arc.azimuth_shift_px is None
     assert arc.range_shift_px is None
+    assert arc.azimuth_omission == "no_overlap"
+    assert arc.range_omission == "no_overlap"
     assert arc.method == "overlap"
     assert arc.n_valid == 0
 
@@ -301,9 +303,60 @@ def test_measure_s1_pair_misreg_empty_ampcor_omits_range_keeps_azimuth(
     assert arc.primary == "20200101"
     assert arc.secondary == "20200113"
     assert arc.azimuth_shift_px == pytest.approx(0.02)
+    assert arc.azimuth_omission is None
     assert arc.range_shift_px is None
+    assert arc.range_omission == "quality_rejected"
     assert arc.method == "overlap"
     assert arc.n_valid == 12
+
+
+def test_measure_s1_pair_misreg_overlap_windows_reject_both_axes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing overlap windows that yield no observation are quality rejection."""
+    primary = Path("S1A_IW_SLC__1SDV_20200101T000000.SAFE")
+    secondary = Path("S1A_IW_SLC__1SDV_20200113T000000.SAFE")
+    products = {
+        primary: _product(
+            primary,
+            _burst(0, start_line=0),
+            _burst(1, start_line=80),
+        ),
+        secondary: _product(
+            secondary,
+            _burst(0, start_line=0),
+            _burst(1, start_line=80),
+        ),
+    }
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.open_acquisition_products",
+        lambda paths, **_kwargs: [products[Path(path)] for path in paths],
+    )
+
+    def fake_observe(*_args: object, **_kwargs: object) -> tuple[object, object]:
+        return (
+            None,
+            PatchAmplitudeShiftResult(
+                range_shift_px=0.0,
+                azimuth_shift_px=0.0,
+                n_valid=0,
+                snr_median=0.0,
+                n_attempted=1,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure._observe_overlap_window",
+        fake_observe,
+        raising=False,
+    )
+
+    arc = measure_s1_pair_misreg(primary, secondary, dem=ConstantDEM(0.0))
+
+    assert arc.azimuth_shift_px is None
+    assert arc.range_shift_px is None
+    assert arc.azimuth_omission == "quality_rejected"
+    assert arc.range_omission == "quality_rejected"
 
 
 def test_fit_ampcor_chip_skips_strips_shorter_than_minimum() -> None:

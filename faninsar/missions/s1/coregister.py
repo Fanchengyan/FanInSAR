@@ -10,7 +10,11 @@ are never re-read from SAFE nor re-deramped per date.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
@@ -47,16 +51,23 @@ from faninsar.missions.s1.processing import (
 )
 from faninsar.missions.s1.safe import open_acquisition_products
 from faninsar.processing.coregistration.tops.deramp import deramp, reramp
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import (
+    InvalidProcessingStateError,
+    reject_invalid_state,
+)
 from faninsar.processing.geometry.coordinates import RadarGrid
 from faninsar.processing.geometry.record import radar_geometry_record
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
     from faninsar.core.orbit import OrbitMetadata
     from faninsar.data.query import BoundingBox, Polygons
     from faninsar.io.storage.product import Product
+    from faninsar.io.storage.unit_checkpoint import (
+        UnitCheckpoint,
+        UnitCheckpointStore,
+    )
     from faninsar.missions.s1.processing import ProductionScene
     from faninsar.missions.s1.types import S1Product
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
@@ -69,6 +80,16 @@ S1_SLC_VALIDITY_REVISION = "mask-aware-lanczos-v1"
 """Scientific validity revision of S1 complex SLC resampling (P0078)."""
 
 _S1_SLC_VALIDITY_REVISION_KEY = "faninsar:slc_validity_revision"
+
+_S1_COREGISTRATION_RECIPE: dict[str, str] = {
+    "deramp": "s1-tops-deramp",
+    "reramp": "s1-tops-reramp",
+    "coregistration": "s1-tops-coregister",
+    "flatten_stage": "coregistration",
+}
+"""Declared result-affecting recipe names for unit checkpoint specifications."""
+
+_UNIT_SPEC_SCHEMA = 1
 
 __all__ = [
     "S1_SLC_VALIDITY_REVISION",
@@ -109,6 +130,13 @@ class S1ReferenceUnit:
         Destination geometry/ROI/LUT admissibility of the published window.
         Per-date echo validity is combined only at publication and is never
         written back onto this shared plan.
+    publication_id : str or None
+        Committed local reference-unit checkpoint write id. Secondaries bind
+        this unit-local publication instead of the whole Reference scene id.
+    specification_id : str or None
+        Canonical id of the local reference-unit scientific specification.
+    support_key : str or None
+        Canonical window/geometry signature of this unit's actual support.
 
     """
 
@@ -126,6 +154,9 @@ class S1ReferenceUnit:
     parent_col0: int = 0
     lut: Geo2RdrLUT | None = None
     scientific_support: np.ndarray | None = None
+    publication_id: str | None = None
+    specification_id: str | None = None
+    support_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -153,6 +184,19 @@ class S1ReferenceContext:
     polarizations : tuple of str or None
         The single channel published on this Reference layout. One
         ``MergeScope.channel`` cannot carry two polarizations.
+    checkpoint_root : pathlib.Path or None
+        Local root of committed reference-unit checkpoints.
+    integrity_root : pathlib.Path or None
+        Strict integrity baselines owned by the Stack workspace.
+    verification : {"fast", "strict"}
+        Checkpoint reuse policy. ``strict`` rereads committed unit payloads
+        against their baselines and is never the default.
+    dem_identity : str or None
+        Cheap authoritative DEM descriptor that participated in the units.
+    roi_identity : str or None
+        Canonical ROI geometry identity that participated in the units.
+    reference_orbit_path, reference_aux_cal_path : pathlib.Path or None
+        Explicit Reference orbit/AUX_CAL inputs.
 
     """
 
@@ -165,6 +209,13 @@ class S1ReferenceContext:
     roi: BoundingBox | Polygons | None = None
     dem: DEM | None = None
     polarizations: tuple[str, ...] | None = None
+    checkpoint_root: Path | None = None
+    integrity_root: Path | None = None
+    verification: Literal["fast", "strict"] = "fast"
+    dem_identity: str | None = None
+    roi_identity: str | None = None
+    reference_orbit_path: Path | None = None
+    reference_aux_cal_path: Path | None = None
 
     @property
     def write_id(self) -> str:
@@ -287,6 +338,529 @@ def _open_coreg_products(
     return restricted, selected
 
 
+def _require_checkpoint_policy(
+    checkpoint_root: Path | None,
+    verification: str,
+    integrity_root: Path | None,
+) -> None:
+    """Validate the opt-in checkpoint/verification combination."""
+    if verification not in {"fast", "strict"}:
+        reject_invalid_state(
+            f"verification must be 'fast' or 'strict', got {verification!r}"
+        )
+    if verification == "strict" and (checkpoint_root is None or integrity_root is None):
+        reject_invalid_state(
+            "strict checkpoint verification requires both checkpoint_root and "
+            "integrity_root"
+        )
+
+
+def _checkpoint_token(value: object) -> str:
+    """Return a safe single-component checkpoint locator token."""
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return text or "unit"
+
+
+def _file_identity(value: object) -> dict[str, object] | None:
+    """Return a small path/stat identity for one explicitly consumed file.
+
+    SAFE directories are deliberately not stat'ed: extending a shared canvas
+    directory changes its mtime without changing the consumed burst bytes and
+    would invalidate every local unit. Only the actual annotation, measurement,
+    orbit, and AUX_CAL inputs named here are recorded.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return None
+    if "://" in text:
+        return {"path": text}
+    path = Path(text).expanduser().resolve(strict=False)
+    identity: dict[str, object] = {"path": str(path)}
+    try:
+        stat = path.stat()
+    except OSError:
+        return identity
+    identity["size"] = int(stat.st_size)
+    identity["mtime_ns"] = int(stat.st_mtime_ns)
+    return identity
+
+
+def _finite_float_or_none(value: object) -> float | None:
+    """Return a finite float or ``None`` for absent/non-finite values."""
+    if value is None:
+        return None
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        return None
+    return resolved if np.isfinite(resolved) else None
+
+
+def _source_identity(
+    product: S1Product,
+    *,
+    swath: object | None = None,
+    burst: object | None = None,
+) -> dict[str, object]:
+    """Return the physical acquisition/burst identity consumed by one unit."""
+    identity: dict[str, object] = {
+        "product_id": str(product.product_id),
+        "source_path": str(
+            Path(product.source_path).expanduser().resolve(strict=False)
+        ),
+        "mission_id": str(product.mission_id),
+        "product_type": str(product.product_type),
+        "mode": str(product.mode),
+        "absolute_orbit": int(product.absolute_orbit),
+        "polarizations": [str(value) for value in product.polarizations],
+        "ipf_version": getattr(product, "ipf_version", None),
+    }
+    if swath is not None:
+        identity["swath"] = {
+            "name": str(getattr(swath, "swath", "")),
+            "polarization": str(getattr(swath, "polarization", "")),
+            "annotation": _file_identity(getattr(swath, "annotation_path", None)),
+            "measurement": _file_identity(getattr(swath, "measurement_path", None)),
+        }
+    if burst is not None:
+        identity["burst"] = {
+            "index": int(getattr(burst, "index", -1)),
+            "absolute_burst_id": getattr(burst, "absolute_burst_id", None),
+            "azimuth_anx_time_s": _finite_float_or_none(
+                getattr(burst, "azimuth_anx_time_s", None)
+            ),
+            "lines": int(getattr(burst, "lines", 0)),
+            "samples": int(getattr(burst, "samples", 0)),
+        }
+    return identity
+
+
+def _source_token(product: S1Product) -> str:
+    """Return a stable checkpoint token for one physical source acquisition."""
+    raw = getattr(product, "product_id", None)
+    if not raw:
+        raw = Path(str(getattr(product, "source_path", ""))).name
+    return _checkpoint_token(raw)
+
+
+def _roi_identity(roi: BoundingBox | Polygons | None) -> str:
+    """Return a canonical ROI geometry identity, never a mutable list index."""
+    if roi is None:
+        return "none"
+    from faninsar.data.query import BoundingBox
+
+    if isinstance(roi, BoundingBox):
+        crs = roi.crs.to_string() if roi.crs else None
+        payload: dict[str, object] = {
+            "kind": "bbox",
+            "crs": crs,
+            "bounds": [float(value) for value in roi],
+        }
+    else:
+        geometry = roi.to_desired().geodataframe.to_crs(4326)
+        members = sorted(
+            member.wkb.hex() for member in geometry.geometry if member is not None
+        )
+        payload = {
+            "kind": "polygons",
+            "crs": "EPSG:4326",
+            "wkb": members,
+            "all_touched": bool(getattr(roi, "all_touched", False)),
+            "pad": bool(getattr(roi, "pad", False)),
+        }
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _absolute_placement(
+    unit: S1ReferenceUnit, coregistration_grid: str
+) -> tuple[int, int]:
+    """Return placement independent of the current scene's growing origin."""
+    if coregistration_grid == "radar":
+        crop = unit.crop
+        row = int(unit.parent_row0) + (int(crop[0]) if crop is not None else 0)
+        col = int(unit.parent_col0) + (int(crop[2]) if crop is not None else 0)
+        return row, col
+    return int(unit.row_origin), int(unit.col_origin)
+
+
+def _lut_geometry_identity(unit: S1ReferenceUnit) -> dict[str, object] | None:
+    """Return the cheap LUT grid bounds, never LUT payload contents."""
+    lut = unit.lut
+    if lut is None:
+        return None
+    return {
+        "row0": int(lut.row0),
+        "col0": int(lut.col0),
+        "shape": [int(lut.shape[0]), int(lut.shape[1])],
+    }
+
+
+def _geo_unit_crop_footprint(
+    unit: S1ReferenceUnit,
+    *,
+    geo_grid: GeoGridSpec | None,
+) -> object | None:
+    """Return an exact EPSG:4326 Geo window polygon, or ``None``.
+
+    A north-up affine window is an exact rectangle only in its own CRS. A
+    nonlinear projection to EPSG:4326 could bow past corner edges, so this
+    helper is used only for already-geographic EPSG:4326 grids; all other
+    Geo grids fall back to the canonical full ROI identity.
+    """
+    from affine import Affine
+    from shapely.geometry import box
+
+    lut = unit.lut
+    if lut is None or geo_grid is None or str(geo_grid.crs) != "EPSG:4326":
+        return None
+    affine = geo_grid.transform
+    if not isinstance(affine, Affine):
+        affine = Affine(*tuple(affine)[:6])  # type: ignore[arg-type]
+    row0, col0 = int(lut.row0), int(lut.col0)
+    rows, cols = int(lut.shape[0]), int(lut.shape[1])
+    x0, y0 = affine * (col0, row0)
+    x1, y1 = affine * (col0 + cols, row0 + rows)
+    return box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+
+def _unit_local_roi_identity(
+    unit: S1ReferenceUnit,
+    *,
+    coregistration_grid: str,
+    roi: BoundingBox | Polygons | None,
+    geo_grid: GeoGridSpec | None,
+) -> str:
+    """Return a conservative local ROI identity for one published unit.
+
+    Radar has no certified cheap footprint that bounds the nonlinear
+    rdr2geo mapping; a sampled hull can miss support, so radar keeps the full
+    canonical ROI identity and deliberately recomputes on any ROI change.
+    Geo clips to the exact affine window only for an EPSG:4326 grid.
+    """
+    if roi is None:
+        return "none"
+    if coregistration_grid != "geo":
+        return _roi_identity(roi)
+    from shapely import normalize
+
+    from faninsar.missions.s1.roi_support import roi_lonlat_geometry
+
+    footprint = _geo_unit_crop_footprint(unit, geo_grid=geo_grid)
+    if footprint is None or footprint.is_empty:
+        return _roi_identity(roi)
+    local = normalize(roi_lonlat_geometry(roi).intersection(footprint))
+    if local.is_empty:
+        return "empty"
+    return json.dumps(
+        {
+            "kind": local.geom_type,
+            "wkb": local.wkb.hex(),
+        },
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _reference_support_metadata(
+    unit: S1ReferenceUnit,
+    *,
+    coregistration_grid: str,
+    roi: BoundingBox | Polygons | None,
+    geo_grid: GeoGridSpec | None,
+    geo_grid_identity: str | None,
+) -> dict[str, object]:
+    """Return the canonical support window/geometry metadata for one unit."""
+    crop = unit.crop
+    roi_window = unit.roi_window
+    return {
+        "domain": coregistration_grid,
+        "roi": _unit_local_roi_identity(
+            unit,
+            coregistration_grid=coregistration_grid,
+            roi=roi,
+            geo_grid=geo_grid,
+        ),
+        "native_shape": [int(value) for value in unit.native_shape],
+        "roi_window": (
+            None if roi_window is None else [int(value) for value in roi_window]
+        ),
+        "crop": None if crop is None else [int(value) for value in crop],
+        "payload_shape": [
+            int(value) for value in _persisted_unit_shape(unit, coregistration_grid)
+        ],
+        "absolute_placement": [
+            int(value) for value in _absolute_placement(unit, coregistration_grid)
+        ],
+        "geo_grid_identity": geo_grid_identity,
+        "lut": _lut_geometry_identity(unit),
+    }
+
+
+def _support_key(support: Mapping[str, object]) -> str:
+    """Return a short canonical digest of small support/geometry metadata."""
+    text = json.dumps(
+        dict(support),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _reference_unit_locator(
+    product: S1Product, unit: S1ReferenceUnit, support_key: str
+) -> str:
+    """Return the stable checkpoint locator of one physical reference burst."""
+    return "_".join(
+        (
+            "reference",
+            _source_token(product),
+            _checkpoint_token(unit.swath),
+            f"b{int(unit.burst_index)}",
+            support_key,
+        )
+    )
+
+
+def _secondary_unit_locator(
+    date_id: str,
+    product: S1Product,
+    unit: S1ReferenceUnit,
+    secondary_burst_index: int,
+    support_key: str,
+) -> str:
+    """Return the stable checkpoint locator of one secondary physical burst."""
+    return "_".join(
+        (
+            _checkpoint_token(date_id),
+            _source_token(product),
+            _checkpoint_token(unit.swath),
+            f"b{int(secondary_burst_index)}",
+            support_key,
+        )
+    )
+
+
+def _reference_unit_specification(
+    unit: S1ReferenceUnit,
+    *,
+    reference_id: str,
+    source: Mapping[str, object],
+    orbit: Mapping[str, object] | None,
+    aux_cal: Mapping[str, object] | None,
+    dem_identity: str,
+    coregistration_grid: str,
+    support_metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the small scientific specification of one reference burst unit."""
+    from faninsar.missions.s1.merge_layout import physical_burst_id
+
+    return {
+        "schema": _UNIT_SPEC_SCHEMA,
+        "stage": "s1_reference_unit",
+        "reference_id": reference_id,
+        "source": dict(source),
+        "physical_burst_id": physical_burst_id(unit),
+        "coregistration_grid": coregistration_grid,
+        "support": dict(support_metadata),
+        "support_key": _support_key(support_metadata),
+        "orbit": None if orbit is None else dict(orbit),
+        "aux_cal": None if aux_cal is None else dict(aux_cal),
+        "dem": dem_identity,
+        "slc_validity_revision": S1_SLC_VALIDITY_REVISION,
+    }
+
+
+def _secondary_unit_specification(
+    context: S1ReferenceContext,
+    unit: S1ReferenceUnit,
+    *,
+    tag: str,
+    source: Mapping[str, object],
+    secondary_source: Mapping[str, object],
+    secondary_burst_index: int,
+    secondary_orbit: Mapping[str, object] | None,
+    secondary_aux_cal: Mapping[str, object] | None,
+    dem_identity: str,
+    support_metadata: Mapping[str, object],
+    geo_grid_identity: str | None,
+    misreg_az_px: float,
+    misreg_rg_px: float,
+) -> dict[str, object]:
+    """Return the small scientific specification of one secondary burst unit."""
+    from faninsar.missions.s1.merge_layout import physical_burst_id
+
+    support = dict(support_metadata)
+    support_key = unit.support_key or _support_key(support)
+    publication_id = unit.publication_id or (f"scene:{context.product.write_id}:{tag}")
+    return {
+        "schema": _UNIT_SPEC_SCHEMA,
+        "stage": "s1_coregister_secondary",
+        "coregistration_grid": context.coregistration_grid,
+        "reference": {
+            "reference_id": context.reference_id,
+            "unit_publication_id": publication_id,
+            "unit_specification_id": unit.specification_id,
+            "physical_burst_id": physical_burst_id(unit),
+            "source": dict(source),
+            "support": support,
+            "support_key": support_key,
+        },
+        "secondary": {
+            "source": dict(secondary_source),
+            "burst_index": int(secondary_burst_index),
+        },
+        "orbit": {
+            "reference": _file_identity(context.reference_orbit_path),
+            "secondary": None if secondary_orbit is None else dict(secondary_orbit),
+        },
+        "aux_cal": {
+            "reference": _file_identity(context.reference_aux_cal_path),
+            "secondary": None if secondary_aux_cal is None else dict(secondary_aux_cal),
+        },
+        "dem": dem_identity,
+        "roi": support.get("roi", "none"),
+        "geo_grid_identity": geo_grid_identity,
+        "correction": {
+            "misreg_az_px": float(misreg_az_px),
+            "misreg_rg_px": float(misreg_rg_px),
+        },
+        "phase_recipe": {
+            **_S1_COREGISTRATION_RECIPE,
+            "slc_validity_revision": S1_SLC_VALIDITY_REVISION,
+        },
+    }
+
+
+def _verify_committed_checkpoint(
+    checkpoint: UnitCheckpoint,
+    *,
+    integrity_root: Path,
+) -> bool:
+    """Return whether strict bytes match this checkpoint's own baseline."""
+    from faninsar.stack.integrity import verify_integrity
+
+    verdict = verify_integrity(
+        integrity_root,
+        checkpoint.path,
+        strict=True,
+        write_id=checkpoint.write_id,
+    )
+    return verdict.status == "verified"
+
+
+def _establish_committed_checkpoint(
+    checkpoint: UnitCheckpoint,
+    *,
+    integrity_root: Path,
+) -> None:
+    """Record a strict baseline immediately after a new checkpoint commit."""
+    from faninsar.stack.integrity import establish_integrity
+
+    establish_integrity(integrity_root, checkpoint.path, write_id=checkpoint.write_id)
+
+
+def _load_reusable_checkpoint(
+    store: UnitCheckpointStore,
+    unit_id: str,
+    specification: Mapping[str, object],
+) -> UnitCheckpoint | None:
+    """Load one committed unit, treating a typed structural rejection as a miss.
+
+    Checkpoints published before fill chunks were materialized, or whose
+    stored chunk disappeared, cannot be replayed and are recomputed. The
+    replacement is published only by the caller's atomic commit, which still
+    refuses a foreign product kind or unit locator at the same path; a decode
+    failure during replay stays an error instead of becoming a silent reuse.
+    """
+    try:
+        return store.load(unit_id, specification)
+    except InvalidProcessingStateError as error:
+        logger.warning(
+            "%s: committed checkpoint is not reusable (%s); recomputing this unit",
+            unit_id,
+            error,
+        )
+        return None
+
+
+def _replay_scene_unit(
+    writer: SceneWriter,
+    *,
+    tag: str,
+    checkpoint: UnitCheckpoint,
+    row_origin: int,
+    col_origin: int,
+) -> None:
+    """Replay committed arrays with current placement, phase, and mask."""
+    writer.add_unit(
+        tag=tag,
+        payload=checkpoint.read_slc(),
+        row_origin=int(row_origin),
+        col_origin=int(col_origin),
+        scientific_lineage=checkpoint.scientific_lineage,
+        phase_state=checkpoint.phase_state,
+        phase_screen=checkpoint.read_phase(),
+        valid_mask=checkpoint.read_valid(),
+        burst_id=checkpoint.burst_id,
+        absolute_burst_id=checkpoint.absolute_burst_id,
+    )
+
+
+def _replay_reference_unit(
+    writer: SceneWriter,
+    unit: S1ReferenceUnit,
+    checkpoint: UnitCheckpoint,
+    *,
+    coregistration_grid: str,
+    scene_row0: int,
+    scene_col0: int,
+) -> None:
+    """Replay one reference unit on the current scene origin."""
+    if coregistration_grid == "radar":
+        row, col = _absolute_placement(unit, coregistration_grid)
+        row -= int(scene_row0)
+        col -= int(scene_col0)
+    else:
+        row, col = int(unit.row_origin), int(unit.col_origin)
+    _replay_scene_unit(
+        writer,
+        tag=unit.tag,
+        checkpoint=checkpoint,
+        row_origin=row,
+        col_origin=col,
+    )
+
+
+def _replay_secondary_unit(
+    writer: SceneWriter,
+    *,
+    tag: str,
+    checkpoint: UnitCheckpoint,
+    row_origin: int,
+    col_origin: int,
+) -> None:
+    """Replay one secondary unit at its current Reference placement."""
+    _replay_scene_unit(
+        writer,
+        tag=tag,
+        checkpoint=checkpoint,
+        row_origin=row_origin,
+        col_origin=col_origin,
+    )
+
+
 def prepare_s1_reference(
     reference_path: Path | Sequence[Path],
     *,
@@ -303,6 +877,9 @@ def prepare_s1_reference(
     polarizations: Sequence[str] | str | None = None,
     device: str = "auto",
     overwrite: bool = False,
+    checkpoint_root: Path | None = None,
+    verification: Literal["fast", "strict"] = "fast",
+    integrity_root: Path | None = None,
 ) -> S1ReferenceContext:
     """Compute the Reference scene once and return its context.
 
@@ -343,6 +920,14 @@ def prepare_s1_reference(
         Numerical device.
     overwrite : bool, optional
         Recompute and replace an existing Reference product.
+    checkpoint_root : pathlib.Path, optional
+        Root for committed per-physical-burst Reference units. Each unit is
+        keyed by its own source, burst, and actual support/geometry metadata;
+        unchanged units are replayed instead of recomputed.
+    verification : {"fast", "strict"}, optional
+        Checkpoint reuse policy. ``fast`` performs no payload hashing.
+    integrity_root : pathlib.Path, optional
+        Strict baseline root; required when ``verification="strict"``.
 
     Returns
     -------
@@ -354,9 +939,11 @@ def prepare_s1_reference(
     InvalidProcessingStateError
         If the selection is empty, the configuration is invalid, an
         existing Reference product does not match the current selection,
-        or the requested polarizations are ambiguous for one layout.
+        the requested polarizations are ambiguous for one layout, or strict
+        verification is requested without its checkpoint/baseline roots.
 
     """
+    _require_checkpoint_policy(checkpoint_root, verification, integrity_root)
     if coregistration_grid not in {"radar", "geo"}:
         reject_invalid_state("coregistration_grid must be 'radar' or 'geo'")
     if coregistration_grid == "geo" and geo_grid is None:
@@ -429,6 +1016,53 @@ def prepare_s1_reference(
         for swath in swath_tuple
         for frame_index, burst_index, _azimuth_offset in units_by_swath[swath]
     )
+    store = None
+    dem_identity: str | None = None
+    roi_identity: str | None = None
+    geo_grid_id: str | None = None
+    if checkpoint_root is not None:
+        from faninsar.io.storage.unit_checkpoint import UnitCheckpointStore
+
+        store = UnitCheckpointStore(checkpoint_root)
+        from faninsar.processing.geometry.api import dem_content_identity
+
+        dem_identity = dem_content_identity(dem)
+        roi_identity = _roi_identity(roi)
+        if coregistration_grid == "geo":
+            from faninsar.processing.geometry.prepared import (
+                geo_grid_identity as _geo_grid_identity,
+            )
+
+            geo_grid_id = _geo_grid_identity(geo_grid)  # type: ignore[arg-type]
+    pending_replays: list[tuple[S1ReferenceUnit, UnitCheckpoint]] = []
+
+    def _start_writer(scene: ProductionScene) -> SceneWriter:
+        """Create the Reference writer and replay any already-validated units."""
+        nonlocal writer
+        if writer is not None:
+            return writer
+        writer = SceneWriter(
+            output_scene,
+            date_id=reference_id,
+            reference_id=reference_id,
+            domain=coregistration_grid,
+            grid_shape=grid_shape,
+            wavelength_m=float(scene.geometry.wavelength_m),
+            overwrite=overwrite or replace_stale_validity or reuse,
+            **header,
+        )
+        for pending_unit, pending in pending_replays:
+            _replay_reference_unit(
+                writer,
+                pending_unit,
+                pending,
+                coregistration_grid=coregistration_grid,
+                scene_row0=scene_row0,
+                scene_col0=scene_col0,
+            )
+        pending_replays.clear()
+        return writer
+
     try:
         for tag, frame_index in ordered:
             if roi_units_resolved and tag not in units:
@@ -447,17 +1081,8 @@ def prepare_s1_reference(
                 read_samples=not reuse,
                 product=primary_products[frame_index],
             )
-            if writer is None and not reuse:
-                writer = SceneWriter(
-                    output_scene,
-                    date_id=reference_id,
-                    reference_id=reference_id,
-                    domain=coregistration_grid,
-                    grid_shape=grid_shape,
-                    wavelength_m=float(scene.geometry.wavelength_m),
-                    overwrite=overwrite or replace_stale_validity,
-                    **header,
-                )
+            if store is None and writer is None and not reuse:
+                writer = _start_writer(scene)
             unit = units.get(tag)
             parent_row0 = int(
                 next(
@@ -487,6 +1112,186 @@ def prepare_s1_reference(
                 unit.parent_row0 = parent_row0
                 unit.parent_col0 = parent_col0
             unit.scene = scene
+            if store is not None:
+                if coregistration_grid == "radar":
+                    _prepare_radar_unit(
+                        unit, roi=roi, dem=dem, compute=False, device=device
+                    )
+                else:
+                    _prepare_geo_unit(
+                        unit,
+                        dem=dem,
+                        geo_grid=geo_grid,  # type: ignore[arg-type]
+                        geo_lut_cache_dir=geo_lut_cache_dir,
+                        work_dir=work_root / tag,
+                        roi=roi,
+                        compute=False,
+                        device=device,
+                    )
+                    if unit.lut is None:
+                        logger.warning("%s: empty geocoded footprint; skipped", tag)
+                        del scene
+                        continue
+                support = _reference_support_metadata(
+                    unit,
+                    coregistration_grid=coregistration_grid,
+                    roi=roi,
+                    geo_grid=geo_grid,
+                    geo_grid_identity=geo_grid_id,
+                )
+                unit.support_key = _support_key(support)
+                source_product = primary_products[frame_index]
+                unit_id = _reference_unit_locator(
+                    source_product, unit, unit.support_key
+                )
+                specification = _reference_unit_specification(
+                    unit,
+                    reference_id=reference_id,
+                    source=_source_identity(
+                        source_product,
+                        swath=unit.scene.swath,
+                        burst=unit.scene.burst,
+                    ),
+                    orbit=_file_identity(ref_orbits[frame_index]),
+                    aux_cal=_file_identity(aux_cal_path),
+                    dem_identity=dem_identity or "none",
+                    coregistration_grid=coregistration_grid,
+                    support_metadata=support,
+                )
+                committed = _load_reusable_checkpoint(store, unit_id, specification)
+                if (
+                    committed is not None
+                    and verification == "strict"
+                    and not _verify_committed_checkpoint(
+                        committed,
+                        integrity_root=integrity_root,  # type: ignore[arg-type]
+                    )
+                ):
+                    logger.warning(
+                        "%s: strict integrity did not verify committed checkpoint; "
+                        "recomputing this unit",
+                        unit_id,
+                    )
+                    committed = None
+                if committed is not None:
+                    unit.publication_id = committed.write_id
+                    unit.specification_id = committed.specification_id
+                    unit.scene = _without_pixels(scene)
+                    units[tag] = unit
+                    if writer is not None:
+                        _replay_reference_unit(
+                            writer,
+                            unit,
+                            committed,
+                            coregistration_grid=coregistration_grid,
+                            scene_row0=scene_row0,
+                            scene_col0=scene_col0,
+                        )
+                    elif not reuse:
+                        _replay_reference_unit(
+                            _start_writer(scene),
+                            unit,
+                            committed,
+                            coregistration_grid=coregistration_grid,
+                            scene_row0=scene_row0,
+                            scene_col0=scene_col0,
+                        )
+                    else:
+                        pending_replays.append((unit, committed))
+                    del scene
+                    continue
+                # A checkpoint miss only authorizes recomputing this unit.
+                if reuse:
+                    scene = load_production_scene(
+                        primary_paths[min(frame_index, len(primary_paths) - 1)],
+                        swath=swath,
+                        burst_index=burst_index,
+                        dem=dem,
+                        orbit_path=ref_orbits[frame_index],
+                        aux_cal_path=aux_cal_path,
+                        coregistration_grid=coregistration_grid,
+                        full_range=True,
+                        read_samples=True,
+                        product=primary_products[frame_index],
+                    )
+                    unit.scene = scene
+                if coregistration_grid == "radar":
+                    prepared = _prepare_radar_unit(
+                        unit, roi=roi, dem=dem, compute=True, device=device
+                    )
+                else:
+                    prepared = _prepare_geo_unit(
+                        unit,
+                        dem=dem,
+                        geo_grid=geo_grid,  # type: ignore[arg-type]
+                        geo_lut_cache_dir=geo_lut_cache_dir,
+                        work_dir=work_root / tag,
+                        roi=roi,
+                        compute=True,
+                        device=device,
+                    )
+                if prepared is None:
+                    logger.warning("%s: empty geocoded footprint; skipped", tag)
+                    del scene
+                    continue
+                payload, published = prepared
+                from faninsar.io.storage.unit_checkpoint import UnitPayloads
+                from faninsar.missions.s1.merge_layout import physical_burst_id
+                from faninsar.missions.s1.scene_bursts import (
+                    official_absolute_burst_id,
+                )
+
+                burst_id = physical_burst_id(unit)
+                absolute_burst_id = official_absolute_burst_id(
+                    getattr(unit.scene, "burst", None)
+                )
+                lineage = [
+                    {
+                        "stage": "s1_reference_burst",
+                        "source": str(primary_paths[frame_index]),
+                    }
+                ]
+                row_origin, col_origin = _absolute_placement(unit, coregistration_grid)
+                checkpoint = store.commit(
+                    unit_id,
+                    specification,
+                    payloads=UnitPayloads(
+                        slc=np.asarray(payload, dtype=np.complex64),
+                        row_origin=row_origin,
+                        col_origin=col_origin,
+                        valid=(
+                            None
+                            if published is None
+                            else np.asarray(published, dtype=bool)
+                        ),
+                        burst_id=burst_id,
+                        absolute_burst_id=absolute_burst_id,
+                        scientific_lineage=lineage,
+                        phase_state=None,
+                    ),
+                )
+                if verification == "strict":
+                    _establish_committed_checkpoint(
+                        checkpoint,
+                        integrity_root=integrity_root,  # type: ignore[arg-type]
+                    )
+                unit.publication_id = checkpoint.write_id
+                unit.specification_id = checkpoint.specification_id
+                unit.scene = _without_pixels(scene)
+                units[tag] = unit
+                _stage_scene_unit(
+                    _start_writer(scene),
+                    tag=tag,
+                    payload=payload,
+                    row_origin=unit.row_origin,
+                    col_origin=unit.col_origin,
+                    valid_mask=published,
+                    burst_id=burst_id,
+                    scientific_lineage=lineage,
+                    absolute_burst_id=absolute_burst_id,
+                )
+                del payload, prepared, scene
+                continue
             if coregistration_grid == "radar":
                 payload = _prepare_radar_unit(
                     unit, roi=roi, dem=dem, compute=not reuse, device=device
@@ -551,6 +1356,13 @@ def prepare_s1_reference(
             properties["faninsar:baseline_parallel_m"] = 0.0
             properties["faninsar:baseline_perpendicular_m"] = 0.0
             properties[_S1_SLC_VALIDITY_REVISION_KEY] = S1_SLC_VALIDITY_REVISION
+            if store is not None:
+                properties["faninsar:reference_unit_publications"] = {
+                    tag: unit.publication_id for tag, unit in units.items()
+                }
+                properties["faninsar:reference_unit_specifications"] = {
+                    tag: unit.specification_id for tag, unit in units.items()
+                }
             from faninsar.missions.s1.merge_layout import (
                 build_s1_reference_layout,
                 publish_reference_merge_layout,
@@ -568,7 +1380,9 @@ def prepare_s1_reference(
                 scene_offset=(scene_row0, scene_col0),
             )
             layout_product = publish_reference_merge_layout(
-                output_scene, layout, overwrite=overwrite or replace_stale_validity
+                output_scene,
+                layout,
+                overwrite=overwrite or replace_stale_validity or reuse,
             )
             properties["faninsar:layout_id"] = layout_product.write_id
             product = writer.commit(
@@ -576,6 +1390,8 @@ def prepare_s1_reference(
                 inputs={"layout": layout_product.write_id},
             )
         else:
+            from faninsar.missions.s1.merge_layout import physical_burst_id
+
             product = CoregisteredSceneStore.open(output_scene)
             _check_reused_reference(
                 product,
@@ -586,6 +1402,19 @@ def prepare_s1_reference(
                 grid_identity=(
                     str(header["grid_identity"]) if "grid_identity" in header else None
                 ),
+                expected_publications=(
+                    None
+                    if store is None
+                    else {tag: unit.publication_id for tag, unit in units.items()}
+                ),
+                expected_specifications=(
+                    None
+                    if store is None
+                    else {tag: unit.specification_id for tag, unit in units.items()}
+                ),
+                expected_burst_ids={
+                    tag: physical_burst_id(unit) for tag, unit in units.items()
+                },
             )
     except BaseException:
         if writer is not None:
@@ -596,7 +1425,7 @@ def prepare_s1_reference(
     logger.info(
         "Reference %s %s once: %d units",
         reference_id,
-        "reused" if reuse else "computed",
+        "reused" if reuse and writer is None else "computed",
         len(units),
     )
     return S1ReferenceContext(
@@ -609,6 +1438,13 @@ def prepare_s1_reference(
         roi=roi,
         dem=dem,
         polarizations=selected_polarizations,
+        checkpoint_root=checkpoint_root,
+        integrity_root=integrity_root,
+        verification=verification,
+        dem_identity=dem_identity,
+        roi_identity=roi_identity,
+        reference_orbit_path=orbit_path,
+        reference_aux_cal_path=aux_cal_path,
     )
 
 
@@ -964,8 +1800,15 @@ def _check_reused_reference(
     *,
     grid_shape: tuple[int, int],
     grid_identity: str | None = None,
+    expected_publications: Mapping[str, str | None] | None = None,
+    expected_specifications: Mapping[str, str | None] | None = None,
+    expected_burst_ids: Mapping[str, str] | None = None,
 ) -> None:
-    """Reject a persisted Reference that no longer matches the selection."""
+    """Reject a persisted Reference that no longer matches the selection.
+
+    Local unit publications are validated before a whole-scene shortcut is
+    accepted: an existing ``item.json`` is never sufficient evidence by itself.
+    """
     if not product.is_reference or product.reference_id != reference_id:
         reject_invalid_state(
             f"{product.root} is not the Reference scene of {reference_id}"
@@ -995,6 +1838,34 @@ def _check_reused_reference(
             "persisted Reference units differ from the current selection; "
             "recoregister with overwrite=True"
         )
+    if expected_publications is not None:
+        stored_publications = product.properties.get(
+            "faninsar:reference_unit_publications"
+        )
+        if not isinstance(stored_publications, Mapping):
+            reject_invalid_state(
+                "persisted Reference has no local unit publications; "
+                "recoregister with overwrite=True"
+            )
+        if dict(stored_publications) != dict(expected_publications):
+            reject_invalid_state(
+                "persisted Reference local unit publications differ from the "
+                "current selection; recoregister with overwrite=True"
+            )
+    if expected_specifications is not None:
+        stored_specifications = product.properties.get(
+            "faninsar:reference_unit_specifications"
+        )
+        if not isinstance(stored_specifications, Mapping):
+            reject_invalid_state(
+                "persisted Reference has no local unit specifications; "
+                "recoregister with overwrite=True"
+            )
+        if dict(stored_specifications) != dict(expected_specifications):
+            reject_invalid_state(
+                "persisted Reference local unit specifications differ from the "
+                "current selection; recoregister with overwrite=True"
+            )
     for tag, unit in units.items():
         placed = stored[tag]
         if (placed.row_origin, placed.col_origin) != (unit.row_origin, unit.col_origin):
@@ -1008,6 +1879,14 @@ def _check_reused_reference(
                 f"persisted Reference unit {tag!r} has shape {tuple(placed.shape)}, "
                 f"expected {tuple(expected_shape)}; recoregister with overwrite=True"
             )
+        if expected_burst_ids is not None:
+            expected_burst = expected_burst_ids.get(tag)
+            if expected_burst is not None and placed.burst_id != expected_burst:
+                reject_invalid_state(
+                    f"persisted Reference unit {tag!r} burst id "
+                    f"{placed.burst_id!r} differs from {expected_burst!r}; "
+                    "recoregister with overwrite=True"
+                )
         if unit.scientific_support is not None and tuple(
             unit.scientific_support.shape
         ) != tuple(placed.shape):
@@ -1037,6 +1916,9 @@ def coregister_s1_secondary(
     inputs: Mapping[str, Product | str] | None = None,
     properties: Mapping[str, object] | None = None,
     overwrite: bool = False,
+    checkpoint_root: Path | None = None,
+    verification: Literal["fast", "strict"] = "fast",
+    integrity_root: Path | None = None,
 ) -> CoregisteredSceneStore:
     """Coregister one secondary date onto the once-prepared Reference.
 
@@ -1070,6 +1952,14 @@ def coregister_s1_secondary(
         Extra item properties.
     overwrite : bool, optional
         Replace an existing secondary product.
+    checkpoint_root : pathlib.Path, optional
+        Root for committed per-burst scientific-unit checkpoints. Each unit
+        binds its physical secondary source, orbit/AUX/DEM inputs, the local
+        Reference unit publication, and the actual support/geometry window.
+    verification : {"fast", "strict"}, optional
+        Checkpoint reuse policy. ``fast`` performs no payload hashing.
+    integrity_root : pathlib.Path, optional
+        Strict baseline root; required when ``verification="strict"``.
 
     Returns
     -------
@@ -1079,10 +1969,12 @@ def coregister_s1_secondary(
     Raises
     ------
     InvalidProcessingStateError
-        If the constants are non-finite, the date is the Reference, or the
-        secondary covers no Reference unit.
+        If the constants are non-finite, the date is the Reference, the
+        secondary covers no Reference unit, or strict verification is
+        requested without its checkpoint/baseline roots.
 
     """
+    _require_checkpoint_policy(checkpoint_root, verification, integrity_root)
     if not np.isfinite(misreg_az_px) or not np.isfinite(misreg_rg_px):
         reject_invalid_state("misreg_az_px and misreg_rg_px must be finite")
     secondary_paths = _as_frame_paths(secondary_path, "secondary_path")
@@ -1101,6 +1993,19 @@ def coregister_s1_secondary(
     work_root = output_scene.parent / f".{output_scene.name}.work"
     wrote = 0
     unit_baselines: list[tuple[float, float]] = []
+    store = None
+    dem_identity: str | None = None
+    geo_grid_id: str | None = None
+    if checkpoint_root is not None:
+        from faninsar.io.storage.unit_checkpoint import UnitCheckpointStore
+        from faninsar.processing.geometry.api import dem_content_identity
+
+        store = UnitCheckpointStore(checkpoint_root)
+        dem_identity = dem_content_identity(context.dem)
+        if domain == "geo" and context.geo_grid is not None:
+            from faninsar.processing.geometry.prepared import geo_grid_identity
+
+            geo_grid_id = geo_grid_identity(context.geo_grid)
     matches = {
         tag: _secondary_burst_match(unit, secondary_products, tag, date_id)
         for tag, unit in context.units.items()
@@ -1129,6 +2034,87 @@ def coregister_s1_secondary(
                 if match is None:
                     continue
                 secondary_burst_index, secondary_product = match
+                placed = reference_units[tag]
+                committed = None
+                specification = None
+                unit_id = ""
+                if store is not None:
+                    support = _reference_support_metadata(
+                        unit,
+                        coregistration_grid=domain,
+                        roi=context.roi,
+                        geo_grid=context.geo_grid,
+                        geo_grid_identity=geo_grid_id,
+                    )
+                    support_key = unit.support_key or _support_key(support)
+                    unit_id = _secondary_unit_locator(
+                        date_id,
+                        secondary_product,
+                        unit,
+                        secondary_burst_index,
+                        support_key,
+                    )
+                    secondary_swath = secondary_product.find_swath(
+                        unit.swath, unit.scene.swath.polarization
+                    )
+                    secondary_burst = None
+                    if secondary_swath is not None and 0 <= secondary_burst_index < len(
+                        secondary_swath.bursts
+                    ):
+                        secondary_burst = secondary_swath.bursts[secondary_burst_index]
+                    specification = _secondary_unit_specification(
+                        context,
+                        unit,
+                        tag=tag,
+                        source=_source_identity(
+                            unit.scene.product,
+                            swath=unit.scene.swath,
+                            burst=unit.scene.burst,
+                        ),
+                        secondary_source=_source_identity(
+                            secondary_product,
+                            swath=secondary_swath,
+                            burst=secondary_burst,
+                        ),
+                        secondary_burst_index=secondary_burst_index,
+                        secondary_orbit=_file_identity(secondary_orbit_path),
+                        secondary_aux_cal=_file_identity(secondary_aux_cal_path),
+                        dem_identity=dem_identity or "none",
+                        support_metadata=support,
+                        geo_grid_identity=geo_grid_id,
+                        misreg_az_px=float(misreg_az_px),
+                        misreg_rg_px=float(misreg_rg_px),
+                    )
+                    committed = _load_reusable_checkpoint(store, unit_id, specification)
+                    if (
+                        committed is not None
+                        and verification == "strict"
+                        and not _verify_committed_checkpoint(
+                            committed,
+                            integrity_root=integrity_root,  # type: ignore[arg-type]
+                        )
+                    ):
+                        logger.warning(
+                            "%s: strict integrity did not verify committed checkpoint; "
+                            "recomputing this unit",
+                            unit_id,
+                        )
+                        committed = None
+                if committed is not None:
+                    _replay_secondary_unit(
+                        writer,
+                        tag=tag,
+                        checkpoint=committed,
+                        row_origin=placed.row_origin,
+                        col_origin=placed.col_origin,
+                    )
+                    parallel = committed.properties.get("baseline_parallel_m")
+                    perpendicular = committed.properties.get("baseline_perpendicular_m")
+                    if parallel is not None and perpendicular is not None:
+                        unit_baselines.append((float(parallel), float(perpendicular)))
+                    wrote += 1
+                    logger.info("Reused committed scene unit %s", unit_id)
+                    continue
                 payload, published, state = _coregister_unit(
                     context,
                     unit,
@@ -1143,7 +2129,6 @@ def coregister_s1_secondary(
                     device=device,
                     product=secondary_product,
                 )
-                placed = reference_units[tag]
                 if payload.shape != placed.shape:
                     reject_invalid_state(
                         f"{tag}: secondary shape {payload.shape} differs from "
@@ -1154,23 +2139,67 @@ def coregister_s1_secondary(
                         f"{tag}: Reference unit is missing physical burst_id"
                     )
 
-                from faninsar.missions.s1.scene_bursts import official_absolute_burst_id
-
-                _stage_scene_unit(
-                    writer,
-                    tag=tag,
-                    payload=payload,
-                    row_origin=placed.row_origin,
-                    col_origin=placed.col_origin,
-                    valid_mask=published,
-                    burst_id=placed.burst_id,
-                    scientific_lineage=state.scientific_lineage,
-                    phase_state=_phase_state_manifest(state),
-                    absolute_burst_id=official_absolute_burst_id(
-                        getattr(state.secondary, "burst", None)
-                    ),
+                from faninsar.missions.s1.scene_bursts import (
+                    official_absolute_burst_id,
                 )
-                unit_baselines.append(_unit_scene_baseline(state))
+
+                absolute_burst_id = official_absolute_burst_id(
+                    getattr(state.secondary, "burst", None)
+                )
+                phase_state = _phase_state_manifest(state)
+                baseline = _unit_scene_baseline(state)
+                if store is not None:
+                    from faninsar.io.storage.unit_checkpoint import UnitPayloads
+
+                    assert specification is not None
+                    checkpoint = store.commit(
+                        unit_id,
+                        specification,
+                        payloads=UnitPayloads(
+                            slc=np.asarray(payload, dtype=np.complex64),
+                            row_origin=placed.row_origin,
+                            col_origin=placed.col_origin,
+                            valid=(
+                                None
+                                if published is None
+                                else np.asarray(published, dtype=bool)
+                            ),
+                            burst_id=placed.burst_id,
+                            absolute_burst_id=absolute_burst_id,
+                            scientific_lineage=state.scientific_lineage,
+                            phase_state=phase_state,
+                        ),
+                        properties={
+                            "baseline_parallel_m": float(baseline[0]),
+                            "baseline_perpendicular_m": float(baseline[1]),
+                        },
+                    )
+                    if verification == "strict":
+                        _establish_committed_checkpoint(
+                            checkpoint,
+                            integrity_root=integrity_root,  # type: ignore[arg-type]
+                        )
+                    _replay_secondary_unit(
+                        writer,
+                        tag=tag,
+                        checkpoint=checkpoint,
+                        row_origin=placed.row_origin,
+                        col_origin=placed.col_origin,
+                    )
+                else:
+                    _stage_scene_unit(
+                        writer,
+                        tag=tag,
+                        payload=payload,
+                        row_origin=placed.row_origin,
+                        col_origin=placed.col_origin,
+                        valid_mask=published,
+                        burst_id=placed.burst_id,
+                        scientific_lineage=state.scientific_lineage,
+                        phase_state=phase_state,
+                        absolute_burst_id=absolute_burst_id,
+                    )
+                unit_baselines.append(baseline)
                 del payload, state
                 shutil.rmtree(work_root / tag, ignore_errors=True)
                 wrote += 1
