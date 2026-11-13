@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
+    from faninsar.stack._stac_service import StackStacService
     from faninsar.stack.catalog import SceneCatalog
     from faninsar.stack.masks import StackMasks
     from faninsar.stack.misreg import MisregRecord
@@ -2057,6 +2058,69 @@ class Stack(NetworkContract, ABC):
                 for asset in verify_product(item_path.parent)
             )
         return problems
+
+    def stac_serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        persist_catalog: bool = True,
+    ) -> StackStacService:
+        """Serve committed products as a read-only STAC API.
+
+        The returned handle exposes ``base_url``, ``catalog_url``,
+        ``api_url``, ``refresh()``, ``report()``, ``wait()``, and ``stop()``,
+        and can be used as a context manager so the service always stops:
+
+        .. code-block:: python
+
+            with stack.stac_serve(port=0) as service:
+                print(service.catalog_url)
+                service.wait()
+
+        Serving reads the committed ``item.json`` records and payloads below
+        :attr:`StackConfig.work_dir`; it never prepares inputs, geocodes,
+        republishes, or changes canonical products. The derived catalog and
+        index are disposable views. With ``persist_catalog=False`` no file in
+        the work directory is created or modified, so a read-only workspace
+        is supported.
+
+        Parameters
+        ----------
+        host : str, default="127.0.0.1"
+            Interface to bind. Loopback is the default; any other host is
+            honored only when passed explicitly.
+        port : int, default=8000
+            TCP port to bind. ``0`` selects an ephemeral port; the actual
+            assigned port is reported in the returned handle and printed
+            URLs.
+        persist_catalog : bool, default=True
+            Write the portable ``catalog.json`` and ``stac/`` views after the
+            socket is bound. ``False`` performs no derived filesystem writes.
+
+        Returns
+        -------
+        StackStacService
+            Running foreground-capable service handle. The actual Catalog and
+            API URLs are printed once, after the service is ready and the
+            initial persistence outcome is known.
+
+        Raises
+        ------
+        ImportError
+            If the serving runtime (``aiohttp``) is not available.
+        OSError
+            If the requested interface or port cannot be bound. No workspace
+            file is written before a successful bind.
+
+        """
+        from faninsar.stack._stac_service import start_stac_service
+
+        return start_stac_service(
+            self.config.work_dir,
+            host=host,
+            port=port,
+            persist_catalog=persist_catalog,
+        )
 
     def _reference_radar_geometry(self) -> tuple[object, tuple[int, int]]:
         """Return the persisted Reference radar geometry and scene-grid shape.

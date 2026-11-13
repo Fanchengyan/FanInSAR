@@ -6,6 +6,19 @@ import argparse
 import sys
 
 
+def _port_number(value: str) -> int:
+    """Parse a TCP port for argparse, rejecting out-of-range values."""
+    try:
+        port = int(value)
+    except ValueError as error:
+        message = "port must be an integer"
+        raise argparse.ArgumentTypeError(message) from error
+    if not 0 <= port <= 65535:
+        message = "port must be between 0 and 65535"
+        raise argparse.ArgumentTypeError(message)
+    return port
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the ``faninsar`` CLI.
 
@@ -69,6 +82,34 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     stack_verify.add_argument("work_dir", help="Stack work directory")
+    stack_stac_serve = stack_sub.add_parser(
+        "stac-serve",
+        help="Serve committed products as a read-only STAC API",
+        description=(
+            "Serve committed products as a read-only STAC API and "
+            "Range-capable asset service. The command runs in the foreground "
+            "until interrupted."
+        ),
+    )
+    stack_stac_serve.add_argument("work_dir", help="Stack work directory")
+    stack_stac_serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Interface to bind (default: loopback 127.0.0.1)",
+    )
+    stack_stac_serve.add_argument(
+        "--port",
+        type=_port_number,
+        default=8000,
+        help="TCP port to bind; 0 selects an ephemeral port (default: 8000)",
+    )
+    stack_stac_serve.add_argument(
+        "--no-persist-catalog",
+        dest="persist_catalog",
+        action="store_false",
+        help="Serve in memory only; write no catalog.json or stac/ views",
+    )
+    stack_stac_serve.set_defaults(persist_catalog=True)
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -91,7 +132,7 @@ def _emit(payload: object) -> None:
     sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
 
 
-def _run_stack(args: argparse.Namespace) -> int:
+def _run_stack(args: argparse.Namespace) -> int:  # noqa: PLR0911
     """Dispatch the ``faninsar stack`` subcommands."""
     from pathlib import Path
 
@@ -124,7 +165,55 @@ def _run_stack(args: argparse.Namespace) -> int:
                 failures[str(item.parent)] = bad
         _emit({"failures": failures})
         return 1 if failures else 0
+    if args.stack_command == "stac-serve":
+        return _run_stac_serve(args)
     return 2
+
+
+def _write_error(message: str) -> None:
+    """Write one CLI diagnostic to stderr."""
+    sys.stderr.write(f"faninsar: {message}\n")
+
+
+def _run_stac_serve(args: argparse.Namespace) -> int:  # noqa: PLR0911
+    """Run the read-only STAC service in the foreground.
+
+    The service prints its actual Catalog and API URLs once it is ready; the
+    CLI adds no second address line. ``SIGINT`` stops the service cleanly.
+    """
+    from faninsar.stack.session import Stack
+
+    try:
+        stack = Stack.open(args.work_dir)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as error:
+        _write_error(f"cannot open Stack work directory {args.work_dir}: {error}")
+        return 1
+    try:
+        service = stack.stac_serve(
+            host=args.host,
+            port=args.port,
+            persist_catalog=args.persist_catalog,
+        )
+    except KeyboardInterrupt:
+        return 0
+    except ImportError as error:
+        _write_error(f"STAC serving runtime is unavailable: {error}")
+        return 2
+    except Exception as error:
+        _write_error(f"STAC service failed to start: {error}")
+        return 1
+    try:
+        service.wait()
+    except KeyboardInterrupt:
+        pass
+    except Exception as error:
+        _write_error(f"STAC service failed: {error}")
+        return 1
+    finally:
+        service.stop()
+    return 0
 
 
 if __name__ == "__main__":

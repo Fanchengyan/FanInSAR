@@ -394,6 +394,7 @@ dev = [
     "curl-cffi>=0.15.0",
     "grequests>=0.7.0",
     "h2>=4.4.0",
+    "jsonschema>=4.26.0",
     "pycurl>=7.47.0",
     "remotezip>=0.12.3",
     "tls-client>=1.0.1",

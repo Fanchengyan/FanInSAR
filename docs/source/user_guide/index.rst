@@ -23,3 +23,4 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    scene_bursts
    durable_workspace
    workspace_recovery
+   stac
