@@ -75,7 +75,7 @@ from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.canvas import BurstFetchedWindow
 from faninsar.missions.s1.overlap import burst_overlap_windows
 from faninsar.missions.s1.types import track_group_key
-from faninsar.remote.errors import RemoteAccessError
+from faninsar.remote.errors import RemoteAccessError, _fail
 from faninsar.remote.fetch import RangeFetcher, RangeSpan, fetch_ranges_async
 from faninsar.remote.fetch.span_cache import (
     SpanCache,
@@ -437,6 +437,7 @@ def discover_cdse_slc_items(
     datetime_range: tuple[datetime, datetime] | None = None,
     *,
     polarizations: Sequence[str] | Literal["all"] = ("VV",),
+    parent_ids: Sequence[str] | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Discover CDSE SLC products and bind OData measurement node URLs.
@@ -454,6 +455,11 @@ def discover_cdse_slc_items(
     polarizations : sequence of str or ``"all"``, optional
         Local channels kept as measurement bindings.  Default ``("VV",)``
         retains every IW swath in VV; ``"all"`` keeps every OData pair.
+    parent_ids : sequence of str or None, optional
+        Exact ASF-selected parent SAFE ids.  When supplied, a parent that
+        the CDSE STAC search did not return is resolved by exact-name CDSE
+        OData metadata lookup.  ``None`` disables the fallback because the
+        caller could not establish every selected parent's identity.
     **kwargs : Any
         Advanced search options forwarded to :func:`faninsar.remote.search`
         (``limit``, ``budget``, ``filters``).  ``catalog`` and
@@ -503,6 +509,25 @@ def discover_cdse_slc_items(
     bindings: list[dict[str, Any]] = []
     for item in items:
         bindings.extend(_bind_cdse_item(item))
+    if parent_ids is not None and catalog == _CDSE_CATALOG:
+        if isinstance(parent_ids, str):
+            parent_ids = (parent_ids,)
+        expected = {
+            _safe_product_id(str(value)) or str(value).strip().upper()
+            for value in parent_ids
+            if str(value).strip()
+        }
+        present = {_binding_parent_id(binding) for binding in bindings}
+        missing = sorted(expected - present)
+        if missing:
+            bindings.extend(
+                _lookup_missing_cdse_parents(
+                    missing,
+                    roi,
+                    requested=requested,
+                    budget=kwargs.get("budget"),
+                )
+            )
     if requested is None:
         return bindings
     return [
@@ -510,6 +535,82 @@ def discover_cdse_slc_items(
         for binding in bindings
         if str(binding.get("polarization", "")).upper() in requested
     ]
+
+
+def _lookup_missing_cdse_parents(
+    parent_ids: Sequence[str],
+    roi: BoundingBox | Points | Polygons,
+    *,
+    requested: set[str] | None,
+    budget: Any | None,
+) -> list[dict[str, Any]]:
+    """Resolve exact missing ASF parents through CDSE OData metadata.
+
+    The lookup is missing-only: callers pass the exact ASF-selected parent
+    ids, and only parents absent from the STAC bindings are queried by their
+    full SAFE name.  The shared preparation ledger is reused when present so
+    these metadata requests cannot bypass the operation's resource cap.
+    """
+    from faninsar.remote.protocols import _CallLedger
+    from faninsar.remote.providers.cdse import lookup_cdse_safe_record
+    from faninsar.remote.records import RemoteResourceBudget
+
+    policy_budget, policy_ledger = _preparation_remote_policy.get()
+    ledger = (
+        policy_ledger
+        if policy_ledger is not None
+        else _CallLedger(policy_budget or budget or RemoteResourceBudget())
+    )
+    resolved: list[dict[str, Any]] = []
+    for parent_id in parent_ids:
+        item = lookup_cdse_safe_record(parent_id, ledger=ledger)
+        if item is None:
+            message = (
+                f"CDSE OData has no exact product named {parent_id}.SAFE; "
+                "refusing to substitute another parent or version"
+            )
+            _fail(RemoteAccessError, "product_not_found", message)
+        if not _exact_parent_covers_roi(item, roi):
+            message = (
+                f"CDSE exact parent {parent_id} does not intersect the requested "
+                "ROI; refusing to substitute another parent"
+            )
+            _fail(RemoteAccessError, "product_not_found", message)
+        bindings = _bind_cdse_item(item)
+        if requested is not None:
+            bindings = [
+                binding
+                for binding in bindings
+                if str(binding.get("polarization", "")).upper() in requested
+            ]
+        if not bindings:
+            message = (
+                f"CDSE exact parent {parent_id} has no requested polarization "
+                f"{sorted(requested) if requested is not None else 'all'}; "
+                "refusing to substitute another measurement"
+            )
+            _fail(RemoteAccessError, "invalid_product", message)
+        resolved.extend(bindings)
+    return resolved
+
+
+def _exact_parent_covers_roi(
+    item: Any,
+    roi: BoundingBox | Points | Polygons,
+) -> bool:
+    """Return whether one exact OData parent intersects the caller's ROI."""
+    geometry = getattr(getattr(item, "acquisition", None), "geometry", None)
+    if not isinstance(geometry, Mapping):
+        return False
+    from shapely.geometry import shape
+
+    from faninsar.remote.catalog import _query_geometry
+
+    query, _query_kind, _point_geometries = _query_geometry(roi)
+    try:
+        return bool(shape(geometry).intersects(query))
+    except (TypeError, ValueError):
+        return False
 
 
 def windows_from_cdse_fetch(
@@ -2668,6 +2769,53 @@ class _CdseBurstTransfer:
             with self._lock, contextlib.suppress(ValueError):
                 self._inflight.remove(future)
 
+    async def bridge_async(self, coro: Any) -> Any:
+        """Await owned-loop work without blocking the caller's event loop.
+
+        Cancellation waits for the actual owned task, not merely the cancelled
+        concurrent future, before releasing a caller-owned cache sink.
+        """
+        loop = self._ensure_loop()
+        tasks = []
+
+        async def run() -> Any:
+            task = asyncio.current_task()
+            tasks.append(task)
+            return await coro
+
+        with self._lock:
+            if self._stop.is_set():
+                coro.close()
+                raise asyncio.CancelledError
+            future = asyncio.run_coroutine_threadsafe(run(), loop)
+            self._inflight.append(future)
+        try:
+            return await asyncio.wrap_future(future)
+        except BaseException:
+            future.cancel()
+
+            async def drain() -> None:
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    coro.close()
+
+            drained = asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(drain(), loop)
+            )
+            # A second caller cancellation must not release a still-writing
+            # sink. Shield the same waiter until owned-loop cleanup settles.
+            while not drained.done():
+                try:
+                    await asyncio.shield(drained)
+                except asyncio.CancelledError:
+                    continue
+            drained.result()
+            raise
+        finally:
+            with self._lock, contextlib.suppress(ValueError):
+                self._inflight.remove(future)
+
     async def _validate_and_open(self, new_urls: tuple[str, ...], policy: Any) -> None:
         """Provider-validate new URLs, then open the fetcher with the token.
 
@@ -2686,6 +2834,7 @@ class _CdseBurstTransfer:
         if self._open_lock is None:
             self._open_lock = asyncio.Lock()
         async with self._open_lock:
+            new_urls = tuple(url for url in new_urls if url not in self._validated)
             if new_urls:
                 await validate_cdse_range_urls(new_urls)
                 self._validated.update(new_urls)
@@ -2847,6 +2996,51 @@ class _LazySpanFetcher:
         return None
 
 
+class _SharedSpanFetcher:
+    """Async facade keeping provider sessions and writes on their owned loop."""
+
+    def __init__(self, operation: _CdseBurstTransfer) -> None:
+        self._operation = operation
+
+    async def _fetch(
+        self, spans: Sequence[RangeSpan], sink: Any = None, **kwargs: Any
+    ) -> Any:
+        operation = self._operation
+        listed = tuple(spans)
+
+        async def transfer() -> Any:
+            # Validate every newly encountered URL before using provider auth.
+            await operation._validate_and_open(
+                tuple(sorted({span.url for span in listed})), operation._policy
+            )
+            if sink is None:
+                return await operation._fetcher.fetch(listed)
+            return await operation._fetcher.fetch_into(listed[0], sink, **kwargs)
+
+        return await operation.bridge_async(transfer())
+
+    async def fetch(self, spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+        """Fetch a batch through the operation's loop-owned provider."""
+        return await self._fetch(spans)
+
+    async def fetch_into(self, span: RangeSpan, sink: Any, **kwargs: Any) -> int:
+        """Stream bytes on the owned loop; report progress on the caller loop."""
+        callback = kwargs.get("on_bytes")
+        if callback is not None:
+            caller_loop = asyncio.get_running_loop()
+            kwargs["on_bytes"] = lambda count: caller_loop.call_soon_threadsafe(
+                callback, count
+            )
+        return await self._fetch((span,), sink, **kwargs)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        # The prepare wrapper owns the session, including the deferred pass.
+        return None
+
+
 def _span_fetcher_cm(spans: Sequence[RangeSpan]) -> Any:
     """Use provider-owned auth and refresh; fixture URLs remain anonymous."""
     span_tuple = tuple(spans)
@@ -2857,6 +3051,9 @@ def _span_fetcher_cm(spans: Sequence[RangeSpan]) -> Any:
         else {"budget": policy_budget, "ledger": policy_ledger}
     )
     if any(_cdse_range_host(span.url) for span in span_tuple):
+        operation = _burst_transfer.get()
+        if operation is not None:
+            return _SharedSpanFetcher(operation)
         return _LazySpanFetcher(lambda: _cdse_range_fetcher(span_tuple, **policy))
     return _LazySpanFetcher(lambda: RangeFetcher(**policy))
 
@@ -3830,23 +4027,54 @@ def _asf_burst_measurement(item: Any) -> tuple[str, str, str] | None:
     ordinal is the parent ``burstList`` index, not a canvas slot, and is not
     used as a resolver key.
     """
-    href = _asf_data_href(item)
-    if not href:
+    assets = getattr(item, "assets", None) or {}
+    if not isinstance(assets, Mapping):
         return None
-    path = urllib.parse.unquote(urllib.parse.urlsplit(href).path)
-    parts = [part for part in path.split("/") if part]
-    for index, segment in enumerate(parts):
-        parent = _safe_product_id(segment)
-        if parent is None:
+    hrefs = []
+    data_href = _asf_data_href(item)
+    if data_href:
+        hrefs.append(data_href)
+    for asset in assets.values():
+        if getattr(asset, "representation", None) != "burst-source":
             continue
-        if index + 2 >= len(parts):
+        href = str(getattr(asset, "href", ""))
+        parsed = urllib.parse.urlsplit(href)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.casefold() != "sentinel1-burst.asf.alaska.edu"
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.casefold().endswith((".tif", ".tiff", ".xml"))
+            or "%" in parsed.path
+        ):
             return None
-        swath = parts[index + 1].upper()
-        pol = parts[index + 2].upper()
-        if swath in _SWATH_NAMES and pol in _POL_NAMES:
-            return parent, swath, pol
-        return None
-    return None
+        hrefs.append(href)
+    measurements = set()
+    for href in hrefs:
+        path = urllib.parse.unquote(urllib.parse.urlsplit(href).path)
+        parts = [part for part in path.split("/") if part]
+        for index, segment in enumerate(parts):
+            parent = _safe_product_id(segment)
+            if parent is None:
+                continue
+            if index + 3 != len(parts) - 1:
+                return None
+            swath = parts[index + 1].upper()
+            pol = parts[index + 2].upper()
+            filename = parts[index + 3]
+            if (
+                swath not in _SWATH_NAMES
+                or pol not in _POL_NAMES
+                or not re.fullmatch(
+                    r"\d+\.(?:zip|tif|tiff|xml)", filename, re.IGNORECASE
+                )
+            ):
+                return None
+            measurements.add((parent, swath, pol))
+            break
+        else:
+            return None
+    return next(iter(measurements)) if len(measurements) == 1 else None
 
 
 def _asf_burst_groups(

@@ -463,13 +463,23 @@ def _prepare_s1_inputs(stack: S1Stack, context: PreparationContext) -> PreparedI
                 )
                 return local.request["paths"]
             except ValueError as error:
-                if "every Sentinel-1 input failed download verification" not in str(
-                    error
-                ):
-                    raise
-                return PreparationFailure(
-                    target, "acquisition", "checksum_mismatch", error
-                )
+                message = str(error)
+                if "every Sentinel-1 input failed download verification" in message:
+                    return PreparationFailure(
+                        target, "acquisition", "checksum_mismatch", error
+                    )
+                if "CDSE rediscovery is missing ASF-selected measurements" in message:
+                    # A missing parent frame is one date's unavailable source,
+                    # not a reason to abandon its downloaded siblings.  Report
+                    # it per target so the report stays partial and the strict
+                    # policy can still refuse a reduced ready set after drain.
+                    return PreparationFailure(
+                        target,
+                        "acquisition",
+                        "rediscovery_missing_parent",
+                        error,
+                    )
+                raise
             except (OSError, RemoteError) as error:
                 return PreparationFailure(
                     target,

@@ -12,15 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -28,12 +32,17 @@ import requests
 from faninsar.logging import reject, setup_logger
 from faninsar.remote.access import _safe_url, _validate_url
 from faninsar.remote.auth import _netrc_credentials, _no_auth
-from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK, _register_adapter
-from faninsar.remote.errors import RemoteAccessError, _fail
+from faninsar.remote.catalog import (
+    _ADAPTERS,
+    _REGISTRY_LOCK,
+    _normalize_record,
+    _register_adapter,
+)
+from faninsar.remote.errors import RemoteAccessError, RemoteLimitError, _fail
 from faninsar.remote.fetch import RangeFetcher, RangeSpan, fetch_ranges_async
 from faninsar.remote.fetch.complete import _RedirectHandler
 from faninsar.remote.protocols import _CallLedger
-from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
+from faninsar.remote.records import CatalogItem, RemoteAsset, RemoteResourceBudget
 
 logger = setup_logger(__name__)
 
@@ -41,6 +50,7 @@ CDSE_CATALOG = "sentinel1-cdse"
 CDSE_COLLECTION = "sentinel-1-slc"
 CDSE_STAC_ENDPOINT = "https://stac.dataspace.copernicus.eu/v1"
 CDSE_STAC_ORIGIN = "https://stac.dataspace.copernicus.eu"
+CDSE_CATALOGUE_ORIGIN = "https://catalogue.dataspace.copernicus.eu"
 CDSE_ZIPPER_ORIGIN = "https://zipper.dataspace.copernicus.eu"
 CDSE_DOWNLOAD_ORIGIN = "https://download.dataspace.copernicus.eu"
 CDSE_IDENTITY_ORIGIN = "https://identity.dataspace.copernicus.eu"
@@ -52,6 +62,27 @@ CDSE_TOKEN_HOST = "identity.dataspace.copernicus.eu"
 CDSE_CLIENT_ID = "cdse-public"
 _MEASUREMENT_KEY = "measurement"
 _ANNOTATION_KEY = "annotation"
+_RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
+# Bound one page's outage even when a campaign ledger allows many retries.
+_MAX_RETRIES_PER_PAGE = 3
+# CDSE OData product names and their child node names.  The provider validates
+# both independently of the mission so a response cannot smuggle another
+# product, swath, or polarization into the exact-parent fallback.
+_S1_SAFE_NAME_RE = re.compile(
+    r"^(?P<mission>S1[ABCD])_(?P<beam>IW|EW)_SLC__1S(?P<pols>[A-Z]{2})_"
+    r"(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_"
+    r"(?P<orbit>\d{6})_(?P<datatake>[0-9A-F]{6})_(?P<uid>[0-9A-F]{4})"
+    r"\.SAFE$"
+)
+_S1_NODE_NAME_RE = re.compile(
+    r"^(?P<mission>s1[abcd])-(?P<swath>iw[1-3]|ew[1-5])-slc-"
+    r"(?P<pol>vv|vh|hh|hv)-"
+    r"(?P<start>\d{8}t\d{6})-(?P<stop>\d{8}t\d{6})-"
+    r"(?P<orbit>\d{6})-(?P<datatake>[0-9a-f]{6})-(?P<seq>\d{3,4})"
+    r"\.(?P<ext>tiff|tif|xml)$",
+    re.IGNORECASE,
+)
 _SWATH_POL = (
     "iw1-vv",
     "iw2-vv",
@@ -146,6 +177,54 @@ def _filter_orbit(filters: Mapping[str, Any] | None) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Return a server-requested delay, or None when it is unusable."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if math.isfinite(seconds) and seconds >= 0:
+        return seconds
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max(retry_at.timestamp() - time.time(), 0.0)
+
+
+def _retry_delay_seconds(retry_after: str | None, attempt: int) -> float:
+    """Prefer a server ``Retry-After``; otherwise use bounded backoff."""
+    requested = _retry_after_seconds(retry_after)
+    if requested is not None:
+        return requested
+    return _RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)]
+
+
+def _is_retryable_transport_error(error: BaseException) -> bool:
+    """Return True for a transient timeout or connection failure."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in _RETRYABLE_HTTP_STATUS
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(error.reason, (TimeoutError, ConnectionError))
+    return isinstance(error, (TimeoutError, ConnectionError))
+
+
+def _wait_before_retry(
+    ledger: _CallLedger, retry_after: str | None, attempt: int
+) -> None:
+    """Charge one retry and wait without undercutting ``Retry-After``."""
+    delay = _retry_delay_seconds(retry_after, attempt)
+    remaining = ledger.budget.max_elapsed_seconds - (time.monotonic() - ledger.started)
+    if delay > remaining:
+        _fail(RemoteLimitError, "max_elapsed_seconds")
+    ledger.retry()
+    time.sleep(delay)
 
 
 def request_cdse_token(*, force: bool = False) -> str:
@@ -389,6 +468,577 @@ async def validate_cdse_range_urls(urls: Sequence[str]) -> None:
             _fail(RemoteAccessError, "invalid_endpoint", message)
 
 
+def _normalize_safe_name(parent_id: Any) -> tuple[str, re.Match[str]]:
+    """Return the exact CDSE SAFE name and its grammar match for one parent id."""
+    text = str(parent_id or "").strip()
+    if text.upper().endswith(".SAFE"):
+        text = text[:-5]
+    text = text.upper()
+    name = f"{text}.SAFE"
+    match = _S1_SAFE_NAME_RE.fullmatch(name)
+    if match is None:
+        message = (
+            f"CDSE exact-parent lookup rejected {parent_id!r}: expected an "
+            "ESA Sentinel-1 IW/EW SLC SAFE product id"
+        )
+        _fail(RemoteAccessError, "invalid_product", message)
+    return name, match
+
+
+def _canonical_product_uuid(value: Any) -> str:
+    """Return a canonical UUID, rejecting opaque or route-changing product ids."""
+    text = str(value or "")
+    try:
+        parsed = uuid.UUID(text)
+    except (AttributeError, TypeError, ValueError):
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            "CDSE OData product Id is not a UUID",
+        )
+    canonical = str(parsed)
+    if canonical != text.casefold():
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            "CDSE OData product Id is not a canonical UUID",
+        )
+    return canonical
+
+
+def _product_attributes(product: Mapping[str, Any]) -> dict[str, Any]:
+    """Return expanded OData product attributes keyed by attribute name."""
+    raw = product.get("Attributes")
+    if not isinstance(raw, list):
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            "CDSE OData product omitted expanded Attributes",
+        )
+    attributes: dict[str, Any] = {}
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                "CDSE OData product has a malformed attribute",
+            )
+        name = entry.get("Name")
+        if not isinstance(name, str) or not name:
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                "CDSE OData product attribute has no name",
+            )
+        attributes[name] = entry.get("Value")
+    return attributes
+
+
+def _required_int_attribute(attributes: Mapping[str, Any], name: str) -> int:
+    """Return one integer product attribute or fail closed."""
+    value = attributes.get(name)
+    if type(value) is not int or value < 0:
+        message = f"CDSE OData product attribute {name!r} is not a non-negative integer"
+        _fail(RemoteAccessError, "invalid_product", message)
+    return value
+
+
+def _required_text_attribute(attributes: Mapping[str, Any], name: str) -> str:
+    """Return one non-empty product attribute or fail closed."""
+    value = str(attributes.get(name) or "").strip()
+    if not value:
+        message = f"CDSE OData product attribute {name!r} is missing"
+        _fail(RemoteAccessError, "invalid_product", message)
+    return value
+
+
+def _odata_datetime(value: Any) -> datetime:
+    """Parse one OData timestamp as timezone-aware UTC."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                "CDSE OData product has an invalid ContentDate",
+            )
+    return (
+        parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    )
+
+
+def _product_window(
+    product: Mapping[str, Any], name_match: re.Match[str]
+) -> tuple[datetime, datetime]:
+    """Return the product sensing interval, falling back to the SAFE name."""
+    content = product.get("ContentDate")
+    if isinstance(content, Mapping) and content.get("Start") and content.get("End"):
+        start = _odata_datetime(content["Start"])
+        end = _odata_datetime(content["End"])
+    else:
+        fmt = "%Y%m%dT%H%M%S"
+        start = datetime.strptime(name_match.group("start"), fmt).replace(tzinfo=UTC)
+        end = datetime.strptime(name_match.group("stop"), fmt).replace(tzinfo=UTC)
+    if end < start:
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            "CDSE OData product ContentDate ends before it starts",
+        )
+    return start, end
+
+
+def _odata_products_url(name: str) -> str:
+    """Return the exact-name catalogue Products query URL."""
+    escaped = urllib.parse.quote(f"Name eq '{name}'", safe="")
+    return (
+        f"{CDSE_CATALOGUE_ORIGIN}/odata/v1/Products"
+        f"?$filter={escaped}&$top=2&$expand=Attributes"
+    )
+
+
+def _odata_nodes_url(product_uuid: str, name: str, role: str) -> str:
+    """Return the node directory listing URL for annotation or measurement."""
+    return (
+        f"{CDSE_DOWNLOAD_ORIGIN}/odata/v1/Products({product_uuid})"
+        f"/Nodes({name})/Nodes({role})/Nodes"
+    )
+
+
+def _odata_node_value_url(
+    product_uuid: str, name: str, role: str, node_name: str
+) -> str:
+    """Return the authenticated OData ``$value`` URL for one metadata node."""
+    return (
+        f"{CDSE_DOWNLOAD_ORIGIN}/odata/v1/Products({product_uuid})"
+        f"/Nodes({name})/Nodes({role})/Nodes({node_name})/$value"
+    )
+
+
+def _request_odata_json(
+    url: str,
+    adapter: CDSESearchAdapter,
+    ledger: _CallLedger,
+) -> Mapping[str, Any]:
+    """GET one anonymous OData document within the shared operation meter.
+
+    The URL is validated against the registered CDSE origins before every
+    attempt.  Retries, response bytes, and elapsed time are charged to the
+    caller's ledger, which is the same operation meter used by preparation.
+    """
+    _safe_url(url, adapter)
+    opener = urllib.request.build_opener(
+        _RedirectHandler(adapter, ledger.budget, ledger)
+    )
+    max_retries = min(ledger.budget.max_retries, _MAX_RETRIES_PER_PAGE)
+    attempt = 0
+    while True:
+        ledger.check_elapsed()
+        ledger.request()
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+            },
+        )
+        try:
+            with opener.open(
+                request, timeout=ledger.budget.read_timeout_seconds
+            ) as response:
+                if response.headers.get("Content-Encoding", "identity") != "identity":
+                    _fail(RemoteAccessError, "unexpected_content_encoding")
+                ledger.begin_response()
+                chunks: list[bytes] = []
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    ledger.response_bytes(len(chunk))
+                    chunks.append(chunk)
+                document = json.loads(b"".join(chunks))
+            break
+        except urllib.error.HTTPError as error:
+            retry_after = error.headers.get("Retry-After")
+            error.close()
+            if not _is_retryable_transport_error(error):
+                logger.exception("CDSE OData request failed")
+                _fail(RemoteAccessError, "request_failed", str(error))
+            if attempt >= max_retries:
+                _fail(
+                    RemoteLimitError,
+                    "max_retries",
+                    "CDSE OData lookup exhausted retries",
+                )
+            logger.warning(
+                "CDSE OData request returned HTTP %s; retrying (%d/%d)",
+                error.code,
+                attempt + 1,
+                max_retries,
+            )
+            _wait_before_retry(ledger, retry_after, attempt)
+            attempt += 1
+        except json.JSONDecodeError as error:
+            logger.exception("CDSE OData response was not JSON")
+            _fail(RemoteAccessError, "malformed_results", str(error))
+        except (urllib.error.URLError, OSError) as error:
+            if not _is_retryable_transport_error(error):
+                logger.exception("CDSE OData request failed")
+                _fail(RemoteAccessError, "request_failed", str(error))
+            if attempt >= max_retries:
+                _fail(
+                    RemoteLimitError,
+                    "max_retries",
+                    "CDSE OData lookup exhausted retries",
+                )
+            logger.warning(
+                "CDSE OData transport error (%s); retrying (%d/%d)",
+                type(error).__name__,
+                attempt + 1,
+                max_retries,
+            )
+            _wait_before_retry(ledger, None, attempt)
+            attempt += 1
+    if not isinstance(document, Mapping):
+        _fail(
+            RemoteAccessError,
+            "malformed_results",
+            "CDSE OData response is not a JSON object",
+        )
+    return document
+
+
+def _node_leaves(document: Mapping[str, Any], *, role: str) -> list[tuple[str, int]]:
+    """Return positive-size leaf nodes of one annotation/measurement directory."""
+    entries = document.get("result", document.get("value"))
+    if not isinstance(entries, list):
+        _fail(
+            RemoteAccessError,
+            "malformed_results",
+            f"CDSE OData {role} node list is missing",
+        )
+    expected_ext = {"xml"} if role == "annotation" else {"tif", "tiff"}
+    leaves: list[tuple[str, int]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            _fail(
+                RemoteAccessError,
+                "malformed_results",
+                f"CDSE OData {role} node is malformed",
+            )
+        name = entry.get("Name")
+        if not isinstance(name, str) or not name:
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                f"CDSE OData {role} node has no name",
+            )
+        children = entry.get("ChildrenNumber")
+        if isinstance(children, int) and children > 0:
+            continue
+        extension = name.rsplit(".", 1)[-1].casefold()
+        if extension not in expected_ext:
+            continue
+        size = entry.get("ContentLength")
+        if type(size) is not int or size <= 0:
+            message = f"CDSE OData {role} node {name!r} has no positive ContentLength"
+            _fail(RemoteAccessError, "invalid_product", message)
+        leaves.append((name, size))
+    return leaves
+
+
+def _node_pairs(
+    annotation_document: Mapping[str, Any],
+    measurement_document: Mapping[str, Any],
+    product_match: re.Match[str],
+    *,
+    channels: frozenset[str],
+    swaths: frozenset[str],
+) -> list[tuple[str, int, str, int, str, str]]:
+    """Pair exact annotation/measurement leaves for every swath/polarization."""
+    annotations: dict[str, tuple[str, int, re.Match[str]]] = {}
+    measurements: dict[str, tuple[str, int, re.Match[str]]] = {}
+    for role, document, target in (
+        ("annotation", annotation_document, annotations),
+        ("measurement", measurement_document, measurements),
+    ):
+        for name, size in _node_leaves(document, role=role):
+            match = _S1_NODE_NAME_RE.fullmatch(name)
+            if match is None:
+                message = (
+                    f"CDSE OData {role} node {name!r} is not a Sentinel-1 "
+                    "SLC measurement/annotation name"
+                )
+                _fail(RemoteAccessError, "invalid_product", message)
+            stem = name.rsplit(".", 1)[0]
+            if stem in target:
+                message = f"CDSE OData {role} node {name!r} is duplicated"
+                _fail(RemoteAccessError, "ambiguous_product", message)
+            target[stem] = (name, size, match)
+    if not annotations or set(annotations) != set(measurements):
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            "CDSE OData SAFE annotation/measurement nodes do not pair exactly",
+        )
+    pairs: list[tuple[str, int, str, int, str, str]] = []
+    for stem in sorted(annotations):
+        annotation_name, annotation_size, annotation_match = annotations[stem]
+        measurement_name, measurement_size, measurement_match = measurements[stem]
+        if annotation_match.group("swath").casefold() != (
+            measurement_match.group("swath").casefold()
+        ) or annotation_match.group("pol").casefold() != (
+            measurement_match.group("pol").casefold()
+        ):
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                f"CDSE OData node stem {stem!r} disagrees about swath or polarization",
+            )
+        if annotation_match.group("seq") != measurement_match.group("seq"):
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                f"CDSE OData node stem {stem!r} disagrees about sequence",
+            )
+        for field_name in ("mission", "orbit", "datatake"):
+            expected = product_match.group(field_name).casefold()
+            for actual in (
+                annotation_match.group(field_name),
+                measurement_match.group(field_name),
+            ):
+                if actual.casefold() != expected:
+                    _fail(
+                        RemoteAccessError,
+                        "invalid_product",
+                        f"CDSE OData node {stem!r} disagrees about {field_name}",
+                    )
+        swath = annotation_match.group("swath").upper()
+        polarization = annotation_match.group("pol").upper()
+        if swaths and swath not in swaths:
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                f"CDSE OData node {stem!r} is not in the product swath list",
+            )
+        if channels and polarization not in channels:
+            _fail(
+                RemoteAccessError,
+                "invalid_product",
+                f"CDSE OData node {stem!r} is not in the product polarization list",
+            )
+        pairs.append(
+            (
+                annotation_name,
+                annotation_size,
+                measurement_name,
+                measurement_size,
+                swath,
+                polarization,
+            )
+        )
+    pairs.sort(key=_node_pair_sort_key)
+    return pairs
+
+
+def _node_pair_sort_key(pair: tuple[str, int, str, int, str, str]) -> tuple[int, str]:
+    """Order fallback bindings by the registered swath/polarization order."""
+    suffix = f"{pair[4].casefold()}-{pair[5].casefold()}"
+    try:
+        return (_SWATH_POL.index(suffix), suffix)
+    except ValueError:
+        return (len(_SWATH_POL), suffix)
+
+
+def lookup_cdse_safe_record(
+    parent_id: str,
+    *,
+    ledger: _CallLedger,
+) -> CatalogItem | None:
+    """Resolve one exact ASF parent SAFE to its CDSE OData metadata nodes.
+
+    This is the missing-only bridge used when the CDSE STAC index omits a
+    parent that the catalogue OData Products endpoint still knows.  The
+    lookup is anonymous metadata only: it returns a normal ``CatalogItem``
+    whose measurement/annotation assets are authenticated OData ``$value``
+    URLs, never a complete SAFE payload.  Every request is charged to the
+    caller's shared operation ledger.
+
+    Parameters
+    ----------
+    parent_id : str
+        Exact ESA Sentinel-1 SAFE product id (with or without ``.SAFE``).
+    ledger : _CallLedger
+        Shared preparation/operation meter.  The budget is never reset here.
+
+    Returns
+    -------
+    CatalogItem or None
+        The exact parent item, or ``None`` when no product has that name.
+
+    Raises
+    ------
+    RemoteAccessError
+        If the product name, UUID, collection, attributes, or child nodes are
+        missing, ambiguous, malformed, or on an unregistered origin.
+
+    """
+    ensure_cdse_catalog()
+    with _REGISTRY_LOCK:
+        adapter = _ADAPTERS.get(CDSE_CATALOG)
+    if not isinstance(adapter, CDSESearchAdapter):
+        message = f"CDSE catalog {CDSE_CATALOG!r} is not registered"
+        _fail(RemoteAccessError, "unknown_catalog", message)
+    name, name_match = _normalize_safe_name(parent_id)
+    document = _request_odata_json(_odata_products_url(name), adapter, ledger)
+    values = document.get("value")
+    if not isinstance(values, list):
+        _fail(
+            RemoteAccessError,
+            "malformed_results",
+            "CDSE OData Products response is missing value",
+        )
+    if not values:
+        return None
+    if len(values) != 1:
+        message = f"CDSE OData returned {len(values)} products for exact name {name!r}"
+        _fail(RemoteAccessError, "ambiguous_product", message)
+    product = values[0]
+    if not isinstance(product, Mapping):
+        _fail(
+            RemoteAccessError,
+            "malformed_results",
+            "CDSE OData product entry is not an object",
+        )
+    product_uuid = _canonical_product_uuid(product.get("Id"))
+    actual_name = str(product.get("Name") or "")
+    if actual_name != name:
+        message = (
+            f"CDSE OData exact-name query returned {actual_name!r}, expected {name!r}; "
+            "refusing to substitute another parent or version"
+        )
+        _fail(RemoteAccessError, "invalid_product", message)
+    s3_path = str(product.get("S3Path") or "")
+    if s3_path and (
+        not s3_path.startswith("/eodata/Sentinel-1/SAR/SLC/")
+        or not s3_path.endswith(f"/{name}")
+    ):
+        message = f"CDSE OData product {name!r} is not the registered SLC collection"
+        _fail(RemoteAccessError, "invalid_product", message)
+    footprint = product.get("GeoFootprint")
+    if not isinstance(footprint, Mapping):
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            f"CDSE OData product {name!r} has no GeoFootprint",
+        )
+    attributes = _product_attributes(product)
+    relative_orbit = _required_int_attribute(attributes, "relativeOrbitNumber")
+    orbit_direction = _required_text_attribute(attributes, "orbitDirection").upper()
+    if orbit_direction not in {"ASCENDING", "DESCENDING"}:
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            f"CDSE OData product {name!r} has an invalid orbitDirection",
+        )
+    serial = str(attributes.get("platformSerialIdentifier") or "").strip().upper()
+    if serial and f"S1{serial}" != name_match.group("mission"):
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            f"CDSE OData product {name!r} has a mismatched platform serial",
+        )
+    channels = frozenset(
+        part.strip().upper()
+        for part in re.split(
+            r"[\s&,;+/]+", str(attributes.get("polarisationChannels") or "")
+        )
+        if part.strip()
+    )
+    swaths = frozenset(
+        part.strip().upper()
+        for part in re.split(r"[\s,;+/]+", str(attributes.get("swathIdentifier") or ""))
+        if part.strip()
+    )
+    start, end = _product_window(product, name_match)
+    annotation_document = _request_odata_json(
+        _odata_nodes_url(product_uuid, name, "annotation"), adapter, ledger
+    )
+    measurement_document = _request_odata_json(
+        _odata_nodes_url(product_uuid, name, "measurement"), adapter, ledger
+    )
+    pairs = _node_pairs(
+        annotation_document,
+        measurement_document,
+        name_match,
+        channels=channels,
+        swaths=swaths,
+    )
+    assets: dict[str, Any] = {}
+    polarizations: list[str] = []
+    for (
+        annotation_name,
+        annotation_size,
+        measurement_name,
+        measurement_size,
+        swath,
+        polarization,
+    ) in pairs:
+        suffix = f"{swath.casefold()}-{polarization.casefold()}"
+        polarizations.append(polarization)
+        assets[f"{_MEASUREMENT_KEY}-{suffix}"] = {
+            "href": _odata_node_value_url(
+                product_uuid, name, "measurement", measurement_name
+            ),
+            "media_type": "image/tiff",
+            "size": measurement_size,
+            "properties": {
+                "swath": swath,
+                "polarization": polarization,
+                "file:size": measurement_size,
+            },
+        }
+        assets[f"{_ANNOTATION_KEY}-{suffix}"] = {
+            "href": _odata_node_value_url(
+                product_uuid, name, "annotation", annotation_name
+            ),
+            "media_type": "application/xml",
+            "size": annotation_size,
+            "properties": {
+                "swath": swath,
+                "polarization": polarization,
+                "file:size": annotation_size,
+            },
+        }
+    if not assets:
+        _fail(
+            RemoteAccessError,
+            "invalid_product",
+            f"CDSE OData product {name!r} has no measurement nodes",
+        )
+    record = {
+        "id": name.removesuffix(".SAFE"),
+        "collection": CDSE_COLLECTION,
+        "geometry": footprint,
+        "start": start,
+        "end": end,
+        "platform": f"sentinel-1{serial.casefold()}" if serial else None,
+        "polarization": polarizations[0],
+        "relative_orbit": relative_orbit,
+        "orbit_direction": orbit_direction,
+        "ipf_version": attributes.get("processingSoftwareVersion")
+        or attributes.get("ipfVersion"),
+        "assets": assets,
+    }
+    logger.info(
+        "CDSE exact-parent OData resolved %s: %d measurement pairs",
+        name,
+        len(pairs),
+    )
+    return _normalize_record(record, CDSE_CATALOG, adapter, "cdse")
+
+
 @dataclass(slots=True)
 class CDSESearchAdapter:
     """Registered remote adapter for CDSE Sentinel-1 SLC STAC.
@@ -426,6 +1076,7 @@ class CDSESearchAdapter:
             "origins",
             (
                 CDSE_STAC_ORIGIN,
+                CDSE_CATALOGUE_ORIGIN,
                 CDSE_ZIPPER_ORIGIN,
                 CDSE_DOWNLOAD_ORIGIN,
                 CDSE_IDENTITY_ORIGIN,
@@ -579,36 +1230,78 @@ class CDSESearchAdapter:
                     "CDSE pagination did not advance",
                 )
             seen.add(identity)
-            ledger.check_elapsed()
-            ledger.request()
-            request = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode() if body is not None else None,
-                method=method,
-                headers={
-                    "Accept": "application/geo+json, application/json",
-                    "Accept-Encoding": "identity",
-                    "Content-Type": "application/json",
-                },
-            )
-            try:
-                with opener.open(
-                    request, timeout=ledger.budget.read_timeout_seconds
-                ) as response:
-                    if (
-                        response.headers.get("Content-Encoding", "identity")
-                        != "identity"
-                    ):
-                        _fail(RemoteAccessError, "unexpected_content_encoding")
-                    ledger.begin_response()
-                    chunks: list[bytes] = []
-                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                        ledger.response_bytes(len(chunk))
-                        chunks.append(chunk)
-                    document = json.loads(b"".join(chunks))
-            except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-                logger.exception("CDSE STAC request failed")
-                _fail(RemoteAccessError, "request_failed", str(error))
+            max_retries = min(ledger.budget.max_retries, _MAX_RETRIES_PER_PAGE)
+            attempt = 0
+            while True:
+                ledger.check_elapsed()
+                ledger.request()
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode() if body is not None else None,
+                    method=method,
+                    headers={
+                        "Accept": "application/geo+json, application/json",
+                        "Accept-Encoding": "identity",
+                        "Content-Type": "application/json",
+                    },
+                )
+                try:
+                    with opener.open(
+                        request, timeout=ledger.budget.read_timeout_seconds
+                    ) as response:
+                        if (
+                            response.headers.get("Content-Encoding", "identity")
+                            != "identity"
+                        ):
+                            _fail(RemoteAccessError, "unexpected_content_encoding")
+                        ledger.begin_response()
+                        chunks: list[bytes] = []
+                        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                            ledger.response_bytes(len(chunk))
+                            chunks.append(chunk)
+                        document = json.loads(b"".join(chunks))
+                    break
+                except urllib.error.HTTPError as error:
+                    retry_after = error.headers.get("Retry-After")
+                    error.close()
+                    if not _is_retryable_transport_error(error):
+                        logger.exception("CDSE STAC request failed")
+                        _fail(RemoteAccessError, "request_failed", str(error))
+                    if attempt >= max_retries:
+                        _fail(
+                            RemoteLimitError,
+                            "max_retries",
+                            "CDSE STAC search exhausted retries",
+                        )
+                    logger.warning(
+                        "CDSE STAC request returned HTTP %s; retrying (%d/%d)",
+                        error.code,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    _wait_before_retry(ledger, retry_after, attempt)
+                    attempt += 1
+                except json.JSONDecodeError as error:
+                    logger.exception("CDSE STAC request failed")
+                    _fail(RemoteAccessError, "request_failed", str(error))
+                except (urllib.error.URLError, OSError) as error:
+                    if not _is_retryable_transport_error(error):
+                        logger.exception("CDSE STAC request failed")
+                        _fail(RemoteAccessError, "request_failed", str(error))
+                    if attempt >= max_retries:
+                        _fail(
+                            RemoteLimitError,
+                            "max_retries",
+                            "CDSE STAC search exhausted retries",
+                        )
+                    logger.warning(
+                        "CDSE STAC transport error (%s); retrying (%d/%d)",
+                        type(error).__name__,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    _wait_before_retry(ledger, None, attempt)
+                    attempt += 1
             if not isinstance(document, Mapping) or not isinstance(
                 document.get("features"), list
             ):

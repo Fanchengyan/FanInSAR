@@ -138,7 +138,10 @@ def plan_owner(
     ``xml_text`` may be supplied when the caller already fetched the
     annotation; otherwise this function fetches the one XML.  Pass
     ``plan_spans=False`` when the caller will fill strip tables on the
-    shared asyncio session before :func:`_plan_owner_spans`.
+    shared asyncio session before :func:`_plan_owner_spans`.  Item-local ASF
+    sensing-time hints freeze the physical burst selection before listing or
+    overlap planning; ROI windows only crop within that selection.  An empty
+    selection intersection is logged and skipped, never widened to neighbors.
     """
     from faninsar.missions.s1 import acquisition as source
 
@@ -156,9 +159,34 @@ def plan_owner(
     )
     if not windows:
         return None
+    hints = item.get("_asf_burst_hints")
+    if hints is not None:
+        absolute_burst_ids = [int(burst_id) for burst_id, _time in hints]
+        catalog_sensing_times = [time for _burst_id, time in hints]
+        if not hints or any(time is None for time in catalog_sensing_times):
+            source.reject_product(
+                "ASF ROI selection requires nonempty physical burst sensing-time hints"
+            )
+    selected = None
+    if absolute_burst_ids is not None:
+        selected = set(
+            source._resolve_burst_indices(
+                swath,
+                absolute_burst_ids=absolute_burst_ids,
+                catalog_sensing_times=catalog_sensing_times,
+            )
+        )
+        windows = [window for window in windows if window.burst_index in selected]
+        if not windows:
+            logger.warning(
+                "Skipping measurement %s: "
+                "no selected physical burst intersects the ROI",
+                item.get("product_id", "?"),
+            )
+            return None
     listed = (
         tuple(sorted(int(burst.index) for burst in swath.bursts))
-        if coreg_mode == "nesd"
+        if coreg_mode == "nesd" and selected is None
         else tuple(sorted({w.burst_index for w in windows}))
     )
     overlaps = (

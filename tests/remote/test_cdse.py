@@ -8,21 +8,24 @@ rewrites ``s3://eodata`` measurement/annotation hrefs to HTTPS OData
 
 from __future__ import annotations
 
+import io
+import json
+import time
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
+from email.utils import formatdate
 from typing import Any
 
 import pytest
-
-import io
-import json
-import urllib.request
 
 from faninsar import remote
 from faninsar.data.query import BoundingBox
 from faninsar.remote.auth import _no_auth
 from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK
-from faninsar.remote.errors import RemoteAccessError
+from faninsar.remote.errors import RemoteAccessError, RemoteLimitError
 from faninsar.remote.fetch import RangeSpan
+from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.providers.cdse import (
     CDSE_CATALOG,
     CDSE_COLLECTION,
@@ -32,6 +35,7 @@ from faninsar.remote.providers.cdse import (
     fetch_cdse_ranges,
     request_cdse_token,
 )
+from faninsar.remote.records import RemoteResourceBudget
 
 ROI = BoundingBox(100.0, 44.0, 100.4, 44.4, crs="EPSG:4326")
 
@@ -126,6 +130,182 @@ def _stac_feature(
         },
         "assets": assets,
     }
+
+
+class _JSONResponse(io.BytesIO):
+    """Minimal urllib response carrying one JSON STAC document."""
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        super().__init__(json.dumps(document).encode())
+        self.headers: dict[str, str] = {}
+
+
+class _SequenceOpener:
+    """Return or raise one scripted outcome for each open call."""
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[urllib.request.Request] = []
+
+    def open(self, request: urllib.request.Request, **kwargs: Any) -> Any:
+        del kwargs
+        self.calls.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _http_error(code: int, retry_after: str | None = None) -> urllib.error.HTTPError:
+    """Build a scripted urllib HTTP error with an optional Retry-After."""
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return urllib.error.HTTPError(
+        f"{CDSE_STAC_ENDPOINT}/search",
+        code,
+        "scripted failure",
+        headers,
+        io.BytesIO(b""),
+    )
+
+
+def _run_search(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[Any],
+    *,
+    budget: RemoteResourceBudget | None = None,
+) -> tuple[_SequenceOpener, _CallLedger, list[float], list[Any]]:
+    """Run one offline CDSE search against scripted opener outcomes."""
+    opener = _SequenceOpener(outcomes)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: opener)
+    delays: list[float] = []
+    monkeypatch.setattr("faninsar.remote.providers.cdse.time.sleep", delays.append)
+    ledger = _CallLedger(budget or RemoteResourceBudget())
+    records = list(CDSESearchAdapter().items(spatial=ROI, ledger=ledger))
+    return opener, ledger, delays, records
+
+
+def test_http_search_retries_503_and_honors_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One 503 with Retry-After is retried after exactly that delay."""
+    document = {"features": [_stac_feature()], "links": []}
+    opener, ledger, delays, records = _run_search(
+        monkeypatch,
+        [_http_error(503, retry_after="3"), _JSONResponse(document)],
+    )
+
+    assert [record["id"] for record in records] == [_PRODUCT_ID]
+    assert len(opener.calls) == 2
+    assert ledger.requests == 2
+    assert ledger.retries == 1
+    assert delays == [3.0]
+
+
+def test_http_search_retries_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rate limit is retried after its Retry-After delay."""
+    document = {"features": [_stac_feature()], "links": []}
+    opener, ledger, delays, records = _run_search(
+        monkeypatch,
+        [_http_error(429, retry_after="5"), _JSONResponse(document)],
+    )
+
+    assert [record["id"] for record in records] == [_PRODUCT_ID]
+    assert len(opener.calls) == 2
+    assert ledger.retries == 1
+    assert delays == [5.0]
+
+
+def test_http_search_honors_http_date_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HTTP-date Retry-After is converted into a non-early wait."""
+    document = {"features": [_stac_feature()], "links": []}
+    retry_after = formatdate(time.time() + 30, usegmt=True)
+    _opener, _ledger, delays, records = _run_search(
+        monkeypatch,
+        [_http_error(503, retry_after=retry_after), _JSONResponse(document)],
+    )
+
+    assert [record["id"] for record in records] == [_PRODUCT_ID]
+    assert len(delays) == 1
+    assert 0 < delays[0] <= 30
+
+
+def test_http_search_retries_transient_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout is retried with the bounded fallback backoff."""
+    document = {"features": [_stac_feature()], "links": []}
+    opener, ledger, delays, records = _run_search(
+        monkeypatch,
+        [urllib.error.URLError(TimeoutError("timed out")), _JSONResponse(document)],
+    )
+
+    assert [record["id"] for record in records] == [_PRODUCT_ID]
+    assert len(opener.calls) == 2
+    assert ledger.retries == 1
+    assert delays == [1.0]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_http_search_does_not_retry_auth_or_invalid_queries(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Authentication and invalid-query statuses fail after one attempt."""
+    opener = _SequenceOpener([_http_error(status)])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: opener)
+    delays: list[float] = []
+    monkeypatch.setattr("faninsar.remote.providers.cdse.time.sleep", delays.append)
+    ledger = _CallLedger(RemoteResourceBudget())
+
+    with pytest.raises(RemoteAccessError) as error:
+        list(CDSESearchAdapter().items(spatial=ROI, ledger=ledger))
+
+    assert error.value.reason == "request_failed"
+    assert len(opener.calls) == 1
+    assert ledger.requests == 1
+    assert ledger.retries == 0
+    assert delays == []
+
+
+def test_http_search_stops_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated retryable failures stop at the operation retry budget."""
+    opener = _SequenceOpener([_http_error(503) for _ in range(3)])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: opener)
+    delays: list[float] = []
+    monkeypatch.setattr("faninsar.remote.providers.cdse.time.sleep", delays.append)
+    ledger = _CallLedger(RemoteResourceBudget(max_retries=2))
+
+    with pytest.raises(RemoteLimitError) as error:
+        list(CDSESearchAdapter().items(spatial=ROI, ledger=ledger))
+
+    assert error.value.reason == "max_retries"
+    assert len(opener.calls) == 3
+    assert ledger.requests == 3
+    assert ledger.retries == 2
+    assert delays == [1.0, 2.0]
+
+
+def test_http_search_caps_retries_below_large_ledger_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large campaign retry budget never retries one outage indefinitely."""
+    opener = _SequenceOpener([_http_error(503) for _ in range(4)])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: opener)
+    delays: list[float] = []
+    monkeypatch.setattr("faninsar.remote.providers.cdse.time.sleep", delays.append)
+    ledger = _CallLedger(RemoteResourceBudget(max_retries=10_000))
+
+    with pytest.raises(RemoteLimitError) as error:
+        list(CDSESearchAdapter().items(spatial=ROI, ledger=ledger))
+
+    assert error.value.reason == "max_retries"
+    assert len(opener.calls) == 4
+    assert ledger.requests == 4
+    assert ledger.retries == 3
+    assert delays == [1.0, 2.0, 4.0]
 
 
 @pytest.mark.parametrize("repeat", [False, True])

@@ -9,8 +9,11 @@ leaks above the materialize seam.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import zipfile
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -482,6 +485,111 @@ class TestAsfBurstPath:
 
 class TestCdseBurstPath:
     """CDSE range fetch emits path-SAFEs under tracks/<key>/acquisitions."""
+
+    @pytest.mark.parametrize("running_loop", [False, True])
+    def test_preparation_budget_reaches_burst_http_fetcher(
+        self, tmp_path: Path, monkeypatch, running_loop: bool
+    ) -> None:
+        import faninsar.missions.s1.acquisition as acquisition
+        import faninsar.missions.s1.preparation as preparation
+        import faninsar.remote.providers.cdse as cdse
+        from faninsar.remote import RemoteResourceBudget
+        from faninsar.remote.fetch import RangeFetcher
+
+        xml = _parent_xml().encode()
+        url = (
+            "https://zipper.dataspace.copernicus.eu/odata/v1/"
+            "Products(test)/Nodes(test.SAFE)/Nodes(annotation)/Nodes(test.xml)/$value"
+        )
+        budget = RemoteResourceBudget(max_workers=2)
+        observed = []
+        original_fetch = RangeFetcher.fetch
+
+        async def observe_fetch(fetcher, spans):
+            observed.append(
+                (
+                    fetcher.window,
+                    fetcher._connector.limit,
+                    fetcher._ledger,
+                    threading.current_thread().name,
+                )
+            )
+            return await original_fetch(fetcher, spans)
+
+        class Content:
+            async def iter_chunked(self, size):
+                del size
+                yield xml
+
+        class Response:
+            status = 206
+            headers = {"Content-Range": f"bytes 0-{len(xml) - 1}/{len(xml)}"}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        def get(session, request_url, **kwargs):
+            assert request_url == url
+            assert kwargs["headers"]["Authorization"] == "Bearer fixture-token"
+            return Response()
+
+        monkeypatch.setattr(cdse, "request_cdse_token", lambda: "fixture-token")
+        monkeypatch.setattr(RangeFetcher, "fetch", observe_fetch)
+        monkeypatch.setattr("aiohttp.ClientSession.get", get)
+        item = {
+            "product_id": "S1A_IW_SLC__1SDV_TEST",
+            "annotation_url": url,
+            "annotation_size": len(xml),
+            "measurement_url": url,
+            "measurement_size": 0,
+            "polarization": "VV",
+            "swath": "IW1",
+        }
+
+        class StopAfterAnnotation(Exception):
+            pass
+
+        def stop_after_annotation(*args, **kwargs):
+            raise StopAfterAnnotation
+
+        def materialize(stack, context):
+            del stack, context
+            policy_budget, ledger = acquisition._preparation_remote_policy.get()
+            assert policy_budget is budget
+            # Stop after the real annotation request; measurement is irrelevant.
+            with pytest.raises(StopAfterAnnotation):
+                materialize_cdse_burst_safes(None, items=[item], work_dir=tmp_path)
+            assert observed[0][2] is ledger
+
+        monkeypatch.setattr(preparation, "_prepare_s1_inputs", materialize)
+        monkeypatch.setattr(
+            "faninsar.missions.s1.acquisition.parse_annotation_xml",
+            stop_after_annotation,
+        )
+        context = SimpleNamespace(
+            budget=budget, request={"kind": "local"}, offline=False
+        )
+
+        async def run():
+            preparation.prepare_s1_inputs(None, context)
+
+        if running_loop:
+            asyncio.run(run())
+        else:
+            preparation.prepare_s1_inputs(None, context)
+
+        assert len(observed) == 1
+        window, connector_limit, ledger, thread_name = observed[0]
+        assert window == connector_limit == 2
+        assert ledger is not None and ledger.budget is budget
+        assert ledger.requests == 1
+        assert ledger.response_bytes_total == len(xml)
+        if running_loop:
+            assert thread_name == "faninsar-s1-range-fetch"
 
     def test_burst_path_writes_path_safe(self, tmp_path: Path, monkeypatch) -> None:
         import faninsar.missions.s1.acquisition as acq

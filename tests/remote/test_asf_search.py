@@ -501,6 +501,99 @@ def test_asf_umm_burst_service_safe_is_selected_as_complete_asset() -> None:
     assert "https://sentinel1-burst.asf.alaska.edu" in adapter.origins
 
 
+def test_umm_burst_service_only_remains_searchable_without_safe_zip() -> None:
+    """A burst selection does not require an ASF complete-file representation."""
+    from faninsar.missions.s1.search import complete_safe_asset
+
+    product = dict(_product())
+    product["GranuleUR"] = "S1_177426_IW2_20190406T095609_VV_90F7-BURST"
+    product["TemporalExtent"] = {
+        "RangeDateTime": {
+            "BeginningDateTime": "2019-04-06T09:56:10.066091Z",
+            "EndingDateTime": "2019-04-06T09:56:13.176148Z",
+        }
+    }
+    product["Platforms"] = [{"ShortName": "SENTINEL-1B"}]
+    product["AdditionalAttributes"] = [
+        {"Name": "BURST_ID_ABSOLUTE", "Values": ["33687249"]},
+        {"Name": "PATH_NUMBER", "Values": ["83"]},
+        {"Name": "ASCENDING_DESCENDING", "Values": ["DESCENDING"]},
+    ]
+    base = (
+        "https://sentinel1-burst.asf.alaska.edu/"
+        "S1B_IW_SLC__1SDV_20190406T095548_20190406T095615_"
+        "015684_01D6D3_90F7/IW2/VV/7"
+    )
+    product.pop("DataGranule")
+    product["RelatedUrls"] = [
+        {"Type": "USE SERVICE API", "Format": "GeoTIFF", "URL": base + ".tiff"},
+        {"Type": "USE SERVICE API", "Format": "XML", "URL": base + ".xml"},
+    ]
+    adapter = ASFSearchAdapter(
+        collection="sentinel-1",
+        package=_ASFModule({"umm": product}),
+        session_factory=lambda: _Session(_Response(b"{}")),
+    )
+    _register_adapter("asf-service-only-burst", adapter)
+    item = remote.search(
+        remote.Points([(0.5, 0.5)], crs=4326), catalog="asf-service-only-burst"
+    )[0]
+    assert {asset.href for asset in item.assets.values()} == {
+        base + ".tiff",
+        base + ".xml",
+    }
+    from faninsar.missions.s1.acquisition import (
+        _asf_burst_groups,
+        asf_frame_selectors,
+        materialize_asf_burst_safes,
+    )
+
+    assert list(_asf_burst_groups([item])) == [
+        (
+            "S1B_IW_SLC__1SDV_20190406T095548_20190406T095615_015684_01D6D3_90F7",
+            "IW2",
+            "VV",
+        )
+    ]
+    assert asf_frame_selectors([item])[1] == {"83D"}
+
+    with pytest.raises(ValueError, match="SAFE ZIP"):
+        complete_safe_asset(item)
+    with pytest.raises(ValueError, match="SAFE ZIP"):
+        materialize_asf_burst_safes(
+            [item],
+            work_dir="unused",
+            download=lambda *_: pytest.fail("must not download"),
+        )
+
+
+@pytest.mark.parametrize(
+    "urls",
+    [
+        ["https://evil.example/burst.tiff"],
+        [
+            "https://sentinel1-burst.asf.alaska.edu/a.tiff",
+            "https://sentinel1-burst.asf.alaska.edu/b.tiff",
+        ],
+    ],
+)
+def test_umm_service_burst_rejects_unsafe_or_ambiguous_links(urls: list[str]) -> None:
+    product = dict(_product())
+    product["GranuleUR"] = "S1_177426_IW2_20190406T095609_VV_90F7-BURST"
+    product["DataGranule"] = {
+        "RelatedUrls": [{"Type": "USE SERVICE API", "URL": url} for url in urls]
+    }
+    adapter = ASFSearchAdapter(
+        collection="sentinel-1",
+        package=_ASFModule(product),
+        session_factory=lambda: _Session(_Response(b"{}")),
+    )
+    catalog = f"asf-unsafe-service-burst-{len(urls)}"
+    _register_adapter(catalog, adapter)
+    with pytest.raises(remote.RemoteAccessError):
+        remote.search(remote.Points([(0.5, 0.5)], crs=4326), catalog=catalog)
+
+
 def test_asf_rejects_multiple_complete_safe_urls() -> None:
     """Multiple distinct SAFE ZIP representations fail at ASF normalization."""
     product = dict(_product())

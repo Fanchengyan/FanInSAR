@@ -125,6 +125,54 @@ def _burst_item(
     )
 
 
+def test_service_only_burst_resolves_parent_without_zip() -> None:
+    """Validated extractor service links retain the exact measurement selection."""
+    item = _burst_item(swath="IW2")
+    href = item.assets["data"].href.removesuffix(".zip")
+    item = replace(
+        item,
+        assets={
+            "tiff": replace(
+                item.assets["data"], href=href + ".tiff", representation="burst-source"
+            ),
+            "xml": replace(
+                item.assets["data"], href=href + ".xml", representation="burst-source"
+            ),
+        },
+    )
+    assert list(_asf_burst_groups([item])) == [(PARENT, "IW2", "VV")]
+    window, _, parents = asf_frame_selectors([item])
+    assert window == (PARENT_START, PARENT_STOP)
+    assert parents == frozenset({PARENT})
+
+
+@pytest.mark.parametrize(
+    "bad_href",
+    [
+        f"https://evil.example/{PARENT}/IW1/VV/8.tiff",
+        f"https://sentinel1-burst.asf.alaska.edu/{PARENT}/IW1/VV/../8.tiff",
+        f"https://sentinel1-burst.asf.alaska.edu/{PARENT}/IW1/VV%2F8.tiff",
+        f"https://sentinel1-burst.asf.alaska.edu/{PARENT}/IW2/VV/8.xml",
+    ],
+)
+def test_service_only_bridge_rejects_untrusted_or_conflicting_paths(
+    bad_href: str,
+) -> None:
+    """Service links cannot redirect or disagree about a selected measurement."""
+    item = _burst_item()
+    source = item.assets["data"]
+    good = source.href.removesuffix(".zip") + ".tiff"
+    item = replace(
+        item,
+        assets={
+            "tiff": replace(source, href=good, representation="burst-source"),
+            "xml": replace(source, href=bad_href, representation="burst-source"),
+        },
+    )
+    with pytest.raises(ValueError, match="parent\\+IW\\+pol"):
+        _asf_burst_groups([item])
+
+
 def _frame_item(
     product_id: str = FRAME_B,
     *,
@@ -289,8 +337,18 @@ def test_known_parent_filter_drops_same_track_neighbor(
         "from_safes",
         classmethod(lambda _cls, _paths, **_kw: SimpleNamespace(prepare=lambda: None)),
     )
+    burst = _burst_item()
+    source = burst.assets["data"]
+    base = source.href.removesuffix(".zip")
+    service_burst = replace(
+        burst,
+        assets={
+            "tiff": replace(source, href=base + ".tiff", representation="burst-source"),
+            "xml": replace(source, href=base + ".xml", representation="burst-source"),
+        },
+    )
     S1Stack._materialize_from_search(
-        _asf_search([_burst_item(), _burst_item(pol="VH", item_id="vh")]),
+        _asf_search([service_burst, _burst_item(pol="VH", item_id="vh")]),
         work_dir=tmp_path,
         provider="cdse",
         granularity="burst",
@@ -646,9 +704,7 @@ def test_per_binding_hints_resolve_two_swaths_two_dates(
         written["n"] += 1
         return SimpleNamespace(safe_root=Path(out_dir) / f"{written['n']}.SAFE")
 
-    monkeypatch.setattr(
-        "faninsar.missions.s1.io.path_safe.write_path_safe", fake_write
-    )
+    monkeypatch.setattr("faninsar.missions.s1.io.path_safe.write_path_safe", fake_write)
 
     paths = materialize_cdse_burst_safes(
         None, items=hinted, work_dir=tmp_path, polarizations=("VV",)

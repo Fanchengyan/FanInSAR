@@ -22,6 +22,10 @@ semantics, 2026-11-12):
 - Main-thread cancellation stops new admission, cancels queued tasks and
   unsettled bridges, joins the workers, and only then closes the shared
   session — no minute-long retry backoff can block the unwind.
+- A CDSE rediscovery that lacks an ASF-selected parent measurement fails
+  only that date (``rediscovery_missing_parent``); its siblings still
+  download and qualify, and ``on_error='raise'`` refuses the reduced set
+  only after every date has drained.
 
 All tests are offline: ``_materialize_from_search`` is a fake on the
 stack class, so no network is touched.
@@ -44,6 +48,7 @@ import pytest
 
 import faninsar.missions.s1.acquisition as acquisition_mod
 import faninsar.missions.s1.preparation as preparation_mod
+import faninsar.missions.s1.stack as s1_stack_mod
 from faninsar.missions.s1.preparation import prepare_s1_inputs
 from faninsar.remote.errors import RemoteAccessError
 
@@ -193,6 +198,13 @@ def _rate_limit_error() -> RemoteAccessError:
     return RemoteAccessError(
         "rate_limit_exhausted", "range object exhausted its 429 retry allowance"
     )
+
+
+_MISSING_PARENT = (
+    "CDSE rediscovery is missing ASF-selected measurements "
+    "[('S1A_IW_SLC__1SDV_20150428T105157_20150428T105224_045935_055FA1_87A1',"
+    "'IW1', 'VV')]; refusing to apply another swath or date's burst hints"
+)
 
 
 class TestRegularParallelStage:
@@ -420,6 +432,155 @@ class TestDeferredFinalPass:
         assert configure_calls == [], "no deferred pass without a 429 exhaustion"
         expected = getattr(error, "reason", "checksum_mismatch")
         assert [failure.reason for failure in result.failures] == [expected]
+
+
+class TestRediscoveryParentBoundary:
+    """A missing CDSE parent is one date's failure, never a global abort."""
+
+    def test_missing_parent_fails_only_its_date_and_peers_still_qualify(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Independent dates download while the unpairable date is reported."""
+        recorder = _Recorder()
+        targets = ("20161201", "20161202", "20161203")
+        sources = {}
+        for target in targets:
+            path = tmp_path / f"{target}.SAFE"
+            path.mkdir()
+            sources[target] = path
+        error = ValueError(_MISSING_PARENT)
+        stack = _make_stack(
+            recorder,
+            tmp_path,
+            {"20161201": error},
+            source_paths=sources,
+        )
+        monkeypatch.setattr(
+            preparation_mod, "restore_search", lambda *_: _search(_dates(3))
+        )
+        monkeypatch.setattr(
+            s1_stack_mod, "_configure_s1_bindings", lambda *_a, **_k: None
+        )
+        context = _context()
+        # One date task at a time proves the peer dates are admitted only
+        # because the missing parent settles as a failure instead of raising.
+        context.budget = SimpleNamespace(max_active_files=1)
+
+        result = prepare_s1_inputs(stack, context)
+
+        assert recorder.calls == dict.fromkeys(targets, 1), (
+            "every selected date must still be attempted"
+        )
+        assert dict(result.sources) == {
+            target: (sources[target],) for target in ("20161202", "20161203")
+        }, "the downloaded siblings are not discarded with the failed date"
+        assert result.requested == targets, "the request contract cannot shrink"
+        assert [
+            (failure.target, failure.phase, failure.reason)
+            for failure in result.failures
+        ] == [("20161201", "acquisition", "rediscovery_missing_parent")]
+        assert result.failures[0].cause is error
+
+    def test_unrelated_value_error_still_aborts_preparation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Only the known rediscovery seam is converted to a per-date failure."""
+        recorder = _Recorder()
+        stack = _make_stack(
+            recorder, tmp_path, {"20161201": ValueError("unexpected defect")}
+        )
+        monkeypatch.setattr(
+            preparation_mod, "restore_search", lambda *_: _search(_dates(3))
+        )
+        context = _context()
+        context.budget = SimpleNamespace(max_active_files=1)
+
+        with pytest.raises(ValueError, match="unexpected defect"):
+            prepare_s1_inputs(stack, context)
+        assert recorder.calls == {"20161201": 1}, "the defect must not be swallowed"
+
+    def test_strict_preparation_raises_partial_report_after_every_date_drained(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """``on_error='raise'`` refuses the reduced set after the drain."""
+        from faninsar.missions.s1.s1search import S1Search
+        from faninsar.missions.s1.stack import S1Stack
+        from faninsar.processing.geometry import DEM
+        from faninsar.remote.records import AcquisitionMetadata, CatalogItem
+        from faninsar.stack.preparation import DataPreparationError
+        from faninsar.stack.search import MissionPreparedInputs
+        from tests.missions.s1.test_from_roi import ROI
+
+        targets = ("20161201", "20161202", "20161203")
+        sources = {}
+        for target in targets:
+            path = tmp_path / f"{target}.SAFE"
+            path.mkdir()
+            sources[target] = path
+        attempts: list[str] = []
+
+        def item(target: str) -> Any:
+            start = datetime.strptime(target, "%Y%m%d").replace(tzinfo=UTC)
+            return CatalogItem(
+                provider="CDSE",
+                catalog="sentinel1-cdse",
+                collection="SENTINEL-1",
+                item_id=target,
+                acquisition=AcquisitionMetadata(
+                    acquisition_id=target, start=start, end=start
+                ),
+                assets={},
+                raw_metadata={"polarization": "VV"},
+            )
+
+        def materialize(_cls: Any, search: Any, **_kwargs: Any) -> Any:
+            target = search.items[0].acquisition.start.strftime("%Y%m%d")
+            attempts.append(target)
+            if target == "20161201":
+                raise ValueError(_MISSING_PARENT)
+            return SimpleNamespace(request={"paths": [sources[target]]})
+
+        def noop(*_args: Any) -> None:
+            return None
+
+        def mission_inputs(_self: Any) -> Any:
+            return MissionPreparedInputs()
+
+        monkeypatch.setattr(
+            S1Stack, "_materialize_from_search", classmethod(materialize)
+        )
+        monkeypatch.setattr(
+            s1_stack_mod, "_configure_s1_bindings", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(S1Stack, "_bind_precise_orbits", noop)
+        monkeypatch.setattr(S1Stack, "_local_mission_inputs", mission_inputs)
+        monkeypatch.setattr(S1Stack, "_track_metadata", noop)
+        stack = S1Stack.from_search(
+            S1Search(
+                items=tuple(item(target) for target in targets),
+                catalog="sentinel1-cdse",
+                spatial=ROI,
+                query={},
+            ),
+            work_dir=tmp_path / "work",
+            dem=DEM.from_constant(0),
+            extra={"orbit_auto_fetch": False, "aux_cal_auto_fetch": False},
+        )
+
+        with pytest.raises(DataPreparationError) as raised:
+            stack.prepare_data(on_error="raise")
+
+        report = raised.value.report
+        assert sorted(attempts) == sorted(targets), (
+            "strict failure may only surface after every date settled"
+        )
+        assert report.outcome == "partial"
+        assert report.requested == targets
+        assert report.ready == ("20161202", "20161203")
+        assert [(failure.target, failure.reason) for failure in report.failed] == [
+            ("20161201", "rediscovery_missing_parent")
+        ]
+        assert not stack.data_ready, "a strict failure cannot commit a reduced set"
 
 
 class TestCancellationSafety:

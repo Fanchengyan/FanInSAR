@@ -593,11 +593,7 @@ def _asf_science_properties(record: Mapping[str, Any], product: Any) -> dict[str
     if mission is None:
         # GeoJSON payloads expose only ``platform`` ("Sentinel-1A"); reduce
         # it to the SAFE mission id so both record shapes agree.
-        platform = props.get("platform") or (
-            _nested_mapping(record, "Platforms")
-            if isinstance(record.get("Platforms"), list) and record["Platforms"]
-            else None
-        )
+        platform = props.get("platform") or record.get("Platforms")
         if isinstance(platform, list) and platform and isinstance(platform[0], Mapping):
             platform = platform[0].get("ShortName")
         if isinstance(platform, str):
@@ -650,6 +646,47 @@ def _merge_science_properties(
     elif not isinstance(acquisition, Mapping):
         record["properties"] = dict(science)
     return record
+
+
+def _burst_service_assets(record: Mapping[str, Any], adapter: Any) -> dict[str, str]:
+    """Validate service-only burst representations without inventing a ZIP."""
+    if not str(record.get("GranuleUR", "")).upper().endswith("-BURST"):
+        return {}
+    granule = record.get("DataGranule")
+    values = granule.get("RelatedUrls") if isinstance(granule, Mapping) else None
+    if not isinstance(values, list):
+        values = record.get("RelatedUrls")
+    if not isinstance(values, list):
+        return {}
+    assets: dict[str, str] = {}
+    for value in values:
+        if (
+            not isinstance(value, Mapping)
+            or str(value.get("Type", "")).upper() != "USE SERVICE API"
+        ):
+            continue
+        href = value.get("URL")
+        if not isinstance(href, str):
+            continue
+        path = urllib.parse.urlsplit(href).path.casefold()
+        key = (
+            "tiff"
+            if path.endswith((".tif", ".tiff"))
+            else "xml"
+            if path.endswith(".xml")
+            else None
+        )
+        if key is None:
+            continue
+        clean = _safe_url(href, adapter)
+        if key in assets and assets[key] != clean:
+            _error(
+                ASFSearchError,
+                "ambiguous_representation",
+                "ASF burst advertises multiple service URLs",
+            )
+        assets[key] = clean
+    return assets
 
 
 def _with_asset_link(record: dict[str, Any], product: Any) -> dict[str, Any]:
@@ -1384,7 +1421,10 @@ class ASFSearchAdapter:
                             "incomplete_results",
                             "ASF result budget was reached before completion",
                         )
-                    record = _with_asset_link(_record_from_product(product), product)
+                    record = _record_from_product(product)
+                    if isinstance(record.get("umm"), Mapping):
+                        record = {**record, **record["umm"]}
+                    record = _with_asset_link(record, product)
                     science = _asf_science_properties(record, product)
                     if "provider" not in record and "Provider" not in record:
                         record["provider"] = self.provider
@@ -1396,7 +1436,33 @@ class ASFSearchAdapter:
                         yield _merge_science_properties(record, science)
                     else:
                         record["collection"] = self.query_collection
-                        normalized = normalizer._normalize(record)
+                        service_assets = _burst_service_assets(record, normalizer)
+                        if service_assets and _burst_safe_url(record) is None:
+                            # Reuse CMR's identity, footprint and time validation with
+                            # one validated discovery link, not a fabricated ZIP.
+                            selected = (
+                                service_assets.get("tiff") or service_assets["xml"]
+                            )
+                            discovery_record = dict(record)
+                            discovery_record["DataGranule"] = {
+                                "RelatedUrls": [{"Type": "GET DATA", "URL": selected}]
+                            }
+                            discovery_normalizer = CMRCollectionAdapter(
+                                provider=self.provider,
+                                collection=self.query_collection,
+                                endpoint=self.endpoint,
+                                data_origins=normalizer.data_origins,
+                                data_path_prefixes=self.path_prefixes,
+                            )
+                            normalized = discovery_normalizer._normalize(
+                                discovery_record
+                            )
+                            normalized["assets"] = {
+                                key: {"href": href, "representation": "burst-source"}
+                                for key, href in service_assets.items()
+                            }
+                        else:
+                            normalized = normalizer._normalize(record)
                         normalized["collection"] = self.collection
                         yield _merge_science_properties(normalized, science)
                     produced += 1
