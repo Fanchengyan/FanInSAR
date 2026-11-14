@@ -476,6 +476,20 @@ def _displayed_width_height_ratio(ax: Any) -> float | None:
     return float(ratio)
 
 
+def _displayed_fills_cell_width(ax: Any) -> bool | None:
+    """Whether the displayed data box reaches the axes cell's horizontal edges."""
+    ratio = _displayed_width_height_ratio(ax)
+    if ratio is None:
+        return None
+    cell = ax.get_position(original=True)
+    fig = ax.get_figure(root=False)
+    fig_w, fig_h = fig.get_size_inches()
+    if cell.width <= 0 or cell.height <= 0 or fig_w <= 0:
+        return None
+    cell_ratio = (cell.width * fig_w) / (cell.height * fig_h)
+    return bool(ratio >= cell_ratio)
+
+
 def _resolve_colorbar_location(ax: Any, location: str) -> str:
     """Resolve ``"auto"`` to a concrete colorbar side from the data box."""
     if location != "auto":
@@ -1504,7 +1518,10 @@ class ProductLayer:
             or above 2.0) and ``"right"`` otherwise. Under
             ``constrained_layout``, ``"auto"`` stays on the right because the
             layout engine repositions horizontal colorbars only approximately.
-            Default ``"auto"``.
+            A warning is emitted when the chosen side cannot match exactly:
+            horizontal bars may be shorter and offset, while vertical bars may
+            be offset horizontally when the image is narrower than the axes
+            cell. Default ``"auto"``.
         colorbar_kwargs : mapping, optional
             Extra keyword arguments forwarded to the colorbar constructor. The
             keys ``data``, ``mappable``, ``ax``, ``cax``, ``location``, and
@@ -1757,20 +1774,28 @@ class ProductLayer:
             reject(msg, ValueError, logger=logger)
         resolved = _resolve_colorbar_location(ax, location)
         engine = fig.get_layout_engine()
-        if (
-            resolved in ("bottom", "top")
-            and engine is not None
-            and not engine.colorbar_gridspec
-        ):
-            warnings.warn(
-                f"colorbar_location={resolved!r} under constrained_layout is "
-                "approximate: the layout engine positions horizontal colorbars "
-                "relative to the axes cell, not the visible data extent. Use "
-                "colorbar_location='right' or a non-constrained layout for "
-                "exact matching.",
-                UserWarning,
-                stacklevel=3,
-            )
+        if engine is not None and not engine.colorbar_gridspec:
+            if resolved in ("bottom", "top"):
+                warnings.warn(
+                    f"colorbar_location={resolved!r} under constrained_layout is "
+                    "approximate: the layout engine anchors horizontal colorbars "
+                    "to the axes cell, so the bar may be shorter than the visible "
+                    "data width and offset from the image. Use "
+                    "colorbar_location='right' or a non-constrained layout for "
+                    "exact matching.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+            elif _displayed_fills_cell_width(ax) is False:
+                warnings.warn(
+                    f"colorbar_location={resolved!r} under constrained_layout may "
+                    "be offset horizontally: the layout engine anchors the bar to "
+                    "the axes cell while the visible image is narrower. Its length "
+                    "still matches the image; use a non-constrained layout for "
+                    "exact positioning.",
+                    UserWarning,
+                    stacklevel=3,
+                )
         if hist:
             import faninsar.plotting  # noqa: F401  (installs Figure.hist_colorbar)
 

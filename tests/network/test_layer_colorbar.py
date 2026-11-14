@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import matplotlib as mpl
@@ -144,5 +145,31 @@ def test_constrained_bottom_warns(tmp_path: Path) -> None:
     try:
         with pytest.warns(UserWarning, match="constrained_layout"):
             layer.plot(ax=ax, crop=False, colorbar_location="bottom")
+    finally:
+        plt.close(fig)
+
+
+def test_constrained_narrow_right_warns(tmp_path: Path) -> None:
+    """A narrow image with a right colorbar warns about horizontal offset."""
+    layer = _geo_unwrap_layer(tmp_path, np.ones((12, 2), dtype=np.float32))
+    fig, ax = plt.subplots(layout="constrained")
+    try:
+        with pytest.warns(UserWarning, match="offset horizontally"):
+            layer.plot(ax=ax, crop=False, colorbar_location="right")
+    finally:
+        plt.close(fig)
+
+
+def test_constrained_wide_right_does_not_warn(tmp_path: Path) -> None:
+    """A wide image filling the cell width does not warn for a right bar."""
+    layer = _geo_unwrap_layer(tmp_path, np.ones((2, 12), dtype=np.float32))
+    fig, ax = plt.subplots(layout="constrained")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            layer.plot(ax=ax, crop=False, colorbar_location="right")
+        assert not [
+            item for item in caught if "constrained_layout" in str(item.message)
+        ]
     finally:
         plt.close(fig)
