@@ -5,6 +5,8 @@ Covers a variety of norm and cmap types, including contourf mappables.
 
 from __future__ import annotations
 
+from typing import Any
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -266,4 +268,102 @@ class TestHistColorbarContourf:
                     break
             assert patch_found, f"No patch found for level interval {i}"
 
+        plt.close(fig)
+
+
+def _long_axis_ratio(ax: Any, hcb: HistColorbar, location: str) -> float:
+    """Return the container's long-axis length over the visible data box."""
+    visible = ax.get_position(original=False)
+    bar = hcb.ax.get_position(original=False)
+    if location in ("left", "right"):
+        return bar.height / visible.height
+    return bar.width / visible.width
+
+
+class TestHistColorbarMatchExtent:
+    """The colorbar long axis follows the displayed data extent."""
+
+    def test_right_matches_displayed_height(self) -> None:
+        """A right colorbar matches the displayed image height."""
+        rng = np.random.default_rng(10)
+        fig, ax = plt.subplots()
+        ax.imshow(np.zeros((100, 1000)))
+        hcb = fig.hist_colorbar(
+            data=rng.normal(size=3000),
+            cmap="viridis",
+            ax=ax,
+            location="right",
+        )
+        fig.canvas.draw()
+        assert abs(_long_axis_ratio(ax, hcb, "right") - 1.0) < 0.02
+        assert hcb.match_factor < 0.2
+        plt.close(fig)
+
+    def test_bottom_matches_displayed_width(self) -> None:
+        """A bottom colorbar matches the displayed image width."""
+        rng = np.random.default_rng(11)
+        fig, ax = plt.subplots()
+        ax.imshow(np.zeros((100, 1000)))
+        hcb = fig.hist_colorbar(
+            data=rng.normal(size=3000),
+            cmap="viridis",
+            ax=ax,
+            location="bottom",
+        )
+        fig.canvas.draw()
+        assert abs(_long_axis_ratio(ax, hcb, "bottom") - 1.0) < 0.02
+        plt.close(fig)
+
+    def test_disabled_restores_full_cell_length(self) -> None:
+        """``match_extent=False`` keeps the legacy full-cell length."""
+        rng = np.random.default_rng(12)
+        fig, ax = plt.subplots()
+        ax.imshow(np.zeros((100, 1000)))
+        hcb = fig.hist_colorbar(
+            data=rng.normal(size=3000),
+            cmap="viridis",
+            ax=ax,
+            location="right",
+            match_extent=False,
+        )
+        fig.canvas.draw()
+        cell = ax.get_position(original=True)
+        bar = hcb.ax.get_position(original=False)
+        assert abs(bar.height / cell.height - 1.0) < 0.02
+        assert hcb.match_factor == 1.0
+        plt.close(fig)
+
+    def test_aspect_auto_disables_matching(self) -> None:
+        """An auto-aspect parent has no displayed extent to match."""
+        rng = np.random.default_rng(13)
+        fig, ax = plt.subplots()
+        ax.imshow(np.zeros((100, 1000)))
+        ax.set_aspect("auto")
+        hcb = fig.hist_colorbar(
+            data=rng.normal(size=3000),
+            cmap="viridis",
+            ax=ax,
+            location="right",
+        )
+        fig.canvas.draw()
+        assert hcb.match_factor == 1.0
+        plt.close(fig)
+
+    def test_user_cax_keeps_position(self) -> None:
+        """A user-provided cax keeps its position and disables matching."""
+        rng = np.random.default_rng(14)
+        fig, ax = plt.subplots()
+        ax.imshow(np.zeros((100, 1000)))
+        cax = fig.add_axes((0.9, 0.1, 0.03, 0.7))
+        before = cax.get_position(original=False).bounds
+        hcb = fig.hist_colorbar(
+            data=rng.normal(size=3000),
+            cmap="viridis",
+            ax=ax,
+            cax=cax,
+        )
+        fig.canvas.draw()
+        after = cax.get_position(original=False).bounds
+        np.testing.assert_allclose(after, before)
+        assert hcb.match_factor == 1.0
         plt.close(fig)

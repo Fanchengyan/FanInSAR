@@ -28,6 +28,7 @@ from matplotlib.ticker import (
     NullLocator,
     ScalarFormatter,
 )
+from matplotlib.transforms import Bbox
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from faninsar.logging import reject, setup_logger
@@ -35,7 +36,7 @@ from faninsar.logging import reject, setup_logger
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
@@ -291,6 +292,11 @@ class HistColorbar:
     shrink : float, default 1.0
         Fraction by which to multiply the size of the colorbar relative to the
         parent axes. Similar to matplotlib's colorbar shrink parameter.
+    match_extent : bool, default True
+        If True, size the colorbar's long axis to the displayed data extent
+        (the parent's image area) instead of the full subplot cell. When the
+        layout engine allows an axes locator the match follows figure resizes;
+        ``False`` restores the full-cell behavior.
     extend : {'neither', 'both', 'min', 'max'}, default 'neither'
         Make pointed end(s) for out-of-range values (unless 'neither'). These
         are set for a given colormap using the colormap set_under and set_over
@@ -335,6 +341,11 @@ class HistColorbar:
     - :meth:`set_cbar_label` : Set colorbar label with custom styling
     - :meth:`set_hist_label` : Set histogram label with custom styling
 
+    ``constrained_layout`` cannot use an axes locator, so ``match_extent``
+    there is computed at creation and only approximates later figure resizes.
+    Horizontal colorbars are also positioned by the layout engine relative to
+    the axes cell, so top/bottom matching is approximate there.
+
     Attributes
     ----------
     fig : Figure or SubFigure
@@ -347,6 +358,9 @@ class HistColorbar:
         The axes containing the histogram.
     cbar : Colorbar
         The colorbar object.
+    match_factor : float
+        Fraction of the parent cell length occupied by the displayed data at
+        construction. ``1.0`` when extent matching is inactive.
 
     See Also
     --------
@@ -374,10 +388,15 @@ class HistColorbar:
     hist: _Histogram
     """The histogram object."""
 
+    match_extent: bool
+    """Whether the colorbar long axis follows the displayed data extent."""
+
     _hist_locater: Locator
     _hist_formatter: Formatter
+    _match_factor: float
     _min_count: float
     _scale: Literal["linear", "log"]
+    _use_locator: bool
     _parent_ax: Axes | None
 
     def __init__(
@@ -394,6 +413,7 @@ class HistColorbar:
         hist_fraction: float = 0.85,
         pad: float | None = None,
         shrink: float = 1.0,
+        match_extent: bool = True,
         extend: Literal["neither", "both", "min", "max"] = "neither",
         extendfrac: float = 0.025,
         ticks: ArrayLike | Locator | None = None,
@@ -413,6 +433,8 @@ class HistColorbar:
 
         # Initialize internal state variables
         self._parent_ax = None
+        self._match_factor = 1.0
+        self._use_locator = False
 
         self.data = np.asanyarray(data).flatten()
         self.location, self.orientation = _determine_location_orientation(
@@ -427,6 +449,7 @@ class HistColorbar:
         else:
             self.pad = pad
         self.shrink = shrink
+        self.match_extent = match_extent
         self.extend = extend
         self.extendfrac = extendfrac
         self.outline = outline
@@ -520,6 +543,65 @@ class HistColorbar:
         """Orientation of the histogram."""
         return "vertical" if self.orientation == "horizontal" else "horizontal"
 
+    @property
+    def match_factor(self) -> float:
+        """Fraction of the parent cell occupied by the displayed data.
+
+        The value is computed at construction. It is ``1.0`` when
+        ``match_extent`` is inactive, no parent axes is available, or the data
+        extent cannot be resolved.
+        """
+        return self._match_factor
+
+    def _compute_match_factor(self, parent: Axes | None) -> float:
+        """Fraction of the parent cell length occupied by the displayed data."""
+        if not self.match_extent:
+            return 1.0
+        return _compute_extent_match_factor(
+            parent,
+            orientation=self.orientation,
+            fraction=self.fraction,
+            pad=self.pad,
+        )
+
+    def _make_locator(self, parent: Axes) -> Callable[[Axes, Any], Bbox]:
+        """Return an axes locator that follows the displayed data extent."""
+        location = self.location
+        fraction = self.fraction
+        pad = self.pad
+        shrink = self.shrink
+
+        def locator(_ax: Axes, _renderer: Any) -> Bbox:
+            visible = parent.get_position(original=False)
+            cell = parent.get_position(original=True)
+            fig = parent.get_figure(root=False)
+            fig_w, fig_h = fig.get_size_inches()
+            denom = max(1e-6, 1.0 - fraction - pad)
+            gap_x = pad / denom * cell.width
+            gap_y = pad / denom * cell.height
+            if location in ("right", "left"):
+                # Preserve the stock colorbar thickness (box aspect = 1/fraction).
+                thickness = fraction * min(
+                    cell.width / denom, cell.height * fig_h / fig_w
+                )
+                x0 = (
+                    cell.x1 + gap_x
+                    if location == "right"
+                    else cell.x0 - gap_x - thickness
+                )
+                length = visible.height * shrink
+                y0 = visible.y0 + (visible.height - length) / 2.0
+                return Bbox.from_bounds(x0, y0, thickness, length)
+            thickness = fraction * min(cell.height / denom, cell.width * fig_w / fig_h)
+            y0 = (
+                cell.y0 - gap_y - thickness if location == "bottom" else cell.y1 + gap_y
+            )
+            length = visible.width * shrink
+            x0 = visible.x0 + (visible.width - length) / 2.0
+            return Bbox.from_bounds(x0, y0, length, thickness)
+
+        return locator
+
     def _create_hcb_axes(
         self,
         cax: Axes | None,
@@ -537,6 +619,24 @@ class HistColorbar:
         method: `https://github.com/matplotlib/matplotlib/blob/v3.10.7/lib/matplotlib/figure.py#L1193-L1311`_
 
         """
+        parent = self._parent_ax
+        use_locator = False
+        if cax is None and self.match_extent and parent is not None:
+            fig = parent.get_figure(root=False)
+            engine = fig.get_layout_engine()
+            use_locator = engine is None or engine.colorbar_gridspec
+            if engine is not None and parent.get_subplotspec() is None:
+                use_locator = False
+        self._use_locator = use_locator
+        self._match_factor = (
+            self._compute_match_factor(parent)
+            if cax is None and self.match_extent
+            else 1.0
+        )
+        effective_shrink = (
+            self.shrink if use_locator else self.shrink * self._match_factor
+        )
+
         # create kwargs for HistColorbar axes
         kwargs = self.cbar_kwargs.copy()
         kwargs.update(
@@ -546,7 +646,7 @@ class HistColorbar:
             aspect=self.aspect,
             fraction=self.fraction,
             pad=self.pad,
-            shrink=self.shrink,
+            shrink=effective_shrink,
             extend=self.extend,
             extendfrac=self.extendfrac,
         )
@@ -584,6 +684,12 @@ class HistColorbar:
             fig.sca(current_ax)
             cax.grid(visible=False, which="both", axis="both")
 
+        if use_locator:
+            # The locator owns thickness; the default box aspect must not
+            # re-shrink it once the data extent is shorter than the cell.
+            cax.set_box_aspect(None)
+            cax.set_axes_locator(self._make_locator(parent))
+
         return cax, kwargs
 
     def _create_hist_and_cbar_axes(self, parent_ax: Axes) -> tuple[Axes, Axes]:
@@ -602,14 +708,15 @@ class HistColorbar:
         """
         # Create axes using appropriate method based on parent_ax type
         parent_subplotspec = parent_ax.get_subplotspec()
-        if parent_subplotspec is not None:
-            # Use SubplotSpec-based gridspec (for tight_layout)
-            ax_cbar, ax_hist = _create_hcb_gridspec_axes(
+        if self._use_locator or parent_subplotspec is None:
+            # The container's locator owns child positions, or the axes has no
+            # SubplotSpec (constrained_layout, no layout).
+            ax_cbar, ax_hist = _create_hcb_inset_axes(
                 parent_ax, self.hist_fraction, self.location
             )
         else:
-            # Use inset_axes (for constrained_layout or no layout)
-            ax_cbar, ax_hist = _create_hcb_inset_axes(
+            # Use SubplotSpec-based gridspec (for tight_layout)
+            ax_cbar, ax_hist = _create_hcb_gridspec_axes(
                 parent_ax, self.hist_fraction, self.location
             )
 
@@ -1319,6 +1426,7 @@ def _hist_colorbar(  # noqa: D417
     hist_fraction: float = 0.85,
     pad: float | None = None,
     shrink: float = 1.0,
+    match_extent: bool = True,
     extend: Literal["neither", "both", "min", "max"] = "neither",
     extendfrac: float = 0.025,
     ticks: ArrayLike | Locator | None = None,
@@ -1373,6 +1481,11 @@ def _hist_colorbar(  # noqa: D417
     shrink : float, default 1.0
         Fraction by which to multiply the size of the colorbar relative to the
         parent axes. Similar to matplotlib's colorbar shrink parameter.
+    match_extent : bool, default True
+        If True, size the colorbar's long axis to the displayed data extent
+        (the parent's image area) instead of the full subplot cell. When the
+        layout engine allows an axes locator the match follows figure resizes;
+        ``False`` restores the full-cell behavior.
     extend : {'neither', 'both', 'min', 'max'}, default 'neither'
         Make pointed end(s) for out-of-range values (unless 'neither'). These
         are set for a given colormap using the colormap set_under and set_over
@@ -1415,6 +1528,7 @@ def _hist_colorbar(  # noqa: D417
         - `ax_hist` : Axes containing the histogram
         - `cbar` : The colorbar object
         - `fig` : The figure containing the colorbar
+        - `match_factor` : Fraction of the parent cell occupied by the data
 
     See Also
     --------
@@ -1424,7 +1538,11 @@ def _hist_colorbar(  # noqa: D417
     -----
     This function is a convenience wrapper around the HistColorbar class.
     For more control and access to additional methods, create a HistColorbar
-    instance directly.
+    instance directly. ``constrained_layout`` cannot use an axes locator, so
+    ``match_extent`` there is computed at creation and only approximates later
+    figure resizes. Horizontal colorbars are also positioned by the layout
+    engine relative to the axes cell, so top/bottom matching is approximate
+    there.
 
     Examples
     --------
@@ -1487,6 +1605,7 @@ def _hist_colorbar(  # noqa: D417
         hist_fraction=hist_fraction,
         pad=pad,
         shrink=shrink,
+        match_extent=match_extent,
         extend=extend,
         extendfrac=extendfrac,
         ticks=ticks,
@@ -1527,6 +1646,45 @@ def hide_tick_labels(ax: Axes) -> None:
         labeltop=False,
         labelbottom=False,
     )
+
+
+def _compute_extent_match_factor(  # noqa: PLR0911
+    parent: Axes | None,
+    *,
+    orientation: Literal["vertical", "horizontal"],
+    fraction: float,
+    pad: float,
+) -> float:
+    """Return the fraction of the parent cell occupied by the displayed data.
+
+    The value is ``1.0`` when no parent is given, the parent uses an automatic
+    aspect, or the data extent cannot be resolved.
+    """
+    if parent is None:
+        return 1.0
+    fig = parent.get_figure(root=False)
+    cell = parent.get_position(original=True)
+    fig_w, fig_h = fig.get_size_inches()
+    w_in, h_in = cell.width * fig_w, cell.height * fig_h
+    aspect = parent.get_aspect()
+    if aspect == "auto":
+        return 1.0
+    aspect_value = 1.0 if aspect == "equal" else float(aspect)
+    data_ratio = abs(parent.get_data_ratio())
+    if not data_ratio or aspect_value <= 0:
+        return 1.0
+    displayed_ratio = 1.0 / (aspect_value * data_ratio)  # width / height
+    if not np.isfinite(displayed_ratio) or displayed_ratio <= 0:
+        return 1.0
+    if orientation == "vertical":
+        main = w_in * (1.0 - fraction - pad)
+        if main <= 0 or h_in <= 0:
+            return 1.0
+        return float(min(1.0, min(h_in, main / displayed_ratio) / h_in))
+    main = h_in * (1.0 - fraction - pad)
+    if main <= 0 or w_in <= 0:
+        return 1.0
+    return float(min(1.0, min(w_in, main * displayed_ratio) / w_in))
 
 
 def _determine_location_orientation(

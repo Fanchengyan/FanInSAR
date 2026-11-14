@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -14,6 +15,7 @@ from faninsar.network.products import ASSET_KIND_GEOCODE_KERNELS, AssetKind
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from faninsar.processing.geocoding.geo_resample import GeocodeKind
@@ -61,6 +63,10 @@ _SCENE_GEOMETRY_ASSETS = (
 _REFERENCE_SUBTRACT_KINDS = frozenset(
     {AssetKind.UNWRAPPED_PHASE, AssetKind.DISPLACEMENT}
 )
+
+#: Displayed width/height ratio at or above which ``colorbar_location="auto"``
+#: places the colorbar below the image instead of to its right.
+_AUTO_COLORBAR_ASPECT_THRESHOLD = 2.0
 
 
 def _as_window(window: object) -> Window:
@@ -453,6 +459,36 @@ def _shift_affine(
         e,
         f + d * col0 + e * row0,
     )
+
+
+def _displayed_width_height_ratio(ax: Any) -> float | None:
+    """Return the displayed data-box width/height ratio, or None if undefined."""
+    aspect = ax.get_aspect()
+    if aspect == "auto":
+        return None
+    aspect_value = 1.0 if aspect == "equal" else float(aspect)
+    data_ratio = abs(ax.get_data_ratio())
+    if not data_ratio or aspect_value <= 0:
+        return None
+    ratio = 1.0 / (aspect_value * data_ratio)
+    if not np.isfinite(ratio) or ratio <= 0:
+        return None
+    return float(ratio)
+
+
+def _resolve_colorbar_location(ax: Any, location: str) -> str:
+    """Resolve ``"auto"`` to a concrete colorbar side from the data box."""
+    if location != "auto":
+        return location
+    engine = ax.get_figure(root=False).get_layout_engine()
+    if engine is not None and not engine.colorbar_gridspec:
+        # constrained_layout repositions horizontal colorbars relative to the
+        # full axes cell, so bottom/top matching is only approximate there.
+        return "right"
+    ratio = _displayed_width_height_ratio(ax)
+    if ratio is not None and ratio >= _AUTO_COLORBAR_ASPECT_THRESHOLD:
+        return "bottom"
+    return "right"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1416,6 +1452,8 @@ class ProductLayer:
         vmin: float | None = None,
         vmax: float | None = None,
         colorbar: bool = True,
+        colorbar_location: Literal["auto", "right", "left", "top", "bottom"] = "auto",
+        colorbar_kwargs: Mapping[str, Any] | None = None,
         masked: bool = True,
         figsize: tuple[float, float] | None = None,
         title: str | None = None,
@@ -1460,6 +1498,19 @@ class ProductLayer:
             phase and displacement are computed after reference subtraction.
         colorbar : bool, optional
             Add a colorbar. Default True.
+        colorbar_location : {'auto', 'right', 'left', 'top', 'bottom'}, optional
+            Colorbar side relative to each displayed image. ``"auto"`` chooses
+            ``"bottom"`` for wide data boxes (displayed width/height ratio at
+            or above 2.0) and ``"right"`` otherwise. Under
+            ``constrained_layout``, ``"auto"`` stays on the right because the
+            layout engine repositions horizontal colorbars only approximately.
+            Default ``"auto"``.
+        colorbar_kwargs : mapping, optional
+            Extra keyword arguments forwarded to the colorbar constructor. The
+            keys ``data``, ``mappable``, ``ax``, ``cax``, ``location``, and
+            ``orientation`` are reserved; use ``colorbar_location`` for
+            placement. ``match_extent=False`` restores the old full-cell
+            colorbar length instead of matching the displayed image extent.
         masked : bool, optional
             Mask pixels outside :attr:`valid_mask` to NaN. Default True.
             Reference-point validity always consults the support mask.
@@ -1517,6 +1568,8 @@ class ProductLayer:
                 vmin=vmin,
                 vmax=vmax,
                 colorbar=colorbar,
+                colorbar_location=colorbar_location,
+                colorbar_kwargs=colorbar_kwargs,
                 masked=masked,
                 figsize=figsize,
                 title=title,
@@ -1585,6 +1638,8 @@ class ProductLayer:
                 values,
                 phase=kind == AssetKind.WRAPPED_PHASE,
                 hist=hist_colorbar,
+                location=colorbar_location,
+                colorbar_kwargs=colorbar_kwargs,
             )
         return ax.figure, ax, im
 
@@ -1599,12 +1654,18 @@ class ProductLayer:
         figsize: tuple[float, float] | None,
         title: str | None,
         hist_colorbar: bool,
+        colorbar_location: Literal["auto", "right", "left", "top", "bottom"] = "auto",
+        colorbar_kwargs: Mapping[str, Any] | None = None,
         window: Window | None = None,
         plot_window: Window | None = None,
         ref_points: object = "inherit",
         **imshow_kwargs: Any,
     ) -> tuple[Any, tuple[Any, Any], tuple[Any, Any]]:
-        """Render a complex layer as side-by-side in-phase/quadrature panels."""
+        """Render a complex layer as side-by-side in-phase/quadrature panels.
+
+        ``colorbar_location`` and ``colorbar_kwargs`` are resolved separately
+        for each panel, so ``"auto"`` follows that panel's displayed data box.
+        """
         import matplotlib.pyplot as plt
 
         values = np.asarray(self.read(window=window), dtype=np.complex64)
@@ -1655,7 +1716,15 @@ class ProductLayer:
             _scatter_reference_markers(axis, markers, extent)
             ims.append(im)
             if colorbar:
-                self._add_colorbar(fig, axis, im, data, hist=hist_colorbar)
+                self._add_colorbar(
+                    fig,
+                    axis,
+                    im,
+                    data,
+                    hist=hist_colorbar,
+                    location=colorbar_location,
+                    colorbar_kwargs=colorbar_kwargs,
+                )
         return fig, (axes[0, 0], axes[0, 1]), (ims[0], ims[1])
 
     @staticmethod
@@ -1667,22 +1736,82 @@ class ProductLayer:
         *,
         phase: bool = False,
         hist: bool = True,
+        location: Literal["auto", "right", "left", "top", "bottom"] = "auto",
+        colorbar_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Attach a colorbar, FanInSAR HistColorbar when *hist* is set."""
+        allowed = {"auto", "right", "left", "top", "bottom"}
+        if location not in allowed:
+            msg = (
+                f"colorbar_location must be one of {sorted(allowed)}; got {location!r}"
+            )
+            reject(msg, ValueError, logger=logger)
+        extra = dict(colorbar_kwargs or {})
+        reserved = {"data", "mappable", "ax", "cax", "location", "orientation"}
+        overlap = reserved.intersection(extra)
+        if overlap:
+            msg = (
+                "colorbar_kwargs may not override "
+                f"{sorted(overlap)}; use colorbar_location for placement."
+            )
+            reject(msg, ValueError, logger=logger)
+        resolved = _resolve_colorbar_location(ax, location)
+        engine = fig.get_layout_engine()
+        if (
+            resolved in ("bottom", "top")
+            and engine is not None
+            and not engine.colorbar_gridspec
+        ):
+            warnings.warn(
+                f"colorbar_location={resolved!r} under constrained_layout is "
+                "approximate: the layout engine positions horizontal colorbars "
+                "relative to the axes cell, not the visible data extent. Use "
+                "colorbar_location='right' or a non-constrained layout for "
+                "exact matching.",
+                UserWarning,
+                stacklevel=3,
+            )
         if hist:
             import faninsar.plotting  # noqa: F401  (installs Figure.hist_colorbar)
 
-            hcb = fig.hist_colorbar(np.asarray(data).ravel(), mappable=im, ax=ax)
+            hcb = fig.hist_colorbar(
+                np.asarray(data).ravel(),
+                mappable=im,
+                ax=ax,
+                location=resolved,
+                **extra,
+            )
             if phase:
                 from faninsar.plotting.formatters import setup_phase_axis
 
-                setup_phase_axis(hcb.ax_cbar.yaxis)
+                axis = (
+                    hcb.ax_cbar.yaxis
+                    if hcb.orientation == "vertical"
+                    else hcb.ax_cbar.xaxis
+                )
+                setup_phase_axis(axis)
             return
-        cbar = fig.colorbar(im, ax=ax)
+        match_extent = bool(extra.pop("match_extent", True))
+        if match_extent:
+            from faninsar.plotting.colorbar import _compute_extent_match_factor
+
+            orientation = "vertical" if resolved in ("left", "right") else "horizontal"
+            fraction = float(extra.get("fraction", 0.15))
+            if extra.get("pad") is None:
+                extra["pad"] = 0.15 if orientation == "horizontal" else 0.05
+            match_factor = _compute_extent_match_factor(
+                ax,
+                orientation=orientation,
+                fraction=fraction,
+                pad=float(extra["pad"]),
+            )
+            extra["shrink"] = float(extra.get("shrink", 1.0)) * match_factor
+        cbar = fig.colorbar(im, ax=ax, location=resolved, **extra)
         if phase:
             from faninsar.plotting.formatters import setup_phase_axis
 
-            setup_phase_axis(cbar.ax.yaxis)
+            axis = cbar.ax.yaxis if cbar.orientation == "vertical" else cbar.ax.xaxis
+            setup_phase_axis(axis)
 
 
 @dataclass(frozen=True, slots=True)
