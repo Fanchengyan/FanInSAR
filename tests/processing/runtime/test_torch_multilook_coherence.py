@@ -44,8 +44,8 @@ def _torch_product(
     ("multilook", "window", "shape"),
     [
         ((1, 1), (5, 5), (37, 45)),
-        ((5, 2), (5, 5), (64, 44)),
-        ((3, 4), (3, 7), (41, 53)),
+        ((2, 5), (5, 5), (64, 44)),
+        ((4, 3), (3, 7), (41, 53)),
     ],
 )
 def test_torch_windowed_coherence_matches_numpy_reference(
@@ -83,8 +83,8 @@ def test_torch_windowed_coherence_matches_numpy_reference(
 def test_torch_direct_block_mle_parity_unchanged() -> None:
     """The default (window=None) lane keeps its prior NumPy parity."""
     primary, secondary = _scenes((40, 50), coherence=0.7, seed=11)
-    reference = form_interferogram(primary, secondary, multilook=(5, 2))
-    product = _torch_product(primary, secondary, (5, 2), None)
+    reference = form_interferogram(primary, secondary, multilook=(2, 5))
+    product = _torch_product(primary, secondary, (2, 5), None)
     np.testing.assert_allclose(
         product.coherence, reference.coherence, rtol=1e-6, equal_nan=True
     )
@@ -123,9 +123,9 @@ def test_all_invalid_inputs_match_reference() -> None:
     secondary = np.full(shape, np.nan + 1j * np.nan, dtype=np.complex64)
 
     reference = form_interferogram(
-        primary, secondary, multilook=(5, 2), coherence_window=(3, 3)
+        primary, secondary, multilook=(2, 5), coherence_window=(3, 3)
     )
-    product = _torch_product(primary, secondary, (5, 2), (3, 3))
+    product = _torch_product(primary, secondary, (2, 5), (3, 3))
 
     assert not product.valid_mask.any()
     assert np.isnan(np.asarray(product.coherence)).all()
@@ -148,9 +148,9 @@ def test_default_precision_windowed_coherence_close_to_reference() -> None:
     """The default float32 lane stays within tolerance of the reference."""
     primary, secondary = _scenes((40, 50), coherence=0.5, seed=9)
     reference = form_interferogram(
-        primary, secondary, multilook=(5, 2), coherence_window=(5, 5)
+        primary, secondary, multilook=(2, 5), coherence_window=(5, 5)
     )
-    product = _torch_product(primary, secondary, (5, 2), (5, 5), precision="auto")
+    product = _torch_product(primary, secondary, (2, 5), (5, 5), precision="auto")
     np.testing.assert_allclose(
         product.coherence,
         reference.coherence,

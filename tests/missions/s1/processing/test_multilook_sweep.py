@@ -303,7 +303,7 @@ def test_finalize_sweep_config_writes_subtree_and_manifest(tmp_path: Path) -> No
     out = tmp_path / "out"
     outcome, state = production_mod._finalize_sweep_config(
         merged,
-        config=(2, 4),
+        config=(4, 2),
         pair_id="20161207_20161231_pair",
         output_root=out,
         goldstein_alpha=0.0,
@@ -313,18 +313,18 @@ def test_finalize_sweep_config_writes_subtree_and_manifest(tmp_path: Path) -> No
         unwrap=False,
         geo_height_m=0.0,
     )
-    subtree = out / looks_dir(2, 4)
+    subtree = out / looks_dir(4, 2)
     assert outcome.zarr_path == subtree / "20161207_20161231_pair.zarr"
     assert outcome.zarr_path.is_dir()
     item = json.loads(outcome.stac_path.read_text(encoding="utf-8"))
-    assert item["id"] == "20161207_20161231_pair__l2x4"
+    assert item["id"] == "20161207_20161231_pair__l4x2"
     manifest = json.loads((subtree / "run.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
-    assert manifest["looks"] == [2, 4]
+    assert manifest["looks"] == [4, 2]
     root = zarr.open_group(str(outcome.zarr_path), mode="r")
     assert tuple(np.asarray(root["wrapped_phase"]).shape) == (4, 4)
-    assert outcome.metadata["multilook"] == [2, 4]
-    assert outcome.metadata["multilook_sweep"] == [[2, 4]]
+    assert outcome.metadata["multilook"] == [4, 2]
+    assert outcome.metadata["multilook_sweep"] == [[4, 2]]
     assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
     assert state.zarr_path == outcome.zarr_path
     assert state.stac_path == outcome.stac_path
@@ -390,7 +390,7 @@ def test_geo_merge_and_finalize_produce_geocoded_product(tmp_path: Path) -> None
     out = tmp_path / "out"
     outcome, state = production_mod._finalize_sweep_config(
         merged,
-        config=(2, 4),
+        config=(4, 2),
         pair_id="20161207_20161231_pair",
         output_root=out,
         goldstein_alpha=0.0,
@@ -418,11 +418,11 @@ def test_geo_merge_and_finalize_produce_geocoded_product(tmp_path: Path) -> None
     assert item["geometry"] is not None
     assert item["bbox"] is not None
     manifest = json.loads(
-        (out / looks_dir(2, 4) / "run.json").read_text(encoding="utf-8")
+        (out / looks_dir(4, 2) / "run.json").read_text(encoding="utf-8")
     )
     assert manifest["grid"]["crs"] == "EPSG:32647"
     assert manifest["grid"]["transform"] is not None
-    assert outcome.metadata["multilook_sweep"] == [[2, 4]]
+    assert outcome.metadata["multilook_sweep"] == [[4, 2]]
     assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
     assert state.zarr_path == outcome.zarr_path
     assert state.stac_path == outcome.stac_path
@@ -453,7 +453,7 @@ def test_finalize_geo_products_builds_multilooked_grid() -> None:
     result = production_mod._finalize_geo_products(
         state,
         geo_grid=grid,
-        multilook=(2, 4),
+        multilook=(4, 2),
         geo_height_m=0.0,
     )
     assert result.geo_grid_meta is not None
@@ -547,7 +547,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
         pytest.skip("no distinct-date pair has a common IW1 burst")
     primary, secondary, common_bursts = pair
     burst_index = common_bursts[0]
-    configs = [(2, 10), (4, 20)]
+    configs = [(10, 2), (20, 4)]
     single = _produce_interferogram_pair(
         primary,
         secondary,
@@ -584,8 +584,8 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
 
     other = sweep.per_config[configs[1]]
     other_root = zarr.open_group(str(other.zarr_path), mode="r")
-    assert other.metadata["multilook"] == [4, 20]
-    assert other.metadata["multilook_sweep"] == [[2, 10], [4, 20]]
+    assert other.metadata["multilook"] == [20, 4]
+    assert other.metadata["multilook_sweep"] == [[10, 2], [20, 4]]
     assert other.shape == (single_shape[0] // 2, single_shape[1] // 2)
     assert other.shape == tuple(other_root["wrapped_phase"].shape)
 
@@ -627,7 +627,7 @@ def test_snaphu_config_nlooks_overridden_per_config_radar(
     monkeypatch.setattr(production_mod, "stage_unwrap", _fake_stage_unwrap)
     production_mod._finalize_sweep_config(
         merged,
-        config=(2, 4),
+        config=(4, 2),
         pair_id="20161207_20161231_pair",
         output_root=tmp_path / "out",
         goldstein_alpha=0.0,
@@ -677,7 +677,7 @@ def test_snaphu_config_nlooks_overridden_per_config_geo(
     monkeypatch.setattr(production_mod, "stage_unwrap", _fake_stage_unwrap)
     production_mod._finalize_sweep_config(
         merged,
-        config=(2, 4),
+        config=(4, 2),
         pair_id="20161207_20161231_pair",
         output_root=tmp_path / "out",
         goldstein_alpha=0.0,

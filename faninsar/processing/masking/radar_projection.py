@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject
 
 if TYPE_CHECKING:
@@ -49,6 +50,8 @@ __all__ = [
     "project_mask_to_radar",
     "radar_projection_cache_key",
 ]
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 #: Default geo2rdr chunk height (mask grid rows per tile) in radar mode.
 DEFAULT_CHUNK_SIZE = 256
@@ -195,12 +198,9 @@ def _load_mask_plane(mask: object) -> tuple[np.ndarray, object | None, object | 
     return result, source_grid, source_identity
 
 
-def _nearest_label_view(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
+def _nearest_label_view(plane: np.ndarray, looks: Looks) -> np.ndarray:
     """Return a nearest-neighbour view of a canonical hard-label plane."""
-    az_looks, rg_looks = (int(multilook[0]), int(multilook[1]))
-    if az_looks < 1 or rg_looks < 1:
-        message = f"multilook factors must be >= 1, got {multilook}"
-        reject(message, ValueError)
+    rg_looks, az_looks = looks
     if az_looks == 1 and rg_looks == 1:
         return np.ascontiguousarray(plane, dtype=np.uint8)
     height, width = plane.shape
@@ -363,7 +363,7 @@ def project_mask_to_radar(
     dem: Any | None = None,
     device: str = "cpu",
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS,
     cache_key: str | None = None,
     cache_dir: str | Path | None = None,
     watchdog: Any | None = None,
@@ -398,9 +398,9 @@ def project_mask_to_radar(
         Numerical device for the radar-mode geo2rdr solve.
     chunk_size : int, optional
         Mask grid rows per radar-mode tile (default 256).
-    multilook : tuple of int, optional
-        ``(azimuth, range)`` nearest-neighbour view factors (default
-        ``(1, 1)`` keeps full resolution).  No labels are aggregated.
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range, azimuth)`` nearest-neighbour view factors
+        (default ``(1, 1)`` keeps full resolution).  No labels are aggregated.
     cache_key : str, optional
         SHA-256 identity from :func:`radar_projection_cache_key`.  Required
         together with ``cache_dir`` to enable caching.
@@ -419,19 +419,20 @@ def project_mask_to_radar(
     -------
     numpy.ndarray
         Canonical uint8 plane at the nearest-neighbour radar shape
-        (``ceil(full_radar_shape / multilook)``; the full shape for
-        ``(1, 1)``).
+        (``ceil(full_radar_shape / (range_looks, azimuth_looks))``; the full
+        shape for ``(1, 1)``).
 
     Raises
     ------
-    ValueError
-        If the mode selection, plane shape, cache key, or multilook factors
-        are invalid.
+    ValueError or TypeError
+        If the mode selection, plane shape, or cache key is invalid, or the
+        multilook factors are not two positive integers.
 
     """
     if (lut is None) == (geometry is None):
         message = "project_mask_to_radar requires exactly one projection source"
         reject(message, ValueError)
+    looks = coerce_looks(multilook)
     labels, source_grid, source_identity = _load_mask_plane(mask)
     if (
         master_grid is not None
@@ -524,4 +525,4 @@ def project_mask_to_radar(
     if cache_file is not None and not cache_file.is_file():
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache_file, np.ascontiguousarray(full_plane, dtype=np.uint8))
-    return _nearest_label_view(full_plane, multilook)
+    return _nearest_label_view(full_plane, looks)

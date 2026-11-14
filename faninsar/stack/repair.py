@@ -242,10 +242,10 @@ def _discover(
 
     _scan(root / "coreg", SCENE_KIND, "scene")
 
-    # IFG products live under ifg/ml_AxR/<pair>; pair-owned unwrap, complex_ion,
-    # and unwrap_ion are nested siblings.  ifg/ion holds shared ion estimates.
-    # Legacy top-level unwrap/ and ion/ are recorded but not treated as the
-    # current products.
+    # IFG products live under ifg/ml_RxA/<pair> (range x azimuth); pair-owned
+    # unwrap, complex_ion, and unwrap_ion are nested siblings.  ifg/ion holds
+    # shared ion estimates.  Legacy top-level unwrap/ and ion/ are recorded
+    # but not treated as the current products.
     ifg_root = root / "ifg"
     unwrap_ids: list[str] = []
     complex_ion_ids: list[str] = []

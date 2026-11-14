@@ -21,7 +21,7 @@ def test_form_interferogram_masks_zero_power_looks_as_nan() -> None:
     # Also zero-fill first two columns of secondary.
     secondary[:, :2] = 0
 
-    prod = form_interferogram(primary, secondary, multilook=(2, 4))
+    prod = form_interferogram(primary, secondary, multilook=(4, 2))
     assert prod.complex.shape == (8, 8)
     # Last azimuth look must be fully NaN.
     assert np.all(~np.isfinite(prod.complex[-1].real))

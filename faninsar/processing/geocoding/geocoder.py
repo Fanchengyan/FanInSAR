@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
 __all__ = ["GeocodedRaster", "Geocoder"]
 
 logger = setup_logger(__name__)
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 _DEFAULT_CACHE_NAMESPACE = "geocoder"
 
@@ -234,7 +237,7 @@ class Geocoder:
         rows: slice | tuple[int, int] | None = None,
         *,
         window: tuple[int, int, int, int] | None = None,
-        looks: tuple[int, int] = (1, 1),
+        looks: Looks | tuple[int, int] = _UNIT_LOOKS,
     ) -> RadarCoordinates:
         """Return radar source coordinates for one destination frame.
 
@@ -247,13 +250,13 @@ class Geocoder:
             Absolute ``(row0, row1, col0, col1)`` sub-window of the
             destination grid; must lie inside :attr:`lut`. Mutually exclusive
             with ``rows``.
-        looks : tuple[int, int], optional
-            Positive ``(azimuth, range)`` look factors of the destination
-            layer. ``(1, 1)`` yields one coordinate per window pixel; other
-            factors yield one coordinate per look block, taken at the
-            box-average block centre — the exact centre row for odd factors
-            and the mean of the two bracketing rows for even factors — mapped
-            into the layer frame with
+        looks : Looks or tuple of int, optional
+            Range-first ``(range, azimuth)`` positive look factors of the
+            destination layer. ``(1, 1)`` yields one coordinate per window
+            pixel; other factors yield one coordinate per look block, taken at
+            the box-average block centre — the exact centre row for odd
+            factors and the mean of the two bracketing rows for even factors —
+            mapped into the layer frame with
             :meth:`RadarCoordinates.to_layer_frame`.
 
         Returns
@@ -265,7 +268,8 @@ class Geocoder:
         """
         from faninsar.processing.geocoding.coordinates import RadarCoordinates
 
-        az_looks, rg_looks = _validate_looks(looks)
+        resolved_looks = coerce_looks(looks)
+        rg_looks, az_looks = resolved_looks
         frame_row, frame_col, _frame_height, _frame_width = self._frame_selection(
             rows,
             window,
@@ -274,7 +278,7 @@ class Geocoder:
         azimuth = lut.az_full[frame_row, frame_col]
         range_index = lut.rg_full[frame_row, frame_col]
         valid = lut.valid[frame_row, frame_col]
-        if (az_looks, rg_looks) != (1, 1):
+        if az_looks != 1 or rg_looks != 1:
             block_az = _center_reduce(azimuth, az_looks, axis=0)
             block_az = _center_reduce(block_az, rg_looks, axis=1)
             block_rg = _center_reduce(range_index, az_looks, axis=0)
@@ -283,7 +287,7 @@ class Geocoder:
             block_valid = _center_reduce_valid(block_valid, rg_looks, axis=1)
             return RadarCoordinates(block_az, block_rg, block_valid).to_layer_frame(
                 origin=(0, 0),
-                looks=(az_looks, rg_looks),
+                looks=resolved_looks,
             )
         return RadarCoordinates(azimuth, range_index, valid)
 
@@ -293,7 +297,7 @@ class Geocoder:
         *,
         kind: GeocodeKind,
         window: tuple[int, int, int, int] | None = None,
-        looks: tuple[int, int] = (1, 1),
+        looks: Looks | tuple[int, int] = _UNIT_LOOKS,
         mask: np.ndarray | object | None = None,
         polygon_dilate_px: int = 0,
         correction: Callable[[RadarCoordinates], RadarCoordinates] | None = None,
@@ -315,8 +319,8 @@ class Geocoder:
             Physical kind selecting the resampling kernel.
         window : tuple[int, int, int, int], optional
             Absolute destination window as in :meth:`coordinates`.
-        looks : tuple[int, int], optional
-            Destination look factors as in :meth:`coordinates`.
+        looks : Looks or tuple of int, optional
+            Range-first destination look factors as in :meth:`coordinates`.
         mask : numpy.ndarray or shapely geometry, optional
             Application-time validity restriction. A boolean array must match
             the destination frame; a shapely ``(lon, lat)`` Polygon or
@@ -347,16 +351,16 @@ class Geocoder:
         from faninsar.processing.geocoding.coordinates import RadarCoordinates
         from faninsar.processing.geocoding.geo_resample import sample
 
-        _validate_looks(looks)
+        resolved_looks = coerce_looks(looks)
         frame_row, frame_col, frame_height, frame_width = self._frame_selection(
             None,
             window,
         )
-        frame = self.coordinates(window=window, looks=looks)
+        frame = self.coordinates(window=window, looks=resolved_looks)
         destination_grid = self._destination_grid(
             (frame_row.start, frame_col.start),
             (frame_height, frame_width),
-            looks,
+            resolved_looks,
         )
         if rows_per_chunk is not None and rows_per_chunk < 1:
             reject_invalid_state("rows_per_chunk must be >= 1")
@@ -371,7 +375,7 @@ class Geocoder:
             mask,
             destination_grid,
             (frame_row.start, frame_col.start),
-            looks,
+            resolved_looks,
             polygon_dilate_px,
         )
         step = frame.shape[0] if rows_per_chunk is None else int(rows_per_chunk)
@@ -446,14 +450,14 @@ class Geocoder:
         self,
         origin: tuple[int, int],
         frame_shape: tuple[int, int],
-        looks: tuple[int, int],
+        looks: Looks,
     ) -> GridSpec:
         """Return the pixel-centre-aligned grid of the produced frame."""
         from affine import Affine
 
         from faninsar.processing.mosaicking.grid import GeoGridSpec
 
-        az_looks, rg_looks = looks
+        rg_looks, az_looks = looks
         window_row0, window_col0 = origin
         frame_height, frame_width = frame_shape
         transform = tuple(float(value) for value in self._grid.transform)[:6]
@@ -477,7 +481,7 @@ class Geocoder:
         mask: np.ndarray | object | None,
         destination_grid: GridSpec,
         origin: tuple[int, int],
-        looks: tuple[int, int],
+        looks: Looks,
         polygon_dilate_px: int,
     ) -> np.ndarray | None:
         """Return the boolean application-time mask, or ``None``."""
@@ -500,14 +504,14 @@ class Geocoder:
             mask,
             self._grid,
             window_row0,
-            window_row0 + height * looks[0],
+            window_row0 + height * looks.azimuth,
             window_col0,
-            window_col0 + width * looks[1],
+            window_col0 + width * looks.range,
             dilate_px=int(polygon_dilate_px),
         )
         return _center_reduce_valid(
-            _center_reduce_valid(window_mask, looks[0], axis=0),
-            looks[1],
+            _center_reduce_valid(window_mask, looks.azimuth, axis=0),
+            looks.range,
             axis=1,
         )
 
@@ -545,20 +549,6 @@ def _validate_window(window: tuple[int, int, int, int]) -> None:
         reject_invalid_state(
             f"window must be a (row0, row1, col0, col1) integer tuple; got {window!r}"
         )
-
-
-def _validate_looks(looks: tuple[int, int]) -> tuple[int, int]:
-    """Return ``(azimuth, range)`` look factors when both are positive ints."""
-    if (
-        not isinstance(looks, tuple)
-        or len(looks) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in looks
-        )
-    ):
-        reject_invalid_state(f"looks must be two positive integers; got {looks!r}")
-    return int(looks[0]), int(looks[1])
 
 
 def _center_indices(

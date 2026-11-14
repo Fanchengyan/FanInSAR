@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject, setup_logger
 
 if TYPE_CHECKING:
@@ -506,7 +507,7 @@ def _schedule_multilook_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     dead_pixel_amp_threshold: float = 0.0,
     coherence_window: tuple[int, int] | None = None,
     device: str = "auto",
@@ -528,7 +529,8 @@ def _schedule_multilook_interferogram(
 
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
-    az_looks, rg_looks = multilook
+    looks = coerce_looks(multilook)
+    rg_looks, az_looks = looks
     height, width = primary.shape
     h = (height // az_looks) * az_looks
     w = (width // rg_looks) * rg_looks
@@ -558,7 +560,7 @@ def _schedule_multilook_interferogram(
         product = multilook_interferogram_torch(
             primary_chunk,
             secondary_chunk,
-            multilook=multilook,
+            multilook=looks,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             coherence_window=coherence_window,
             device=worker_device,
@@ -836,7 +838,7 @@ def run_multilook_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     dead_pixel_amp_threshold: float = 0.0,
     coherence_window: tuple[int, int] | None = None,
     device: str = "auto",
@@ -847,13 +849,14 @@ def run_multilook_interferogram(
     from faninsar.processing.interferometry.pair import InterferogramProduct
     from faninsar.processing.runtime.torch_kernels import multilook_interferogram_torch
 
+    looks = coerce_looks(multilook)
     _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "multilook_interferogram"):
         graphs = _schedule_multilook_interferogram(
             primary,
             secondary,
-            multilook=multilook,
+            multilook=looks,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             coherence_window=coherence_window,
             device=device,
@@ -871,7 +874,7 @@ def run_multilook_interferogram(
     return multilook_interferogram_torch(
         primary,
         secondary,
-        multilook=multilook,
+        multilook=looks,
         dead_pixel_amp_threshold=dead_pixel_amp_threshold,
         coherence_window=coherence_window,
         device=_local_device_after_remote_rejection(

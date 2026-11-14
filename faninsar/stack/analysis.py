@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import torch
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage.ifg_store import (
     COMPLEX_ION_KIND,
     complex_ion_root,
@@ -104,7 +105,7 @@ def _resolved_ion_snaphu(
     *,
     snaphu_config: SnaphuConfig | None,
     grid_shape: tuple[int, int],
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve one effective SNAPHU config for the ion subband grid."""
     from faninsar.processing.unwrapping.snaphu_backend import (
@@ -115,9 +116,9 @@ def _resolved_ion_snaphu(
         _snaphu_json_parameters,
     )
 
-    azimuth_looks, range_looks = looks
+    rg_looks, az_looks = coerce_looks(looks)
     height, width = int(grid_shape[0]), int(grid_shape[1])
-    shape = (max(1, height // azimuth_looks), max(1, width // range_looks))
+    shape = (max(1, height // az_looks), max(1, width // rg_looks))
     budget = stack.config.resource_budget
     process_limit = None if budget is None else budget.max_processes
     resolved = _resolve_snaphu_config(
@@ -136,7 +137,7 @@ def estimate_ionosphere(
     config: IonosphereEstimationConfig,
     range_sampling_rate_hz: float,
     pairs: Any | None = None,
-    ion_multilook: tuple[int, int] | None = None,
+    ion_multilook: Looks | tuple[int, int] | None = None,
     low_offset_hz: float | None = None,
     high_offset_hz: float | None = None,
     valid_mask: np.ndarray | None = None,
@@ -157,7 +158,7 @@ def estimate_ionosphere(
     the configured range bandpass, forms low/high subband interferograms
     without Goldstein filtering, unwraps them, and runs the dispersive /
     non-dispersive estimation and inverse-variance smoothing. Each pair
-    result is committed as the product ``work_dir/ifg/ion/ml_<az>x<rg>/<pair>``
+    result is committed as the product ``work_dir/ifg/ion/ml_RxA/<pair>``
     bound to the consumed scene ``write_id``s and the canonical Stack
     runtime fingerprint.
 
@@ -171,8 +172,9 @@ def estimate_ionosphere(
         Range sampling rate of the persisted radar-grid scenes.
     pairs : Pairs, optional
         Pair network to process. Defaults to the configured network.
-    ion_multilook : tuple[int, int], optional
-        Look factors of the ion grid. Defaults to the configured Stack
+    ion_multilook : Looks or tuple[int, int], optional
+        Range-first look factors of the ion grid: range looks apply to
+        columns and azimuth looks to rows. Defaults to the configured Stack
         multilook.
     low_offset_hz, high_offset_hz : float, optional
         Subband center offsets relative to the carrier. Defaults to
@@ -214,9 +216,7 @@ def estimate_ionosphere(
 
     stack._ensure_prepared()
 
-    ion_looks = tuple(int(value) for value in (ion_multilook or stack.config.multilook))
-    if len(ion_looks) != 2 or any(value < 1 for value in ion_looks):
-        reject_invalid_state("ion multilook must contain two positive integers")
+    ion_looks = coerce_looks(ion_multilook or stack.config.multilook)
     resolved_device = _resolve_device(stack, device)
     torch_device = torch.device(resolved_device)
     split_low = (
@@ -406,7 +406,7 @@ def estimate_ionosphere(
             "window_shape": float(config.window_shape),
             "alignment_strategy": config.alignment_strategy,
             "coherence_threshold": float(config.coherence_threshold),
-            "looks": list(ion_looks),
+            "looks": [int(ion_looks.range), int(ion_looks.azimuth)],
             "filter_sigma": [float(filter_sigma[0]), float(filter_sigma[1])],
             "min_cluster_pixels": int(min_cluster_pixels),
             "unwrap_method": str(unwrap_method),
@@ -444,8 +444,8 @@ def estimate_ionosphere(
 def apply_ionosphere_correction(
     stack: Stack,
     *,
-    ion_multilook: tuple[int, int],
-    multilook: tuple[int, int] | None = None,
+    ion_multilook: Looks | tuple[int, int],
+    multilook: Looks | tuple[int, int] | None = None,
     allow_degraded: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Path]:
@@ -464,11 +464,12 @@ def apply_ionosphere_correction(
     ----------
     stack : Stack
         Session whose planned Pairs carry current IFG products.
-    ion_multilook : tuple[int, int]
-        Look factors of the ion products to consume. Their native-pixel
-        placement is mapped onto each target IFG grid.
-    multilook : tuple[int, int], optional
-        IFG product view to correct. Defaults to the configured multilook.
+    ion_multilook : Looks or tuple[int, int]
+        Range-first look factors of the ion products to consume. Their
+        native-pixel placement is mapped onto each target IFG grid.
+    multilook : Looks or tuple[int, int], optional
+        Range-first IFG product view to correct. Defaults to the configured
+        multilook.
     allow_degraded : bool, optional
         Explicitly consume degraded ion products when true.
     overwrite : bool, optional
@@ -481,8 +482,10 @@ def apply_ionosphere_correction(
         Pair id to the committed ``complex_ion`` directory.
 
     """
-    looks = (int(ion_multilook[0]), int(ion_multilook[1]))
-    stores = stack._pair_artifact_stores(looks=multilook or stack.config.multilook)
+    looks = coerce_looks(ion_multilook)
+    stores = stack._pair_artifact_stores(
+        looks=coerce_looks(multilook or stack.config.multilook)
+    )
     published: dict[str, Path] = {}
     for store in stores:
         pair_id = f"{store.pair[0]}_{store.pair[1]}"
@@ -559,7 +562,7 @@ def apply_ionosphere_correction(
 def invert_ionosphere_dates(
     stack: Stack,
     *,
-    ion_multilook: tuple[int, int],
+    ion_multilook: Looks | tuple[int, int],
     reference_date: str | None = None,
     excluded_dates: tuple[str, ...] | list[str] = (),
     excluded_pairs: tuple[str, ...] | list[str] = (),
@@ -580,8 +583,8 @@ def invert_ionosphere_dates(
     ----------
     stack : Stack
         Session whose pairs carry committed ion products.
-    ion_multilook : tuple[int, int]
-        Look factors of the ion products to consume.
+    ion_multilook : Looks or tuple[int, int]
+        Range-first look factors of the ion products to consume.
     reference_date : str, optional
         Date whose screen is pinned to zero; defaults to the earliest
         date in the network.
@@ -610,15 +613,12 @@ def invert_ionosphere_dates(
     ]
     pair_screens: dict[str, np.ndarray] = {}
     pair_windows: dict[str, np.ndarray] = {}
+    looks = coerce_looks(ion_multilook)
     for pair_id in expected_pairs:
         primary, secondary = pair_id.split("_")
         if primary not in stack.catalog.paths or secondary not in stack.catalog.paths:
             continue
-        root = ion_dir(
-            stack.config.work_dir,
-            pair_id,
-            (int(ion_multilook[0]), int(ion_multilook[1])),
-        )
+        root = ion_dir(stack.config.work_dir, pair_id, looks)
         ion_store = IonosphereArtifactStore.open(root)
         try:
             if ion_store.pair != (primary, secondary):

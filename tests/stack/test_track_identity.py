@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from faninsar.core import Pairs
+from faninsar.core.sar_tools import Looks
 from faninsar.missions.s1.stack import S1Stack
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.stack import StackConfig
@@ -375,9 +376,9 @@ def test_track_multilook_is_independent_per_track(tmp_path: Path) -> None:
     path_12d.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
     sub = S1Stack.open(stack.config.work_dir / "tracks" / "12D")
-    assert sub.config.multilook == (10, 2)
+    assert sub.config.multilook == Looks(10, 2)
     other = S1Stack.open(stack.config.work_dir / "tracks" / "88A")
-    assert other.config.multilook == (1, 1)
+    assert other.config.multilook == Looks(1, 1)
 
 
 def test_external_safe_paths_stay_absolute(tmp_path: Path) -> None:

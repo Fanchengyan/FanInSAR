@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import setup_logger
 from faninsar.processing.coregistration.tops.deramp import (
     TOPSCarrierModel,
@@ -30,6 +31,7 @@ logger = setup_logger(__name__)
 
 _RESPONSE_EPS_PX = 0.5
 _MIN_ABS_RESPONSE_RAD_PX = 1e-3
+_DEFAULT_OVERLAP_LOOKS: Looks = Looks(15, 5)
 
 __all__ = [
     "OverlapESDAggregate",
@@ -138,11 +140,9 @@ class OverlapESDInput:
     """Burst index of the bottom overlap member, copied onto the record."""
 
 
-def _boxcar_mean(arr: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
+def _boxcar_mean(arr: np.ndarray, looks: Looks) -> np.ndarray:
     """Return the non-overlapping boxcar mean of a 2-D array."""
-    az_looks, rg_looks = looks
-    if az_looks < 1 or rg_looks < 1:
-        reject_invalid_state("multilook factors must be >= 1")
+    rg_looks, az_looks = looks
     height, width = arr.shape
     if az_looks == 1 and rg_looks == 1:
         return np.asarray(arr)
@@ -160,7 +160,7 @@ def _boxcar_mean(arr: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
 def _multilooked_ifg_coherence(
     reference: np.ndarray,
     secondary: np.ndarray,
-    looks: tuple[int, int],
+    looks: Looks,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the multilooked complex IFG and its MLE coherence."""
     ifg = reference * np.conjugate(secondary)
@@ -359,7 +359,7 @@ def estimate_overlap_esd(
     data: OverlapESDInput,
     *,
     coherence_threshold: float = 0.85,
-    multilook: tuple[int, int] = (5, 15),
+    multilook: Looks | tuple[int, int] = _DEFAULT_OVERLAP_LOOKS,
 ) -> OverlapESDRecord | None:
     """Estimate one overlap's residual azimuth shift from original-domain DD.
 
@@ -375,8 +375,9 @@ def estimate_overlap_esd(
         coordinates, and geometry-only offset crops.
     coherence_threshold : float, optional
         Minimum per-cell coherence of **both** overlap IFGs. Default 0.85.
-    multilook : tuple of int, optional
-        ``(azimuth, range)`` looks. Default ``(5, 15)`` (ISCE2-aligned).
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range, azimuth)`` looks. Default ``(15, 5)``
+        (ISCE2-aligned).
 
     Returns
     -------
@@ -393,15 +394,16 @@ def estimate_overlap_esd(
     """
     if not 0.0 < coherence_threshold <= 1.0:
         reject_invalid_state("coherence_threshold must lie in (0, 1]")
+    looks = coerce_looks(multilook)
     shape = _validate_overlap_input(data)
-    ifg_top, coh_top = _multilooked_ifg_coherence(data.ref_top, data.sec_top, multilook)
-    ifg_bot, coh_bot = _multilooked_ifg_coherence(data.ref_bot, data.sec_bot, multilook)
+    ifg_top, coh_top = _multilooked_ifg_coherence(data.ref_top, data.sec_top, looks)
+    ifg_bot, coh_bot = _multilooked_ifg_coherence(data.ref_bot, data.sec_bot, looks)
     dd = ifg_top * np.conjugate(ifg_bot)
     coherence = np.minimum(coh_top, coh_bot)
 
-    r_b = _boxcar_mean(_secondary_response(data, shape), multilook)
+    r_b = _boxcar_mean(_secondary_response(data, shape), looks)
     r_a_full = _reference_response(data, shape)
-    r_a = None if r_a_full is None else _boxcar_mean(r_a_full, multilook)
+    r_a = None if r_a_full is None else _boxcar_mean(r_a_full, looks)
 
     finite = np.isfinite(coherence) & np.isfinite(r_b) & np.isfinite(dd)
     valid = (

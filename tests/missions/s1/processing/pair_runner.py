@@ -74,9 +74,9 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
-def looks_dir(azimuth_looks: int, range_looks: int) -> str:
+def looks_dir(range_looks: int, azimuth_looks: int) -> str:
     """Return the deterministic per-config output subtree name."""
-    return f"looks_{azimuth_looks}x{range_looks}"
+    return f"looks_{range_looks}x{azimuth_looks}"
 
 
 def _sweep_list_metadata(
@@ -90,7 +90,7 @@ def _sweep_list_metadata(
 
 
 def _is_multilook_pair(value: object) -> bool:
-    """Return whether the multilook argument is one (az, rg) pair."""
+    """Return whether the multilook argument is one (range, azimuth) pair."""
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         return False
     return all(isinstance(part, int) and not isinstance(part, bool) for part in value)
@@ -99,17 +99,17 @@ def _is_multilook_pair(value: object) -> bool:
 def normalize_multilook_sweep(value: object) -> list[tuple[int, int]]:
     """Normalize a multilook sweep specification into validated configs."""
     if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
-        message = "multilook must be an iterable of [azimuth_looks, range_looks] pairs"
+        message = "multilook must be an iterable of [range_looks, azimuth_looks] pairs"
         raise TypeError(message)
     configs: list[tuple[int, int]] = []
     for item in value:
         if isinstance(item, (str, bytes)) or not isinstance(item, (list, tuple)):
-            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            message = f"each multilook config must be a [range, azimuth] pair; got {item!r}"
             raise TypeError(message)
         if len(item) != 2:
-            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            message = f"each multilook config must be a [range, azimuth] pair; got {item!r}"
             raise ValueError(message)
-        azimuth_looks, range_looks = item
+        range_looks, azimuth_looks = item
         if (
             isinstance(azimuth_looks, bool)
             or isinstance(range_looks, bool)
@@ -121,7 +121,7 @@ def normalize_multilook_sweep(value: object) -> list[tuple[int, int]]:
         if azimuth_looks < 1 or range_looks < 1:
             message = f"multilook factors must be >= 1; got {item!r}"
             raise ValueError(message)
-        configs.append((azimuth_looks, range_looks))
+        configs.append((range_looks, azimuth_looks))
     if not configs:
         message = "multilook must contain at least one config"
         raise ValueError(message)
@@ -1640,9 +1640,9 @@ def _produce_interferogram_sweep(
         reject_invalid_state("coregistration_grid='geo' requires geo_grid")
     output_root = Path(output_dir)
     existing = [
-        looks_dir(az, rg)
-        for az, rg in configs
-        if (output_root / looks_dir(az, rg)).exists()
+        looks_dir(rg, az)
+        for rg, az in configs
+        if (output_root / looks_dir(rg, az)).exists()
     ]
     if existing and not overwrite:
         reject_invalid_state(
@@ -1650,8 +1650,8 @@ def _produce_interferogram_sweep(
             + ", ".join(existing)
         )
     if overwrite:
-        for az_looks, rg_looks in configs:
-            stale = output_root / looks_dir(az_looks, rg_looks)
+        for rg_looks, az_looks in configs:
+            stale = output_root / looks_dir(rg_looks, az_looks)
             if stale.exists():
                 shutil.rmtree(stale)
 
@@ -1885,7 +1885,7 @@ def _produce_interferogram_sweep(
         per_config: dict[tuple[int, int], PairSweepOutcome] = {}
         single_state: ProductionPairState | None = None
         for config in configs:
-            az_looks, rg_looks = config
+            rg_looks, az_looks = config
             merge_started = time.perf_counter()
             merged = _merge_burst_ifgs(
                 archive,
@@ -2343,7 +2343,7 @@ def _finalize_sweep_config(
     record_scientific_lineage: bool = False,
 ) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build the config product, write it, and record the completion manifest."""
-    az_looks, rg_looks = config
+    rg_looks, az_looks = config
     merged_ifg = merged["merged_ifg"]
     coherence = merged["coherence"]
     wrapped = merged["wrapped"]
@@ -2434,8 +2434,8 @@ def _finalize_sweep_config(
         result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
         result.note("UNWRAP skipped (unwrap=False)")
 
-    config_dir = output_root / looks_dir(az_looks, rg_looks)
-    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    config_dir = output_root / looks_dir(rg_looks, az_looks)
+    stac_item_id = pair_id + "__l" + str(rg_looks) + "x" + str(az_looks)
     result = stage_write(
         result,
         config_dir,
@@ -2447,7 +2447,7 @@ def _finalize_sweep_config(
         "crs": None,
         "transform": None,
         "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
-        "looks": [az_looks, rg_looks],
+        "looks": [rg_looks, az_looks],
     }
     _write_run_manifest(
         config_dir,
@@ -2457,7 +2457,7 @@ def _finalize_sweep_config(
         grid=grid,
     )
     metadata = {
-        "multilook": [az_looks, rg_looks],
+        "multilook": [rg_looks, az_looks],
         "multilook_sweep": _sweep_list_metadata(all_configs, config),
         "wavelength_m": float(origin.primary.geometry.wavelength_m),
         "pair_id": pair_id,
@@ -2563,7 +2563,7 @@ def _finalize_geo_config(
     record_scientific_lineage: bool = False,
 ) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build and write the geocoded product for one look configuration."""
-    az_looks, rg_looks = config
+    rg_looks, az_looks = config
     merged_ifg = merged["merged_ifg"]
     coherence = merged["coherence"]
     wrapped = merged["wrapped"]
@@ -2650,8 +2650,8 @@ def _finalize_geo_config(
         multilook=config,
         geo_height_m=geo_height_m,
     )
-    config_dir = output_root / looks_dir(az_looks, rg_looks)
-    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    config_dir = output_root / looks_dir(rg_looks, az_looks)
+    stac_item_id = pair_id + "__l" + str(rg_looks) + "x" + str(az_looks)
     result = stage_write(
         result,
         config_dir,
@@ -2664,7 +2664,7 @@ def _finalize_geo_config(
         "crs": None if grid_meta is None else grid_meta["crs"],
         "transform": None if grid_meta is None else grid_meta["transform"],
         "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
-        "looks": [az_looks, rg_looks],
+        "looks": [rg_looks, az_looks],
     }
     _write_run_manifest(
         config_dir,
@@ -2674,7 +2674,7 @@ def _finalize_geo_config(
         grid=grid,
     )
     metadata = {
-        "multilook": [az_looks, rg_looks],
+        "multilook": [rg_looks, az_looks],
         "multilook_sweep": _sweep_list_metadata(all_configs, config),
         "wavelength_m": float(origin.primary.geometry.wavelength_m),
         "pair_id": pair_id,

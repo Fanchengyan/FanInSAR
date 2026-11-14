@@ -63,7 +63,7 @@ def test_coordinates_reject_mismatched_arrays() -> None:
 
 @pytest.mark.parametrize(
     ("origin", "looks"),
-    [((0, 0), (1, 1)), ((0, 0), (3, 3)), ((2, 1), (2, 4)), ((4, 0), (3, 2))],
+    [((0, 0), (1, 1)), ((0, 0), (3, 3)), ((2, 1), (4, 2)), ((4, 0), (2, 3))],
 )
 def test_to_layer_frame_matches_box_average_center(
     origin: tuple[int, int],
@@ -77,7 +77,7 @@ def test_to_layer_frame_matches_box_average_center(
     ``i`` for odd and even look factors alike.
     """
     rows, cols = 8, 12
-    az_looks, rg_looks = looks
+    rg_looks, az_looks = looks
     base = _grid_coordinates(rows, cols)
     coords = base.to_layer_frame(origin=origin, looks=looks)
     expected_az = (base.az - origin[0] - (az_looks - 1) / 2.0) / az_looks
@@ -111,7 +111,9 @@ def test_to_layer_frame_maps_block_centers_to_layer_indices() -> None:
         center_rg,
         np.ones(box_average.shape, dtype=bool),
     )
-    layer_frame = full_frame.to_layer_frame(origin=(0, 0), looks=(az_looks, rg_looks))
+    layer_frame = full_frame.to_layer_frame(
+        origin=(0, 0), looks=(rg_looks, az_looks)
+    )
 
     sampled, valid = sample(box_average, layer_frame, kind="continuous")
     assert valid.all()
@@ -128,16 +130,22 @@ def test_to_layer_frame_identity_for_single_look() -> None:
 
 
 @pytest.mark.parametrize(
-    ("looks", "origin"),
-    [((0, 1), (0, 0)), ((1, -2), (0, 0)), ((1, 1), (-1, 0)), ((1.5, 1), (0, 0))],
+    ("looks", "origin", "error"),
+    [
+        ((0, 1), (0, 0), ValueError),
+        ((1, -2), (0, 0), ValueError),
+        ((1, 1), (-1, 0), InvalidProcessingStateError),
+        ((1.5, 1), (0, 0), TypeError),
+    ],
 )
 def test_to_layer_frame_rejects_invalid_geometry(
     looks: tuple[float, float],
     origin: tuple[float, float],
+    error: type[Exception],
 ) -> None:
-    """Non-positive looks and negative origins are rejected."""
+    """Non-positive, non-integer looks and negative origins are rejected."""
     coords = _grid_coordinates(2, 2)
-    with pytest.raises(InvalidProcessingStateError):
+    with pytest.raises(error):
         coords.to_layer_frame(origin=origin, looks=looks)
 
 

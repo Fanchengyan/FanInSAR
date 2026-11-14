@@ -6,10 +6,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,13 +124,13 @@ def _legacy_form_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS,
     coherence_window: tuple[int, int] | None = (5, 5),
     dead_pixel_amp_threshold: float = DEAD_PIXEL_AMP_THRESHOLD,
 ) -> InterferogramProduct:
     """Form a complex interferogram and coherence from two complex SLCs.
 
-    When ``multilook`` is greater than ``(1, 1)``, the product, primary
+    When either look factor is greater than one, the product, primary
     power and secondary power are accumulated in non-overlapping blocks
     without materialising a full-resolution interferogram. On a full S1
     IW burst this avoids ~1 GB of temporary complex/float64 planes that
@@ -146,10 +149,10 @@ def _legacy_form_interferogram(
     ----------
     primary, secondary : numpy.ndarray
         Coregistered complex arrays on the same grid.
-    multilook : tuple[int, int], optional
-        ``(azimuth_looks, range_looks)`` non-overlapping boxcar looks. The
-        output is downsampled by these factors (true multilook), not merely
-        smoothed.
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range_looks, azimuth_looks)`` non-overlapping boxcar
+        looks. The output is downsampled by these factors (true multilook),
+        not merely smoothed.
     coherence_window : tuple[int, int] or None, optional
         Centered stride-one ``(azimuth, range)`` support for the first MLE
         coherence stage. Axes must be odd integers at least 3. ``None``
@@ -170,14 +173,8 @@ def _legacy_form_interferogram(
         reject_invalid_state("interferogram inputs must be matching 2-D arrays")
     if not np.iscomplexobj(primary) or not np.iscomplexobj(secondary):
         reject_invalid_state("interferogram inputs must remain complex")
-    az_looks, rg_looks = multilook
-    if (
-        type(az_looks) is not int
-        or type(rg_looks) is not int
-        or az_looks < 1
-        or rg_looks < 1
-    ):
-        reject_invalid_state("multilook factors must be >= 1")
+    looks = coerce_looks(multilook)
+    rg_looks, az_looks = looks
 
     use_dead_mask = dead_pixel_amp_threshold > 0.0 and (az_looks > 1 or rg_looks > 1)
 
@@ -238,7 +235,7 @@ def _legacy_form_interferogram(
         ifg = ifg_real + 1j * ifg_imag
         logger.info(
             "Multilook %s -> output shape %s",
-            multilook,
+            looks,
             ifg.shape,
         )
 
@@ -301,10 +298,10 @@ def _sliding_coherence(
     return output
 
 
-def _block_finite_mean(array: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
+def _block_finite_mean(array: np.ndarray, looks: Looks) -> np.ndarray:
     """Average finite values over non-overlapping blocks, dropping tails."""
     height, width = array.shape
-    az_looks, rg_looks = multilook
+    rg_looks, az_looks = looks
     output = np.full(
         (height // az_looks, width // rg_looks),
         np.nan,
@@ -357,10 +354,10 @@ def _complete_look_bounds(
     native_origin: tuple[int, int],
     input_shape: tuple[int, int],
     output_window: tuple[int, int, int, int],
-    multilook: tuple[int, int],
+    looks: Looks,
 ) -> tuple[int, int, int, int]:
     """Return ``(first_i, last_i, first_j, last_j)`` for complete global looks."""
-    az_looks, rg_looks = multilook
+    rg_looks, az_looks = looks
     row0, row1, col0, col1 = output_window
     first_i = (row0 + az_looks - 1) // az_looks
     last_i = row1 // az_looks
@@ -396,7 +393,7 @@ def form_interferogram_from_fields(
     *,
     native_origin: tuple[int, int],
     output_window: tuple[int, int, int, int],
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS,
     coherence_window: tuple[int, int] | None = None,
 ) -> InterferogramProduct:
     """Form an IFG from selected native cross-products and endpoint powers.
@@ -419,8 +416,8 @@ def form_interferogram_from_fields(
     output_window : tuple of int
         Half-open global native window ``(r0, r1, c0, c1)`` whose complete
         looks are returned.
-    multilook : tuple of int, optional
-        ``(azimuth, range)`` look factors.
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range, azimuth)`` look factors.
     coherence_window : tuple of int or None, optional
         Odd native sliding support, or ``None`` for direct block MLE.
 
@@ -432,8 +429,8 @@ def form_interferogram_from_fields(
     Raises
     ------
     InvalidProcessingStateError
-        If shapes disagree, looks are invalid, or the input crop does not
-        cover a requested complete look block.
+        If shapes disagree or the input crop does not cover a requested
+        complete look block.
 
     """
     coherence_window = validate_coherence_window(coherence_window)
@@ -463,15 +460,10 @@ def form_interferogram_from_fields(
         reject_invalid_state(
             "output_window must be a non-empty half-open (r0, r1, c0, c1)"
         )
-    if (
-        not isinstance(multilook, tuple)
-        or len(multilook) != 2
-        or any(type(axis) is not int or axis < 1 for axis in multilook)
-    ):
-        reject_invalid_state("multilook factors must be positive integers")
-    az_looks, rg_looks = multilook
+    looks = coerce_looks(multilook)
+    rg_looks, az_looks = looks
     first_i, last_i, first_j, last_j = _complete_look_bounds(
-        native_origin, cross_arr.shape, output_window, multilook
+        native_origin, cross_arr.shape, output_window, looks
     )
     n_i = last_i - first_i
     n_j = last_j - first_j
@@ -553,7 +545,7 @@ def form_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS,
     coherence_window: tuple[int, int] | None = None,
     dead_pixel_amp_threshold: float = DEAD_PIXEL_AMP_THRESHOLD,
 ) -> InterferogramProduct:
@@ -571,13 +563,8 @@ def form_interferogram(
         reject_invalid_state("interferogram inputs must be matching 2-D arrays")
     if not np.iscomplexobj(primary) or not np.iscomplexobj(secondary):
         reject_invalid_state("interferogram inputs must remain complex")
-    if (
-        not isinstance(multilook, tuple)
-        or len(multilook) != 2
-        or any(type(axis) is not int or axis < 1 for axis in multilook)
-    ):
-        reject_invalid_state("multilook factors must be positive integers")
-    az_looks, rg_looks = multilook
+    looks = coerce_looks(multilook)
+    rg_looks, az_looks = looks
     use_dead_mask = dead_pixel_amp_threshold > 0.0
     height, width = primary.shape
     out_h = height // az_looks
@@ -622,7 +609,7 @@ def form_interferogram(
         coherence = np.where(sample_counts >= 2, direct, np.nan)
     else:
         coherence = _block_finite_mean(
-            _sliding_coherence(primary, secondary, coherence_window), multilook
+            _sliding_coherence(primary, secondary, coherence_window), looks
         )
     coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
     invalid = ~valid_out | ~np.isfinite(ifg.real) | ~np.isfinite(ifg.imag)

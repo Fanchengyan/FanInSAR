@@ -77,7 +77,7 @@ def test_multilook_uses_nearest_hard_label_without_aggregation() -> None:
         full_radar_shape=(1, 2),
     )
     result = project_mask_to_radar(
-        np.array([[0, 1]], dtype=np.uint8), lut=lut, multilook=(1, 2)
+        np.array([[0, 1]], dtype=np.uint8), lut=lut, multilook=(2, 1)
     )
     np.testing.assert_array_equal(result, [[0]])
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.data.reference import (
     ReferencePixelMap,
     applied_reference_record,
@@ -27,24 +28,29 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+_UNIT_LOOKS = Looks(1, 1)
+
 
 def native_layer_origin(
     *,
     row_origin: int = 0,
     col_origin: int = 0,
     look_origin: tuple[int, int] = (0, 0),
-    looks: tuple[int, int] = (1, 1),
+    looks: Looks | tuple[int, int] = _UNIT_LOOKS,
 ) -> tuple[int, int]:
     """Return the native index of layer pixel ``(0, 0)``'s first sample.
 
     Matches :func:`faninsar.io.storage.ifg_store.ifg_sample_placement`:
     ``row_origin``/``col_origin`` are native crop offsets and
-    ``look_origin`` is the look-grid origin on the parent looked grid.
-    They are not two copies of the same origin.
+    ``look_origin`` is the ``(row, col)`` look-grid origin on the parent
+    looked grid. They are not two copies of the same origin. ``looks`` is
+    range-first: azimuth looks scale ``look_origin[0]`` (rows) and range
+    looks scale ``look_origin[1]`` (columns).
     """
+    resolved = coerce_looks(looks)
     return (
-        int(row_origin) + int(look_origin[0]) * int(looks[0]),
-        int(col_origin) + int(look_origin[1]) * int(looks[1]),
+        int(row_origin) + int(look_origin[0]) * resolved.azimuth,
+        int(col_origin) + int(look_origin[1]) * resolved.range,
     )
 
 
@@ -54,7 +60,7 @@ def origin_from_store(store: InterferogramArtifactStore) -> tuple[int, int]:
         row_origin=int(store.row_origin),
         col_origin=int(store.col_origin),
         look_origin=tuple(store.look_origin),
-        looks=tuple(store.looks),
+        looks=store.looks,
     )
 
 
@@ -76,10 +82,16 @@ def _placement_properties(layer: ProductLayer) -> dict[str, Any]:
 def origin_from_layer(layer: ProductLayer) -> tuple[int, int]:
     """Return the native radar origin from layer or parent IFG metadata."""
     properties = _placement_properties(layer)
-    looks = tuple(layer.multilook)
-    raw_looks = properties.get("faninsar:looks")
-    if isinstance(raw_looks, (list, tuple)) and len(raw_looks) == 2:
-        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    looks = coerce_looks(layer.multilook)
+    raw_range_looks = properties.get("faninsar:range_looks")
+    raw_azimuth_looks = properties.get("faninsar:azimuth_looks")
+    if (
+        isinstance(raw_range_looks, int)
+        and not isinstance(raw_range_looks, bool)
+        and isinstance(raw_azimuth_looks, int)
+        and not isinstance(raw_azimuth_looks, bool)
+    ):
+        looks = Looks(range=raw_range_looks, azimuth=raw_azimuth_looks)
     raw_look_origin = properties.get("faninsar:look_origin", (0, 0))
     look_origin = (int(raw_look_origin[0]), int(raw_look_origin[1]))
     return native_layer_origin(
@@ -96,7 +108,7 @@ def map_radar_points(
     geometry: object,
     dem: object | None,
     origin: tuple[int, int],
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
     shape: tuple[int, int],
     device: str = "cpu",
 ) -> ReferencePixelMap:
@@ -117,8 +129,9 @@ def map_radar_points(
         Reference radar geometry.
     dem : DEM or None
         Sampler exposing ``sample(latitude_deg, longitude_deg)``.
-    origin, looks : tuple[int, int]
-        Full-radar origin of the layer and ``(azimuth, range)`` looks.
+    origin, looks : tuple[int, int] and Looks or tuple[int, int]
+        Full-radar origin of the layer and range-first looks: range looks
+        apply to columns and azimuth looks to rows.
     shape : tuple[int, int]
         Layer ``(height, width)``.
     device : str, optional
@@ -140,6 +153,7 @@ def map_radar_points(
     from faninsar.processing.geometry.api import SourceDEM
     from faninsar.processing.geometry.prepare_production import run_geo2rdr
 
+    resolved_looks = coerce_looks(looks)
     if dem is None or isinstance(dem, SourceDEM) or not hasattr(dem, "sample"):
         message = (
             "DEM is not available for radar reference-point mapping; "
@@ -191,7 +205,7 @@ def map_radar_points(
         range_index.reshape(1, -1),
         valid.reshape(1, -1),
     )
-    layer = coords.to_layer_frame(origin=origin, looks=looks)
+    layer = coords.to_layer_frame(origin=origin, looks=resolved_looks)
     row_center = np.asarray(layer.az, dtype=np.float64).reshape(-1)
     col_center = np.asarray(layer.rg, dtype=np.float64).reshape(-1)
     layer_valid = np.asarray(layer.valid, dtype=bool).reshape(-1)
@@ -231,7 +245,7 @@ def map_points_for_store(
         geometry=geometry,
         dem=stack._geometry_dem(),
         origin=origin_from_store(store),
-        looks=tuple(store.looks),
+        looks=store.looks,
         shape=store.shape,
         device=str(stack.config.device),
     )
@@ -274,10 +288,16 @@ def map_points_for_layer(
             "geographic layer"
         )
         reject(message, ValueError, logger=logger)
-    looks = tuple(layer.multilook)
-    if "faninsar:looks" in properties:
-        raw_looks = properties["faninsar:looks"]
-        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    looks = coerce_looks(layer.multilook)
+    raw_range_looks = properties.get("faninsar:range_looks")
+    raw_azimuth_looks = properties.get("faninsar:azimuth_looks")
+    if (
+        isinstance(raw_range_looks, int)
+        and not isinstance(raw_range_looks, bool)
+        and isinstance(raw_azimuth_looks, int)
+        and not isinstance(raw_azimuth_looks, bool)
+    ):
+        looks = Looks(range=raw_range_looks, azimuth=raw_azimuth_looks)
     return mapper(
         points,
         origin=origin_from_layer(layer),
@@ -338,10 +358,11 @@ def support_mask_from_product(product: object) -> np.ndarray | None:
 def grid_payload_from_store(store: InterferogramArtifactStore) -> dict[str, Any]:
     """Return the grid context stored with applied reference provenance."""
     transform = store.transform
+    looks = coerce_looks(store.looks)
     return {
         "domain": store.domain,
         "shape": [int(store.shape[0]), int(store.shape[1])],
-        "looks": [int(store.looks[0]), int(store.looks[1])],
+        "looks": [int(looks.range), int(looks.azimuth)],
         "origin": list(origin_from_store(store)),
         "crs": store.crs,
         "transform": None if transform is None else [float(v) for v in transform],

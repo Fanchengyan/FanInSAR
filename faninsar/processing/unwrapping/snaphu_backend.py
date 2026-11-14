@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import ProcessingContractError, reject_invalid_state
 from faninsar.processing.runtime.capabilities import snaphu_capability
@@ -114,7 +115,7 @@ def _as_tile_pair(value: object, *, name: str) -> tuple[int, int]:
 def _resolve_nlooks(
     config: SnaphuConfig,
     *,
-    looks: tuple[int, int] | None,
+    looks: Looks | None,
     nlooks_divisor: float | None,
 ) -> float:
     """Return the SNAPHU ``nlooks`` argument for one invocation."""
@@ -122,7 +123,7 @@ def _resolve_nlooks(
         nlooks = float(config.nlooks)
     elif looks is not None:
         divisor = _require_positive_finite(nlooks_divisor, "nlooks_divisor")
-        nlooks = float(int(looks[0]) * int(looks[1])) / divisor
+        nlooks = float(looks.nlooks) / divisor
     else:
         nlooks = 1.0
     if not math.isfinite(nlooks) or nlooks < 1.0:
@@ -133,7 +134,7 @@ def _resolve_nlooks(
 def _nlooks_diagnostics(
     config: SnaphuConfig,
     *,
-    looks: tuple[int, int] | None,
+    looks: Looks | tuple[int, int] | None,
     nlooks_divisor: float | None,
     nlooks: float,
 ) -> dict[str, Any]:
@@ -141,8 +142,10 @@ def _nlooks_diagnostics(
 
     These fields are recorded on the unwrap Item, not in compared method
     identity. An explicit ``SnaphuConfig.nlooks`` bypasses the divisor for
-    reuse while still recording the applicable coefficient and looks.
+    reuse while still recording the applicable coefficient and looks. The
+    ``looks`` field records both factors in range-first order.
     """
+    resolved_looks = None if looks is None else coerce_looks(looks)
     if config.nlooks is not None:
         source: Literal["explicit", "multilook_divisor", "default"] = "explicit"
     elif looks is not None:
@@ -153,7 +156,11 @@ def _nlooks_diagnostics(
         "nlooks": float(nlooks),
         "source": source,
         "nlooks_divisor": (None if nlooks_divisor is None else float(nlooks_divisor)),
-        "looks": None if looks is None else [int(looks[0]), int(looks[1])],
+        "looks": (
+            None
+            if resolved_looks is None
+            else [resolved_looks.range, resolved_looks.azimuth]
+        ),
     }
     return json.loads(json.dumps(payload, allow_nan=False))
 
@@ -173,7 +180,7 @@ def _resolve_snaphu_config(
     config: SnaphuConfig,
     *,
     shape: tuple[int, int],
-    looks: tuple[int, int] | None = None,
+    looks: Looks | tuple[int, int] | None = None,
     nlooks_divisor: float | None = None,
     process_limit: int | None = None,
 ) -> SnaphuConfig:
@@ -191,7 +198,10 @@ def _resolve_snaphu_config(
     if len(shape) != 2 or any(int(axis) < 1 for axis in shape):
         reject("SNAPHU input shape must be two positive integers", ValueError)
     height, width = int(shape[0]), int(shape[1])
-    nlooks = _resolve_nlooks(config, looks=looks, nlooks_divisor=nlooks_divisor)
+    resolved_looks = None if looks is None else coerce_looks(looks)
+    nlooks = _resolve_nlooks(
+        config, looks=resolved_looks, nlooks_divisor=nlooks_divisor
+    )
 
     if config.ntiles is None:
         tile_size = _AUTO_TILE_SIZE

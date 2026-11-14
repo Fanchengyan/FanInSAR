@@ -1,13 +1,13 @@
 """Interferogram, unwrap, and ion-corrected products of a Stack.
 
-An interferogram product is ``ifg/ml_AxR/<pair>/`` with Zarr layers and one
+An interferogram product is ``ifg/ml_RxA/<pair>/`` with Zarr layers and one
 ``item.json`` (kind ``ifg``) that binds both scene write ids. The persisted
 layers are the canonical ``complex_ifg`` plus optional ``coherence`` and
 ``valid_mask``; ``wrapped_phase`` and ``amplitude`` are virtual layers derived
 as ``angle(complex_ifg)`` and ``abs(complex_ifg)`` at read time and never
 materialize separate Zarr stores. Ordinary unwrap is the pair sibling
-``ifg/ml_AxR/<pair>/unwrap`` (kind ``unwrap``). Ion estimates live under
-``ifg/ion/ml_AxR/<pair>``. The ion-corrected complex IFG is the pair sibling
+``ifg/ml_RxA/<pair>/unwrap`` (kind ``unwrap``). Ion estimates live under
+``ifg/ion/ml_RxA/<pair>``. The ion-corrected complex IFG is the pair sibling
 ``complex_ion/`` (kind ``complex_ion``) written before any full-band unwrap;
 its unwrap is ``unwrap_ion/`` (kind ``unwrap_ion``). Products are written
 through :mod:`faninsar.io.storage.product`; reads validate the Item, shapes,
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage._zarr_stac import (
     read_zarr_array,
     require_basename,
@@ -145,7 +146,7 @@ def _is_source_identity(value: object) -> bool:
 
 def ifg_artifact_dir(
     work_dir: str | Path,
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
     pair: tuple[str, str],
     *,
     representation: str = MERGED_REPRESENTATION,
@@ -154,13 +155,14 @@ def ifg_artifact_dir(
 ) -> Path:
     """Return the product directory of one merged or burst interferogram.
 
-    Merged products keep ``<work>/ifg/ml_AxR/<pair>[/pN]``. Burst products
-    live at ``<work>/ifg/bursts/ml_AxR/<pair>/<burst_id>[/pN]``.
+    Merged products keep ``<work>/ifg/ml_RxA/<pair>[/pN]``. Burst products
+    live at ``<work>/ifg/bursts/ml_RxA/<pair>/<burst_id>[/pN]``.
     """
     if representation not in {MERGED_REPRESENTATION, BURST_REPRESENTATION}:
         reject_invalid_state("IFG representation must be merged or burst")
     pair_id = f"{pair[0]}_{pair[1]}"
-    looks_name = f"ml_{int(looks[0])}x{int(looks[1])}"
+    looks = coerce_looks(looks)
+    looks_name = f"ml_{looks.range}x{looks.azimuth}"
     root = Path(work_dir) / "ifg"
     if representation == BURST_REPRESENTATION:
         if burst_id is None:
@@ -182,7 +184,7 @@ def unwrap_root(
 ) -> Path:
     """Return the unwrap product directory paired with an IFG product.
 
-    ``<work>/ifg/ml_AxR/<pair>`` maps to ``<work>/ifg/ml_AxR/<pair>/unwrap``.
+    ``<work>/ifg/ml_RxA/<pair>`` maps to ``<work>/ifg/ml_RxA/<pair>/unwrap``.
     Burst products are rejected unless ``allow_burst=True``, in which case
     unwrap is the sibling ``unwrap/`` under the burst IFG root.
     """
@@ -230,12 +232,12 @@ def _validated_ifg_root(
         if root.parent.parent.parent.name != "bursts":
             reject_invalid_state(
                 "burst IFG product is not under "
-                f"ifg/bursts/ml_AxR/<pair>/<burst>: {root}"
+                f"ifg/bursts/ml_RxA/<pair>/<burst>: {root}"
             )
         return root
     if root.parent.parent.name != "ifg":
         reject_invalid_state(
-            f"IFG product is not under an ifg/ml_AxR/<pair> layout: {root}"
+            f"IFG product is not under an ifg/ml_RxA/<pair> layout: {root}"
         )
     return root
 
@@ -252,12 +254,15 @@ def ifg_sample_placement(
     from faninsar.processing.atmosphere.grid_map import native_block_center_anchor
 
     native_origin = (
-        int(store.row_origin) + int(store.look_origin[0]) * int(store.looks[0]),
-        int(store.col_origin) + int(store.look_origin[1]) * int(store.looks[1]),
+        int(store.row_origin) + int(store.look_origin[0]) * store.looks.azimuth,
+        int(store.col_origin) + int(store.look_origin[1]) * store.looks.range,
     )
-    return native_block_center_anchor(native_origin, store.looks), (
-        float(store.looks[0]),
-        float(store.looks[1]),
+    # ``native_block_center_anchor`` consumes placement pairs as (azimuth, range).
+    return native_block_center_anchor(
+        native_origin, (store.looks.azimuth, store.looks.range)
+    ), (
+        float(store.looks.azimuth),
+        float(store.looks.range),
     )
 
 
@@ -410,11 +415,11 @@ class InterferogramArtifactStore:
     Attributes
     ----------
     root : pathlib.Path
-        Product directory ``ifg/ml_AxR/<pair>``.
+        Product directory ``ifg/ml_RxA/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
-    looks : tuple[int, int]
-        Applied azimuth and range look factors.
+    looks : Looks
+        Applied range and azimuth look factors.
     filter_name : str
         Applied filter name.
     filter_parameters : dict[str, object]
@@ -434,7 +439,7 @@ class InterferogramArtifactStore:
     domain: str
     wavelength_m: float | None
     grid_identity: str
-    looks: tuple[int, int]
+    looks: Looks
     filter_name: str
     filter_parameters: dict[str, Any]
     source_manifest_digests: dict[str, str]
@@ -504,16 +509,24 @@ class InterferogramArtifactStore:
             or any(not isinstance(value, str) or not value for value in raw_pair)
         ):
             reject_invalid_state("artifact pair must contain two non-empty ids")
-        raw_looks = p.get("faninsar:looks")
+        raw_range_looks = p.get("faninsar:range_looks")
         if (
-            not isinstance(raw_looks, list)
-            or len(raw_looks) != 2
-            or any(
-                not isinstance(value, int) or isinstance(value, bool) or value < 1
-                for value in raw_looks
-            )
+            not isinstance(raw_range_looks, int)
+            or isinstance(raw_range_looks, bool)
+            or raw_range_looks < 1
         ):
-            reject_invalid_state("artifact looks must contain two positive integers")
+            reject_invalid_state(
+                "artifact faninsar:range_looks must be a positive integer"
+            )
+        raw_azimuth_looks = p.get("faninsar:azimuth_looks")
+        if (
+            not isinstance(raw_azimuth_looks, int)
+            or isinstance(raw_azimuth_looks, bool)
+            or raw_azimuth_looks < 1
+        ):
+            reject_invalid_state(
+                "artifact faninsar:azimuth_looks must be a positive integer"
+            )
         raw_shape = p.get("faninsar:shape")
         if not isinstance(raw_shape, list) or len(raw_shape) != 2:
             reject_invalid_state("artifact shape is invalid")
@@ -578,7 +591,7 @@ class InterferogramArtifactStore:
             grid_identity=str(grid_identity),
             crs=crs,
             transform=transform,
-            looks=(raw_looks[0], raw_looks[1]),
+            looks=Looks(range=raw_range_looks, azimuth=raw_azimuth_looks),
             filter_name=str(raw_filter["name"]),
             filter_parameters=_canonical_parameters(
                 raw_filter.get("parameters", {}), "filter parameters"
@@ -774,18 +787,26 @@ class InterferogramArtifactStore:
         """Return the write id of the ion product this complex_ion named."""
         from faninsar.io.storage.ion_store import ION_KIND, ion_dir
 
-        raw_looks = complex_ion.properties.get("faninsar:ion_looks")
+        raw_range_looks = complex_ion.properties.get("faninsar:ion_range_looks")
         if (
-            not isinstance(raw_looks, list)
-            or len(raw_looks) != 2
-            or any(
-                not isinstance(value, int) or isinstance(value, bool) or value < 1
-                for value in raw_looks
-            )
+            not isinstance(raw_range_looks, int)
+            or isinstance(raw_range_looks, bool)
+            or raw_range_looks < 1
         ):
-            reject_invalid_state("complex_ion ion_looks metadata is invalid")
+            reject_invalid_state(
+                "complex_ion faninsar:ion_range_looks metadata is invalid"
+            )
+        raw_azimuth_looks = complex_ion.properties.get("faninsar:ion_azimuth_looks")
+        if (
+            not isinstance(raw_azimuth_looks, int)
+            or isinstance(raw_azimuth_looks, bool)
+            or raw_azimuth_looks < 1
+        ):
+            reject_invalid_state(
+                "complex_ion faninsar:ion_azimuth_looks metadata is invalid"
+            )
         pair_id = f"{self.pair[0]}_{self.pair[1]}"
-        ion_looks = (int(raw_looks[0]), int(raw_looks[1]))
+        ion_looks = Looks(range=raw_range_looks, azimuth=raw_azimuth_looks)
         ion_path = ion_dir(self.root.parent.parent.parent, pair_id, ion_looks)
         if not (ion_path / "item.json").is_file():
             return None
@@ -971,7 +992,7 @@ def write_ifg_artifact(
     root: str | Path,
     *,
     pair: tuple[str, str],
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
     domain: str = "radar",
     wavelength_m: float | None = None,
     grid_identity: str | None = None,
@@ -1005,11 +1026,11 @@ def write_ifg_artifact(
     Parameters
     ----------
     root : str or pathlib.Path
-        Product directory ``ifg/ml_AxR/<pair>``.
+        Product directory ``ifg/ml_RxA/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
-    looks : tuple[int, int]
-        Applied azimuth and range look factors.
+    looks : Looks or tuple of int
+        Applied range and azimuth look factors.
     domain : {"radar", "geo"}, optional
         Output coordinate domain.
     wavelength_m : float, optional
@@ -1066,6 +1087,7 @@ def write_ifg_artifact(
         The committed product.
 
     """
+    looks = coerce_looks(looks)
     arrays: dict[str, np.ndarray] = {"complex": np.asarray(complex_ifg)}
     if coherence is not None:
         arrays["coherence"] = np.asarray(coherence)
@@ -1086,11 +1108,6 @@ def write_ifg_artifact(
     if (
         len(pair) != 2
         or any(not isinstance(value, str) or not value for value in pair)
-        or len(looks) != 2
-        or any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 1
-            for value in looks
-        )
         or not isinstance(filter_name, str)
         or not filter_name
         or domain not in {"radar", "geo"}
@@ -1169,7 +1186,8 @@ def write_ifg_artifact(
     runtime = {name: value for name, value in sources.items() if name not in inputs}
     properties: dict[str, object] = {
         "faninsar:pair": list(pair),
-        "faninsar:looks": [int(looks[0]), int(looks[1])],
+        "faninsar:range_looks": looks.range,
+        "faninsar:azimuth_looks": looks.azimuth,
         "faninsar:domain": domain,
         "faninsar:shape": [int(shape[0]), int(shape[1])],
         "faninsar:wavelength_m": wavelength_m,
@@ -1237,7 +1255,7 @@ def write_complex_ion_artifact(
     complex_ifg: np.ndarray,
     valid_mask: np.ndarray | None = None,
     ion_write_id: str,
-    ion_looks: tuple[int, int],
+    ion_looks: Looks | tuple[int, int],
     interpolation: str,
     source_anchor: Sequence[float],
     source_spacing: Sequence[float],
@@ -1262,8 +1280,8 @@ def write_complex_ion_artifact(
         Support of the correction (IFG validity ∩ mapped ion support).
     ion_write_id : str
         ``write_id`` of the consumed ion product.
-    ion_looks : tuple[int, int]
-        Look factors of that ion product.
+    ion_looks : Looks or tuple of int
+        Range and azimuth look factors of that ion product.
     interpolation : str
         Interpolation policy; must be ``masked_bilinear_unwrapped``.
     source_anchor, source_spacing, target_anchor, target_spacing : sequence
@@ -1278,6 +1296,7 @@ def write_complex_ion_artifact(
         The committed ``complex_ion`` product.
 
     """
+    ion_looks = coerce_looks(ion_looks)
     store = InterferogramArtifactStore.open(root)
     array = np.asarray(complex_ifg)
     if array.shape != store.shape or array.dtype.kind != "c":
@@ -1289,22 +1308,17 @@ def write_complex_ion_artifact(
         reject_invalid_state(
             "complex_ion interpolation must be 'masked_bilinear_unwrapped'"
         )
-    if (
-        len(ion_looks) != 2
-        or any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 1
-            for value in ion_looks
-        )
-        or not _is_source_identity(ion_write_id)
-    ):
+    if not _is_source_identity(ion_write_id):
         reject_invalid_state("complex_ion ion binding is invalid")
     item_properties: dict[str, object] = {
         "faninsar:pair": list(store.pair),
-        "faninsar:looks": list(store.looks),
+        "faninsar:range_looks": store.looks.range,
+        "faninsar:azimuth_looks": store.looks.azimuth,
         "faninsar:domain": store.domain,
         "faninsar:shape": list(store.shape),
         "faninsar:grid_identity": store.grid_identity,
-        "faninsar:ion_looks": [int(ion_looks[0]), int(ion_looks[1])],
+        "faninsar:ion_range_looks": ion_looks.range,
+        "faninsar:ion_azimuth_looks": ion_looks.azimuth,
         "faninsar:interpolation": interpolation,
         "faninsar:sample_center_anchor": _placement_pair(
             target_anchor, "target_anchor"
@@ -1412,7 +1426,8 @@ def write_unwrapped_artifact(
         reject_invalid_state("unwrap method must not be empty")
     item_properties: dict[str, object] = {
         "faninsar:pair": list(store.pair),
-        "faninsar:looks": list(store.looks),
+        "faninsar:range_looks": store.looks.range,
+        "faninsar:azimuth_looks": store.looks.azimuth,
         "faninsar:domain": store.domain,
         "faninsar:shape": list(store.shape),
         "faninsar:grid_identity": store.grid_identity,

@@ -151,7 +151,6 @@ def test_selected_numpy_oracle_definitions_preserve_source_and_ast() -> None:
         "faninsar/processing/geometry/dem.py": ("_natural_spline_six",),
         "faninsar/processing/interferometry/pair.py": (
             "_block_reduce",
-            "_block_finite_mean",
         ),
         "faninsar/processing/coregistration/tops/deramp.py": ("_poly_eval",),
         "faninsar/processing/geocoding/coordinates.py": ("_offset_fields_numpy",),

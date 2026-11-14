@@ -782,11 +782,18 @@ def _placement(
 ) -> tuple[tuple[float, float], tuple[float, float]] | RadarDiagnostic:
     """Return native-pixel first-sample centres and spacing for one IFG."""
     properties = _properties(ifg)
-    looks = properties.get("faninsar:looks")
-    if not isinstance(looks, list | tuple) or len(looks) != 2:
+    look_rows = properties.get("faninsar:azimuth_looks")
+    look_cols = properties.get("faninsar:range_looks")
+    if not (
+        isinstance(look_rows, int)
+        and not isinstance(look_rows, bool)
+        and isinstance(look_cols, int)
+        and not isinstance(look_cols, bool)
+        and look_rows > 0
+        and look_cols > 0
+    ):
         return RadarDiagnostic("invalid-placement")
     try:
-        look_rows, look_cols = int(looks[0]), int(looks[1])
         row_origin = int(properties.get("faninsar:row_origin", 0))
         col_origin = int(properties.get("faninsar:col_origin", 0))
         origin = properties.get("faninsar:look_origin", [0, 0])
@@ -794,8 +801,6 @@ def _placement(
             return RadarDiagnostic("invalid-placement")
         look_row_origin, look_col_origin = int(origin[0]), int(origin[1])
     except (TypeError, ValueError):
-        return RadarDiagnostic("invalid-placement")
-    if look_rows <= 0 or look_cols <= 0:
         return RadarDiagnostic("invalid-placement")
     first_center = (
         float(row_origin + look_row_origin * look_rows + (look_rows - 1) / 2),

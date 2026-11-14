@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.processing.runtime.compute.cache import apply_compile_cache_env
 from faninsar.processing.runtime.compute.compile_specs import DEFAULT_CHUNK
 
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_LOOKS: Looks = Looks(2, 2)
 
 
 @dataclass
@@ -114,22 +117,22 @@ def _identity_kernel() -> Callable[..., Any]:
 def _multilook_factory() -> Callable[..., Any]:
     """Boxcar multilook factory (compile target)."""
 
-    def multilook(arr: Any, looks: tuple[int, int] = (2, 2)) -> Any:
+    def multilook(arr: Any, looks: Looks | tuple[int, int] = _DEFAULT_LOOKS) -> Any:
         import torch
 
         if not isinstance(arr, torch.Tensor):
             arr = torch.as_tensor(arr)
-        az, rg = looks
+        rg_looks, az_looks = coerce_looks(looks)
         if torch.is_complex(arr):
             real = torch.nn.functional.avg_pool2d(
-                arr.real.unsqueeze(0).unsqueeze(0), (az, rg)
+                arr.real.unsqueeze(0).unsqueeze(0), (az_looks, rg_looks)
             )
             imag = torch.nn.functional.avg_pool2d(
-                arr.imag.unsqueeze(0).unsqueeze(0), (az, rg)
+                arr.imag.unsqueeze(0).unsqueeze(0), (az_looks, rg_looks)
             )
             return torch.complex(real.squeeze(), imag.squeeze())
         return torch.nn.functional.avg_pool2d(
-            arr.unsqueeze(0).unsqueeze(0).float(), (az, rg)
+            arr.unsqueeze(0).unsqueeze(0).float(), (az_looks, rg_looks)
         ).squeeze()
 
     return multilook

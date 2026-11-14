@@ -1,6 +1,6 @@
 """Network-facing view over the committed products of a Stack (PROPOSAL-0059).
 
-The collection reads ``ifg/ml_AxR/<pair>`` and the pair-owned
+The collection reads ``ifg/ml_{range}x{azimuth}/<pair>`` and the pair-owned
 ``unwrap/``, ``complex_ion/``, and ``unwrap_ion/`` siblings in place;
 nothing is copied into a second layout.
 
@@ -24,6 +24,7 @@ import pandas as pd
 import xarray as xr
 
 from faninsar.core import Pair, Pairs
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
@@ -78,14 +79,14 @@ def _canonical_asset_name(name: str) -> str:
 class _Selection:
     """Internal selection carried by one collection view (PROPOSAL-0064).
 
-    ``looks`` picks a committed ``ifg/ml_AxR`` tree; ``pairs`` narrows the
-    planned Pair network to a subset; ``polygon`` reads one ``p<i>``
-    subtree of a multi-polygon ROI; ``track``/``pol`` hold the resolved
-    track label and polarization axis selectors. ``None`` means the Stack
-    defaults — ``StackConfig.multilook`` and the full planned network.
+    ``looks`` picks a committed ``ifg/ml_{range}x{azimuth}`` tree; ``pairs``
+    narrows the planned Pair network to a subset; ``polygon`` reads one
+    ``p<i>`` subtree of a multi-polygon ROI; ``track``/``pol`` hold the
+    resolved track label and polarization axis selectors. ``None`` means the
+    Stack defaults — ``StackConfig.multilook`` and the full planned network.
     """
 
-    looks: tuple[int, int] | None = None
+    looks: Looks | tuple[int, int] | None = None
     pairs: Pairs | None = None
     polygon: int | None = None
     track: str | None = None
@@ -95,17 +96,18 @@ class _Selection:
     merge_on_read: bool = False
 
     def __post_init__(self) -> None:
-        """Validate looks shape; subset-of-plan is checked by ``sel``."""
-        if self.looks is not None and (
-            not isinstance(self.looks, tuple)
-            or len(self.looks) != 2
-            or any(
-                not isinstance(v, int) or isinstance(v, bool) or v < 1
-                for v in self.looks
+        """Normalize looks to range-first factors; ``sel`` checks the plan."""
+        if self.looks is None:
+            return
+        try:
+            resolved = coerce_looks(self.looks)
+        except (TypeError, ValueError) as error:
+            message = (
+                "looks must be two positive integers (range, azimuth); "
+                f"got {self.looks!r}"
             )
-        ):
-            message = f"looks must be two positive integers; got {self.looks!r}"
-            raise ValueError(message)
+            raise ValueError(message) from error
+        object.__setattr__(self, "looks", resolved)
 
 
 class StackInterferogramCollection(InterferogramCollection):
@@ -130,7 +132,7 @@ class StackInterferogramCollection(InterferogramCollection):
         self._selection = selection or _Selection()
 
     @property
-    def looks(self) -> tuple[int, int]:
+    def looks(self) -> Looks:
         """Return the multilook this view reads.
 
         ``sel(looks=)`` overrides it; otherwise it is
@@ -138,34 +140,33 @@ class StackInterferogramCollection(InterferogramCollection):
         """
         if self._selection.looks is not None:
             return self._selection.looks
-        looks = self._stack.config.multilook
-        return (int(looks[0]), int(looks[1]))
+        return coerce_looks(self._stack.config.multilook)
 
     @property
-    def available_looks(self) -> list[tuple[int, int]]:
+    def available_looks(self) -> list[Looks]:
         """Return the committed multilook views under ``work_dir/ifg``.
 
-        The list enumerates ``ml_AxR`` directories on disk, so every entry
-        names a committed product view regardless of completeness.
+        The list enumerates ``ml_{range}x{azimuth}`` directories on disk, so
+        every entry names a committed product view regardless of completeness.
         """
         ifg_root = self._stack.config.work_dir / "ifg"
         if not ifg_root.is_dir():
             return []
-        views: list[tuple[int, int]] = []
+        views: list[Looks] = []
         for path in ifg_root.iterdir():
             if not path.is_dir() or not path.name.startswith("ml_"):
                 continue
             try:
-                az_str, rg_str = path.name[3:].split("x", 1)
-                views.append((int(az_str), int(rg_str)))
+                range_str, azimuth_str = path.name[3:].split("x", 1)
+                views.append(Looks(int(range_str), int(azimuth_str)))
             except ValueError:
                 continue
-        return sorted(set(views))
+        return sorted(set(views), key=lambda looks: (looks.range, looks.azimuth))
 
     def sel(
         self,
         *,
-        looks: tuple[int, int] | None = None,
+        looks: Looks | tuple[int, int] | None = None,
         pairs: Pairs | Pair | str | None = None,
         polygon: int | None = None,
         track: str | None = None,
@@ -178,11 +179,11 @@ class StackInterferogramCollection(InterferogramCollection):
 
         Parameters
         ----------
-        looks : tuple[int, int], optional
-            ``(azimuth, range)`` look factors of a committed
-            ``ifg/ml_AxR`` view. The view must exist on disk; reading it
-            still enforces per-pair validation. ``None`` keeps the current
-            ``self.looks``.
+        looks : Looks or tuple[int, int], optional
+            Range-first ``(range, azimuth)`` look factors of a committed
+            ``ifg/ml_{range}x{azimuth}`` view. The view must exist on disk;
+            reading it still enforces per-pair validation. ``None`` keeps the
+            current ``self.looks``.
         pairs : Pairs, Pair, or str, optional
             A :class:`Pairs` selects a subset of the planned network and
             returns a new :class:`StackInterferogramCollection`; a scalar
@@ -223,10 +224,10 @@ class StackInterferogramCollection(InterferogramCollection):
             burst IFG products under ``ifg/bursts/``.
         representation : {"merged", "burst"}, optional
             Product representation to read. ``"merged"`` (the default) opens
-            ``ifg/ml_AxR/<pair>[/pN]``. ``"burst"`` opens
-            ``ifg/bursts/ml_AxR/<pair>/<burst_id>[/pN]`` and requires
-            ``burst=`` to name the burst product. ``None`` keeps the current
-            view's representation.
+            ``ifg/ml_{range}x{azimuth}/<pair>[/pN]``. ``"burst"`` opens
+            ``ifg/bursts/ml_{range}x{azimuth}/<pair>/<burst_id>[/pN]`` and
+            requires ``burst=`` to name the burst product. ``None`` keeps the
+            current view's representation.
 
         Returns
         -------
@@ -242,23 +243,24 @@ class StackInterferogramCollection(InterferogramCollection):
         KeyError
             If a scalar ``pairs`` is not part of the planned network.
         ValueError
-            If ``looks`` is not two positive integers, ``pairs`` is not a
-            non-empty subset of the planned network, ``polygon`` is given
-            for a single-polygon or absent ROI or names a polygon on
-            another track, ``track``/``direction``/``pol``/``burst``
-            select nothing or cannot be resolved, ``representation`` is
-            invalid, or no dims select anything.
+            If ``looks`` is not two positive integers (range, azimuth),
+            ``pairs`` is not a non-empty subset of the planned network,
+            ``polygon`` is given for a single-polygon or absent ROI or names
+            a polygon on another track, ``track``/``direction``/``pol``/
+            ``burst`` select nothing or cannot be resolved,
+            ``representation`` is invalid, or no dims select anything.
 
         """
-        if looks is not None and (
-            not isinstance(looks, tuple)
-            or len(looks) != 2
-            or any(
-                not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in looks
-            )
-        ):
-            message = f"looks must be two positive integers; got {looks!r}"
-            raise ValueError(message)
+        resolved_looks: Looks | None = None
+        if looks is not None:
+            try:
+                resolved_looks = coerce_looks(looks)
+            except (TypeError, ValueError) as error:
+                message = (
+                    "looks must be two positive integers (range, azimuth); "
+                    f"got {looks!r}"
+                )
+                raise ValueError(message) from error
 
         resolved_track = self._resolve_track_selector(track)
         resolved_pol = self._resolve_pol_selector(pol)
@@ -306,7 +308,7 @@ class StackInterferogramCollection(InterferogramCollection):
             resolved_pairs = self._resolve_burst_selector(burst, resolved_pairs)
 
         selection = _Selection(
-            looks=self._selection.looks if looks is None else looks,
+            looks=(self._selection.looks if resolved_looks is None else resolved_looks),
             pairs=resolved_pairs,
             polygon=self._selection.polygon if polygon is None else resolved_polygon,
             track=(
@@ -632,7 +634,7 @@ class StackInterferogramCollection(InterferogramCollection):
     def root(self) -> Path:
         """Return the IFG product directory of this view's multilook."""
         looks = self.looks
-        return self._stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}"
+        return self._stack.config.work_dir / "ifg" / f"ml_{looks.range}x{looks.azimuth}"
 
     def _pair_dir(self, pair_id: str) -> Path:
         """Return the product directory of one Pair for this view's polygon."""
@@ -657,7 +659,7 @@ class StackInterferogramCollection(InterferogramCollection):
             self._stack.config.work_dir
             / "ifg"
             / "bursts"
-            / f"ml_{looks[0]}x{looks[1]}"
+            / f"ml_{looks.range}x{looks.azimuth}"
             / pair_id
             / str(burst_id)
         )
@@ -677,7 +679,7 @@ class StackInterferogramCollection(InterferogramCollection):
             self._stack.config.work_dir
             / "ifg"
             / "bursts"
-            / f"ml_{looks[0]}x{looks[1]}"
+            / f"ml_{looks.range}x{looks.azimuth}"
             / pair_id
         )
         if not parent.is_dir():
@@ -849,8 +851,7 @@ class StackInterferogramCollection(InterferogramCollection):
             reject_invalid_state(
                 "Stack IFG artifact pair differs from the configured network"
             )
-        azimuth_looks, range_looks = (int(self.looks[0]), int(self.looks[1]))
-        if store.looks != (azimuth_looks, range_looks):
+        if coerce_looks(store.looks) != self.looks:
             reject_invalid_state("Stack IFG artifacts use mixed or unexpected looks")
         if store.domain != self._stack.config.coregistration_grid:
             reject_invalid_state("Stack IFG artifacts use mixed or unexpected domains")
@@ -1108,7 +1109,7 @@ class StackInterferogramCollection(InterferogramCollection):
         """Return a one-line summary of this view."""
         return (
             f"StackInterferogramCollection({len(self.pairs)} pairs, "
-            f"looks={self.looks[0]}x{self.looks[1]})"
+            f"looks={self.looks.range}x{self.looks.azimuth})"
         )
 
     def __repr__(self) -> str:
@@ -1116,7 +1117,7 @@ class StackInterferogramCollection(InterferogramCollection):
         looks = self.looks
         header = (
             f"StackInterferogramCollection({len(self.pairs)} pairs, "
-            f"looks={looks[0]}x{looks[1]}, root={self.root!r})"
+            f"looks={looks.range}x{looks.azimuth}, root={self.root!r})"
         )
         return f"{header}\n{self.pairs._to_frame().__repr__()}"
 

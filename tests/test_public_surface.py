@@ -9,6 +9,7 @@ REQUIRED_NAMES = {
     "Acquisitions",
     "Baselines",
     "Frequency",
+    "Looks",
     "Network",
     "Pair",
     "Pairs",

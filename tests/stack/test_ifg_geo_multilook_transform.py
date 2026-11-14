@@ -32,7 +32,7 @@ def _session_with_geo_grid(
     return S1Stack.from_safes(
         safes,
         work_dir=tmp_path / "out",
-        multilook=(5, 2),
+        multilook=(2, 5),
         geo_grid=GeoGridSpec("EPSG:4326", transform, shape=shape),
     )
 
@@ -41,7 +41,7 @@ def test_scale_multiplies_pixel_sizes_and_keeps_origin() -> None:
     """Five azimuth and two range looks scale the two pixel sizes only."""
     transform = (20.0, 0.0, X0, 0.0, -8.0, Y0)
 
-    scaled = _scale_geo_artifact_transform(transform, (5, 2))
+    scaled = _scale_geo_artifact_transform(transform, (2, 5))
 
     assert scaled == (40.0, 0.0, X0, 0.0, -40.0, Y0)
 
@@ -50,10 +50,10 @@ def test_scale_accepts_affine_and_passthrough_none() -> None:
     """Nine-value affine inputs scale identically; None stays None."""
     affine = Affine(20.0, 0.0, X0, 0.0, -8.0, Y0)
 
-    from_affine = _scale_geo_artifact_transform(affine, (5, 2))
+    from_affine = _scale_geo_artifact_transform(affine, (2, 5))
 
     assert from_affine == (40.0, 0.0, X0, 0.0, -40.0, Y0)
-    assert _scale_geo_artifact_transform(None, (5, 2)) is None
+    assert _scale_geo_artifact_transform(None, (2, 5)) is None
 
 
 def test_ifg_geo_grid_scales_stored_nine_value_transform(
@@ -66,7 +66,7 @@ def test_ifg_geo_grid_scales_stored_nine_value_transform(
         (37555, 11778),
     )
 
-    transform, shape = stack._ifg_geo_grid((5, 2))
+    transform, shape = stack._ifg_geo_grid((2, 5))
 
     assert transform == Affine(0.0004, 0.0, 12.0, 0.0, -0.0005, 44.0)
     assert shape == (7511, 5889)

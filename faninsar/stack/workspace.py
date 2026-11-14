@@ -954,15 +954,13 @@ def _read_locked(root: Path, *, on_error: ErrorPolicy) -> IntentState | None:
     if not isinstance(document, dict):
         return None
     version = _schema_version(document)
-    if version > WORKSPACE_SCHEMA_VERSION:
+    if version != WORKSPACE_SCHEMA_VERSION:
         message = (
-            f"{path} records workspace schema version {version}, newer than "
-            f"this FanInSAR supports ({WORKSPACE_SCHEMA_VERSION}); use a matching "
-            "FanInSAR version instead of downgrading the workspace"
+            f"{path} records workspace schema version {version}; this "
+            f"FanInSAR supports only version {WORKSPACE_SCHEMA_VERSION}. "
+            "Rebuild this work directory with the current FanInSAR version."
         )
         reject(message, WorkspaceIntegrityError, logger=logger)
-    if version < WORKSPACE_SCHEMA_VERSION:
-        return _adopt_legacy(root, path, document, on_error=on_error)
     return _repair_request_extras(root, path, document, on_error=on_error)
 
 

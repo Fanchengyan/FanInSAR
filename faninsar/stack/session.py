@@ -36,6 +36,7 @@ from typing import (
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage.ifg_store import (
     BURST_REPRESENTATION,
     MERGED_REPRESENTATION,
@@ -165,6 +166,7 @@ def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
 
 
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
+_DEFAULT_MULTILOOK = Looks(10, 2)
 
 
 def _phase_filter_metadata(  # noqa: PLR0911
@@ -773,7 +775,7 @@ def _geocode_product_identity(
     asset_tag: str | None,
     grid: GridSpec,
     full_radar_shape: tuple[int, int],
-    looks: tuple[int, int],
+    looks: Looks,
     origin: tuple[int, int],
     extent: tuple[int, int] | None = None,
     selection: frozenset[str] | None = None,
@@ -789,7 +791,7 @@ def _geocode_product_identity(
             "shape": [int(grid.height), int(grid.width)],
         },
         "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
-        "multilook": [int(looks[0]), int(looks[1])],
+        "multilook": [int(looks.range), int(looks.azimuth)],
         "origin": [int(origin[0]), int(origin[1])],
     }
     if extent is not None:
@@ -1846,7 +1848,7 @@ class Stack(NetworkContract, ABC):
             "committed": misreg_record is not None,
         }
 
-        ifg_root = work / "ifg" / f"ml_{looks[0]}x{looks[1]}"
+        ifg_root = work / "ifg" / f"ml_{looks.range}x{looks.azimuth}"
         planned_pairs = [
             f"{first}_{second}" for first, second in _iter_pair_dates(self.pairs)
         ]
@@ -2253,11 +2255,15 @@ class Stack(NetworkContract, ABC):
         points: Points,
         *,
         origin: tuple[int, int],
-        looks: tuple[int, int],
+        looks: Looks | tuple[int, int],
         shape: tuple[int, int],
         device: str | None = None,
     ) -> object:
-        """Map geographic points onto a cropped, multilooked radar layer."""
+        """Map geographic points onto a cropped, multilooked radar layer.
+
+        ``looks`` is range-first: range looks apply to columns and azimuth
+        looks to rows.
+        """
         from faninsar.data.reference import normalize_stored_points
         from faninsar.stack.reference import map_radar_points
 
@@ -2635,7 +2641,15 @@ class Stack(NetworkContract, ABC):
             return product
         resolved_kind, asset_tag = _geocode_resolve_kind(product)
         full_radar_shape = _geocode_int_pair(product, "full_radar_shape")
-        looks = _geocode_int_pair(product, "multilook")
+        raw_looks = getattr(product, "multilook", None)
+        try:
+            looks = coerce_looks(raw_looks)
+        except (TypeError, ValueError) as error:
+            message = (
+                "geocode product attribute 'multilook' must be a Looks or a "
+                f"(range, azimuth) pair; got {raw_looks!r}"
+            )
+            reject(message, ValueError, logger=logger, cause=error)
         origin = _geocode_int_pair(product, "origin")
         if any(value < 1 for value in looks):
             message = f"multilook must contain positive integers; got {looks}"
@@ -3726,7 +3740,7 @@ class Stack(NetworkContract, ABC):
         coreg_mode: CoregMode = "geometry",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
-        multilook: tuple[int, int] = (5, 2),
+        multilook: Looks | tuple[int, int] = _DEFAULT_MULTILOOK,
         goldstein_alpha: float = 0.5,
         nlooks_divisor: float | None = None,
         esd_coherence_threshold: float = 0.85,
@@ -4071,7 +4085,7 @@ class Stack(NetworkContract, ABC):
         return self._effective_roi_with_mask().lineage
 
     def _ifg_geo_grid(
-        self, looks: tuple[int, int]
+        self, looks: Looks | tuple[int, int]
     ) -> tuple[Any, tuple[int, int]] | None:
         """Return the multilooked ``(transform, shape)`` of the geo IFG grid.
 
@@ -4079,6 +4093,8 @@ class Stack(NetworkContract, ABC):
         geo-referenced grid the Stack session carries; multilooking scales
         the pixel size by the look factors and keeps the grid origin (the
         scene-grid alignment convention of ``form_interferograms``).
+        ``looks`` is range-first: range looks scale columns (affine ``a``)
+        and azimuth looks scale rows (affine ``e``).
         ``None`` when no geo grid is configured or its CRS is not EPSG:4326
         (the v1 water pipeline is geographic-only, fail-closed).
         """
@@ -4092,7 +4108,7 @@ class Stack(NetworkContract, ABC):
         aff_a, aff_b, aff_c, aff_d, aff_e, aff_f = (
             float(value) for value in tuple(grid.transform)[:6]
         )
-        az_looks, rg_looks = (int(looks[0]), int(looks[1]))
+        rg_looks, az_looks = coerce_looks(looks)
         transform = Affine(
             aff_a * rg_looks,
             aff_b,
@@ -4112,10 +4128,11 @@ class Stack(NetworkContract, ABC):
         *,
         stage: StageName,
         domain: str,
-        looks: tuple[int, int],
+        looks: Looks | tuple[int, int],
         expected_shape: tuple[int, int] | None = None,
     ) -> np.ndarray | None:
         """Return one stage's canonical mask plane on its target domain/grid."""
+        resolved_looks = coerce_looks(looks)
         if not self.config.mask_plan.references(stage):
             return None
         if domain == "radar":
@@ -4158,7 +4175,10 @@ class Stack(NetworkContract, ABC):
                 master_grid=target,
                 target_grid={
                     "shape": tuple(int(value) for value in full_shape),
-                    "multilook": looks,
+                    "multilook": [
+                        int(resolved_looks.range),
+                        int(resolved_looks.azimuth),
+                    ],
                 },
                 reference_scene=self.reference,
                 lut=lut,
@@ -4176,7 +4196,7 @@ class Stack(NetworkContract, ABC):
                         mask_transform=target.transform,
                         dem=self._geometry_dem(),
                         device=self.config.device,
-                        multilook=looks,
+                        multilook=resolved_looks,
                         master_grid=target,
                         reference_scene=self.reference,
                     )
@@ -4186,7 +4206,7 @@ class Stack(NetworkContract, ABC):
             projected_shape = tuple(
                 expected_shape or self._radar_projected_masks[projection_key].shape
             )
-            self._radar_mask_identities[(stage, tuple(looks), projected_shape)] = (
+            self._radar_mask_identities[(stage, resolved_looks, projected_shape)] = (
                 projection_key
             )
             projected = self._radar_projected_masks[projection_key]
@@ -4200,7 +4220,7 @@ class Stack(NetworkContract, ABC):
         if domain != "geo":
             message = f"unsupported mask projection domain {domain!r}"
             reject(message, ValueError, logger=logger)
-        grid = self._ifg_geo_grid(looks)
+        grid = self._ifg_geo_grid(resolved_looks)
         if grid is None:
             raise ValueError("interferogram masks require an EPSG:4326 geo_grid")
         transform, shape = grid
@@ -4216,7 +4236,7 @@ class Stack(NetworkContract, ABC):
         self,
         *,
         domain: str,
-        looks: tuple[int, int],
+        looks: Looks | tuple[int, int],
         expected_shape: tuple[int, int] | None = None,
     ) -> np.ndarray | None:
         """Return the interferogram-stage mask on its target grid."""
@@ -4374,12 +4394,12 @@ class Stack(NetworkContract, ABC):
             self._persisted_mask_products[(name, domain)] = product
 
     def _ionosphere_mask_plane(
-        self, ion_multilook: tuple[int, int] | None
+        self, ion_multilook: Looks | tuple[int, int] | None
     ) -> np.ndarray | None:
         """Return the explicit ionosphere-stage mask plane."""
         if not self.config.mask_plan.references("ionosphere"):
             return None
-        looks = tuple(int(value) for value in (ion_multilook or self.config.multilook))
+        looks = coerce_looks(ion_multilook or self.config.multilook)
         grid = self._ifg_geo_grid(looks)
         if grid is None:
             raise ValueError("ionosphere masks require an EPSG:4326 geo_grid")
@@ -4662,7 +4682,7 @@ class Stack(NetworkContract, ABC):
             materialized = self._materialize_stage_mask("unwrap", target)
             return None if materialized is None else str(materialized.identity)
         key = self._radar_mask_identities.get(
-            ("unwrap", tuple(self.config.multilook), tuple(shape))
+            ("unwrap", self.config.multilook, tuple(shape))
         )
         if key is None:
             reject_invalid_state(
@@ -4859,7 +4879,7 @@ class Stack(NetworkContract, ABC):
             "coregistration_grid": config.coregistration_grid,
             "esd_coherence_threshold": config.esd_coherence_threshold,
             "ampcor_snr_threshold": config.ampcor_snr_threshold,
-            "multilook": list(config.multilook),
+            "multilook": [int(config.multilook.range), int(config.multilook.azimuth)],
             "goldstein_alpha": config.goldstein_alpha,
             "control_spacing": config.control_spacing,
             "swaths": config.swaths,
@@ -6182,17 +6202,18 @@ class Stack(NetworkContract, ABC):
         current = self._date_correction_signature(date_id)
         return stored is not None and current is not None and stored == current
 
-    def _bind_multilook(self, looks: tuple[int, int]) -> None:
-        """Adopt one look pair as the session default and persist it.
+    def _bind_multilook(self, looks: Looks | tuple[int, int]) -> None:
+        """Adopt one range-first look pair as the session default and persist it.
 
         ``form_interferograms(multilook=...)`` is a per-call override that
         used to leave :attr:`StackConfig.multilook` (and ``stack.json``) on
-        the construction default.  Reopen then looks for ``ifg/ml_5x2``
-        while products live under ``ml_10x2``.  A single explicit look pair
-        becomes the science value for later unwrap, inversion, and identity.
+        the construction default.  Reopen then looked for the default
+        ``ifg/ml_RxA`` while products lived under the explicit view.  A single
+        explicit look pair becomes the science value for later unwrap,
+        inversion, and identity.
         """
-        adopted = (int(looks[0]), int(looks[1]))
-        current = (int(self.config.multilook[0]), int(self.config.multilook[1]))
+        adopted = coerce_looks(looks)
+        current = self.config.multilook
         if adopted == current:
             return
         self.config.multilook = adopted
@@ -6218,7 +6239,9 @@ class Stack(NetworkContract, ABC):
         self,
         *,
         pairs: Pairs | None = None,
-        multilook: tuple[int, int] | list[tuple[int, int]] | None = None,
+        multilook: (
+            Looks | tuple[int, int] | list[Looks | tuple[int, int]] | None
+        ) = None,
         coherence_window: tuple[int, int] | None = None,
         phase_filter: PhaseFilter | None = _DEFAULT_PHASE_FILTER,
         goldstein_alpha: float | None = None,
@@ -6233,12 +6256,14 @@ class Stack(NetworkContract, ABC):
             Pair graph to form. ``None`` uses the Stack graph fixed at
             construction. Pair endpoints are acquisition dates; their order is
             canonicalized by :class:`~faninsar.core.pair.Pairs`.
-        multilook : tuple[int, int] or list[tuple[int, int]], optional
-            One or more true boxcar look factors in ``(azimuth, range)``
-            pixels. ``None`` uses :attr:`StackConfig.multilook`, whose default
-            is ``(5, 2)``. Each result is aligned to the common scene-grid
-            origin. Scene-grid edge coverage and incomplete look support are
-            represented by the validity mask rather than interpolation.
+        multilook : Looks, tuple[int, int], or list of them, optional
+            One or more range-first true boxcar look factors: range looks
+            apply to columns and azimuth looks to rows. ``None`` uses
+            :attr:`StackConfig.multilook`, whose default is
+            ``Looks(10, 2)``. Each result is aligned to the common
+            scene-grid origin. Scene-grid edge coverage and incomplete look
+            support are represented by the validity mask rather than
+            interpolation.
         coherence_window : tuple[int, int] or None, default=None
             ``None`` (the default) estimates coherence per multilook block
             from that block's own samples (pure block MLE). A tuple enables
@@ -6263,14 +6288,14 @@ class Stack(NetworkContract, ABC):
             An explicitly supplied ``phase_filter`` (including ``None``)
             takes precedence.
         overwrite : bool, default=False
-            Replace existing IFG products (``work_dir/ifg/ml_AxR/<pair>`` or
-            ``work_dir/ifg/bursts/ml_AxR/<pair>/<burst>``). Without it a
+            Replace existing IFG products (``work_dir/ifg/ml_RxA/<pair>`` or
+            ``work_dir/ifg/bursts/ml_RxA/<pair>/<burst>``). Without it a
             current product is reused and a stale or differently configured
             one is rejected.
         merge : bool, default=True
             ``True`` writes the default merged Pair product under
-            ``ifg/ml_AxR/<pair>``. ``False`` writes independent burst products
-            under ``ifg/bursts/ml_AxR/<pair>/<burst_id>`` and does not create
+            ``ifg/ml_RxA/<pair>``. ``False`` writes independent burst products
+            under ``ifg/bursts/ml_RxA/<pair>/<burst_id>`` and does not create
             the merged product. Unwrap and Network consume merged products.
 
         Returns
@@ -6375,7 +6400,7 @@ class Stack(NetworkContract, ABC):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
                 continue
             for looks in looks_list:
-                az_l, rg_l = looks
+                rg_l, az_l = coerce_looks(looks)
                 for polygon in polygons:
                     scenes = scenes_by_polygon[polygon]
                     if primary not in scenes or secondary not in scenes:
@@ -6824,7 +6849,7 @@ class Stack(NetworkContract, ABC):
 
         ``Stack`` owns pair iteration, Dataset materialization, and one unwrap
         product per Pair. Ordinary unwrap is the pair sibling
-        ``ifg/ml_AxR/<pair>/unwrap`` bound to the IFG ``write_id``.
+        ``ifg/ml_RxA/<pair>/unwrap`` bound to the IFG ``write_id``.
         ``source="complex_ion"`` unwraps the ion-corrected complex sibling
         into ``unwrap_ion/`` and never falls back to the ordinary branch.
         ``unwrapper`` owns the numerical solve for one two-dimensional pair.
@@ -7191,7 +7216,7 @@ class Stack(NetworkContract, ABC):
         *,
         pair_phases: dict[str, np.ndarray] | None = None,
         device: str | None = None,
-        multilook: tuple[int, int] | None = None,
+        multilook: Looks | tuple[int, int] | None = None,
         phase: Literal["unwrapped", "unwrapped_ion"] = "unwrapped",
         pairs: Pairs | None = None,
         overwrite: bool = False,
@@ -7212,8 +7237,9 @@ class Stack(NetworkContract, ABC):
             disabled.
         device : str, optional
             Solver device. Defaults to :attr:`StackConfig.invert_device`.
-        multilook : tuple[int, int], optional
-            Product view to consume. Defaults to the configured look factors.
+        multilook : Looks or tuple[int, int], optional
+            Range-first product view to consume. Defaults to the configured
+            look factors.
         phase : {"unwrapped", "unwrapped_ion"}, default="unwrapped"
             Ordinary unwrap products, or the unwrap of ``complex_ion``. A
             missing named branch raises; there is no fallback.
@@ -7294,7 +7320,7 @@ class Stack(NetworkContract, ABC):
                 result = replace(result, metadata=metadata)
             self.timeseries = result
             return self.timeseries
-        looks = multilook or self.config.multilook
+        looks = coerce_looks(multilook or self.config.multilook)
         stores = self._pair_artifact_stores(looks=looks)
         if pairs is not None:
             selected = set(_iter_pair_dates(pairs))
@@ -7372,7 +7398,8 @@ class Stack(NetworkContract, ABC):
             inputs=inputs,
             properties={
                 "faninsar:phase_source": phase_source,
-                "faninsar:looks": [int(looks[0]), int(looks[1])],
+                "faninsar:range_looks": int(looks.range),
+                "faninsar:azimuth_looks": int(looks.azimuth),
             },
             overwrite=overwrite or (target / "item.json").is_file(),
         )
@@ -7412,7 +7439,7 @@ class Stack(NetworkContract, ABC):
             grid = grid_payload_from_store(stores[0])
         else:
             geometry, _grid_shape = self._reference_radar_geometry()
-            looks = tuple(self.config.multilook)
+            looks = coerce_looks(self.config.multilook)
             mapping = map_radar_points(
                 points,
                 geometry=geometry,
@@ -7425,7 +7452,7 @@ class Stack(NetworkContract, ABC):
             grid = {
                 "domain": "radar",
                 "shape": [int(shape[0]), int(shape[1])],
-                "looks": [int(looks[0]), int(looks[1])],
+                "looks": [int(looks.range), int(looks.azimuth)],
                 "origin": [0, 0],
                 "crs": None,
                 "transform": None,
@@ -7563,31 +7590,36 @@ class Stack(NetworkContract, ABC):
     def _pair_artifact_stores(
         self,
         *,
-        looks: tuple[int, int],
+        looks: Looks | tuple[int, int],
         polygon: int | None = None,
     ) -> list[InterferogramArtifactStore]:
         """Open the exact planned IFG product set of one multilook view.
 
-        ``polygon`` selects the ``p<i>`` subtree written for a multi-polygon
-        ROI; ``None`` reads the un-suffixed single-polygon layout.
+        ``looks`` is range-first: the view directory is
+        ``ifg/ml_{range}x{azimuth}``. ``polygon`` selects the ``p<i>``
+        subtree written for a multi-polygon ROI; ``None`` reads the
+        un-suffixed single-polygon layout.
 
         Raises
         ------
         InvalidProcessingStateError
-            If a planned Pair has no IFG product, an unplanned one exists, or
-            the products do not share one grid.
+            If a planned Pair has no IFG product for the requested looks, an
+            unplanned one exists, or the products do not share one grid.
 
         """
         from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
-        azimuth_looks, range_looks = (int(looks[0]), int(looks[1]))
-        root = self.config.work_dir / "ifg" / f"ml_{azimuth_looks}x{range_looks}"
+        resolved = coerce_looks(looks)
+        root = self.config.work_dir / "ifg" / f"ml_{resolved.range}x{resolved.azimuth}"
         expected_pairs = _iter_pair_dates(self.pairs)
         expected_ids = [
             f"{primary}_{secondary}" for primary, secondary in expected_pairs
         ]
         if not root.is_dir():
-            reject_invalid_state(f"Stack IFG product view is missing: {root}")
+            reject_invalid_state(
+                "Stack IFG product view is missing for the requested looks "
+                f"(range={resolved.range}, azimuth={resolved.azimuth}): {root}"
+            )
         if polygon is None:
             discovered_ids = sorted(
                 path.parent.name for path in root.glob("*/item.json")
@@ -7621,8 +7653,15 @@ class Stack(NetworkContract, ABC):
         artifact_grid_identities = {store.grid_identity for store in stores}
         if len(shapes) != 1:
             reject_invalid_state("Stack IFG artifacts do not share one common grid")
-        if artifact_looks != {(azimuth_looks, range_looks)}:
-            reject_invalid_state("Stack IFG artifacts use mixed or unexpected looks")
+        if artifact_looks != {resolved}:
+            observed = sorted(
+                artifact_looks, key=lambda value: (value.range, value.azimuth)
+            )
+            reject_invalid_state(
+                "Stack IFG artifacts use mixed or unexpected looks: expected "
+                f"range={resolved.range}, azimuth={resolved.azimuth}; got "
+                f"{[(value.range, value.azimuth) for value in observed]!r}"
+            )
         if artifact_domains != {self.config.coregistration_grid}:
             reject_invalid_state("Stack IFG artifacts use mixed or unexpected domains")
         if len(artifact_wavelengths) != 1:
@@ -7686,7 +7725,7 @@ def _bound_stack_unwrapper(
     unwrapper: object,
     *,
     shape: tuple[int, int],
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
 ) -> object:
     """Return a WorkDir-bound built-in SNAPHU invocation, or ``unwrapper``.
 
@@ -7784,28 +7823,34 @@ def _network_snapshot_id(stores: Sequence[InterferogramArtifactStore]) -> str:
 
 
 def _normalize_multilook(
-    multilook: tuple[int, int] | list[tuple[int, int]] | Iterable[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    """Accept one look pair or a list of look pairs."""
+    multilook: Looks | tuple[int, int] | Iterable[Looks | tuple[int, int]],
+) -> list[Looks]:
+    """Accept one range-first look pair or an iterable of look pairs."""
+    if isinstance(multilook, Looks):
+        return [multilook]
     if (
         isinstance(multilook, tuple)
         and len(multilook) == 2
-        and not isinstance(multilook[0], (list, tuple))
+        and all(
+            isinstance(item, int) and not isinstance(item, bool) for item in multilook
+        )
     ):
-        return [(int(multilook[0]), int(multilook[1]))]
-    return [(int(a), int(b)) for a, b in multilook]  # type: ignore[misc]
+        return [coerce_looks(multilook)]
+    return [coerce_looks(item) for item in multilook]  # type: ignore[arg-type]
 
 
 def _scale_geo_artifact_transform(
-    transform: object | None, looks: tuple[int, int]
+    transform: object | None, looks: Looks | tuple[int, int]
 ) -> tuple[float, ...] | None:
-    """Scale one geo artifact transform by (azimuth, range) look factors.
+    """Scale one geo artifact transform by the look factors.
 
-    Block multilooking multiplies the pixel sizes by the look factors and
-    keeps the grid origin, matching the scene-grid alignment convention of
-    ``form_interferograms``.  Radar-domain artifacts carry no transform, so
-    ``None`` passes through unchanged.  The stored convention is the
-    six-coefficient affine order of the persisted manifest.
+    ``looks`` is range-first: range looks scale columns (affine ``a``) and
+    azimuth looks scale rows (affine ``e``). Block multilooking multiplies
+    the pixel sizes by the look factors and keeps the grid origin, matching
+    the scene-grid alignment convention of ``form_interferograms``.
+    Radar-domain artifacts carry no transform, so ``None`` passes through
+    unchanged.  The stored convention is the six-coefficient affine order of
+    the persisted manifest.
     """
     if transform is None:
         return None
@@ -7814,7 +7859,7 @@ def _scale_geo_artifact_transform(
     aff_a, aff_b, aff_c, aff_d, aff_e, aff_f = (
         float(value) for value in tuple(transform)[:6]
     )
-    az_looks, rg_looks = (int(looks[0]), int(looks[1]))
+    rg_looks, az_looks = coerce_looks(looks)
     scaled = Affine(
         aff_a * rg_looks,
         aff_b,

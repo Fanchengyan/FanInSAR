@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Self
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage._zarr_stac import (
     read_zarr_array,
     require_basename,
@@ -1287,10 +1288,10 @@ def _crop_merge_layout(
 
 def _complete_look_indices(
     native_window: tuple[int, int, int, int],
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
 ) -> tuple[int, int, int, int]:
     """Return ``(first_i, last_i, first_j, last_j)`` complete global looks."""
-    az_looks, rg_looks = multilook
+    rg_looks, az_looks = coerce_looks(multilook)
     row0, row1, col0, col1 = native_window
     return (
         (row0 + az_looks - 1) // az_looks,
@@ -1745,7 +1746,7 @@ def _form_unit_pair_interferogram(
     *,
     support: np.ndarray | None,
     flatten_screen: np.ndarray | None,
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     goldstein_alpha: float,
     device: str,
     dask_client: object | None,
@@ -1753,6 +1754,7 @@ def _form_unit_pair_interferogram(
     phase_filter: PhaseFilter | None,
 ) -> InterferogramProduct:
     """Form one unit-local interferogram through the Pair kernel."""
+    multilook = coerce_looks(multilook)
     if support is not None:
         primary = primary.copy()
         secondary = secondary.copy()
@@ -1824,7 +1826,7 @@ def form_merged_scene_interferogram(
     primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
     device: str = "auto",
     dask_client: object | None = None,
@@ -1854,8 +1856,8 @@ def form_merged_scene_interferogram(
         Persisted acquisition stores of the pair's primary and secondary
         dates. Either may be the single Stack Reference store; both must be
         bound to the same Reference payloads.
-    multilook : tuple[int, int], optional
-        Azimuth and range boxcar look factors aligned to global origins.
+    multilook : Looks or tuple of int, optional
+        Range and azimuth boxcar look factors aligned to global origins.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
     flatten_stage : {"coregistration", "interferogram"}, optional
@@ -1893,7 +1895,7 @@ def form_merged_scene_interferogram(
         reject_invalid_state("scene artifacts mix flattening stages")
     validate_scene_ownership(primary_store)
     validate_scene_ownership(secondary_store)
-    az_looks, rg_looks = multilook
+    rg_looks, az_looks = coerce_looks(multilook)
     if (
         type(az_looks) is not int
         or type(rg_looks) is not int
@@ -1992,7 +1994,7 @@ def form_burst_scene_interferogram(
     secondary_store: CoregisteredSceneStore,
     tag: str,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
     device: str = "auto",
     dask_client: object | None = None,
@@ -2011,8 +2013,8 @@ def form_burst_scene_interferogram(
         Persisted acquisition stores bound to the same Reference payloads.
     tag : str
         Shared unit identifier.
-    multilook : tuple[int, int], optional
-        Azimuth and range boxcar look factors on the unit payload.
+    multilook : Looks or tuple of int, optional
+        Range and azimuth boxcar look factors on the unit payload.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
     device : str, optional
@@ -2042,7 +2044,7 @@ def form_burst_scene_interferogram(
         or secondary_store.flatten_stage != flatten_stage
     ):
         reject_invalid_state("scene artifacts mix flattening stages")
-    az_looks, rg_looks = multilook
+    rg_looks, az_looks = coerce_looks(multilook)
     if az_looks < 1 or rg_looks < 1:
         reject_invalid_state("multilook factors must be >= 1")
     primary, primary_unit = primary_store.read(tag)
@@ -2072,7 +2074,7 @@ def form_scene_interferograms(
     primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
     device: str = "auto",
     dask_client: object | None = None,
@@ -2083,8 +2085,8 @@ def form_scene_interferograms(
     ----------
     primary_store, secondary_store : CoregisteredSceneStore
         Persisted acquisition stores bound to the same Reference payloads.
-    multilook : tuple[int, int], optional
-        Azimuth and range looks applied through the Pair interferogram kernel.
+    multilook : Looks or tuple of int, optional
+        Range and azimuth looks applied through the Pair interferogram kernel.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
     device : str, optional
@@ -2098,6 +2100,7 @@ def form_scene_interferograms(
         Multilooked and optionally filtered complex interferograms by burst tag.
 
     """
+    multilook = coerce_looks(multilook)
     outputs: dict[str, np.ndarray] = {}
     for tag in _validate_pair_binding(primary_store, secondary_store):
         primary, _ = primary_store.read(tag)

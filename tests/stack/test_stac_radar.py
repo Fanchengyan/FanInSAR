@@ -129,7 +129,8 @@ def _publish_ifg(
     properties = {
         "faninsar:pair": [DATE, SECONDARY_DATE],
         "faninsar:dates": [DATE, SECONDARY_DATE],
-        "faninsar:looks": list(looks),
+        "faninsar:range_looks": looks[1],
+        "faninsar:azimuth_looks": looks[0],
         "faninsar:domain": "radar",
         "faninsar:shape": list(shape),
         "faninsar:grid_identity": "radar-grid",
@@ -177,7 +178,8 @@ def _publish_unwrap(
     properties = {
         "faninsar:pair": [DATE, SECONDARY_DATE],
         "faninsar:dates": [DATE, SECONDARY_DATE],
-        "faninsar:looks": [1, 1],
+        "faninsar:range_looks": 1,
+        "faninsar:azimuth_looks": 1,
         "faninsar:domain": "radar",
         "faninsar:shape": [SIZE, SIZE],
         "faninsar:grid_identity": "radar-grid",
@@ -895,7 +897,8 @@ def test_stale_source_and_unsafe_tails_return_404(tmp_path: Path) -> None:
             properties={
                 "faninsar:pair": [DATE, SECONDARY_DATE],
                 "faninsar:dates": [DATE, SECONDARY_DATE],
-                "faninsar:looks": [1, 1],
+                "faninsar:range_looks": 1,
+        "faninsar:azimuth_looks": 1,
                 "faninsar:domain": "radar",
                 "faninsar:shape": [SIZE, SIZE],
                 "faninsar:grid_identity": "radar-grid",

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject
 
 JumpAlignmentStrategy = Literal["isce3_global_jump", "alosstack_pixel_rounded"]
@@ -57,9 +58,9 @@ class IonosphereEstimationConfig:
         Coherence-power exponent for the weighted surface fit in the
         ``"guided_split"`` lane.  ``cor ** cor_order_adj`` mirrors the
         alosStack ``corOrderAdj`` parameter (default 20).
-    looks : tuple[int, int], optional
-        Nominal (azimuth, range) multilook factors applied before
-        estimation; recorded in manifests only, applied by callers.
+    looks : Looks or tuple of int, optional
+        Nominal range-first ``(range, azimuth)`` multilook factors applied
+        before estimation; recorded in manifests only, applied by callers.
     coherence_threshold : float, optional
         Masking threshold for coherence-gated filtering stages.
     degraded : bool, optional
@@ -93,7 +94,7 @@ class IonosphereEstimationConfig:
     alignment_strategy: JumpAlignmentStrategy = "isce3_global_jump"
     solve_core: SolveCore = "isce3"
     cor_order_adj: int = 20
-    looks: tuple[int, int] = field(default=(16, 16))
+    looks: Looks | tuple[int, int] = field(default=Looks(16, 16))
     coherence_threshold: float = 0.5
     window_function: str = "tukey"
     window_shape: float = 0.25
@@ -123,10 +124,7 @@ class IonosphereEstimationConfig:
                 f"min_bandwidth_hz must be positive, got {self.min_bandwidth_hz!r}"
             )
             reject(message, ValueError)
-        az_looks, rg_looks = self.looks
-        if az_looks < 1 or rg_looks < 1:
-            message = f"looks must be >= 1, got {self.looks!r}"
-            reject(message, ValueError)
+        object.__setattr__(self, "looks", coerce_looks(self.looks))
         if not 0.0 < self.coherence_threshold < 1.0:
             message = (
                 "coherence_threshold must lie in (0, 1), got "

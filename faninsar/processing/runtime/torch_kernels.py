@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal, ParamSpec, TypeVar
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
 
 logger = setup_logger(__name__)
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 __all__ = [
     "CUDA_DTYPE_CHOICE",
@@ -457,7 +460,7 @@ def multilook_interferogram_torch(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
-    multilook: tuple[int, int] = (1, 1),
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS,
     dead_pixel_amp_threshold: float = 0.0,
     coherence_window: tuple[int, int] | None = None,
     device: DeviceName = "auto",
@@ -474,8 +477,9 @@ def multilook_interferogram_torch(
     ----------
     primary, secondary : numpy.ndarray
         Coregistered complex arrays on the same grid.
-    multilook : tuple[int, int], optional
-        ``(azimuth_looks, range_looks)`` non-overlapping boxcar looks.
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range_looks, azimuth_looks)`` non-overlapping boxcar
+        looks.
     dead_pixel_amp_threshold : float, optional
         SLC amplitude below which a pixel is excluded from the look average.
     coherence_window : tuple[int, int] or None, optional
@@ -498,9 +502,8 @@ def multilook_interferogram_torch(
         reject_invalid_state("interferogram inputs must be matching 2-D arrays")
     if not np.iscomplexobj(primary) or not np.iscomplexobj(secondary):
         reject_invalid_state("interferogram inputs must remain complex")
-    az_looks, rg_looks = multilook
-    if az_looks < 1 or rg_looks < 1:
-        reject_invalid_state("multilook factors must be >= 1")
+    looks = coerce_looks(multilook)
+    rg_looks, az_looks = looks
     from faninsar.processing.interferometry.pair import validate_coherence_window
 
     coherence_window = validate_coherence_window(coherence_window)
@@ -575,7 +578,7 @@ def multilook_interferogram_torch(
     ifg = torch.complex(ifg_real, ifg_imag)
     logger.info(
         "Torch multilook %s -> output shape %s",
-        multilook,
+        looks,
         tuple(ifg.shape),
     )
 

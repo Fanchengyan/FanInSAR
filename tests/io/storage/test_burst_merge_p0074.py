@@ -244,7 +244,7 @@ def test_supported_zero_look_is_not_erased_as_missing_support(tmp_path: Path) ->
     product = form_merged_scene_interferogram(
         reference_store,
         secondary_store,
-        multilook=(2, 1),
+        multilook=(1, 2),
     )
     assert product.complex.shape == (1, 1)
     np.testing.assert_allclose(product.complex[0, 0], 0.0 + 0.0j, atol=1e-6)

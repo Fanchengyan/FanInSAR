@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import operator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -9,16 +11,106 @@ import numpy as np
 from faninsar.core.sar_property import Frequency, Wavelength
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+    from numpy.typing import NDArray
+
     from faninsar.core.types import FrequencyUnit, WavelengthUnit
 
-if TYPE_CHECKING:
-    from numpy.typing import NDArray
+
+@dataclass(frozen=True, slots=True)
+class Looks:
+    """Range-first multilook factors for one radar product.
+
+    A look factor is an integer block size in one radar axis. Range looks
+    apply to columns and azimuth looks apply to rows. The two factors are
+    independent, so a product may be non-square.
+
+    Parameters
+    ----------
+    range : int
+        Number of range (column) looks, at least one.
+    azimuth : int
+        Number of azimuth (row) looks, at least one.
+
+    Examples
+    --------
+    >>> looks = Looks(10, 2)
+    >>> looks.range, looks.azimuth, looks.nlooks
+    (10, 2, 20)
+    >>> tuple(looks)
+    (10, 2)
+
+    """
+
+    range: int
+    azimuth: int
+
+    def __post_init__(self) -> None:
+        """Reject non-integer and non-positive look factors."""
+        for name, value in (("range", self.range), ("azimuth", self.azimuth)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                message = f"Looks.{name} must be an integer; got {value!r}"
+                raise TypeError(message)
+            if value < 1:
+                message = f"Looks.{name} must be at least 1; got {value!r}"
+                raise ValueError(message)
+
+    @property
+    def nlooks(self) -> int:
+        """Return the nominal number of independent looks."""
+        return self.range * self.azimuth
+
+    def __iter__(self) -> Iterator[int]:
+        """Iterate range then azimuth."""
+        return iter((self.range, self.azimuth))
+
+
+def coerce_looks(value: Looks | Sequence[int]) -> Looks:
+    """Return ``value`` as a range-first :class:`Looks`.
+
+    Parameters
+    ----------
+    value : Looks or sequence of int
+        A ready value or a two-element ``(range, azimuth)`` sequence.
+
+    Returns
+    -------
+    Looks
+        The normalized range-first look factors.
+
+    Raises
+    ------
+    TypeError
+        If ``value`` is not a two-element sequence of integers.
+
+    """
+    if isinstance(value, Looks):
+        return value
+    try:
+        range_looks, azimuth_looks = value
+    except (TypeError, ValueError) as error:
+        message = f"multilook must be a Looks or a (range, azimuth) pair; got {value!r}"
+        raise TypeError(message) from error
+    factors = []
+    for name, factor in (
+        ("range", range_looks),
+        ("azimuth", azimuth_looks),
+    ):
+        if isinstance(factor, bool):
+            message = f"multilook {name} factor must be an integer; got {factor!r}"
+            raise TypeError(message)
+        try:
+            factors.append(operator.index(factor))
+        except TypeError as error:
+            message = f"multilook {name} factor must be an integer; got {factor!r}"
+            raise TypeError(message) from error
+    return Looks(factors[0], factors[1])
 
 
 def multi_look(
     arr_in: np.ndarray,
-    azimuth_looks: int,
-    range_looks: int,
+    looks: Looks | Sequence[int],
 ) -> np.ndarray:
     """Multi-look an array by averaging blocks.
 
@@ -27,10 +119,9 @@ def multi_look(
     arr_in : numpy.ndarray
         Input array to be multi-looked. Can be 2D (rows, cols) or
         nD (..., rows, cols).
-    azimuth_looks : int
-        Number of looks in azimuth (rows).
-    range_looks : int
-        Number of looks in range (cols).
+    looks : Looks or sequence of int
+        Range-first ``(range_looks, azimuth_looks)`` factors. Range looks
+        apply to columns and azimuth looks apply to rows.
 
     Returns
     -------
@@ -39,16 +130,19 @@ def multi_look(
 
     Notes
     -----
-    The input array is cropped to the nearest multiple of `azimuth_looks`
-    and `range_looks` before multi-looking.
+    The input array is cropped to the nearest multiple of the azimuth and
+    range factors before multi-looking.
 
     Examples
     --------
     >>> data = np.ones((4, 4))
-    >>> multi_look(data, 2, 2)
+    >>> multi_look(data, Looks(2, 2))
     array([[1.]])
 
     """
+    resolved = coerce_looks(looks)
+    azimuth_looks = resolved.azimuth
+    range_looks = resolved.range
     if azimuth_looks == 1 and range_looks == 1:
         return arr_in.copy()
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject
 from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.processing.runtime.resources import ResourceBudget
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 
 CoregMode = Literal["geometry", "nesd"]
 FlattenStage = Literal["coregistration", "interferogram"]
+_DEFAULT_MULTILOOK = Looks(10, 2)
 
 
 @dataclass
@@ -46,6 +48,8 @@ class StackConfig:
     ``dem_cache_dir`` supplies the source cache at materialization. An
     explicit ``GridSpec`` always wins over automatic ROI selection.
     ``coreg_mode`` is ``"geometry"`` or ``"nesd"`` (default ``"geometry"``).
+    ``multilook`` is a range-first :class:`~faninsar.core.sar_tools.Looks`
+    value; range looks apply to columns and azimuth looks to rows.
     ``swaths=None`` and ``bursts=None`` select every sub-swath and burst.
     ``nlooks_divisor`` is an inheritance sentinel: ``None`` means the
     concrete Stack class default is installed at construction. The live
@@ -65,7 +69,7 @@ class StackConfig:
     coregistration_grid: CoregistrationGrid = "radar"
     esd_coherence_threshold: float = 0.85
     ampcor_snr_threshold: float = 6.0
-    multilook: tuple[int, int] = (5, 2)
+    multilook: Looks = _DEFAULT_MULTILOOK
     nlooks_divisor: float | None = None
     ref_points: Points | None = None
     ref_policy: Literal["common", "per_image"] = "common"
@@ -137,7 +141,7 @@ class StackConfig:
             message = "mask_plan must be a MaskPlan"
             reject(message, TypeError)
         ml = self.multilook
-        self.multilook = (int(ml[0]), int(ml[1]))
+        self.multilook = coerce_looks(ml)
         if self.nlooks_divisor is not None:
             try:
                 divisor = float(self.nlooks_divisor)

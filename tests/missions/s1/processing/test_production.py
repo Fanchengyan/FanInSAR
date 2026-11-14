@@ -824,7 +824,7 @@ def test_stage_interferogram_with_synthetic() -> None:
     )
     state.primary_deramped = np.ones((16, 16), dtype=np.complex64)
     state.secondary_aligned = np.ones((16, 16), dtype=np.complex64)
-    result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
+    result = stage_interferogram(state, multilook=(4, 2), goldstein_alpha=0.0)
     assert result.complex is not None
     assert result.coherence is not None
     assert result.wrapped_phase is not None
@@ -1062,7 +1062,7 @@ def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
     secondary[:, :2] = 0
     state.primary_deramped = primary
     state.secondary_aligned = secondary
-    result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
+    result = stage_interferogram(state, multilook=(4, 2), goldstein_alpha=0.0)
     assert result.complex is not None
     assert result.wrapped_phase is not None
     assert result.coherence is not None

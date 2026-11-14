@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject
 
 
@@ -220,7 +221,7 @@ def _built_in_filter_work(
 def estimate_formation_resources(
     *,
     shape: tuple[int, int],
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     coherence_window: tuple[int, int] | None,
     phase_filter: object | None,
 ) -> ResourceEstimate:
@@ -230,8 +231,8 @@ def estimate_formation_resources(
     ----------
     shape : tuple[int, int]
         Full-resolution ``(azimuth, range)`` scene grid.
-    multilook : tuple[int, int]
-        Positive output look factors.
+    multilook : Looks or tuple of int
+        Range-first ``(range, azimuth)`` positive output look factors.
     coherence_window : tuple[int, int] or None
         Centered first-stage coherence support, or direct output-block MLE.
     phase_filter : object or None
@@ -250,13 +251,17 @@ def estimate_formation_resources(
 
     """
     height, width, pixels = _checked_shape(shape)
-    if not isinstance(multilook, tuple) or len(multilook) != 2:
-        _raise_resource_error("multilook must be a two-dimensional tuple")
-    azimuth = _checked_integer(multilook[0], "multilook azimuth", minimum=1)
-    range_ = _checked_integer(multilook[1], "multilook range", minimum=1)
-    block_area = _checked_product(azimuth, range_, name="multilook area")
-    output_rows = _ceil_dividend(height, azimuth, name="output rows")
-    output_cols = _ceil_dividend(width, range_, name="output columns")
+    try:
+        looks = coerce_looks(multilook)
+    except (TypeError, ValueError) as error:
+        reject(
+            f"multilook must be two positive integers; got {multilook!r}",
+            ResourceAdmissionError,
+            cause=error,
+        )
+    block_area = _checked_product(looks.azimuth, looks.range, name="multilook area")
+    output_rows = _ceil_dividend(height, looks.azimuth, name="output rows")
+    output_cols = _ceil_dividend(width, looks.range, name="output columns")
     output_pixels = _checked_product(output_rows, output_cols, name="output pixels")
     formation_work = _checked_product(
         2, output_pixels, block_area, name="formation work"

@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 
+from faninsar.core.sar_tools import Looks
 from faninsar.io.storage.ifg_store import (
     InterferogramArtifactStore,
     write_ifg_artifact,
@@ -85,7 +86,7 @@ def test_ion_artifact_roundtrip(tmp_path) -> None:
     root = ion_dir(tmp_path, _PAIR, (1, 1))
     store = _write(root)
     assert store.pair == ("20240101", "20240113")
-    assert store.looks == (1, 1)
+    assert store.looks == Looks(1, 1)
     assert store.degraded is False
     assert store.degradation_reason is None
     assert store.runtime_fingerprint == _DIGEST

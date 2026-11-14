@@ -24,7 +24,12 @@ from faninsar.core.physical import (
     is_complete_lattice,
 )
 from faninsar.core.sar_missions import Sentinel1
-from faninsar.core.sar_tools import PhaseDeformationConverter, multi_look
+from faninsar.core.sar_tools import (
+    Looks,
+    PhaseDeformationConverter,
+    coerce_looks,
+    multi_look,
+)
 
 __all__ = [
     "PHYSICAL_TYPE_MEMBERS",
@@ -37,6 +42,7 @@ __all__ = [
     "DateManager",
     "DaySpan",
     "Frequency",
+    "Looks",
     "Loop",
     "Loops",
     "Pair",
@@ -49,6 +55,7 @@ __all__ = [
     "TripletLoop",
     "TripletLoops",
     "Wavelength",
+    "coerce_looks",
     "is_complete_lattice",
     "multi_look",
 ]

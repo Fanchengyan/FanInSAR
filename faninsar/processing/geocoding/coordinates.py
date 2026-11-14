@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.ndimage import map_coordinates
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.runtime.torch_kernels import resolve_torch_device
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
 __all__ = ["RadarCoordinates"]
 
 logger = setup_logger(__name__)
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +125,7 @@ class RadarCoordinates:
         self,
         *,
         origin: tuple[int, int] = (0, 0),
-        looks: tuple[int, int] = (1, 1),
+        looks: Looks | tuple[int, int] = _UNIT_LOOKS,
     ) -> RadarCoordinates:
         """Map full-radar coordinates into a cropped, multilooked layer frame.
 
@@ -138,8 +141,9 @@ class RadarCoordinates:
         origin : tuple[int, int], optional
             ``(row, column)`` origin of the cropped window in the full
             radar raster.
-        looks : tuple[int, int], optional
-            Positive ``(azimuth, range)`` look factors of the layer.
+        looks : Looks or tuple of int, optional
+            Range-first ``(range, azimuth)`` positive look factors of the
+            layer.
 
         Returns
         -------
@@ -150,7 +154,7 @@ class RadarCoordinates:
 
         """
         row0, col0 = _validate_non_negative_ints(origin, "origin")
-        az_looks, rg_looks = _validate_positive_ints(looks, "looks")
+        rg_looks, az_looks = coerce_looks(looks)
         azimuth = (
             np.asarray(self.az, dtype=np.float64) - row0 - (az_looks - 1) / 2.0
         ) / az_looks
@@ -163,19 +167,6 @@ class RadarCoordinates:
             & np.isfinite(range_index)
         )
         return RadarCoordinates(azimuth, range_index, valid)
-
-
-def _validate_positive_ints(
-    values: tuple[int, int],
-    name: str,
-) -> tuple[int, int]:
-    """Return ``(a, b)`` when both entries are positive integers."""
-    if len(values) != 2 or any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 1
-        for value in values
-    ):
-        reject_invalid_state(f"{name} must be two positive integers; got {values!r}")
-    return int(values[0]), int(values[1])
 
 
 def _validate_non_negative_ints(

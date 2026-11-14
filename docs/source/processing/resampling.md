@@ -307,13 +307,13 @@ tracked as a follow-up to the skill review.
 
 ### Multilooking an interferogram
 
-For an $L \times L$ complex multilook:
+For a range x azimuth complex multilook:
 
 ```python
 from scipy.ndimage.uniform_filter
 
 def multilook_complex(z: np.ndarray, L: tuple[int, int]) -> np.ndarray:
-    """Boxcar-average complex `z` by (L_az, L_rg). Phase-safe."""
+    """Boxcar-average complex `z` by (L_rg, L_az). Phase-safe."""
     # uniform_filter computes the mean over the window — equivalent to
     # incoherent complex averaging when applied to complex input.
     real = uniform_filter(z.real.astype(np.float64), size=L, mode="reflect")
@@ -321,12 +321,12 @@ def multilook_complex(z: np.ndarray, L: tuple[int, int]) -> np.ndarray:
     return (real + 1j * imag).astype(z.dtype)
 
 # Correct: average the complex ifg, then derive phase/intensity
-z_ml = multilook_complex(ifg_complex, L=(2, 8))
+z_ml = multilook_complex(ifg_complex, L=(8, 2))
 phase_ml = np.angle(z_ml)
 intensity_ml = np.abs(z_ml) ** 2
 
 # WRONG — averaging phase directly produces bell-shaped histogram artifacts
-# phase_ml_wrong = uniform_filter(np.angle(ifg_complex), size=(2, 8))
+# phase_ml_wrong = uniform_filter(np.angle(ifg_complex), size=(8, 2))
 ```
 
 ### Sub-pixel coregistration via FFT

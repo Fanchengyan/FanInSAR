@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.data.query import BoundingBox, Polygons
 from faninsar.logging import reject, setup_logger
 from faninsar.missions.s1 import (
@@ -92,6 +93,8 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 DEM_BOUNDS_BUFFER_M = 2000.0
+#: Production default range-first look factors for a pair interferogram.
+_PRODUCTION_PAIR_LOOKS = Looks(range=20, azimuth=4)
 
 
 def _sync_admitted_device(device: object) -> None:
@@ -741,7 +744,7 @@ class ProductionPairState:
     dem_id: str = ""
     coreg_executor: str = "torch"
     coreg_device: str = "auto"
-    multilook: tuple[int, int] | None = None
+    multilook: Looks | None = None
     goldstein_alpha: float = 0.5
     unwrap_method: str = "snaphu"
     geo_grid_meta: dict[str, Any] | None = None
@@ -2295,7 +2298,7 @@ def stage_coregister(
 def stage_interferogram(
     state: ProductionPairState,
     *,
-    multilook: tuple[int, int] = (4, 20),
+    multilook: Looks | tuple[int, int] = _PRODUCTION_PAIR_LOOKS,
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 0.0,
     coherence_window: tuple[int, int] | None = None,
@@ -2308,8 +2311,9 @@ def stage_interferogram(
     ----------
     state : ProductionPairState
         Pair state after coregistration.
-    multilook : tuple[int, int], optional
-        Non-overlapping azimuth and range look factors.
+    multilook : Looks or tuple[int, int], optional
+        Range-first ``(range, azimuth)`` non-overlapping look factors. A
+        two-sequence is read as ``(range, azimuth)``.
     goldstein_alpha : float, optional
         Goldstein filter exponent.
     dead_pixel_amp_threshold : float, optional
@@ -2330,7 +2334,8 @@ def stage_interferogram(
     """
     if state.primary_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
-    state.multilook = multilook
+    resolved_looks = coerce_looks(multilook)
+    state.multilook = resolved_looks
     from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     accelerated = should_accelerate(
@@ -2342,7 +2347,7 @@ def stage_interferogram(
         ifg = form_interferogram(
             state.primary_deramped,
             state.secondary_aligned,
-            multilook=multilook,
+            multilook=resolved_looks,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             coherence_window=coherence_window,
         )
@@ -2352,7 +2357,7 @@ def stage_interferogram(
         ifg = run_multilook_interferogram(
             state.primary_deramped,
             state.secondary_aligned,
-            multilook=multilook,
+            multilook=resolved_looks,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             coherence_window=coherence_window,
             device=device,
@@ -2408,14 +2413,15 @@ def stage_interferogram(
     state.wrapped_phase = wrapped
     n_invalid = int(np.isnan(state.wrapped_phase).sum())
     state.note(
-        f"IFG multilook={multilook} goldstein={goldstein_alpha} "
+        f"IFG multilook={resolved_looks.range}x{resolved_looks.azimuth} "
+        f"goldstein={goldstein_alpha} "
         f"mean_coh={float(np.nanmean(state.coherence)):.3f} "
         f"invalid_looks={n_invalid}"
     )
     _record_scientific_transition(
         state,
         "form_interferogram",
-        multilook=multilook,
+        multilook=[resolved_looks.range, resolved_looks.azimuth],
         goldstein_alpha=goldstein_alpha,
     )
     return state
@@ -2486,7 +2492,7 @@ def stage_flatten(
     # centres rather than leading edges so path-length phase matches the
     # multilooked ifg sampling.
     if state.multilook is not None:
-        az_looks, rg_looks = state.multilook
+        rg_looks, az_looks = coerce_looks(state.multilook)
     else:
         full_h, full_w = state.primary.array.samples.shape
         az_looks = max(full_h // max(height, 1), 1)
@@ -2791,11 +2797,14 @@ def stage_write(
         )
     except (TypeError, AttributeError):
         temporal_days = float("nan")
+    recorded_looks = (
+        coerce_looks(state.multilook) if state.multilook is not None else Looks(1, 1)
+    )
     meta: dict[str, Any] = {
         "unwrap_method": state.unwrap_method,
         "coregistration_grid": state.coregistration_grid,
         "dem_id": state.dem_id,
-        "multilook": list(state.multilook or (1, 1)),
+        "multilook": [recorded_looks.range, recorded_looks.azimuth],
         "goldstein_alpha": state.goldstein_alpha,
         "coreg_executor": state.coreg_executor,
         "coreg_device": state.coreg_device,
@@ -3087,12 +3096,17 @@ def _geo_grid_meta(geo_grid: GeoGridSpec | None) -> dict[str, Any] | None:
 
 def _multilooked_geo_grid(
     grid: GeoGridSpec,
-    multilook: tuple[int, int],
+    looks: Looks | tuple[int, int],
 ) -> GeoGridSpec:
-    """Return the pixel-centre-aligned product grid after block multilooking."""
+    """Return the pixel-centre-aligned product grid after block multilooking.
+
+    ``looks`` is range-first; range looks scale the column axis and azimuth
+    looks the row axis.
+    """
     from faninsar.processing.mosaicking.grid import GeoGridSpec
 
-    azimuth_looks, range_looks = multilook
+    resolved = coerce_looks(looks)
+    azimuth_looks, range_looks = resolved.azimuth, resolved.range
     from affine import Affine
 
     affine = Affine(*grid.transform)
@@ -3117,10 +3131,11 @@ def _multilooked_geo_grid(
 
 def _multilook_real_field(
     field: np.ndarray,
-    multilook: tuple[int, int],
+    looks: Looks | tuple[int, int],
 ) -> np.ndarray:
     """Average a real geographic field over the SLC multilook blocks."""
-    azimuth_looks, range_looks = multilook
+    resolved = coerce_looks(looks)
+    azimuth_looks, range_looks = resolved.azimuth, resolved.range
     height = field.shape[0] // azimuth_looks * azimuth_looks
     width = field.shape[1] // range_looks * range_looks
     return np.nanmean(
@@ -3138,10 +3153,13 @@ def _finalize_geo_products(
     state: ProductionPairState,
     *,
     geo_grid: GeoGridSpec,
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     geo_height_m: float,
 ) -> ProductionPairState:
-    """Assemble the multilooked geographic product grid from unwrapped phase."""
+    """Assemble the multilooked geographic product grid from unwrapped phase.
+
+    ``multilook`` is range-first: a two-sequence is ``(range, azimuth)``.
+    """
     from faninsar.processing.geocoding.geo_lut import grid_lonlat
 
     assert state.unwrapped_phase is not None

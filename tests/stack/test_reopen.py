@@ -10,6 +10,7 @@ import pytest
 from tests.support.local_stack import LocalStack
 
 from faninsar import Pairs
+from faninsar.core.sar_tools import Looks
 from faninsar.missions.s1 import S1Stack
 from faninsar.processing.errors import (
     InvalidProcessingStateError,
@@ -127,7 +128,7 @@ def test_prepare_saves_identity_and_open_restores_the_stack(
 
     assert type(reopened) is LocalStack
     assert reopened.reference == "20240101"
-    assert reopened.config.multilook == (1, 1)
+    assert reopened.config.multilook == Looks(1, 1)
     assert reopened.config.coreg_mode == "geometry"
     assert reopened.config.device == "cpu"
     assert set(reopened.scenes) == {"20240101", "20240113"}

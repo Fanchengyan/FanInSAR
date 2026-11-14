@@ -11,6 +11,7 @@ from faninsar.core.acquisition import Acquisition, Acquisitions
 from faninsar.core.baseline import Baselines
 from faninsar.core.pair import Pair, Pairs
 from faninsar.core.sar_property import Frequency, Wavelength
+from faninsar.core.sar_tools import Looks
 
 # Defined before the grouped facades: dataset modules may read the package
 # version while ``faninsar`` itself is still initializing.
@@ -28,6 +29,7 @@ __all__ = [
     "Acquisitions",
     "Baselines",
     "Frequency",
+    "Looks",
     "Network",
     "Pair",
     "Pairs",

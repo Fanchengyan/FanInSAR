@@ -220,8 +220,8 @@ def test_open_adopts_request_only_legacy_workspace_with_backup(
     assert not opened.data_ready
 
 
-def test_open_migrates_legacy_v1_identity_with_backup(tmp_path: Path) -> None:
-    """A version-1 resolved identity is adopted without rerunning science."""
+def test_open_rejects_unsupported_workspace_schema(tmp_path: Path) -> None:
+    """A version other than the single v1 layout is rejected, not adopted."""
     safe = _safe(tmp_path)
     work = tmp_path / "work"
     stack = LocalStack.from_paths(
@@ -233,26 +233,13 @@ def test_open_migrates_legacy_v1_identity_with_backup(tmp_path: Path) -> None:
     assert stack.prepare_data().complete
     path = work / STACK_JSON_NAME
     document = json.loads(path.read_text(encoding="utf-8"))
-    for key in (
-        "schema_version",
-        "intent_revision",
-        "identity_status",
-        "request",
-        "targets",
-        "requested_science",
-        "requested_science_extra",
-    ):
-        document.pop(key, None)
+    document["schema_version"] = WORKSPACE_SCHEMA_VERSION + 1
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    opened = Stack.open(work)
+    with pytest.raises(WorkspaceIntegrityError, match="supports only version"):
+        Stack.open(work)
 
-    assert (work / ("stack.json" + BACKUP_SUFFIX)).is_file()
-    migrated = _document(work)
-    assert migrated["schema_version"] == WORKSPACE_SCHEMA_VERSION
-    assert migrated["request"]["kind"] == "safes"
-    assert opened.data_ready
-    assert opened.catalog.dates == ("20240101",)
+    assert not (work / ("stack.json" + BACKUP_SUFFIX)).is_file()
 
 
 def test_open_adopts_request_only_legacy_workspace_with_request_extras(
@@ -293,36 +280,19 @@ def test_open_adopts_request_only_legacy_workspace_with_request_extras(
     assert (work / STACK_JSON_NAME).read_bytes() == before
 
 
-def test_open_migrates_legacy_v1_ready_identity_with_request_extras(
+def test_open_accepts_absent_schema_version_as_v1(
     tmp_path: Path,
 ) -> None:
-    """A ready version-1 identity keeps the request extras it recorded."""
+    """An absent schema_version is the single v1 layout."""
     stack = _vv_stack(tmp_path)
     work = stack.config.work_dir
-    _write_legacy_request(work, _VV_EXTRA, backup=False)
     path = work / STACK_JSON_NAME
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["science_extra"] == _VV_EXTRA
-    targets = document["targets"]
-    for key in (
-        "schema_version",
-        "intent_revision",
-        "identity_status",
-        "request",
-        "targets",
-        "requested_science",
-        "requested_science_extra",
-    ):
-        document.pop(key, None)
+    document.pop("schema_version", None)
     path.write_text(json.dumps(document), encoding="utf-8")
 
     opened = Stack.open(work)
 
-    migrated = _document(work)
-    assert migrated["schema_version"] == WORKSPACE_SCHEMA_VERSION
-    assert migrated["requested_science_extra"] == _VV_EXTRA
-    assert migrated["science_extra"] == _VV_EXTRA
-    assert migrated["targets"] == targets
     assert opened.config.extra["polarizations"] == ("VV",)
     assert opened._request_config.extra["polarizations"] == ("VV",)
 
@@ -489,10 +459,10 @@ def test_extend_burst_and_swath_union_is_additive(tmp_path: Path) -> None:
     assert all_bursts._request_config.swaths is None
 
 
-def test_extend_rejects_contradictory_modes_and_newer_schema(
+def test_extend_rejects_contradictory_modes_and_unsupported_schema(
     tmp_path: Path,
 ) -> None:
-    """Source modes are exclusive and newer intent schemas are not downgraded."""
+    """Source modes are exclusive and unsupported intent schemas are rejected."""
     stack = _configured(tmp_path)
     with pytest.raises(ValueError, match="search or paths"):
         stack.extend(search=_search(), paths=[tmp_path / "other"])
@@ -504,7 +474,7 @@ def test_extend_rejects_contradictory_modes_and_newer_schema(
     (stack.config.work_dir / STACK_JSON_NAME).write_text(
         json.dumps(document), encoding="utf-8"
     )
-    with pytest.raises(WorkspaceIntegrityError, match="newer"):
+    with pytest.raises(WorkspaceIntegrityError, match="supports only version"):
         Stack.open(stack.config.work_dir)
 
 

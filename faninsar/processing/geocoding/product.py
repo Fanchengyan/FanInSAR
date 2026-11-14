@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
@@ -33,6 +34,8 @@ __all__ = [
 ]
 
 logger = setup_logger(__name__)
+
+_UNIT_LOOKS: Looks = Looks(1, 1)
 
 
 class GeocodeableProduct(Protocol):
@@ -78,8 +81,8 @@ class GeocodeableProduct(Protocol):
         ...
 
     @property
-    def multilook(self) -> tuple[int, int]:
-        """Return the ``(azimuth, range)`` look factors of ``values``."""
+    def multilook(self) -> Looks | tuple[int, int]:
+        """Return the range-first look factors of ``values``."""
         ...
 
     @property
@@ -132,8 +135,8 @@ class RadarDomainProduct:
         :attr:`~faninsar.network.products.AssetKind.LABEL` for label masks.
         May be ``None`` only when ``crs`` is set, because an already
         georeferenced product passes through without resampling.
-    multilook : tuple[int, int], optional
-        Positive ``(azimuth, range)`` look factors of ``values``.
+    multilook : Looks or tuple of int, optional
+        Range-first ``(range, azimuth)`` positive look factors of ``values``.
     origin : tuple[int, int], optional
         ``(row, column)`` origin of the cropped window in the full radar
         frame.
@@ -144,11 +147,10 @@ class RadarDomainProduct:
     ------
     InvalidProcessingStateError
         If the name is not one safe path component, shapes are malformed,
-        look factors and origin are not non-negative integers,
-        ``values.shape`` does not match the layer frame implied by
-        ``full_radar_shape``, ``origin``, and ``multilook`` (see
-        :func:`layer_frame_shape`), or a radar-domain product omits
-        ``asset_kind``.
+        origin is not a pair of non-negative integers, ``values.shape`` does
+        not match the layer frame implied by ``full_radar_shape``,
+        ``origin``, and ``multilook`` (see :func:`layer_frame_shape`), or a
+        radar-domain product omits ``asset_kind``.
 
     """
 
@@ -156,7 +158,7 @@ class RadarDomainProduct:
     values: np.ndarray
     full_radar_shape: tuple[int, int]
     asset_kind: object | None = None
-    multilook: tuple[int, int] = (1, 1)
+    multilook: Looks | tuple[int, int] = _UNIT_LOOKS
     origin: tuple[int, int] = (0, 0)
     crs: object | None = None
 
@@ -181,18 +183,19 @@ class RadarDomainProduct:
         full_radar_shape = _validate_pair(
             self.full_radar_shape, "full_radar_shape", positive=True
         )
-        multilook = _validate_pair(self.multilook, "multilook", positive=True)
+        looks = coerce_looks(self.multilook)
+        object.__setattr__(self, "multilook", looks)
         origin = _validate_pair(self.origin, "origin", positive=False)
         expected = layer_frame_shape(
             full_radar_shape,
-            multilook=multilook,
+            multilook=looks,
             origin=origin,
         )
         if values.shape != expected:
             reject_invalid_state(
                 f"product values shape {values.shape} does not match the layer "
                 f"frame implied by full_radar_shape={full_radar_shape}, "
-                f"origin={origin}, multilook={multilook} (expected {expected})"
+                f"origin={origin}, multilook={looks} (expected {expected})"
             )
         if self.crs is None and self.asset_kind is None:
             reject_invalid_state(
@@ -211,7 +214,7 @@ class RadarDomainProduct:
 def layer_frame_shape(
     full_radar_shape: tuple[int, int],
     *,
-    multilook: tuple[int, int],
+    multilook: Looks | tuple[int, int],
     origin: tuple[int, int],
 ) -> tuple[int, int]:
     """Return the layer shape implied by the crop/multilook frame mapping.
@@ -227,8 +230,8 @@ def layer_frame_shape(
     ----------
     full_radar_shape : tuple[int, int]
         Full-resolution ``(azimuth, range)`` radar frame shape.
-    multilook : tuple[int, int]
-        Positive ``(azimuth, range)`` look factors of the layer.
+    multilook : Looks or tuple of int
+        Range-first ``(range, azimuth)`` positive look factors of the layer.
     origin : tuple[int, int]
         ``(row, column)`` crop origin of the layer window in the full frame.
 
@@ -238,9 +241,10 @@ def layer_frame_shape(
         The ``(height, width)`` a frame-consistent layer must have.
 
     """
+    looks = coerce_looks(multilook)
     return (
-        (full_radar_shape[0] - origin[0]) // multilook[0],
-        (full_radar_shape[1] - origin[1]) // multilook[1],
+        (full_radar_shape[0] - origin[0]) // looks.azimuth,
+        (full_radar_shape[1] - origin[1]) // looks.range,
     )
 
 

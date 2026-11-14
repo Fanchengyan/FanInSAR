@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage.product import Product, open_product
 from faninsar.logging import reject, setup_logger
 from faninsar.network.products import ASSET_KIND_GEOCODE_KERNELS, AssetKind
@@ -253,17 +254,18 @@ def _layer_placement_properties(layer: ProductLayer) -> dict[str, Any]:
 def _layer_native_origin(layer: ProductLayer) -> tuple[int, int]:
     """Return the native index of layer pixel ``(0, 0)``'s first sample."""
     properties = _layer_placement_properties(layer)
-    looks = tuple(layer.multilook)
-    raw_looks = properties.get("faninsar:looks")
-    if isinstance(raw_looks, (list, tuple)) and len(raw_looks) == 2:
-        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    looks = coerce_looks(layer.multilook)
+    raw_range_looks = properties.get("faninsar:range_looks")
+    raw_azimuth_looks = properties.get("faninsar:azimuth_looks")
+    if raw_range_looks is not None and raw_azimuth_looks is not None:
+        looks = Looks(int(raw_range_looks), int(raw_azimuth_looks))
     raw_look_origin = properties.get("faninsar:look_origin", (0, 0))
     look_origin = (int(raw_look_origin[0]), int(raw_look_origin[1]))
     row_origin = int(properties.get("faninsar:row_origin", layer.origin[0]))
     col_origin = int(properties.get("faninsar:col_origin", layer.origin[1]))
     return (
-        row_origin + look_origin[0] * looks[0],
-        col_origin + look_origin[1] * looks[1],
+        row_origin + look_origin[0] * looks.azimuth,
+        col_origin + look_origin[1] * looks.range,
     )
 
 
@@ -321,10 +323,11 @@ def _map_layer_reference_points(
             "geographic layer"
         )
         reject(message, ValueError, logger=logger)
-    looks = tuple(layer.multilook)
-    raw_looks = properties.get("faninsar:looks")
-    if isinstance(raw_looks, (list, tuple)) and len(raw_looks) == 2:
-        looks = (int(raw_looks[0]), int(raw_looks[1]))
+    looks = coerce_looks(layer.multilook)
+    raw_range_looks = properties.get("faninsar:range_looks")
+    raw_azimuth_looks = properties.get("faninsar:azimuth_looks")
+    if raw_range_looks is not None and raw_azimuth_looks is not None:
+        looks = Looks(int(raw_range_looks), int(raw_azimuth_looks))
     return (
         mapper(
             points,
@@ -464,8 +467,11 @@ class ProductLayer:
         Physical type used to select the resampling kernel. Every layer
         produced by a Stack declares one; ``None`` only appears on a
         hand-built handle.
-    full_radar_shape, multilook, origin : tuple[int, int]
-        Full radar frame and the layer's sampling within it.
+    full_radar_shape, origin : tuple[int, int]
+        Full radar frame and the layer's ``(row, col)`` sampling origin.
+    multilook : Looks or tuple[int, int]
+        Range-first ``(range, azimuth)`` look factors, normalized to
+        :class:`~faninsar.core.sar_tools.Looks`.
     crs : str or None
         Map CRS for geographic products, otherwise ``None``.
 
@@ -487,7 +493,7 @@ class ProductLayer:
     name: str
     asset_kind: AssetKind | None
     full_radar_shape: tuple[int, int]
-    multilook: tuple[int, int] = (1, 1)
+    multilook: Looks | tuple[int, int] = field(default_factory=lambda: Looks(1, 1))
     origin: tuple[int, int] = (0, 0)
     crs: str | None = None
     extent: tuple[int, int] | None = None
@@ -502,6 +508,10 @@ class ProductLayer:
     )
     _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Normalize the look factors to range-first :class:`Looks`."""
+        object.__setattr__(self, "multilook", coerce_looks(self.multilook))
 
     @property
     def source(self) -> Product:
@@ -1252,7 +1262,7 @@ class ProductLayer:
             data = da.from_zarr(str(self.path), chunks=self.shape)
         attrs = {
             "shape": self.shape,
-            "multilook": self.multilook,
+            "multilook": tuple(self.multilook),
             "full_radar_shape": self.full_radar_shape,
             "origin": self.origin,
             "asset_kind": None if self.asset_kind is None else str(self.asset_kind),
@@ -1687,7 +1697,7 @@ class MergedBurstLayers:
 
     _product: Product = field(repr=False)
     full_radar_shape: tuple[int, int]
-    multilook: tuple[int, int] = (1, 1)
+    multilook: Looks | tuple[int, int] = field(default_factory=lambda: Looks(1, 1))
     origin: tuple[int, int] = (0, 0)
     crs: str | None = None
     extent: tuple[int, int] | None = None
@@ -1699,6 +1709,10 @@ class MergedBurstLayers:
     )
     _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Normalize the look factors to range-first :class:`Looks`."""
+        object.__setattr__(self, "multilook", coerce_looks(self.multilook))
 
     def _layer(self, name: str, asset_kind: AssetKind) -> ProductLayer:
         """Return one merged lazy layer bound to this view."""
@@ -1762,8 +1776,10 @@ class InterferogramLayers:
         Committed interferogram product.
     full_radar_shape : tuple[int, int]
         Authoritative full frame from the Stack Reference.
-    multilook : tuple[int, int]
-        Azimuth and range look factors.
+    multilook : Looks or tuple[int, int]
+        Range-first look factors; a two-sequence is read as
+        ``(range, azimuth)`` and normalized to
+        :class:`~faninsar.core.sar_tools.Looks`.
     crs : str or None, optional
         Map CRS when this is already a geographic product.
 
@@ -1771,7 +1787,7 @@ class InterferogramLayers:
 
     _product: Product = field(repr=False)
     full_radar_shape: tuple[int, int]
-    multilook: tuple[int, int]
+    multilook: Looks | tuple[int, int]
     crs: str | None = None
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
     _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
@@ -1781,6 +1797,10 @@ class InterferogramLayers:
     )
     _layout_product: Product | None = field(default=None, repr=False, compare=False)
     _burst_products: tuple[Product, ...] = field(default=(), repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Normalize the look factors to range-first :class:`Looks`."""
+        object.__setattr__(self, "multilook", coerce_looks(self.multilook))
 
     @property
     def root(self) -> Path:
@@ -1978,5 +1998,6 @@ class InterferogramLayers:
         """Return a concise summary of this per-Pair IFG layer view."""
         return (
             f"InterferogramLayers(pair={self._product.path.name!r}, "
-            f"looks={self.multilook}, layers={self.layers})"
+            f"looks={self.multilook.range}x{self.multilook.azimuth}, "
+            f"layers={self.layers})"
         )

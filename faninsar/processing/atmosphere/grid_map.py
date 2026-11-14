@@ -39,7 +39,8 @@ def native_block_center_anchor(
         Native-pixel index ``(azimuth, range)`` of the first contributing
         sample of the first block.
     looks : sequence of int
-        Absolute ``(azimuth, range)`` look counts.
+        Placement-ordered ``(azimuth, range)`` absolute look counts. This is
+        a radar-grid placement pair, not the range-first look-factor value.
 
     Returns
     -------
@@ -164,7 +165,7 @@ def map_unwrapped_phase_bilinear(
 
 
 def _as_looks(value: Sequence[int]) -> tuple[int, int]:
-    """Validate two positive integer look factors."""
+    """Validate two placement-ordered positive integer look counts."""
     if (
         not isinstance(value, (tuple, list))
         or len(value) != 2

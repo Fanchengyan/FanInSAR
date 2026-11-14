@@ -35,7 +35,7 @@ New records store:
 
 - the operation name and a metadata hash of the operation chain
   (pair id, operation, previous state, parameter JSON);
-- scalar parameters such as multilook, Goldstein exponent, residual
+- parameters such as multilook, Goldstein exponent, residual
   policy, and carrier model;
 - phase-state fields: carrier, registration model, geometric phase,
   and residual application identity.

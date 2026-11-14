@@ -63,7 +63,7 @@ def _write_geo_unwrapped(
     for pair_id, phase in phases.items():
         extras = {} if mask is None else {"valid_mask": mask}
         store = write_ifg_artifact(
-            stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}" / pair_id,
+            stack.config.work_dir / "ifg" / f"ml_{looks.range}x{looks.azimuth}" / pair_id,
             pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
             looks=looks,
             domain="geo",
@@ -323,7 +323,7 @@ def test_radar_mapping_uses_dem_and_rejects_missing_height() -> None:
         geometry=geometry,
         dem=ConstantDEM(float(geo.height_m[0])),
         origin=(0, 4),
-        looks=(1, 2),
+        looks=(2, 1),
         shape=(64, 64),
         device="cpu",
     )
@@ -401,9 +401,9 @@ def test_native_origin_combines_row_origin_and_look_origin(tmp_path: Path) -> No
     from faninsar.io.storage.ifg_store import ifg_sample_placement
     from faninsar.stack.reference import native_layer_origin, origin_from_store
 
-    looks = (2, 3)
+    looks = (3, 2)
     store = write_ifg_artifact(
-        tmp_path / "ifg" / "ml_2x3" / "20240101_20240113",
+        tmp_path / "ifg" / "ml_3x2" / "20240101_20240113",
         pair=("20240101", "20240113"),
         looks=looks,
         row_origin=10,

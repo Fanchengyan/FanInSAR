@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+from faninsar.core.sar_tools import Looks
 from faninsar.io.storage.ifg_store import (
     IFG_KIND,
     InterferogramArtifactStore,
@@ -102,7 +103,7 @@ def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
     assert product.wrapped_phase.dtype == np.float32
     assert product.amplitude.dtype == np.float32
     assert store.pair == ("20240101", "20240113")
-    assert store.looks == (2, 3)
+    assert store.looks == Looks(2, 3)
     assert store.filter_name == "goldstein"
     assert store.filter_parameters == {"alpha": 0.5}
     assert {key: store.source_manifest_digests[key] for key in _SOURCES} == _SOURCES
@@ -280,7 +281,7 @@ def test_ifg_artifact_records_phase_screen_lineage(tmp_path: Path) -> None:
         ("faninsar:flatten_stage", "invalid"),
         ("faninsar:phase_screen_model", "invalid"),
         ("faninsar:phase_screen_digests", {"primary": {"IW1_b1": "not-a-digest"}}),
-        ("faninsar:looks", [0, 1]),
+        ("faninsar:range_looks", 0),
         ("faninsar:pair", ["20240101"]),
         ("faninsar:filter", {"parameters": {}}),
     ],

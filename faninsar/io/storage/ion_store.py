@@ -1,6 +1,6 @@
 """Ionosphere products of a Stack (PROPOSAL-0036, PROPOSAL-0059, PROPOSAL-0080).
 
-A per-Pair ionosphere estimate is the product ``ifg/ion/ml_AxR/<pair>/``
+A per-Pair ionosphere estimate is the product ``ifg/ion/ml_RxA/<pair>/``
 (kind ``ion``) bound to both scene write ids. The grouping directory
 ``ifg/ion`` is not an IFG multilook collection. Placement is persisted as
 ``faninsar:sample_center_anchor`` and ``faninsar:sample_spacing`` using the
@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.io.storage._zarr_stac import read_zarr_array, write_zarr_array
 from faninsar.io.storage.ifg_store import (
     _canonical_parameters,
@@ -87,11 +88,11 @@ class IonosphereArtifactStore:
     Attributes
     ----------
     root : pathlib.Path
-        Product directory ``ifg/ion/ml_AxR/<pair>``.
+        Product directory ``ifg/ion/ml_RxA/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
-    looks : tuple[int, int]
-        Applied azimuth and range look factors of the ion grid.
+    looks : Looks
+        Applied range and azimuth look factors of the ion grid.
     domain : str
         Coordinate domain of the source scenes.
     wavelength_m : float | None
@@ -121,7 +122,7 @@ class IonosphereArtifactStore:
 
     root: Path
     pair: tuple[str, str]
-    looks: tuple[int, int]
+    looks: Looks
     domain: str
     wavelength_m: float | None
     grid_identity: str
@@ -162,16 +163,24 @@ class IonosphereArtifactStore:
             or any(not isinstance(value, str) or not value for value in raw_pair)
         ):
             reject_invalid_state("ion artifact pair must contain two non-empty ids")
-        raw_looks = p.get("faninsar:looks")
+        raw_range_looks = p.get("faninsar:range_looks")
         if (
-            not isinstance(raw_looks, list)
-            or len(raw_looks) != 2
-            or any(
-                not isinstance(value, int) or isinstance(value, bool) or value < 1
-                for value in raw_looks
-            )
+            not isinstance(raw_range_looks, int)
+            or isinstance(raw_range_looks, bool)
+            or raw_range_looks < 1
         ):
-            reject_invalid_state("ion artifact looks must be two positive integers")
+            reject_invalid_state(
+                "ion artifact faninsar:range_looks must be a positive integer"
+            )
+        raw_azimuth_looks = p.get("faninsar:azimuth_looks")
+        if (
+            not isinstance(raw_azimuth_looks, int)
+            or isinstance(raw_azimuth_looks, bool)
+            or raw_azimuth_looks < 1
+        ):
+            reject_invalid_state(
+                "ion artifact faninsar:azimuth_looks must be a positive integer"
+            )
         raw_shape = p.get("faninsar:shape")
         if (
             not isinstance(raw_shape, list)
@@ -197,7 +206,7 @@ class IonosphereArtifactStore:
         return cls(
             root=product.path,
             pair=(raw_pair[0], raw_pair[1]),
-            looks=(raw_looks[0], raw_looks[1]),
+            looks=Looks(range=raw_range_looks, azimuth=raw_azimuth_looks),
             domain=str(p.get("faninsar:domain")),
             wavelength_m=None if raw_wavelength is None else float(raw_wavelength),
             grid_identity=str(p.get("faninsar:grid_identity")),
@@ -248,7 +257,7 @@ def write_ionosphere_artifact(
     root: str | Path,
     *,
     pair: tuple[str, str],
-    looks: tuple[int, int],
+    looks: Looks | tuple[int, int],
     domain: str,
     wavelength_m: float | None,
     grid_identity: str,
@@ -270,11 +279,11 @@ def write_ionosphere_artifact(
     Parameters
     ----------
     root : str or pathlib.Path
-        Product directory ``ifg/ion/ml_AxR/<pair>``.
+        Product directory ``ifg/ion/ml_RxA/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
-    looks : tuple[int, int]
-        Applied azimuth and range look factors of the ion grid.
+    looks : Looks or tuple of int
+        Applied range and azimuth look factors of the ion grid.
     domain : {"radar", "geo"}
         Coordinate domain of the source scenes.
     wavelength_m : float, optional
@@ -312,6 +321,7 @@ def write_ionosphere_artifact(
         The committed product.
 
     """
+    looks = coerce_looks(looks)
     arrays = {
         "ionosphere_phase": np.asarray(ionosphere_phase),
         "nondispersive_phase": np.asarray(nondispersive_phase),
@@ -329,11 +339,6 @@ def write_ionosphere_artifact(
     if (
         len(pair) != 2
         or any(not isinstance(value, str) or not value for value in pair)
-        or len(looks) != 2
-        or any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 1
-            for value in looks
-        )
         or domain not in {"radar", "geo"}
         or not isinstance(method_name, str)
         or not method_name
@@ -363,12 +368,13 @@ def write_ionosphere_artifact(
         reject_invalid_state("ion artifact source manifest digests are invalid")
     from faninsar.processing.atmosphere.grid_map import native_block_center_anchor
 
-    look_pair = (int(looks[0]), int(looks[1]))
-    anchor = native_block_center_anchor(native_origin, look_pair)
-    spacing = (float(look_pair[0]), float(look_pair[1]))
+    # Placement pairs are (azimuth, range) even though looks are range-first.
+    anchor = native_block_center_anchor(native_origin, (looks.azimuth, looks.range))
+    spacing = (float(looks.azimuth), float(looks.range))
     properties = {
         "faninsar:pair": list(pair),
-        "faninsar:looks": [look_pair[0], look_pair[1]],
+        "faninsar:range_looks": looks.range,
+        "faninsar:azimuth_looks": looks.azimuth,
         "faninsar:domain": domain,
         "faninsar:shape": [int(shape[0]), int(shape[1])],
         "faninsar:wavelength_m": wavelength_m,
@@ -403,10 +409,15 @@ def write_ionosphere_artifact(
     return IonosphereArtifactStore.open(product.path)
 
 
-def ion_dir(work_dir: str | Path, pair_id: str, looks: tuple[int, int]) -> Path:
-    """Return the ion product directory ``work_dir/ifg/ion/ml_AxR/<pair>``."""
+def ion_dir(
+    work_dir: str | Path,
+    pair_id: str,
+    looks: Looks | tuple[int, int],
+) -> Path:
+    """Return the ion product directory ``work_dir/ifg/ion/ml_RxA/<pair>``."""
+    looks = coerce_looks(looks)
     return (
-        Path(work_dir) / "ifg" / "ion" / f"ml_{int(looks[0])}x{int(looks[1])}" / pair_id
+        Path(work_dir) / "ifg" / "ion" / f"ml_{looks.range}x{looks.azimuth}" / pair_id
     )
 
 

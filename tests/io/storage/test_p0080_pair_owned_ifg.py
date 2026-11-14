@@ -185,7 +185,7 @@ def test_ion_grouping_directory_is_not_an_ifg_collection(tmp_path: Path) -> None
 
 def test_ion_persists_and_round_trips_sample_placement(tmp_path: Path) -> None:
     """Ion products record explicit native-pixel anchors and spacing."""
-    store = _write_ion(tmp_path / "work", looks=(2, 4), shape=(3, 5), native_origin=(6, 1))
+    store = _write_ion(tmp_path / "work", looks=(4, 2), shape=(3, 5), native_origin=(6, 1))
     assert store.sample_center_anchor == (6.5, 2.5)
     assert store.sample_spacing == (2.0, 4.0)
     item = json.loads((store.root / "item.json").read_text())

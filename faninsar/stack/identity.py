@@ -39,6 +39,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from faninsar.core.sar_tools import Looks, coerce_looks
 from faninsar.logging import reject, setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 from faninsar.stack.layout import (
@@ -55,13 +56,12 @@ logger = setup_logger(__name__)
 
 STACK_IDENTITY_SCHEMA = "faninsar.stack.v1"
 STACK_JSON_NAME = "stack.json"
-WORKSPACE_SCHEMA_VERSION = 2
-"""Durable intent schema version (PROPOSAL-0088).
+WORKSPACE_SCHEMA_VERSION = 1
+"""Durable intent schema version.
 
-Version 1 documents persisted resolved inputs/products only. Version 2 adds
-the normalized source request, mission targets, and an intent revision token.
-A version-1 document is adopted in place; a newer version is rejected rather
-than downgraded.
+Version 1 is the single supported Stack workspace schema. A document with any
+other integer version is an unsupported layout and must be rebuilt; there is
+no legacy adoption path.
 """
 
 # StackConfig fields that never enter ``stack.json``: runtime values
@@ -138,7 +138,9 @@ def _fail_unserializable(value: object) -> NoReturn:
     reject_invalid_state(message)
 
 
-def encode_value(value: Any, *, identity_dir: Path | None = None) -> object:
+def encode_value(  # noqa: PLR0911
+    value: Any, *, identity_dir: Path | None = None
+) -> object:
     """Encode one strict-JSON science value.
 
     Tuples are tagged so they round-trip as tuples.  Paths become strings
@@ -157,6 +159,10 @@ def encode_value(value: Any, *, identity_dir: Path | None = None) -> object:
             str(value)
             if identity_dir is None
             else encode_identity_path(value, identity_dir)
+        )
+    if isinstance(value, Looks):
+        return encode_value(
+            (int(value.range), int(value.azimuth)), identity_dir=identity_dir
         )
     if isinstance(value, (tuple, list)):
         encoded = [encode_value(item, identity_dir=identity_dir) for item in value]
@@ -628,8 +634,11 @@ def _requested_science_and_extra(
     for field in fields(config):
         if field.name in UNSAVED_FIELDS:
             continue
-        science[field.name] = encode_value(
-            getattr(config, field.name), identity_dir=identity_dir
+        value = getattr(config, field.name)
+        science[field.name] = (
+            _encode_multilook(value)
+            if field.name == "multilook"
+            else encode_value(value, identity_dir=identity_dir)
         )
     extra = {
         key: encode_value(config.extra[key], identity_dir=identity_dir)
@@ -681,6 +690,12 @@ def _request_reference(stack: Stack) -> str | None:
     return None if value is None else str(value)
 
 
+def _encode_multilook(value: Looks | tuple[int, int]) -> object:
+    """Encode ``science.multilook`` as the range-first ``[range, azimuth]`` pair."""
+    looks = coerce_looks(value)
+    return encode_value((int(looks.range), int(looks.azimuth)))
+
+
 def _science_and_extra(
     stack: Stack, *, identity_dir: Path | None = None
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -697,7 +712,11 @@ def _science_and_extra(
         value = getattr(config, field.name)
         if field.name == "dem" and stack._dem_source is not None:
             value = stack._dem_source
-        science[field.name] = encode_value(value, identity_dir=identity_dir)
+        science[field.name] = (
+            _encode_multilook(value)
+            if field.name == "multilook"
+            else encode_value(value, identity_dir=identity_dir)
+        )
     extra = {
         key: encode_value(config.extra[key], identity_dir=identity_dir)
         for key in sorted(config.extra)
@@ -978,15 +997,15 @@ def read_stack_identity(work_dir: str | Path) -> dict[str, object]:
         )
         reject_invalid_state(message)
     version = document.get("schema_version")
-    if (
-        isinstance(version, int)
-        and not isinstance(version, bool)
-        and version > WORKSPACE_SCHEMA_VERSION
+    if version is not None and (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != WORKSPACE_SCHEMA_VERSION
     ):
         message = (
-            f"{path} records workspace schema version {version}, newer than "
-            f"this FanInSAR supports ({WORKSPACE_SCHEMA_VERSION}); use a matching "
-            "FanInSAR version instead of downgrading the workspace"
+            f"{path} records workspace schema version {version}; this "
+            f"FanInSAR supports only version {WORKSPACE_SCHEMA_VERSION}. "
+            "Rebuild this work directory with the current FanInSAR version."
         )
         reject_invalid_state(message)
     return merge_track_documents(Path(work_dir), document, strict=True)

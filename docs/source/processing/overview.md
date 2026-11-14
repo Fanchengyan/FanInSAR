@@ -24,7 +24,7 @@ stack = S1Stack.from_safes(
 # Each stage is explicit and resumable.
 report = stack.prepare_data()
 stack.coregister_scenes()
-stack.form_interferograms(multilook=(2, 8))
+stack.form_interferograms(multilook=(8, 2))  # range looks, azimuth looks
 stack.unwrap()
 result = stack.network.invert()
 ```

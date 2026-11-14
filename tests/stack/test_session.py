@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from tests.support.local_stack import LocalStack
 
+from faninsar.core.sar_tools import Looks
 from faninsar.io.storage.ifg_store import (
     InterferogramArtifactStore,
     write_ifg_artifact,
@@ -508,18 +509,18 @@ def test_stack_scene_provider_receives_normalized_callback_arguments(
 
 
 def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
-    """StackConfig coerces multilook to int pair."""
+    """StackConfig coerces a range-first pair to Looks."""
     cfg = StackConfig(
         work_dir=tmp_path,
         multilook=(2, 10),
     )
-    assert cfg.multilook == (2, 10)
+    assert cfg.multilook == Looks(range=2, azimuth=10)
 
 
-def test_stack_config_default_multilook_is_isce2_like(tmp_path: Path) -> None:
-    """Stack defaults to five azimuth by two range looks."""
+def test_stack_config_default_multilook_is_range_first(tmp_path: Path) -> None:
+    """Stack defaults to range ten by azimuth two looks."""
     cfg = StackConfig(work_dir=tmp_path)
-    assert cfg.multilook == (5, 2)
+    assert cfg.multilook == Looks(range=10, azimuth=2)
 
 
 def test_stack_formation_validates_coherence_before_scene_io(tmp_path: Path) -> None:
@@ -638,7 +639,7 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
     _publish_explicit_overlap_layout(stack.config.work_dir, dates[0], boundary=1)
 
     stack.form_interferograms(multilook=(1, 1))
-    assert stack.config.multilook == (1, 1)
+    assert stack.config.multilook == Looks(1, 1)
     identity = json.loads(
         (stack.config.work_dir / "stack.json").read_text(encoding="utf-8")
     )
