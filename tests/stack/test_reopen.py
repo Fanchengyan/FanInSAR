@@ -159,6 +159,62 @@ def test_reopen_after_stages_reuses_committed_work(tmp_path: Path) -> None:
     )
 
 
+def test_reopen_reuses_layout_bound_ifg_without_false_source_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A layout input is structural lineage, not a scene-source mismatch."""
+    stack = _stack(tmp_path)
+    stack.prepare_data()
+    stack.coregister_scenes()
+    for date_id in ("20240101", "20240113"):
+        path = stack.config.work_dir / "coreg" / date_id / "item.json"
+        item = json.loads(path.read_text(encoding="utf-8"))
+        item["properties"]["faninsar:layout_id"] = "layout-test"
+        item["properties"].setdefault("faninsar:inputs", {})["layout"] = "layout-test"
+        path.write_text(json.dumps(item), encoding="utf-8")
+
+    stack.form_interferograms()
+    ifg_item = json.loads(
+        (
+            stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113" / "item.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert ifg_item["properties"]["faninsar:inputs"]["layout"] == "layout-test"
+    first = {
+        store.pair: store.write_id
+        for store in stack._pair_artifact_stores(looks=(1, 1))
+    }
+    reopened = Stack.open(stack.config.work_dir)
+    reopened.form_interferograms()
+    assert {
+        store.pair: store.write_id
+        for store in reopened._pair_artifact_stores(looks=(1, 1))
+    } == first
+
+
+def test_reopen_rejects_changed_layout_binding(tmp_path: Path) -> None:
+    """Layout is still compared strictly through the separate layout_id field."""
+    stack = _stack(tmp_path)
+    stack.prepare_data()
+    stack.coregister_scenes()
+    for date_id in ("20240101", "20240113"):
+        path = stack.config.work_dir / "coreg" / date_id / "item.json"
+        item = json.loads(path.read_text(encoding="utf-8"))
+        item["properties"]["faninsar:layout_id"] = "layout-test"
+        item["properties"].setdefault("faninsar:inputs", {})["layout"] = "layout-test"
+        path.write_text(json.dumps(item), encoding="utf-8")
+    stack.form_interferograms()
+    path = stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113" / "item.json"
+    item = json.loads(path.read_text(encoding="utf-8"))
+    item["properties"]["faninsar:layout_id"] = "other-layout"
+    item["properties"]["faninsar:inputs"]["layout"] = "other-layout"
+    path.write_text(json.dumps(item), encoding="utf-8")
+
+    reopened = Stack.open(stack.config.work_dir)
+    with pytest.raises(InvalidProcessingStateError, match="layout_id"):
+        reopened.form_interferograms()
+
+
 def test_reopen_rejects_unknown_runtime_option(tmp_path: Path) -> None:
     """Science options cannot be changed through ``Stack.open``."""
     stack = _stack(tmp_path)

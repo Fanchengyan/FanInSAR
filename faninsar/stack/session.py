@@ -6485,13 +6485,15 @@ class Stack(NetworkContract, ABC):
                                 # Products written before the runtime fingerprint was
                                 # removed still carry a ``runtime`` entry next to the
                                 # real scene digests; it is not a source, so it does
-                                # not participate in the lineage comparison.
+                                # not participate in the lineage comparison. The
+                                # merge-layout input is also structural and is
+                                # compared separately through ``layout_id``.
                                 "sources": {
                                     role: digest
                                     for role, digest in (
                                         existing_store.source_manifest_digests.items()
                                     )
-                                    if role != "runtime"
+                                    if role not in {"layout", "runtime"}
                                 },
                                 "flatten_stage": existing_store.flatten_stage,
                                 "phase_screen_model": existing_store.phase_screen_model,
