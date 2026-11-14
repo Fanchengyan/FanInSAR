@@ -17,9 +17,10 @@ import os
 import socket
 import stat
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from email.utils import formatdate, parsedate_to_datetime
 from importlib import import_module
@@ -28,6 +29,8 @@ from typing import Any, Self
 from urllib.parse import quote, unquote, urlencode
 
 from faninsar.logging import setup_logger
+from faninsar.stack import _stac_georef as georef
+from faninsar.stack import _stac_radar as radar
 
 __all__ = [
     "StacRefreshError",
@@ -68,6 +71,7 @@ _JSON_MEDIA_TYPE = "application/json"
 _GEOJSON_MEDIA_TYPE = "application/geo+json"
 _OPENAPI_MEDIA_TYPE = "application/vnd.oai.openapi+json;version=3.0"
 _MAX_ITEM_BYTES = 4 * 1024 * 1024
+_MAX_ZARR_METADATA_BYTES = 4 * 1024 * 1024
 _STREAM_CHUNK = 1024 * 1024
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -80,12 +84,28 @@ _MAX_LIMIT = 1000
 _DEFAULT_LIMIT = 10
 _READY_TIMEOUT = 30.0
 _STOP_TIMEOUT = 10.0
+_RESERVATION_TIMEOUT = _READY_TIMEOUT + _STOP_TIMEOUT + 5.0
+_LIFECYCLE_STARTING = "starting"
+_LIFECYCLE_RUNNING = "running"
+_LIFECYCLE_STOPPING = "stopping"
+_LIFECYCLE_FAILED = "failed"
+_ZARR_METADATA_NAMES = ("zarr.json", ".zarray", ".zgroup")
+_JSON_METADATA_SUFFIXES = frozenset({".zarray", ".zgroup", ".zattrs"})
 
 _WEB_KEY = "faninsar:stac:web"
 _IO_KEY = "faninsar:stac:io"
 _STATE_KEY = "faninsar:stac:state"
 _WORK_DIR_KEY = "faninsar:stac:work_dir"
 _BASE_URL_KEY = "faninsar:stac:base_url"
+_GEOREF_KEY = "faninsar:stac:georef"
+_RADAR_KEY = "faninsar:stac:radar"
+
+# Process-local strong references to endpoint reservations and healthy
+# services, keyed by the literal requested host and actual bound port. One
+# entry per endpoint lets a repeated ``stac_serve`` return the same handle
+# without touching the index, while concurrent callers wait on the entry event.
+_SERVICE_REGISTRY_LOCK = threading.RLock()
+_SERVICE_REGISTRY: dict[tuple[str, int], _ServiceRegistration] = {}
 
 
 class StacRefreshError(RuntimeError):
@@ -192,6 +212,204 @@ class _StackIO:
     render_collection: Any
     search_request: Any
     search_error: Any
+
+
+@dataclass(slots=True)
+class _ServiceRegistration:
+    """One endpoint reservation, its canonical workspace, and its handle."""
+
+    key: tuple[str, int]
+    work_dir: Path
+    persist_catalog: bool
+    lifecycle: str = _LIFECYCLE_STARTING
+    service: StackStacService | None = None
+    error: BaseException | None = None
+    changed: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(frozen=True, slots=True)
+class _StartDecision:
+    """Outcome of reserving an endpoint or reusing its running handle."""
+
+    service: StackStacService | None = None
+    registration: _ServiceRegistration | None = None
+    dead_service: StackStacService | None = None
+
+
+def _normalized_host(host: str) -> str:
+    """Return the literal bind host used as a registry key component."""
+    return host.strip().lower()
+
+
+def _service_key(host: str, port: int) -> tuple[str, int]:
+    """Return the registry key for one literal host and actual port."""
+    return (_normalized_host(host), int(port))
+
+
+def _live_service(registration: _ServiceRegistration) -> StackStacService | None:
+    """Return the healthy handle for one registration, or ``None``."""
+    service = registration.service
+    if registration.lifecycle != _LIFECYCLE_RUNNING or service is None:
+        return None
+    if service._stopping.is_set():
+        return None
+    if not service._runtime.is_alive():
+        return None
+    return service
+
+
+def _busy_endpoint_error(
+    work_root: Path, host: str, port: int, registration: _ServiceRegistration
+) -> OSError:
+    """Build the error for an endpoint owned by a different workspace."""
+    msg = (
+        f"cannot serve workspace {work_root} on "
+        f"{_base_url(host, port)}: that endpoint is already served for "
+        f"another workspace ({registration.work_dir}); stop that service "
+        "before starting a different one"
+    )
+    return OSError(msg)
+
+
+def _log_reuse(
+    registration: _ServiceRegistration,
+    service: StackStacService,
+    work_root: Path,
+    persist_catalog: bool,
+) -> None:
+    """Report a reused handle and any persistence-mode mismatch."""
+    logger.info(
+        "reusing the running STAC service for workspace %s at %s",
+        work_root,
+        service.base_url,
+    )
+    if registration.persist_catalog != persist_catalog:
+        logger.info(
+            "the reused STAC service keeps its original persist_catalog=%s; "
+            "stop and restart it to change catalog persistence",
+            registration.persist_catalog,
+        )
+
+
+def _reserve_start(
+    work_root: Path,
+    host: str,
+    port: int,
+    persist_catalog: bool,
+) -> _StartDecision:
+    """Reserve this endpoint, wait for a peer, or return a live handle.
+
+    Only the short registry lookup and reservation happen under
+    :data:`_SERVICE_REGISTRY_LOCK`; a caller that must wait for a peer does so
+    on the registration event outside the lock. The starter performs the index
+    build, bind, readiness wait, persistence, and URL printing without holding
+    the global lock.
+    """
+    key = _service_key(host, port)
+    deadline = time.monotonic() + _RESERVATION_TIMEOUT
+    while True:
+        wait_event: threading.Event | None = None
+        with _SERVICE_REGISTRY_LOCK:
+            registration = _SERVICE_REGISTRY.get(key)
+            if registration is None:
+                registration = _ServiceRegistration(
+                    key=key,
+                    work_dir=work_root,
+                    persist_catalog=persist_catalog,
+                )
+                _SERVICE_REGISTRY[key] = registration
+                return _StartDecision(registration=registration)
+            service = _live_service(registration)
+            if service is not None:
+                if registration.work_dir != work_root:
+                    raise _busy_endpoint_error(work_root, host, port, registration)
+                _log_reuse(registration, service, work_root, persist_catalog)
+                return _StartDecision(service=service)
+            if registration.lifecycle in {
+                _LIFECYCLE_STARTING,
+                _LIFECYCLE_STOPPING,
+            }:
+                if registration.work_dir != work_root:
+                    raise _busy_endpoint_error(work_root, host, port, registration)
+                wait_event = registration.changed
+            else:
+                dead_service = (
+                    registration.service
+                    if registration.lifecycle == _LIFECYCLE_RUNNING
+                    else None
+                )
+                registration.work_dir = work_root
+                registration.persist_catalog = persist_catalog
+                registration.lifecycle = _LIFECYCLE_STARTING
+                registration.service = None
+                registration.error = None
+                registration.changed.clear()
+                return _StartDecision(
+                    registration=registration,
+                    dead_service=dead_service,
+                )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            msg = (
+                f"timed out waiting for the STAC endpoint {_base_url(host, port)} "
+                "to finish starting or stopping"
+            )
+            raise RuntimeError(msg)
+        wait_event.wait(remaining)
+
+
+def _abandon_start(registration: _ServiceRegistration, error: BaseException) -> None:
+    """Release a failed reservation and wake peers waiting on it."""
+    with _SERVICE_REGISTRY_LOCK:
+        if _SERVICE_REGISTRY.get(registration.key) is registration:
+            del _SERVICE_REGISTRY[registration.key]
+        registration.lifecycle = _LIFECYCLE_FAILED
+        registration.service = None
+        registration.error = error
+        registration.changed.set()
+
+
+def _publish_running(
+    registration: _ServiceRegistration, service: StackStacService
+) -> bool:
+    """Publish a ready service, or report that a live endpoint already owns it."""
+    with _SERVICE_REGISTRY_LOCK:
+        existing = _SERVICE_REGISTRY.get(registration.key)
+        if (
+            existing is not None
+            and existing is not registration
+            and _live_service(existing) is not None
+        ):
+            return False
+        _SERVICE_REGISTRY[registration.key] = registration
+        registration.lifecycle = _LIFECYCLE_RUNNING
+        registration.service = service
+        registration.error = None
+        registration.changed.set()
+        return True
+
+
+def _begin_stop(service: StackStacService) -> _ServiceRegistration | None:
+    """Mark this service's endpoint stopping under the registry lock."""
+    with _SERVICE_REGISTRY_LOCK:
+        for registration in _SERVICE_REGISTRY.values():
+            if registration.service is service:
+                if registration.lifecycle != _LIFECYCLE_STOPPING:
+                    registration.lifecycle = _LIFECYCLE_STOPPING
+                    registration.changed.clear()
+                return registration
+    return None
+
+
+def _finish_stop(registration: _ServiceRegistration, terminated: bool) -> None:
+    """Remove a terminated registration; keep ownership on timeout."""
+    with _SERVICE_REGISTRY_LOCK:
+        if _SERVICE_REGISTRY.get(registration.key) is not registration:
+            return
+        if not terminated:
+            return
+        del _SERVICE_REGISTRY[registration.key]
+        registration.changed.set()
 
 
 def _load_web() -> Any:
@@ -440,6 +658,142 @@ def _read_write_id(product_fd: int) -> str | None:
     return write_id if isinstance(write_id, str) and write_id else None
 
 
+def _read_bounded(descriptor: int, limit: int) -> bytes | None:
+    """Read at most ``limit`` bytes, returning ``None`` when the file is larger."""
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    return data if len(data) <= limit else None
+
+
+def _read_native_zarr_metadata(
+    work_dir: Path, record: Any, asset_key: str
+) -> tuple[dict[str, Any] | None, float]:
+    """Read ``zarr.json`` through the pinned safe asset open, with receipt checks.
+
+    The native metadata is the only source for descriptor construction. The
+    asset root and the metadata file are opened without following symbolic
+    links, the read is bounded, and the product write id is checked before and
+    after the read.
+    """
+    try:
+        product_fd = _open_directory(work_dir, _product_parts(work_dir, record))
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        return None, 0.0
+    try:
+        return _read_metadata_from_product(product_fd, work_dir, record, asset_key)
+    finally:
+        os.close(product_fd)
+
+
+def _read_metadata_from_product(
+    product_fd: int, work_dir: Path, record: Any, asset_key: str
+) -> tuple[dict[str, Any] | None, float]:
+    """Read one bounded Zarr group document below an already pinned product."""
+    if _read_write_id(product_fd) != str(record.write_id):
+        return None, 0.0
+    try:
+        descriptor, metadata = _open_asset(
+            work_dir, product_fd, record, asset_key, "zarr.json"
+        )
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        return None, 0.0
+    try:
+        parsed = _read_metadata_descriptor(descriptor, metadata)
+    finally:
+        os.close(descriptor)
+    if parsed is None:
+        return None, 0.0
+    payload, modified = parsed
+    if _read_write_id(product_fd) != str(record.write_id):
+        return None, 0.0
+    return payload, modified
+
+
+def _read_metadata_descriptor(
+    descriptor: int, metadata: os.stat_result
+) -> tuple[dict[str, Any], float] | None:
+    """Parse one bounded regular Zarr v3 group document from a descriptor."""
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > _MAX_ZARR_METADATA_BYTES
+    ):
+        return None
+    data = _read_bounded(descriptor, _MAX_ZARR_METADATA_BYTES)
+    if data is None:
+        return None
+    try:
+        payload = _strict_loads(data)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("zarr_format") != 3:
+        return None
+    return payload, metadata.st_mtime
+
+
+def _receipt_matches(work_dir: Path, record: Any) -> bool:
+    """Return whether the product receipt still names the record write id."""
+    try:
+        product_fd = _open_directory(work_dir, _product_parts(work_dir, record))
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        return False
+    try:
+        return _read_write_id(product_fd) == str(record.write_id)
+    finally:
+        os.close(product_fd)
+
+
+def _receipt_fingerprint(work_dir: Path, record: Any) -> str:
+    """Return a bounded digest of the current canonical product receipt.
+
+    The scene write id is preserved when geometry assets are added, so the
+    radar adapter cannot key caches on the write id or the index generation
+    alone. Reading the bounded ``item.json`` bytes makes an added or replaced
+    asset declaration change the preview identity immediately.
+    """
+    try:
+        product_fd = _open_directory(work_dir, _product_parts(work_dir, record))
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        return ""
+    descriptor: int | None = None
+    try:
+        if _read_write_id(product_fd) != str(record.write_id):
+            return ""
+        descriptor, metadata = _open_at(product_fd, "item.json", directory=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_ITEM_BYTES:
+            return ""
+        data = _read_bounded(descriptor, _MAX_ITEM_BYTES)
+        if data is None or _read_write_id(product_fd) != str(record.write_id):
+            return ""
+        return hashlib.sha256(data).hexdigest()
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        return ""
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(product_fd)
+
+
+def _build_georeferenced_zarr_view(
+    record: Any, asset_key: str, metadata: Mapping[str, Any]
+) -> Any | None:
+    """Import and call the metadata worker's descriptor builder lazily."""
+    try:
+        module = import_module("faninsar.io.stac.georef")
+    except ImportError:
+        return None
+    builder = getattr(module, "build_georeferenced_zarr_view", None)
+    if builder is None:
+        return None
+    return builder(record, asset_key, metadata)
+
+
 def _product_directory(work_dir: Path, record: Any) -> Path:
     """Return the lexical product directory rooted at ``work_dir``."""
     product_dir = Path(record.source_item_path).parent
@@ -462,10 +816,12 @@ def _product_parts(work_dir: Path, record: Any) -> tuple[str, ...]:
     return parts
 
 
-def _open_asset(
-    work_dir: Path, product_fd: int, record: Any, asset_key: str, relative: str
-) -> tuple[int, os.stat_result]:
-    """Open one registered asset beneath a pinned product descriptor."""
+def _asset_root_parts(work_dir: Path, record: Any, asset_key: str) -> tuple[str, ...]:
+    """Return the registered asset root components below the product directory.
+
+    The components are lexical and are later opened without following any
+    symbolic link; an absolute root, ``..``, or ``item.json`` is rejected.
+    """
     asset_root = Path(record.asset_paths[asset_key])
     product_dir = _product_directory(work_dir, record)
     if not asset_root.is_absolute():
@@ -479,12 +835,20 @@ def _open_asset(
         raise _UnsafeAssetPathError(str(asset_root))
     if root_parts[-1] == "item.json":
         raise _UnsafeAssetPathError(str(asset_root))
+    return root_parts
+
+
+def _open_asset(
+    work_dir: Path, product_fd: int, record: Any, asset_key: str, relative: str
+) -> tuple[int, os.stat_result]:
+    """Open one registered asset beneath a pinned product descriptor."""
+    root_parts = _asset_root_parts(work_dir, record, asset_key)
     tail = _safe_asset_parts(relative)
     descriptor, metadata = _open_parts(product_fd, root_parts, final_directory=None)
     if stat.S_ISDIR(metadata.st_mode):
         if not tail:
             os.close(descriptor)
-            raise _UnsafeAssetPathError(str(asset_root))
+            raise _UnsafeAssetPathError(str(record.asset_paths[asset_key]))
         try:
             return _open_parts(descriptor, tail, final_directory=False)
         finally:
@@ -492,10 +856,53 @@ def _open_asset(
     if stat.S_ISREG(metadata.st_mode):
         if tail:
             os.close(descriptor)
-            raise _UnsafeAssetPathError(str(asset_root))
+            raise _UnsafeAssetPathError(str(record.asset_paths[asset_key]))
         return descriptor, metadata
     os.close(descriptor)
-    raise _UnsafeAssetPathError(str(asset_root))
+    raise _UnsafeAssetPathError(str(record.asset_paths[asset_key]))
+
+
+def _open_zarr_metadata(
+    work_dir: Path, product_fd: int, record: Any, asset_key: str
+) -> tuple[str, int] | None:
+    """Open store-defining Zarr metadata for one directory asset root.
+
+    Only ``zarr.json``, ``.zarray``, and ``.zgroup`` define a Zarr store root;
+    ``.zattrs`` alone is child metadata and does not make a directory a store.
+    Returns the basename and its already-open descriptor, or ``None`` when the
+    asset root is a regular file or a directory without store metadata.
+    Directories are opened without following any symbolic link, and the caller
+    closes the descriptor.
+    """
+    root_parts = _asset_root_parts(work_dir, record, asset_key)
+    root_fd, root_metadata = _open_parts(product_fd, root_parts, final_directory=None)
+    try:
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            return None
+        for name in _ZARR_METADATA_NAMES:
+            try:
+                descriptor, metadata = _open_at(root_fd, name, directory=False)
+            except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                return name, descriptor
+            os.close(descriptor)
+        return None
+    finally:
+        os.close(root_fd)
+
+
+def _zarr_redirect_location(request: Any, asset_key: str, metadata_name: str) -> str:
+    """Build a safe relative Location that resolves to the metadata child URL."""
+    quoted_key = quote(asset_key, safe="")
+    quoted_name = quote(metadata_name, safe="")
+    if request.path.endswith("/"):
+        location = quoted_name
+    else:
+        location = f"{quoted_key}/{quoted_name}"
+    if "\r" in location or "\n" in location:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    return location
 
 
 def _parse_byte_range(value: str, size: int) -> tuple[int, int]:
@@ -616,7 +1023,7 @@ def _asset_media_type(record: Any, asset_key: str, relative: str) -> str:
     suffix = Path(name).suffix.lower()
     if suffix in {".tif", ".tiff"}:
         return "image/tiff"
-    if suffix == ".json":
+    if suffix == ".json" or Path(name).name in _JSON_METADATA_SUFFIXES:
         return _JSON_MEDIA_TYPE
     if not relative:
         assets = getattr(record, "item", {}).get("assets", {})
@@ -646,6 +1053,7 @@ def _status_code(status: int) -> str:
         415: "UnsupportedMediaType",
         416: "RangeNotSatisfiable",
         500: "InternalServerError",
+        503: "ServiceUnavailable",
     }.get(status, "HTTPError")
 
 
@@ -890,18 +1298,26 @@ async def _collection(request: Any) -> Any:
     return _json_response(web, document)
 
 
+def _render_http_item(request: Any, record: Any, view_path: str) -> dict[str, Any]:
+    """Render one Item and add supported derived Zarr view assets."""
+    io = request.app[_IO_KEY]
+    base_url = request.app[_BASE_URL_KEY]
+    item = io.render_item(record, _http_targets(io, base_url, view_path))
+    index = request.app[_STATE_KEY].snapshot()
+    request.app[_GEOREF_KEY].augment_item(record, item, base_url, index.generation)
+    request.app[_RADAR_KEY].augment_item(record, item, index)
+    return item
+
+
 async def _item(request: Any) -> Any:
     """Serve one public Item."""
     web = request.app[_WEB_KEY]
-    io = request.app[_IO_KEY]
     index = request.app[_STATE_KEY].snapshot()
-    base_url = request.app[_BASE_URL_KEY]
     public_id = request.match_info["public_id"]
     record = index.record(public_id)
     if record is None:
         raise _ApiError(404, "NotFound", f"unknown item: {public_id}")
-    view = f"/items/{quote(public_id, safe='')}"
-    document = io.render_item(record, _http_targets(io, base_url, view))
+    document = _render_http_item(request, record, f"/items/{quote(public_id, safe='')}")
     return _json_response(web, document, media_type=_GEOJSON_MEDIA_TYPE)
 
 
@@ -1165,12 +1581,7 @@ async def _search(request: Any) -> Any:
     features = []
     for record in page.items:
         public_id = quote(str(record.public_id), safe="")
-        features.append(
-            io.render_item(
-                record,
-                _http_targets(io, base_url, f"/items/{public_id}"),
-            )
-        )
+        features.append(_render_http_item(request, record, f"/items/{public_id}"))
     links: list[dict[str, Any]] = []
     if request.method == "GET":
         query = request.rel_url.raw_query_string
@@ -1301,6 +1712,288 @@ async def _asset_response(
     )
 
 
+def _view_bytes_response(
+    web: Any,
+    request: Any,
+    payload: bytes,
+    *,
+    etag: str,
+    modified: float,
+    media_type: str,
+) -> Any:
+    """Serve validated generated bytes with conditional and Range support."""
+    size = len(payload)
+    headers = _cache_headers(etag, modified)
+    if _conditional_status(request, etag, modified) == 304:
+        return web.Response(status=304, headers=headers)
+    headers["Content-Type"] = media_type
+    range_header = request.headers.get("Range")
+    if (
+        range_header
+        and request.headers.get("If-Range")
+        and not _if_range_matches(request.headers["If-Range"], etag, modified)
+    ):
+        range_header = None
+    if range_header:
+        try:
+            start, end = _parse_byte_range(range_header, size)
+        except _UnsatisfiableRangeError:
+            unsatisfiable = _cache_headers(etag, modified)
+            unsatisfiable["Content-Range"] = f"bytes */{size}"
+            return web.Response(status=416, headers=unsatisfiable)
+        except _InvalidRangeError as error:
+            msg = f"malformed Range header: {error}"
+            raise _ApiError(400, "InvalidRange", msg) from error
+        body = payload[start : end + 1]
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        headers["Content-Length"] = str(len(body))
+        return web.Response(status=206, headers=headers, body=body)
+    headers["Content-Length"] = str(size)
+    if request.method == "HEAD":
+        return web.Response(status=200, headers=headers)
+    return web.Response(status=200, headers=headers, body=payload)
+
+
+async def _serve_mapped_asset(
+    request: Any, record: Any, asset_key: str, relative: str
+) -> Any:
+    """Serve one canonical source chunk through the pinned asset machinery."""
+    work_dir = request.app[_WORK_DIR_KEY]
+    try:
+        product_fd = _open_directory(work_dir, _product_parts(work_dir, record))
+    except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+        raise _ApiError(404, "NotFound", "asset is not available") from None
+    descriptor: int | None = None
+    try:
+        if _read_write_id(product_fd) != str(record.write_id):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        try:
+            descriptor, metadata = _open_asset(
+                work_dir, product_fd, record, asset_key, relative
+            )
+        except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+            raise _ApiError(404, "NotFound", "asset is not available") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        if _read_write_id(product_fd) != str(record.write_id):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        return await _asset_response(
+            request,
+            descriptor,
+            metadata,
+            record=record,
+            asset_key=asset_key,
+            relative=relative,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(product_fd)
+
+
+async def _zarr_view(request: Any) -> Any:
+    """Serve one HTTP-only georeferenced Zarr compatibility view."""
+    web = request.app[_WEB_KEY]
+    index = request.app[_STATE_KEY].snapshot()
+    public_id = request.match_info["public_id"]
+    record = index.record(public_id)
+    if record is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    parsed = georef.parse_view_tail(
+        record.asset_paths, request.match_info.get("tail", "")
+    )
+    if parsed is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    source_key, relative, slashless = parsed
+    if slashless:
+        response = web.Response(status=307)
+        response.headers["Location"] = georef.view_path(public_id, source_key)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+    try:
+        parts = _safe_asset_parts(relative) if relative else ()
+    except _UnsafeAssetPathError:
+        raise _ApiError(404, "NotFound", "asset is not available") from None
+    normalized = "/".join(parts)
+    resolved = request.app[_GEOREF_KEY].resolve(record, source_key, index.generation)
+    if resolved is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    view, modified = resolved
+    etag = _asset_etag(str(record.write_id), f"{source_key}_georef", normalized or "/")
+    work_dir = request.app[_WORK_DIR_KEY]
+    if not normalized:
+        payload = georef.manifest_html(public_id, source_key)
+        media_type = "text/html; charset=utf-8"
+    elif normalized in georef.METADATA_PATHS:
+        document = view.metadata(normalized)
+        if not isinstance(document, Mapping):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        payload = _strict_dumps(document).encode("utf-8")
+        media_type = _JSON_MEDIA_TYPE
+    elif normalized.startswith(("x/", "y/")):
+        payload = view.coordinate_chunk(normalized)
+        if not isinstance(payload, bytes):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        media_type = "application/octet-stream"
+    elif normalized.startswith("values/"):
+        source_relative = view.source_chunk(normalized)
+        if not isinstance(source_relative, str):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        return await _serve_mapped_asset(request, record, source_key, source_relative)
+    else:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    if not _receipt_matches(work_dir, record):
+        raise _ApiError(404, "NotFound", "asset is not available")
+    return _view_bytes_response(
+        web,
+        request,
+        payload,
+        etag=etag,
+        modified=modified,
+        media_type=media_type,
+    )
+
+
+def _radar_head_response(
+    web: Any,
+    request: Any,
+    size: int,
+    *,
+    etag: str,
+    modified: float,
+) -> Any:
+    """Answer HEAD for a generated chunk without materialising its bytes."""
+    headers = _cache_headers(etag, modified)
+    range_header = request.headers.get("Range")
+    if (
+        range_header
+        and request.headers.get("If-Range")
+        and not _if_range_matches(request.headers["If-Range"], etag, modified)
+    ):
+        range_header = None
+    if range_header:
+        try:
+            start, end = _parse_byte_range(range_header, size)
+        except _UnsatisfiableRangeError:
+            unsatisfiable = _cache_headers(etag, modified)
+            unsatisfiable["Content-Range"] = f"bytes */{size}"
+            return web.Response(status=416, headers=unsatisfiable)
+        except _InvalidRangeError as error:
+            msg = f"malformed Range header: {error}"
+            raise _ApiError(400, "InvalidRange", msg) from error
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        headers["Content-Length"] = str(end - start + 1)
+        return web.Response(status=206, headers=headers)
+    headers["Content-Length"] = str(size)
+    return web.Response(status=200, headers=headers)
+
+
+async def _radar_view(request: Any) -> Any:
+    """Serve one lazily resampled radar geolocation preview."""
+    web = request.app[_WEB_KEY]
+    index = request.app[_STATE_KEY].snapshot()
+    public_id = request.match_info["public_id"]
+    record = index.record(public_id)
+    if record is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    parsed = radar.parse_view_tail(
+        record.asset_paths, request.match_info.get("tail", "")
+    )
+    if parsed is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    source_key, relative, slashless = parsed
+    if slashless:
+        response = web.Response(status=307)
+        response.headers["Location"] = radar.view_path(public_id, source_key)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+    try:
+        parts = _safe_asset_parts(relative) if relative else ()
+    except _UnsafeAssetPathError:
+        raise _ApiError(404, "NotFound", "asset is not available") from None
+    normalized = "/".join(parts)
+    provider = request.app[_RADAR_KEY]
+    try:
+        resolution = await asyncio.to_thread(
+            provider.resolve, index, record, source_key
+        )
+    except radar.RadarUnavailableError as error:
+        description = (
+            "asset is not available"
+            if error.status == 404
+            else f"radar preview unavailable: {error.reason}"
+        )
+        raise _ApiError(error.status, _status_code(error.status), description) from None
+    if resolution is None:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    work_dir = request.app[_WORK_DIR_KEY]
+    etag = _asset_etag(resolution.fingerprint, source_key, normalized or "/")
+    if not normalized:
+        payload: bytes | None = radar.manifest_html(public_id, source_key)
+        media_type = "text/html; charset=utf-8"
+    elif normalized in radar.METADATA_PATHS:
+        document = resolution.metadata(normalized)
+        if not isinstance(document, Mapping):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        payload = _strict_dumps(document).encode("utf-8")
+        media_type = _JSON_MEDIA_TYPE
+    elif normalized.startswith(("x/", "y/")):
+        payload = resolution.coordinate_chunk(normalized)
+        if not isinstance(payload, bytes):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        media_type = "application/octet-stream"
+    elif normalized.startswith("values/"):
+        coordinates = resolution.chunk_index(normalized)
+        if coordinates is None:
+            raise _ApiError(404, "NotFound", "asset is not available")
+        if not _receipt_matches(work_dir, record):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        size = resolution.chunk_length()
+        if _conditional_status(request, etag, resolution.modified) == 304:
+            headers = _cache_headers(etag, resolution.modified)
+            return web.Response(status=304, headers=headers)
+        if request.method == "HEAD":
+            return _radar_head_response(
+                web,
+                request,
+                size,
+                etag=etag,
+                modified=resolution.modified,
+            )
+        try:
+            payload = await asyncio.to_thread(
+                provider.read_chunk, resolution, *coordinates
+            )
+        except radar.RadarUnavailableError as error:
+            raise _ApiError(
+                error.status,
+                _status_code(error.status),
+                f"radar preview unavailable: {error.reason}",
+            ) from None
+        if payload is None or not _receipt_matches(work_dir, record):
+            raise _ApiError(404, "NotFound", "asset is not available")
+        return _view_bytes_response(
+            web,
+            request,
+            payload,
+            etag=etag,
+            modified=resolution.modified,
+            media_type="application/octet-stream",
+        )
+    else:
+        raise _ApiError(404, "NotFound", "asset is not available")
+    if not _receipt_matches(work_dir, record):
+        raise _ApiError(404, "NotFound", "asset is not available")
+    return _view_bytes_response(
+        web,
+        request,
+        payload,
+        etag=etag,
+        modified=resolution.modified,
+        media_type=media_type,
+    )
+
+
 async def _asset(request: Any) -> Any:
     """Serve one registered file or Zarr asset after identity revalidation."""
     index = request.app[_STATE_KEY].snapshot()
@@ -1322,6 +2015,24 @@ async def _asset(request: Any) -> Any:
     try:
         if _read_write_id(product_fd) != str(record.write_id):
             raise _ApiError(404, "NotFound", "asset is not available")
+        if not relative:
+            try:
+                metadata = _open_zarr_metadata(work_dir, product_fd, record, asset_key)
+            except (OSError, _UnsafeAssetPathError, _IdentityMismatchError):
+                raise _ApiError(404, "NotFound", "asset is not available") from None
+            if metadata is not None:
+                metadata_name, metadata_fd = metadata
+                try:
+                    if _read_write_id(product_fd) != str(record.write_id):
+                        raise _ApiError(404, "NotFound", "asset is not available")
+                finally:
+                    os.close(metadata_fd)
+                location = _zarr_redirect_location(request, asset_key, metadata_name)
+                web = request.app[_WEB_KEY]
+                response = web.Response(status=307)
+                response.headers["Location"] = location
+                response.headers["Cache-Control"] = "no-cache"
+                return response
         try:
             descriptor, metadata = _open_asset(
                 work_dir, product_fd, record, asset_key, relative
@@ -1606,6 +2317,18 @@ def _asset_parameters() -> list[dict[str, Any]]:
     ]
 
 
+async def _close_radar_provider(app: Any) -> None:
+    """Close cached radar handles without blocking the event loop.
+
+    A close can wait for an in-flight chunk read that is itself using GDAL over
+    this service's HTTP raw-asset route. Running it on a worker thread keeps
+    the event loop able to answer that read while shutdown proceeds.
+    """
+    provider = app.get(_RADAR_KEY)
+    if provider is not None:
+        await asyncio.to_thread(provider.close)
+
+
 def _create_app(
     web: Any,
     io: _StackIO,
@@ -1620,6 +2343,22 @@ def _create_app(
     app[_STATE_KEY] = state
     app[_WORK_DIR_KEY] = work_dir
     app[_BASE_URL_KEY] = base_url
+    app[_GEOREF_KEY] = georef.GeorefProvider(
+        open_metadata=lambda record, asset_key: _read_native_zarr_metadata(
+            work_dir, record, asset_key
+        ),
+        receipt_valid=lambda record: _receipt_matches(work_dir, record),
+        build_view=_build_georeferenced_zarr_view,
+    )
+    app[_RADAR_KEY] = radar.RadarProvider(
+        base_url=base_url,
+        open_metadata=lambda record, asset_key: _read_native_zarr_metadata(
+            work_dir, record, asset_key
+        ),
+        receipt_valid=lambda record: _receipt_matches(work_dir, record),
+        receipt_fingerprint=lambda record: _receipt_fingerprint(work_dir, record),
+    )
+    app.on_cleanup.append(_close_radar_provider)
     app.on_response_prepare.append(_normalise_http_error)
     app.router.add_get("/", _landing)
     app.router.add_get("/catalog.json", _root_catalog)
@@ -1629,6 +2368,8 @@ def _create_app(
     app.router.add_get("/collections", _collections)
     app.router.add_get("/collections/{collection_id}", _collection)
     app.router.add_get("/items/{public_id}", _item)
+    app.router.add_get("/zarr/{public_id}/{tail:.*}", _zarr_view)
+    app.router.add_get("/radar/{public_id}/{tail:.*}", _radar_view)
     app.router.add_get("/search", _search, allow_head=False)
     app.router.add_post("/search", _search)
     app.router.add_get("/assets/{public_id}/{asset_key}", _asset)
@@ -1734,6 +2475,8 @@ class _ServerRuntime:
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         self._thread.join(_STOP_TIMEOUT)
+        with suppress(OSError):
+            self._sock.close()
         if self._thread.is_alive():
             logger.warning("STAC service thread did not stop within its timeout")
 
@@ -1745,6 +2488,29 @@ class _ServerRuntime:
     def stopped(self) -> bool:
         """Return whether ``stop`` has been requested."""
         return self._stopped
+
+    def is_terminated(self) -> bool:
+        """Return whether the server thread has exited."""
+        return not self._thread.is_alive()
+
+    def is_alive(self) -> bool:
+        """Return whether this runtime can still accept requests.
+
+        The predicate is local state only: it never probes the port over HTTP.
+        A stop request, failed startup, dead thread, stopped loop, or closed
+        listener makes the runtime ineligible for reuse.
+        """
+        with self._lock:
+            if self._stopped:
+                return False
+        if self._startup_error is not None or not self._ready.is_set():
+            return False
+        if not self._thread.is_alive():
+            return False
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        return self._sock.fileno() != -1
 
 
 class StackStacService:
@@ -1796,6 +2562,7 @@ class StackStacService:
         self._report = report
         self._persist_catalog = persist_catalog
         self._lock = threading.Lock()
+        self._stopping = threading.Event()
 
     @property
     def base_url(self) -> str:
@@ -1868,17 +2635,49 @@ class StackStacService:
             )
 
     def report(self) -> dict[str, Any]:
-        """Return the latest refresh outcome as a strict-JSON mapping."""
+        """Return the latest refresh outcome and effective service identity."""
         with self._lock:
-            return self._report.as_dict()
+            document = self._report.as_dict()
+        document["service"] = {
+            "work_dir": str(self._work_dir),
+            "host": self._host,
+            "port": self._port,
+            "persist_catalog": self._persist_catalog,
+            "lifecycle": self._lifecycle_state(),
+        }
+        _strict_dumps(document)
+        return document
+
+    def _lifecycle_state(self) -> str:
+        """Return the process-local lifecycle label for reporting."""
+        if self._stopping.is_set():
+            return "stopped" if self._runtime.is_terminated() else "stopping"
+        return "running" if self._runtime.is_alive() else "stopped"
 
     def wait(self, timeout: float | None = None) -> None:
         """Block until the server stops or ``timeout`` elapses."""
         self._runtime.wait(timeout)
 
     def stop(self) -> None:
-        """Stop the service and join the server thread; safe to call twice."""
+        """Stop the service and join the server thread; safe to call twice.
+
+        The endpoint is marked stopping under the registry lock, the runtime is
+        stopped and joined without that lock, and only this registration is
+        removed after the thread terminates. A concurrent start waits on the
+        registration event and never receives a stopping handle.
+        """
+        self._stopping.set()
+        registration = _begin_stop(self)
         self._runtime.stop()
+        terminated = self._runtime.is_terminated()
+        if registration is not None:
+            _finish_stop(registration, terminated)
+        if not terminated:
+            msg = (
+                "the STAC service did not stop within its timeout; its "
+                "endpoint remains reserved as stopping"
+            )
+            raise RuntimeError(msg)
 
     def __enter__(self) -> Self:
         """Return this running service handle."""
@@ -1951,6 +2750,12 @@ def start_stac_service(
     then URL printing, so a failed startup prints nothing and mutates no
     workspace file.
 
+    A second call for the same canonical workspace, literal host, and live
+    nonzero port returns the existing process-local handle without rebuilding
+    the index, refreshing, persisting, or printing the URLs again. The
+    original ``persist_catalog`` mode stays in force and is reported when the
+    new call asks for a different mode.
+
     Parameters
     ----------
     work_dir : str or path-like
@@ -1973,7 +2778,8 @@ def start_stac_service(
     ImportError
         If ``aiohttp`` or the ``faninsar.io.stac`` package is unavailable.
     OSError
-        If the requested host and port cannot be bound.
+        If the requested host and port cannot be bound, or the live endpoint
+        is already served for a different workspace.
     RuntimeError
         If the application does not become ready.
 
@@ -1981,49 +2787,83 @@ def start_stac_service(
     if not isinstance(persist_catalog, bool):
         msg = "persist_catalog must be a bool"
         raise TypeError(msg)
+    _validate_port(port)
+    if not isinstance(host, str) or not host.strip():
+        msg = "host must be a non-empty string"
+        raise ValueError(msg)
     work_root = Path(work_dir).expanduser().resolve()
+    decision = (
+        _StartDecision()
+        if port == 0
+        else _reserve_start(work_root, host, port, persist_catalog)
+    )
+    if decision.service is not None:
+        return decision.service
+    registration = decision.registration
+    if decision.dead_service is not None:
+        try:
+            decision.dead_service.stop()
+        except BaseException as error:
+            if registration is not None:
+                _abandon_start(registration, error)
+            raise
     if not _is_loopback(host):
         logger.warning(
             "binding the STAC service to non-loopback host %s makes it "
             "reachable beyond this machine",
             host,
         )
-    web = _load_web()
-    io = _load_io()
-    index = io.build_index(work_root)
-    sock = _bind_socket(host, port)
+    sock: socket.socket | None = None
+    runtime: _ServerRuntime | None = None
     try:
+        web = _load_web()
+        io = _load_io()
+        index = io.build_index(work_root)
+        sock = _bind_socket(host, port)
         assigned = int(sock.getsockname()[1])
         base_url = _base_url(host, assigned)
+        if registration is None:
+            registration = _ServiceRegistration(
+                key=_service_key(host, assigned),
+                work_dir=work_root,
+                persist_catalog=persist_catalog,
+            )
         state = _IndexState(index)
         app = _create_app(web, io, state, work_root, base_url)
         runtime = _ServerRuntime(web, app, sock)
-        try:
-            runtime.start()
-            persistence = _persist(io, index, work_root, persist_catalog)
-            report = _build_report(index, persistence)
-        except BaseException:
-            runtime.stop()
-            raise
-    except BaseException:
-        with suppress(OSError):
-            sock.close()
-        raise
-    service = StackStacService(
-        work_dir=work_root,
-        host=host,
-        port=assigned,
-        base_url=base_url,
-        state=state,
-        runtime=runtime,
-        io=io,
-        report=report,
-        persist_catalog=persist_catalog,
-    )
-    try:
-        print(f"FanInSAR STAC Catalog: {base_url}/catalog.json", flush=True)  # noqa: T201
+        runtime.start()
+        persistence = _persist(io, index, work_root, persist_catalog)
+        report = _build_report(index, persistence)
+        service = StackStacService(
+            work_dir=work_root,
+            host=host,
+            port=assigned,
+            base_url=base_url,
+            state=state,
+            runtime=runtime,
+            io=io,
+            report=report,
+            persist_catalog=persist_catalog,
+        )
+        print(  # noqa: T201
+            f"FanInSAR STAC Catalog: {base_url}/catalog.json", flush=True
+        )
         print(f"FanInSAR STAC API: {base_url}/api", flush=True)  # noqa: T201
-    except BaseException:
-        runtime.stop()
+    except BaseException as error:
+        if runtime is not None:
+            runtime.stop()
+        if sock is not None:
+            with suppress(OSError):
+                sock.close()
+        if registration is not None:
+            _abandon_start(registration, error)
         raise
+    assert registration is not None
+    if not _publish_running(registration, service):
+        service.stop()
+        msg = (
+            f"cannot publish the STAC service on {base_url}: another live "
+            "service owns that endpoint"
+        )
+        raise RuntimeError(msg)
     return service

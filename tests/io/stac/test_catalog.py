@@ -506,6 +506,75 @@ def test_renderers_are_deterministic_and_schema_complete(tmp_path: Path) -> None
     assert "bbox" not in radar_item
 
 
+def _zarr_record(work_dir: Path, public_id: str) -> StacRecord:
+    """Build one normalized record whose registered asset is a Zarr store."""
+    store = work_dir / public_id / "data.zarr"
+    store.mkdir(parents=True)
+    (store / "zarr.json").write_text('{"zarr_format": 3}', encoding="utf-8")
+    item: dict[str, object] = {
+        "stac_version": "1.0.0",
+        "type": "Feature",
+        "id": f"scene-{public_id}",
+        "geometry": None,
+        "properties": {
+            "datetime": None,
+            "faninsar:kind": "scene",
+            "faninsar:family": "scenes",
+            "faninsar:write_id": public_id,
+        },
+        "assets": {
+            "data": {
+                "href": f"{public_id}/data.zarr",
+                "type": "application/vnd+zarr",
+                "roles": ["data"],
+            }
+        },
+        "links": [],
+    }
+    return StacRecord(
+        public_id=public_id,
+        write_id=public_id,
+        kind="scene",
+        family="scenes",
+        source_item_path=work_dir / public_id / "item.json",
+        source_relative_path=public_id,
+        collection_id=None,
+        temporal=TemporalCoverage(start=_START, end=_END, precision="timestamp"),
+        bbox=None,
+        item=item,
+        asset_paths={"data": store},
+    )
+
+
+def test_zarr_directory_assets_render_store_root_href_and_type(
+    tmp_path: Path,
+) -> None:
+    """Zarr store hrefs identify the directory root, never its metadata file."""
+    work_dir = tmp_path / "stack"
+    work_dir.mkdir()
+    record = _zarr_record(work_dir, "scene-zarr")
+    index = _index(work_dir, [record])
+    http_targets = LinkTargets.for_http(
+        base_url="http://127.0.0.1:8000",
+        view_path="/catalog.json",
+    )
+
+    rendered = render_item(index.record(record.public_id), http_targets)
+    asset = rendered["assets"]["data"]
+    assert asset["type"] == "application/vnd+zarr"
+    assert asset["href"] == f"http://127.0.0.1:8000/assets/{record.public_id}/data/"
+    assert "zarr.json" not in asset["href"]
+
+    view = work_dir / "stac" / "items" / f"{record.public_id}.json"
+    disk = render_item(
+        record,
+        LinkTargets.for_disk(work_dir=work_dir, view_path=view),
+    )
+    disk_href = disk["assets"]["data"]["href"]
+    assert disk_href == "../../scene-zarr/data.zarr/"
+    assert (view.parent / disk_href).resolve() == record.asset_paths["data"].resolve()
+
+
 def test_disk_links_are_relative_and_resolve_to_registered_assets(
     tmp_path: Path,
 ) -> None:

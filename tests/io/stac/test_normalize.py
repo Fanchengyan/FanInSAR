@@ -149,6 +149,61 @@ def test_committed_scene_normalizes_to_one_public_feature(tmp_path: Path) -> Non
     assert (product.path / "item.json").read_bytes() == canonical_item
 
 
+def test_committed_zarr_asset_gains_zarr_media_type(tmp_path: Path) -> None:
+    """A real committed Zarr directory asset is typed for STAC clients."""
+    import zarr
+
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    product = _commit_product(
+        work_dir,
+        "coreg/20200101",
+        kind="scene",
+        properties={
+            "faninsar:date": "20200101",
+            "faninsar:domain": "radar",
+            "faninsar:shape": [2, 3],
+            "faninsar:grid_identity": "radar-grid-identity",
+        },
+    )
+    canonical = json.loads((product.path / "item.json").read_text(encoding="utf-8"))
+
+    record = normalize_product(product, work_dir=work_dir)
+    asset = record.as_item()["assets"]["data"]
+
+    assert "type" not in canonical["assets"]["data"]
+    assert record.asset_paths["data"].is_dir()
+    assert asset["type"] == "application/vnd+zarr"
+    assert asset["href"] == "coreg/20200101/data.zarr"
+    array = zarr.open_array(store=str(record.asset_paths["data"]), mode="r")
+    assert array.shape == (2, 3)
+
+
+def test_non_zarr_directory_asset_is_not_typed_as_zarr(tmp_path: Path) -> None:
+    """A plain asset directory without Zarr metadata keeps no invented type."""
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    product = _direct_product(
+        work_dir,
+        "scene/plain",
+        kind="scene",
+        write_id=_write_id(7),
+        properties={
+            "faninsar:date": "20200101",
+            "faninsar:domain": "radar",
+            "faninsar:shape": [2, 3],
+            "faninsar:grid_identity": "radar-grid-identity",
+        },
+        assets={"data": {"href": "data"}},
+    )
+    (product.path / "data").mkdir()
+    (product.path / "data" / "note.txt").write_text("not zarr", encoding="utf-8")
+
+    asset = normalize_product(product, work_dir=work_dir).as_item()["assets"]["data"]
+
+    assert "type" not in asset
+
+
 def test_geo_product_publishes_true_geometry_and_projection_v2(
     tmp_path: Path,
 ) -> None:
@@ -273,6 +328,10 @@ def test_geocoded_inherits_source_family_time_and_pair_not_reference(
     }
     assert item["properties"]["faninsar:geocode"] == {"kernel": "nearest"}
     assert item["properties"]["faninsar:source_item_id"] == ("geocoded-coherence")
+    assert item["assets"]["values"]["type"] == "image/tiff"
+    assert item["assets"]["values"]["href"] == (
+        "ifg/20200101_20200103/geocoded/coherence/values.tif"
+    )
     assert record.bbox == pytest.approx((-5.0, 4.6, -4.4, 5.0))
     assert item["geometry"] is not None
 

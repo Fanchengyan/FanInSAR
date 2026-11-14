@@ -87,7 +87,8 @@ class LinkTargets:
                 raise KeyError(message) from error
             if not target.is_absolute():
                 target = root_dir / target
-            return _relative_href(target, parent)
+            href = _relative_href(target, parent)
+            return _directory_href(href, target)
 
         return cls(
             root=_relative_href(root_dir / "catalog.json", parent),
@@ -123,9 +124,10 @@ class LinkTargets:
             return f"{base}/catalogs/{quote(name, safe='')}.json"
 
         def asset(record: StacRecord, key: str) -> str:
+            suffix = "/" if _is_directory_asset(record, key) else ""
             return (
                 f"{base}/assets/{quote(record.public_id, safe='')}/"
-                f"{quote(key, safe='')}"
+                f"{quote(key, safe='')}{suffix}"
             )
 
         return cls(
@@ -275,6 +277,21 @@ def _link(
     if title is not None:
         link["title"] = title
     return link
+
+
+def _directory_href(href: str, target: Path) -> str:
+    """Return ``href`` with a trailing slash when it addresses a directory."""
+    if target.is_dir() and not href.endswith("/"):
+        return f"{href}/"
+    return href
+
+
+def _is_directory_asset(record: StacRecord, key: str) -> bool:
+    """Return whether one registered asset is a directory store."""
+    try:
+        return Path(record.asset_paths[key]).is_dir()
+    except OSError:
+        return False
 
 
 def _relative_href(target: Path, start: Path) -> str:

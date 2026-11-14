@@ -49,6 +49,8 @@ _GEOCODED = "geocoded"
 _GEO = "geo"
 _RADAR = "radar"
 _PAIR_ROLES = ("primary", "secondary")
+_ZARR_MEDIA_TYPE = "application/vnd+zarr"
+_ZARR_METADATA_NAMES = ("zarr.json", ".zgroup", ".zarray")
 
 _INVALID: NormalizationReason = "invalid-item"
 _UNSUPPORTED: NormalizationReason = "unsupported-kind"
@@ -633,7 +635,7 @@ def _source_item_href(source_relative_path: str) -> str:
 def _normalized_assets(
     assets: Mapping[str, Any], *, product_root: Path, work_root: Path
 ) -> dict[str, Path]:
-    """Validate canonical assets and register their absolute paths."""
+    """Validate canonical assets, type Zarr stores, and register absolute paths."""
     paths: dict[str, Path] = {}
     for name, asset in assets.items():
         if not isinstance(asset, Mapping):
@@ -647,6 +649,9 @@ def _normalized_assets(
         if path.is_symlink():
             message = f"asset {name!r} is a symbolic link: {path}"
             raise StacNormalizationError(_UNSAFE, message)
+        asset_type = _asset_media_type(asset, path)
+        if asset_type is not None:
+            asset["type"] = asset_type
         paths[str(name)] = path
     for name, path in paths.items():
         try:
@@ -656,6 +661,23 @@ def _normalized_assets(
             raise StacNormalizationError(_OUTSIDE, message) from error
         assets[name]["href"] = relative.as_posix()
     return paths
+
+
+def _asset_media_type(asset: Mapping[str, Any], path: Path) -> str | None:
+    """Preserve a declared media type or infer one for a Zarr store directory."""
+    declared = asset.get("type")
+    if isinstance(declared, str) and "/" in declared:
+        return declared
+    if _is_zarr_directory(path):
+        return _ZARR_MEDIA_TYPE
+    return None
+
+
+def _is_zarr_directory(path: Path) -> bool:
+    """Return whether ``path`` is a Zarr v2 or v3 store directory."""
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return any((path / name).is_file() for name in _ZARR_METADATA_NAMES)
 
 
 def _is_safe_basename(href: str) -> bool:

@@ -9,15 +9,34 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import socket
+import threading
+import time
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from faninsar.stack import _stac_service as stac_service
+
+
+@pytest.fixture(autouse=True)
+def _clean_service_registry() -> Any:
+    """Stop and forget services still registered at the end of each test."""
+    yield
+    registry = getattr(stac_service, "_SERVICE_REGISTRY", None)
+    if registry is None:
+        return
+    lock = stac_service._SERVICE_REGISTRY_LOCK
+    with lock:
+        registrations = list(registry.values())
+        registry.clear()
+    for registration in registrations:
+        with suppress(Exception):
+            registration.service.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -155,15 +174,94 @@ def _publish_scene(
     )
 
 
-def _publish_zarr(work_dir: Path, name: str, *, payload: bytes, chunk: bytes) -> Any:
-    """Commit one tiny directory asset that contains Zarr metadata and a chunk."""
+def _publish_zarr(
+    work_dir: Path,
+    name: str,
+    *,
+    values: Any = None,
+    overwrite: bool = False,
+) -> Any:
+    """Commit one tiny real Zarr v3 array asset with a known 2x2 value grid."""
+    import numpy as np
+    import zarr
+    from faninsar.io.storage.product import publish_product
+
+    grid = (
+        np.arange(4, dtype="i4").reshape(2, 2)
+        if values is None
+        else np.asarray(values, dtype="i4")
+    )
+
+    def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
+        array = zarr.open_array(
+            store=str(staging / "arr"),
+            mode="w",
+            shape=grid.shape,
+            dtype=grid.dtype,
+        )
+        array[:] = grid
+        return {"data": {"href": "arr", "type": "application/octet-stream"}}
+
+    return publish_product(
+        work_dir / "scenes" / name,
+        kind="scene",
+        properties={"faninsar:date": "2024-01-02", "faninsar:domain": "radar"},
+        write_payloads=write_payloads,
+        overwrite=overwrite,
+    )
+
+
+def _publish_zarr_v2(work_dir: Path, name: str) -> Any:
+    """Commit one tiny real Zarr v2 array asset with ``.zarray`` metadata."""
+    import zarr
+    from faninsar.io.storage.product import publish_product
+
+    def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
+        array = zarr.open_array(
+            store=str(staging / "arr"),
+            mode="w",
+            shape=(2, 2),
+            dtype="i4",
+            zarr_format=2,
+        )
+        array[:] = [[1, 2], [3, 4]]
+        return {"data": {"href": "arr", "type": "application/octet-stream"}}
+
+    return publish_product(
+        work_dir / "scenes" / name,
+        kind="scene",
+        properties={"faninsar:date": "2024-01-02", "faninsar:domain": "radar"},
+        write_payloads=write_payloads,
+    )
+
+
+def _publish_zarr_attrs_only(work_dir: Path, name: str) -> Any:
+    """Commit one directory asset with only ``.zattrs`` child metadata."""
     from faninsar.io.storage.product import publish_product
 
     def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
         root = staging / "arr"
-        (root / "c" / "0").mkdir(parents=True)
-        (root / "zarr.json").write_bytes(payload)
-        (root / "c" / "0" / "0").write_bytes(chunk)
+        root.mkdir(parents=True)
+        (root / ".zattrs").write_bytes(b'{"unit": "metre"}\n')
+        (root / "0.0").write_bytes(b"\x00\x01\x02\x03")
+        return {"data": {"href": "arr", "type": "application/octet-stream"}}
+
+    return publish_product(
+        work_dir / "scenes" / name,
+        kind="scene",
+        properties={"faninsar:date": "2024-01-02", "faninsar:domain": "radar"},
+        write_payloads=write_payloads,
+    )
+
+
+def _publish_plain_directory(work_dir: Path, name: str) -> Any:
+    """Commit one directory asset that contains no Zarr metadata."""
+    from faninsar.io.storage.product import publish_product
+
+    def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
+        root = staging / "arr"
+        root.mkdir(parents=True)
+        (root / "plain.txt").write_bytes(b"not-a-zarr-store")
         return {"data": {"href": "arr", "type": "application/octet-stream"}}
 
     return publish_product(
@@ -191,6 +289,28 @@ def _parts_of(base_url: str) -> tuple[str, int]:
     assert parsed.hostname is not None
     assert parsed.port is not None
     return parsed.hostname, parsed.port
+
+
+def _registration_keys() -> set[tuple[str, int]]:
+    """Return the currently published endpoint keys under the registry lock."""
+    with stac_service._SERVICE_REGISTRY_LOCK:
+        return set(stac_service._SERVICE_REGISTRY)
+
+
+def _free_port() -> int:
+    """Reserve and release one loopback port for a deterministic bind race."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+    finally:
+        probe.close()
+
+
+def _resolved_path(request_path: str, location: str) -> str:
+    """Resolve a relative redirect Location against the request URL path."""
+    joined = urllib.parse.urljoin(f"http://unit.test{request_path}", location)
+    return urllib.parse.urlsplit(joined).path
 
 
 def _request(
@@ -453,29 +573,168 @@ def test_asset_get_head_range_conditionals_and_traversal(tmp_path: Path) -> None
         assert status == 404
 
 
-def test_zarr_directory_asset_serves_metadata_and_one_chunk(tmp_path: Path) -> None:
+def test_zarr_directory_root_redirects_to_verified_metadata_and_serves_bytes(
+    tmp_path: Path,
+) -> None:
+    """Legacy and slash roots 307 to the real metadata, while children still serve."""
     work_dir = tmp_path / "stack"
-    metadata = b'{"zarr_format": 3}\n'
-    chunk = b"chunk-bytes"
-    _publish_zarr(work_dir, "a", payload=metadata, chunk=chunk)
+    product = _publish_zarr(work_dir, "a")
+    local_metadata = (product.path / "arr" / "zarr.json").read_bytes()
 
     with _running_service(work_dir) as service:
         (public_id,) = _search_ids(service.base_url)
+        legacy_root = f"/assets/{public_id}/data"
+        slash_root = f"{legacy_root}/"
+
+        locations: dict[str, str] = {}
+        for root in (legacy_root, slash_root):
+            status, headers, body = _request(service.base_url, root)
+            assert status == 307
+            assert body == b""
+            location = headers["location"]
+            assert "\r" not in location
+            assert "\n" not in location
+            assert _resolved_path(root, location) == f"{legacy_root}/zarr.json"
+            locations[root] = location
+
+        status, headers, body = _request(service.base_url, legacy_root, method="HEAD")
+        assert status == 307
+        assert body == b""
+        assert headers["location"] == locations[legacy_root]
+
         status, headers, body = _request(
-            service.base_url, f"/assets/{public_id}/data/zarr.json"
+            service.base_url,
+            f"{legacy_root}/zarr.json",
         )
         assert status == 200
-        assert body == metadata
+        assert body == local_metadata
         assert headers["content-type"] == "application/json"
 
         status, headers, body = _request(
-            service.base_url, f"/assets/{public_id}/data/c/0/0"
+            service.base_url,
+            f"{legacy_root}/c/0/0",
+            headers={"Range": "bytes=0-3"},
+        )
+        assert status == 206
+        assert len(body) == 4
+        assert headers["content-range"].startswith("bytes 0-3/")
+
+        import numpy as np
+        import zarr
+        from zarr.storage import FsspecStore
+
+        store = FsspecStore.from_url(f"{service.base_url}{slash_root}", read_only=True)
+        array = zarr.open_array(store=store, mode="r")
+        assert array.shape == (2, 2)
+        assert np.array_equal(array[:], np.arange(4, dtype="i4").reshape(2, 2))
+
+
+def test_zarr_v2_root_redirects_to_verified_zarray_metadata(tmp_path: Path) -> None:
+    """A v2 store root redirects to ``.zarray`` and keeps its chunk ranged."""
+    work_dir = tmp_path / "stack"
+    product = _publish_zarr_v2(work_dir, "a")
+    local_metadata = (product.path / "arr" / ".zarray").read_bytes()
+
+    with _running_service(work_dir) as service:
+        (public_id,) = _search_ids(service.base_url)
+        root = f"/assets/{public_id}/data"
+        status, headers, body = _request(service.base_url, root)
+        assert status == 307
+        assert body == b""
+        assert _resolved_path(root, headers["location"]) == f"{root}/.zarray"
+
+        status, headers, body = _request(service.base_url, f"{root}/.zarray")
+        assert status == 200
+        assert body == local_metadata
+        assert headers["content-type"] == "application/json"
+
+        status, headers, body = _request(
+            service.base_url,
+            f"{root}/0.0",
+            headers={"Range": "bytes=4-7"},
+        )
+        assert status == 206
+        assert len(body) == 4
+        assert headers["content-range"].startswith("bytes 4-7/")
+
+
+def test_zattrs_only_directory_root_is_404_but_child_is_served(
+    tmp_path: Path,
+) -> None:
+    """``.zattrs`` alone is child JSON, not a store root, and must not redirect."""
+    work_dir = tmp_path / "stack"
+    product = _publish_zarr_attrs_only(work_dir, "a")
+    local_attrs = (product.path / "arr" / ".zattrs").read_bytes()
+
+    with _running_service(work_dir) as service:
+        (public_id,) = _search_ids(service.base_url)
+        root = f"/assets/{public_id}/data"
+
+        for path in (root, f"{root}/"):
+            status, headers, body = _request(service.base_url, path)
+            assert status == 404
+            assert body
+            assert "location" not in headers
+
+        status, headers, body = _request(service.base_url, f"{root}/.zattrs")
+        assert status == 200
+        assert body == local_attrs
+        assert headers["content-type"] == "application/json"
+
+        status, _, body = _request(service.base_url, f"{root}/0.0")
+        assert status == 200
+        assert body == b"\x00\x01\x02\x03"
+
+
+def test_plain_directory_asset_root_stays_404_without_zarr_metadata(
+    tmp_path: Path,
+) -> None:
+    """An arbitrary directory root is never listed or redirected."""
+    work_dir = tmp_path / "stack"
+    _publish_plain_directory(work_dir, "a")
+
+    with _running_service(work_dir) as service:
+        (public_id,) = _search_ids(service.base_url)
+        root = f"/assets/{public_id}/data"
+        for path in (root, f"{root}/"):
+            status, _, body = _request(service.base_url, path)
+            assert status == 404
+            assert body
+
+        status, _, body = _request(service.base_url, f"{root}/plain.txt")
+        assert status == 200
+        assert body == b"not-a-zarr-store"
+
+
+def test_overwritten_zarr_root_redirect_is_404_before_refresh(tmp_path: Path) -> None:
+    """A stale root URL cannot redirect to replacement metadata before refresh."""
+    work_dir = tmp_path / "stack"
+    _publish_zarr(work_dir, "a")
+
+    with _running_service(work_dir) as service:
+        (old_id,) = _search_ids(service.base_url)
+        old_root = f"/assets/{old_id}/data"
+        status, _, _ = _request(service.base_url, old_root)
+        assert status == 307
+
+        _publish_zarr(work_dir, "a", values=[[9, 8], [7, 6]], overwrite=True)
+
+        for path in (old_root, f"{old_root}/", f"{old_root}/zarr.json"):
+            status, headers, _ = _request(service.base_url, path)
+            assert status == 404
+            assert "location" not in headers
+
+        service.refresh()
+        (new_id,) = _search_ids(service.base_url)
+        assert new_id != old_id
+        status, headers, _ = _request(service.base_url, f"/assets/{new_id}/data")
+        assert status == 307
+        status, _, body = _request(
+            service.base_url,
+            _resolved_path(f"/assets/{new_id}/data", headers["location"]),
         )
         assert status == 200
-        assert body == chunk
-
-        status, _, _ = _request(service.base_url, f"/assets/{public_id}/data")
-        assert status == 404
+        assert b'"shape"' in body
 
 
 def test_overwrite_before_refresh_old_asset_is_404_then_refresh_serves_new(
@@ -567,3 +826,326 @@ def test_persist_catalog_writes_only_after_bind_and_stop_is_idempotent(
         connection.close()
     report = service.report()
     assert report["persistence"]["persisted"] is True
+    assert report["service"]["lifecycle"] == "stopped"
+    assert report["service"]["persist_catalog"] is True
+
+
+# ---------------------------------------------------------------------------
+# Process-local endpoint reuse
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_start_same_workspace_and_actual_port_returns_same_handle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A nonzero-port request for a live endpoint returns the exact same handle."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    try:
+        first_output = capsys.readouterr().out
+        assert first.catalog_url in first_output
+
+        second = stac_service.start_stac_service(
+            work_dir / ".", port=first.port, persist_catalog=False
+        )
+
+        assert second is first
+        assert second.base_url == first.base_url
+        assert second.port == first.port
+        assert second.host == first.host
+        assert capsys.readouterr().out == ""
+        assert len(_search_ids(second.base_url)) == 1
+        report = second.report()
+        assert report["item_count"] == 1
+        assert "exclusions" in report
+        assert report["service"] == {
+            "work_dir": str(work_dir.resolve()),
+            "host": "127.0.0.1",
+            "port": first.port,
+            "persist_catalog": False,
+            "lifecycle": "running",
+        }
+    finally:
+        first.stop()
+
+
+def test_reuse_does_not_rebuild_index_or_load_serving_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse is a handle return, not an implicit refresh or reindex."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+
+    def fail() -> Any:
+        message = "reuse must not rebuild the index or serving runtime"
+        raise AssertionError(message)
+
+    try:
+        monkeypatch.setattr(stac_service, "_load_web", fail)
+        monkeypatch.setattr(stac_service, "_load_io", fail)
+        second = stac_service.start_stac_service(work_dir, port=first.port)
+        assert second is first
+    finally:
+        first.stop()
+
+
+def test_reuse_preserves_the_original_persist_mode_without_hidden_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A different persist flag reuses the running mode and says so explicitly."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=True)
+    try:
+        assert (work_dir / "catalog.json").is_file()
+        capsys.readouterr()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=stac_service.logger.name):
+            second = stac_service.start_stac_service(
+                work_dir, port=first.port, persist_catalog=False
+            )
+        assert second is first
+        assert second.report()["persistence"]["requested"] is True
+        assert first._persist_catalog is True
+        assert capsys.readouterr().out == ""
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("persist_catalog" in message for message in messages)
+        assert any("True" in message for message in messages)
+    finally:
+        first.stop()
+
+
+def test_port_zero_always_starts_new_listener_and_actual_port_can_be_reacquired(
+    tmp_path: Path,
+) -> None:
+    """Ephemeral requests never reuse, while the assigned port is addressable."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    second = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    try:
+        assert first is not second
+        assert first.port != second.port
+        assert stac_service.start_stac_service(work_dir, port=first.port) is first
+        assert stac_service.start_stac_service(work_dir, port=second.port) is second
+    finally:
+        first.stop()
+        second.stop()
+
+
+def test_different_workspace_on_a_busy_endpoint_raises_and_preserves_active(
+    tmp_path: Path,
+) -> None:
+    """A busy registered endpoint never gets attached to a different workspace."""
+    active_dir = tmp_path / "active"
+    other_dir = tmp_path / "other"
+    _publish_scene(active_dir, "a", b"payload")
+    _publish_scene(other_dir, "b", b"payload")
+    active = stac_service.start_stac_service(active_dir, port=0, persist_catalog=False)
+    try:
+        with pytest.raises(OSError, match="another workspace") as excinfo:
+            stac_service.start_stac_service(
+                other_dir, port=active.port, persist_catalog=False
+            )
+        message = str(excinfo.value)
+        assert str(active_dir.resolve()) in message
+        assert "another" in message.lower()
+        assert _registration_keys() == {
+            stac_service._service_key(active.host, active.port)
+        }
+        status, _, _ = _request(active.base_url, "/")
+        assert status == 200
+        assert stac_service.start_stac_service(active_dir, port=active.port) is active
+    finally:
+        active.stop()
+
+
+def test_concurrent_starts_on_one_port_publish_exactly_one_handle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two racing callers serialize on the registry and share one service."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    port = _free_port()
+    barrier = threading.Barrier(2)
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        barrier.wait()
+        try:
+            results.append(
+                stac_service.start_stac_service(
+                    work_dir, port=port, persist_catalog=False
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] is results[1]
+    service = results[0]
+    try:
+        assert service.port == port
+        assert _registration_keys() == {stac_service._service_key("127.0.0.1", port)}
+        assert capsys.readouterr().out.count("FanInSAR STAC Catalog:") == 1
+    finally:
+        service.stop()
+
+
+def test_stop_removes_only_its_registration_and_restart_returns_new_handle(
+    tmp_path: Path,
+) -> None:
+    """Stopping is idempotent, clears the entry, and frees the endpoint."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    port = first.port
+    key = stac_service._service_key(first.host, port)
+    first.stop()
+    first.stop()
+    assert key not in _registration_keys()
+
+    second = stac_service.start_stac_service(work_dir, port=port, persist_catalog=False)
+    try:
+        assert second is not first
+        assert second.port == port
+        assert key in _registration_keys()
+    finally:
+        second.stop()
+
+
+def test_dead_service_is_purged_and_failed_start_publishes_no_entry(
+    tmp_path: Path,
+) -> None:
+    """A dead runtime is never returned and a bind failure leaves no registration."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    port = first.port
+    key = stac_service._service_key(first.host, port)
+
+    # Simulate an unexpectedly stopped runtime whose strong registration remains.
+    first._runtime.stop()
+    assert key in _registration_keys()
+
+    replacement = stac_service.start_stac_service(
+        work_dir, port=port, persist_catalog=False
+    )
+    try:
+        assert replacement is not first
+        assert replacement.port == port
+        assert key in _registration_keys()
+    finally:
+        replacement.stop()
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    blocked_port = int(listener.getsockname()[1])
+    try:
+        with pytest.raises(OSError, match="in use"):
+            stac_service.start_stac_service(
+                work_dir, port=blocked_port, persist_catalog=False
+            )
+    finally:
+        listener.close()
+
+    assert all(
+        existing_port != blocked_port for _, existing_port in _registration_keys()
+    )
+
+
+def test_start_build_does_not_hold_the_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second endpoint can start while a peer is still building its index."""
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _publish_scene(first_dir, "a", b"payload-a")
+    _publish_scene(second_dir, "b", b"payload-b")
+    original_load_io = stac_service._load_io
+    entered_build = threading.Event()
+    release_build = threading.Event()
+    calls = {"count": 0}
+
+    def slow_load_io() -> Any:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            entered_build.set()
+            if not release_build.wait(15):
+                message = "slow build gate timed out"
+                raise RuntimeError(message)
+        return original_load_io()
+
+    monkeypatch.setattr(stac_service, "_load_io", slow_load_io)
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def start_first() -> None:
+        try:
+            results.append(
+                stac_service.start_stac_service(
+                    first_dir, port=0, persist_catalog=False
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=start_first)
+    thread.start()
+    second: Any = None
+    try:
+        assert entered_build.wait(10)
+        second = stac_service.start_stac_service(
+            second_dir, port=0, persist_catalog=False
+        )
+        assert second._runtime.is_alive()
+    finally:
+        release_build.set()
+        thread.join(30)
+        if second is not None:
+            second.stop()
+        for service in results:
+            service.stop()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert not results[0]._runtime.is_alive()
+
+
+def test_start_after_stop_begins_waits_and_returns_a_new_live_handle(
+    tmp_path: Path,
+) -> None:
+    """A stop in progress is waited out, never returned as a live handle."""
+    work_dir = tmp_path / "stack"
+    _publish_scene(work_dir, "a", b"payload")
+    first = stac_service.start_stac_service(work_dir, port=0, persist_catalog=False)
+    port = first.port
+    stop_thread = threading.Thread(target=first.stop)
+    stop_thread.start()
+    deadline = time.monotonic() + 10
+    while not first._stopping.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert first._stopping.is_set()
+
+    second = stac_service.start_stac_service(work_dir, port=port, persist_catalog=False)
+    stop_thread.join(15)
+    try:
+        assert not stop_thread.is_alive()
+        assert second is not first
+        assert second.port == port
+        assert second._runtime.is_alive()
+        assert not second._stopping.is_set()
+    finally:
+        second.stop()
