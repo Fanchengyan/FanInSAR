@@ -143,7 +143,7 @@ Build docs with `cd docs && make html`; the generated index is
 Never write temporary or scratch files to the system `/tmp` or the filesystem
 root. Put them under the working directory instead: create a dedicated
 `tmp/` directory there for temporary files when needed and keep all of them
-inside it.
+inside it. Do not leave temporary files behind after the work is complete.
 
 ## Sentinel-1 scratch workspace
 
