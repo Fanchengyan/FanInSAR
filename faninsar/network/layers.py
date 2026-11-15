@@ -655,20 +655,15 @@ class ProductLayer:
         domain are unchanged. Use :meth:`geocode` when a different frame is
         wanted.
 
-        Values come from :attr:`read`, so the exported file holds exactly what
-        this handle yields; the view selection still enters the export identity,
-        so two selections of one source never reuse each other's file.
-
         Parameters
         ----------
         path : str or pathlib.Path, optional
             Destination. A ``.tif``/``.tiff`` path names the file; anything
-            else is treated as a directory. ``None`` writes to
-            ``<product>/cog/<generated name>``.
+            else is a directory. ``None`` writes to ``<product>/cog/``.
         mask : bool, optional
-            Embed validity as the file's internal mask. The plane comes from
-            the persisted support, not from the sample values, so a supported
-            ``0`` stays valid and an unsupported finite sample stays masked.
+            Embed the committed support plane as the file's internal mask, so
+            a supported ``0``/``0j`` sample stays valid and an unsupported
+            finite sample stays masked. ``False`` writes no mask.
         overwrite : bool, optional
             Replace an existing destination written by a different export
             request.
@@ -683,18 +678,45 @@ class ProductLayer:
         InvalidProcessingStateError
             If the owning product was replaced.
         RuntimeError
-            If the export failed; the reason names the destination.
-
-        Examples
-        --------
-        >>> ifg = stack.interferograms["20240101_20240113"]
-        >>> path = ifg.unwrapped_phase.to_cog()  # doctest: +SKIP
+            If the export failed; the message carries the reason.
 
         """
-        from faninsar.io.cog import CogExportItem, export_cog, request_from_product
+        item = self.export_cog(path=path, mask=mask, overwrite=overwrite)
+        if item.status == "failed" or item.path is None:
+            message = f"COG export of layer {self.name!r} failed: {item.reason}"
+            raise RuntimeError(message)
+        return item.path
+
+    def export_cog(
+        self,
+        path: str | Path | None = None,
+        *,
+        mask: bool = True,
+        overwrite: bool = False,
+    ) -> Any:
+        """Export this layer and return the full receipt.
+
+        Unlike :meth:`to_cog` this reports whether the file was written or
+        reused, which a batch needs in order to describe what it did.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path, optional
+            Destination, as in :meth:`to_cog`.
+        mask : bool, optional
+            Embed the committed support plane.
+        overwrite : bool, optional
+            Replace a destination written by a different export request.
+
+        Returns
+        -------
+        faninsar.io.cog.CogExportItem
+            Outcome, path, and identity of this one export.
+
+        """
+        from faninsar.io.cog import export_cog, request_from_product
 
         self.validate_source()
-        product = self._product
         contributing: list[tuple[str, str]] = [
             (f"upstream_{index}", upstream.write_id)
             for index, upstream in enumerate(self._upstream)
@@ -710,7 +732,7 @@ class ProductLayer:
         selection.append(("name", self.name))
 
         request = request_from_product(
-            product=product,
+            product=self._product,
             asset_key=self.name,
             composition="merge-on-read" if self._merge_on_read else "identity",
             selection=selection,
@@ -720,43 +742,45 @@ class ProductLayer:
         )
 
         values = self.read()
-        grid = None
-        if self.crs is not None:
-            # A geographic layer carries its frame on the product: proj:code,
-            # proj:transform, and the declared shape. Rebuilding the grid from
-            # those is exact, whereas opening one payload would only work for
-            # a layer that happens to have a stored raster.
-            from affine import Affine
-
-            from faninsar.data.datasets.geogrid import GeoGrid
-
-            properties = self._product.properties
-            raw_transform = properties.get("proj:transform")
-            raw_shape = properties.get("faninsar:shape")
-            if raw_transform is None or raw_shape is None:
-                message = (
-                    f"geo layer {self.name!r} cannot be exported: its product "
-                    "records no proj:transform or faninsar:shape"
-                )
-                raise RuntimeError(message)
-            grid = GeoGrid(
-                shape=(int(raw_shape[0]), int(raw_shape[1])),
-                transform=Affine(*[float(value) for value in raw_transform]),
-                crs=self.crs,
-            )
-
-        item: CogExportItem = export_cog(
+        support = self.valid_mask
+        grid = self._export_grid(values.shape) if self.crs is not None else None
+        return export_cog(
             request,
             values,
             path=path,
             grid=grid,
-            mask=mask,
+            mask=(support if mask and support is not None else mask),
             overwrite=overwrite,
         )
-        if item.status == "failed" or item.path is None:
-            message = f"COG export of layer {self.name!r} failed: {item.reason}"
+
+    def _export_grid(self, shape: tuple[int, int]) -> Any:
+        """Return the destination grid of this view, cropped to its own frame."""
+        from affine import Affine
+
+        from faninsar.data.datasets.geogrid import GeoGrid
+
+        properties = self._product.properties
+        raw_transform = properties.get("proj:transform")
+        raw_shape = properties.get("faninsar:shape")
+        if raw_transform is None or raw_shape is None:
+            message = (
+                f"geo layer {self.name!r} cannot be exported: its product "
+                "records no proj:transform or faninsar:shape"
+            )
             raise RuntimeError(message)
-        return item.path
+        height, width = int(raw_shape[0]), int(raw_shape[1])
+        if (height, width) == shape and self.origin == (0, 0):
+            return GeoGrid(
+                shape=shape,
+                transform=Affine(*[float(value) for value in raw_transform]),
+                crs=self.crs,
+            )
+        # A cropped view starts at its own origin on the product canvas, so the
+        # affine shifts by the pixel offset rather than describing the canvas.
+        base = Affine(*[float(value) for value in raw_transform])
+        row0, col0 = self.origin
+        shifted = base * Affine.translation(col0, row0)
+        return GeoGrid(shape=shape, transform=shifted, crs=self.crs)
 
     def validate_source(self) -> None:
         """Reject a handle whose owning, layout, or upstream product was replaced."""

@@ -87,11 +87,13 @@ def test_identity_changes_with_every_output_affecting_input() -> None:
     assert export_identity(base, mask=True, writer=writer) == baseline
 
 
-def test_requested_block_size_is_not_effective_block_size() -> None:
-    """A clamped block size must not split the identity of identical files."""
+def test_block_size_participates_in_the_identity() -> None:
+    """A different tile size is a different file layout, so it is a different export."""
     small = resolved_writer_profile(dtype="float32", blocksize=256)
     large = resolved_writer_profile(dtype="float32", blocksize=1024)
-    assert small == large
+    assert small != large
+    assert small["blocksize"] == 256
+    assert large["blocksize"] == 1024
 
 
 def test_export_writes_valid_cog_and_reuses_on_identical_request(
@@ -309,3 +311,30 @@ def test_stable_import_surface() -> None:
     assert raster_io.validate_cog is validate_cog
     assert raster_io.read_geogrid is read_geogrid
     assert RasterGridSpec is not None
+
+
+def test_export_defaults_to_the_product_cog_directory(tmp_path: Path) -> None:
+    """Calling with no destination writes under the product, not the cwd."""
+    request = _request(default_root=str(tmp_path / "cog"))
+    item = export_cog(request, np.ones((8, 8), dtype="float32"))
+    assert item.status == "written"
+    assert item.path is not None
+    assert item.path.parent == tmp_path / "cog"
+    assert item.path.name == "unwrapped_phase_ml4x2_20240101-20240113_radar.cog.tif"
+
+
+def test_identity_covers_nodata_and_georeferencing(tmp_path: Path) -> None:
+    """Two files that differ only in nodata or CRS are not interchangeable."""
+    request = _request()
+    values = np.ones((8, 8), dtype="float32")
+    assert export_cog(request, values, path=tmp_path).status == "written"
+    # Different nodata is a different file.
+    assert export_cog(request, values, path=tmp_path, nodata=0).status == "failed"
+
+
+def test_write_cog_rejects_an_empty_volume(tmp_path: Path) -> None:
+    """A zero-band or empty raster is a caller error, not a rasterio crash."""
+    with pytest.raises(ValueError, match="at least one band"):
+        write_cog(np.empty((0, 8, 8), dtype="float32"), tmp_path / "z.cog.tif", None)
+    with pytest.raises(ValueError, match="non-empty raster"):
+        write_cog(np.empty((3, 0, 8), dtype="float32"), tmp_path / "z.cog.tif", None)

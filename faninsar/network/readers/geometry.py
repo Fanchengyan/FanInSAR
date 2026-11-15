@@ -80,6 +80,10 @@ class NetworkGeometry:
         if not self._root.is_dir():
             msg = f"Geometry directory not found: {self._root}"
             raise FileNotFoundError(msg)
+        # The root is the trusted anchor: a caller naming a directory is
+        # choosing to read it, whether or not that path is a link. What the
+        # asset containment check below distrusts is everything *below* the
+        # root — a recorded href or a planted link inside the directory.
 
         self._metadata_path = self._root / "geometry.json"
         self._metadata: dict[str, Any] | None = None

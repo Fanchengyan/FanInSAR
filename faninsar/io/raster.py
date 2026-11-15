@@ -284,6 +284,7 @@ def _resolved_profile(path: Path) -> dict[str, Any]:
             else profile["nodata"]
         ),
         "block_shapes": [list(shape) for shape in block_shapes],
+        "blocksize": int(block_shapes[0][0]) if block_shapes else 0,
         "overviews": list(overviews),
         "overview_resampling": structure.get("OVERVIEW_RESAMPLING"),
     }
@@ -381,6 +382,16 @@ def write_cog(
 
     height, width = values.shape[-2], values.shape[-1]
     band_count = 1 if values.ndim == 2 else values.shape[0]
+    if band_count < 1:
+        reject(
+            f"write_cog requires at least one band; got shape {values.shape}",
+            ValueError,
+        )
+    if height < 1 or width < 1:
+        reject(
+            f"write_cog requires a non-empty raster; got shape {values.shape}",
+            ValueError,
+        )
     if band_descriptions is not None and len(band_descriptions) != band_count:
         reject(
             f"band_descriptions has {len(band_descriptions)} entries for "

@@ -1525,3 +1525,81 @@ def test_collection_to_cog_requires_an_asset_name(stack: Stack) -> None:
     _write_ifg(stack)
     with pytest.raises(ValueError, match="at least one asset name"):
         stack.interferograms.to_cog(())
+
+
+def test_layer_to_cog_embeds_persisted_support_not_finiteness(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A supported zero stays valid and an unsupported finite sample stays masked."""
+    import rasterio
+
+    _write_ifg(stack)
+
+    # Rewrite the Reference scene so one pixel is unsupported while still
+    # holding a finite sample, and another is supported with a zero sample.
+    support = np.ones(RADAR_SHAPE, dtype=bool)
+    support[0, 0] = False
+    support[1, 1] = True
+    payload = np.ones(RADAR_SHAPE, dtype=np.complex64)
+    payload[1, 1] = 0.0
+    write_scene(
+        stack.config.work_dir / "coreg" / "20240101",
+        date_id="20240101",
+        reference_id=stack.reference,
+        domain="radar",
+        grid_shape=RADAR_SHAPE,
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": payload,
+                "row_origin": 0,
+                "col_origin": 0,
+                "valid_mask": support,
+            }
+        ],
+        properties={
+            "faninsar:radar_geometry": radar_geometry_record(*_toy_grid_and_orbit())
+        },
+        overwrite=True,
+    )
+
+    written = stack.scenes["20240101"].layers.slc.to_cog(path=tmp_path / "support")
+    with rasterio.open(written) as dataset:
+        exported = dataset.read_masks(1).astype(bool)
+    # The persisted plane wins over any finiteness inference.
+    assert not exported[0, 0]
+    assert exported[1, 1]
+
+
+def test_collection_to_cog_reports_reuse_on_a_second_run(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A repeated collection export reports reuse instead of claiming a write."""
+    _write_ifg(stack)
+    out = tmp_path / "batch"
+
+    first = stack.interferograms.to_cog(("wrapped_phase",), path=out)
+    assert first.items[0].status == "written"
+
+    second = stack.interferograms.to_cog(("wrapped_phase",), path=out)
+    assert second.items[0].status == "reused"
+    assert second.reused == ("20240101_20240113/wrapped_phase",)
+    assert second.items[0].path == first.items[0].path
+
+
+def test_collection_to_cog_survives_an_unreadable_pair(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """One unreadable source product costs only its own targets."""
+    import shutil
+
+    store = _write_ifg(stack)
+    # Destroy the one planned pair's envelope so opening it raises, while the
+    # product directory still exists.
+    (store.root / "item.json").unlink()
+
+    report = stack.interferograms.to_cog(("wrapped_phase",), path=tmp_path / "batch")
+    assert report.outcome == "failed"
+    assert report.items[0].target == "20240101_20240113/wrapped_phase"
+    assert report.items[0].status == "failed"
+    assert "item.json" in report.items[0].reason

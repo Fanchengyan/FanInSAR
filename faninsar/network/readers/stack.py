@@ -1152,7 +1152,21 @@ class StackInterferogramCollection(InterferogramCollection):
         items: list[CogExportItem] = []
         root: Path | None = Path(path) if path is not None else None
         for pair in pair_names:
-            layers = self[pair]
+            # Opening one source product can fail on its own; that must not cost
+            # the batch its remaining pairs.
+            try:
+                layers = self[pair]
+            except Exception as error:
+                items.extend(
+                    CogExportItem(
+                        target=f"{pair}/{asset}",
+                        path=None,
+                        status="failed",
+                        reason=str(error),
+                    )
+                    for asset in requested_assets
+                )
+                continue
             for asset in requested_assets:
                 target_label = f"{pair}/{asset}"
                 try:
@@ -1169,7 +1183,7 @@ class StackInterferogramCollection(InterferogramCollection):
                     continue
                 destination = None if root is None else root / str(pair)
                 try:
-                    written = layer.to_cog(
+                    receipt = layer.export_cog(
                         path=destination, mask=mask, overwrite=overwrite
                     )
                 except Exception as error:
@@ -1182,11 +1196,15 @@ class StackInterferogramCollection(InterferogramCollection):
                         )
                     )
                 else:
+                    # Preserve the layer's own outcome: a target served from an
+                    # existing identical file is ``reused``, not ``written``.
                     items.append(
                         CogExportItem(
                             target=target_label,
-                            path=written,
-                            status="written",
+                            path=receipt.path,
+                            status=receipt.status,
+                            identity=receipt.identity,
+                            reason=receipt.reason,
                         )
                     )
         return CogExportReport(
@@ -1927,7 +1945,19 @@ class StackSceneCollection(dict):
         items: list[CogExportItem] = []
         root: Path | None = Path(path) if path is not None else None
         for date_id in dates:
-            layers = self[date_id].layers
+            try:
+                layers = self[date_id].layers
+            except Exception as error:
+                items.extend(
+                    CogExportItem(
+                        target=f"{date_id}/{asset}",
+                        path=None,
+                        status="failed",
+                        reason=str(error),
+                    )
+                    for asset in requested_assets
+                )
+                continue
             for asset in requested_assets:
                 target_label = f"{date_id}/{asset}"
                 try:
@@ -1944,7 +1974,7 @@ class StackSceneCollection(dict):
                     continue
                 destination = None if root is None else root / str(date_id)
                 try:
-                    written = layer.to_cog(
+                    receipt = layer.export_cog(
                         path=destination, mask=mask, overwrite=overwrite
                     )
                 except Exception as error:
@@ -1957,11 +1987,15 @@ class StackSceneCollection(dict):
                         )
                     )
                 else:
+                    # Preserve the layer's own outcome: a target served from an
+                    # existing identical file is ``reused``, not ``written``.
                     items.append(
                         CogExportItem(
                             target=target_label,
-                            path=written,
-                            status="written",
+                            path=receipt.path,
+                            status=receipt.status,
+                            identity=receipt.identity,
+                            reason=receipt.reason,
                         )
                     )
         return CogExportReport(

@@ -314,7 +314,10 @@ class InterferogramCollection:
                 if isinstance(record, dict):
                     href = record.get("href")
         if href is None:
-            return pair_dir / _PAIR_ASSET_FILENAMES[name]
+            # The static table still names data, so it gets the same containment
+            # check: a planted symlink at the conventional filename must not
+            # redirect a read outside the collection.
+            return self._contained(pair_dir / _PAIR_ASSET_FILENAMES[name], self._root)
         resolved_href = _require_basename(href, "asset href")
         return self._contained(pair_dir / resolved_href, self._root)
 

@@ -100,6 +100,7 @@ class ExportRequest:
     contributing_write_ids: tuple[tuple[str, str], ...] = ()
     composition: str = "identity"
     selection: tuple[tuple[str, str], ...] = ()
+    default_root: str = "cog"
 
     @property
     def stem(self) -> str:
@@ -247,6 +248,8 @@ def export_identity(
 def resolved_writer_profile(
     *,
     dtype: object,
+    nodata: float | None = None,
+    georeferenced: bool = False,
     compress: str = "DEFLATE",
     blocksize: int = 512,
     overview_resampling: str = "average",
@@ -268,6 +271,13 @@ def resolved_writer_profile(
     ----------
     dtype : str or numpy.dtype
         Written sample dtype.
+    nodata : float or None, optional
+        NoData value written into the file. It is part of the identity because
+        a file written with one value serves different bytes to a reader than
+        the same samples written with another.
+    georeferenced : bool, optional
+        Whether a grid was supplied. An unreferenced file and a georeferenced
+        one with identical samples are not interchangeable.
     compress : str, optional
         Requested compression.
     blocksize : int, optional
@@ -281,12 +291,13 @@ def resolved_writer_profile(
         Normalized profile used for the identity digest.
 
     """
-    del blocksize  # the COG driver clamps it; 512 is what it emits
     return {
         "driver": "COG",
         "dtype": str(np.dtype(dtype)),
         "compress": compress.casefold(),
-        "blocksize": 512,
+        "blocksize": int(blocksize),
+        "nodata": None if nodata is None else str(float(nodata)),
+        "georeferenced": bool(georeferenced),
         "overview_resampling": overview_resampling.casefold(),
     }
 
@@ -463,9 +474,15 @@ def export_cog(
         Outcome of this one export.
 
     """
-    target = request.filename if path is None else Path(path)
-    if target.suffix.lower() not in {".tif", ".tiff"}:
-        target = target / request.filename
+    if path is None:
+        # The documented default: ``<product>/cog/<generated name>``. A bare
+        # filename here would resolve against the process working directory,
+        # which is not the product tree.
+        target = Path(request.default_root) / request.filename
+    else:
+        target = Path(path)
+        if target.suffix.lower() not in {".tif", ".tiff"}:
+            target = target / request.filename
 
     root = target.parent
     try:
@@ -480,11 +497,12 @@ def export_cog(
 
     tags = _tags_for(request)
     mask_policy = "derived" if mask is True else "none" if mask is False else "explicit"
-    identity = export_identity(
-        request,
-        mask=mask_policy,
-        writer=resolved_writer_profile(dtype=np.asarray(values).dtype),
+    writer_profile = resolved_writer_profile(
+        dtype=np.asarray(values).dtype,
+        nodata=nodata,
+        georeferenced=grid is not None,
     )
+    identity = export_identity(request, mask=mask_policy, writer=writer_profile)
     tags["EXPORT_IDENTITY"] = identity
 
     if target.exists() and not overwrite:
@@ -556,10 +574,20 @@ _VIRTUAL_DERIVATIONS: dict[str, tuple[str, ...]] = {
 
 
 def _is_virtual_for(kind: str, asset_key: str, assets: Mapping[str, object]) -> bool:
-    """Return whether a layer is derived from a committed asset this product has."""
-    del kind
+    """Return whether a layer is derived from a committed asset this product has.
+
+    A scene derives ``slc``/``amplitude``/``intensity``/``phase`` from its unit
+    payloads, which are named after burst tags rather than after the layer, so
+    any committed unit asset makes those derivations reachable.
+    """
     sources = _VIRTUAL_DERIVATIONS.get(asset_key, ())
-    return any(source in assets for source in sources)
+    if any(source in assets for source in sources):
+        return True
+    if kind == "scene":
+        return asset_key in {"slc", "amplitude", "intensity", "phase"} and any(
+            not str(name).endswith(".valid") for name in assets
+        )
+    return False
 
 
 def request_from_product(
@@ -642,6 +670,9 @@ def request_from_product(
     if not write_id:
         reject("product records no write id", ValueError)
 
+    product_path = getattr(product, "path", None)
+    default_root = str(Path(product_path) / "cog") if product_path else "cog"
+
     return ExportRequest(
         label=label or export_label(asset_key, product_kind=kind),
         asset_key=asset_key,
@@ -654,4 +685,5 @@ def request_from_product(
         if origin == (0, 0)
         else f"{composition}@{origin[0]},{origin[1]}",
         selection=tuple(selection),
+        default_root=default_root,
     )
