@@ -9,6 +9,7 @@ import numpy as np
 import xarray as xr
 
 from faninsar.data.datasets.geogrid import GeoGrid
+from faninsar.io.storage._zarr_stac import require_basename
 from faninsar.logging import setup_logger
 
 from .metadata import (
@@ -397,11 +398,40 @@ class NetworkGeometry:
         )
 
     def path(self, name: GeometryAssetName) -> Path:
-        """Return the file path for a geometry asset."""
+        """Return the file path for a geometry asset.
+
+        ``geometry.json`` records each asset's ``href``, and that record wins
+        over the built-in table so a directory written under an older or newer
+        naming scheme keeps resolving. The recorded value is data: it is
+        validated as a basename and its resolved target must stay inside this
+        directory, because an absolute or parent-traversing href would
+        otherwise escape into an unrelated file.
+        """
         if name not in _ASSET_FILENAMES:
             msg = f"Unknown geometry asset: {name}"
             raise ValueError(msg)
-        return self._root / _ASSET_FILENAMES[name]
+        href: object = None
+        if self._metadata is not None:
+            assets = self._metadata.get("assets")
+            if isinstance(assets, dict):
+                record = assets.get(name)
+                if isinstance(record, dict):
+                    href = record.get("href")
+        if href is None:
+            target = self._root / _ASSET_FILENAMES[name]
+        else:
+            target = self._root / require_basename(
+                href, f"geometry asset {name!r} href"
+            )
+        if target.is_symlink():
+            msg = f"geometry asset is a symlink: {target}"
+            raise ValueError(msg)
+        resolved_root = self._root.resolve()
+        resolved = target.resolve()
+        if resolved != resolved_root and resolved_root not in resolved.parents:
+            msg = f"geometry asset escapes its directory: {target}"
+            raise ValueError(msg)
+        return target
 
     def exists(self, name: GeometryAssetName) -> bool:
         """Check if a geometry asset file exists."""

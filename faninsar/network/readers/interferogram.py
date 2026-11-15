@@ -11,6 +11,7 @@ import xarray as xr
 
 from faninsar.core import Pairs
 from faninsar.data.datasets.geogrid import GeoGrid
+from faninsar.io.storage._zarr_stac import require_basename as _require_basename
 from faninsar.logging import setup_logger
 
 from .metadata import (
@@ -263,18 +264,59 @@ class InterferogramCollection:
     def pair_dir(self, pair: str) -> Path:
         """Return the directory for a given pair."""
         name = _pair_name(pair)
-        d = self._root / name
+        # A collection root is a trusted anchor; every path below it is data.
+        # A pair name is a single directory component, never a path.
+        _require_basename(name, "pair")
+        d = self._contained(self._root / name, self._root)
         if not d.is_dir():
             msg = f"Pair '{name}' not found in the interferogram collection."
             raise LookupError(msg)
         return d
 
+    @staticmethod
+    def _contained(path: Path, root: Path) -> Path:
+        """Return ``path`` when it stays under ``root`` and is not a symlink.
+
+        Resolving is not enough on its own: a basename directory that is a
+        symlink leaves the collection while ``is_dir()`` still reports true,
+        and the files behind it would be read as if they belonged here. Both
+        checks are needed, and both happen before any open.
+        """
+        if path.is_symlink():
+            msg = f"collection path component is a symlink: {path}"
+            raise ValueError(msg)
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+        if resolved != resolved_root and resolved_root not in resolved.parents:
+            msg = f"collection path escapes its root: {path}"
+            raise ValueError(msg)
+        return path
+
     def path(self, pair: str, name: InterferogramAssetName) -> Path:
-        """Return the file path for a pair asset."""
+        """Return the file path for a pair asset.
+
+        A committed ``href`` wins over the built-in table, so a collection
+        written under an older or newer naming scheme keeps resolving. The
+        resolved value is validated as a basename before it is joined: the item
+        is data, and an absolute or parent-traversing href would otherwise
+        escape the collection root.
+        """
         if name not in _PAIR_ASSET_FILENAMES:
             msg = f"Unknown interferogram asset: {name}"
             raise ValueError(msg)
-        return self.pair_dir(pair) / _PAIR_ASSET_FILENAMES[name]
+        pair_dir = self.pair_dir(pair)
+        item_path = pair_dir / "item.json"
+        href: object = None
+        if item_path.is_file():
+            assets = load_json(item_path).get("assets")
+            if isinstance(assets, dict):
+                record = assets.get(name)
+                if isinstance(record, dict):
+                    href = record.get("href")
+        if href is None:
+            return pair_dir / _PAIR_ASSET_FILENAMES[name]
+        resolved_href = _require_basename(href, "asset href")
+        return self._contained(pair_dir / resolved_href, self._root)
 
     def exists(self, pair: str, name: InterferogramAssetName) -> bool:
         """Check if a pair asset file exists."""

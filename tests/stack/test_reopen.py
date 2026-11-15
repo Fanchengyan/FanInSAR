@@ -698,3 +698,44 @@ def test_raster_vertical_datum_change_changes_canonical_identity(
     assert first["faninsar:dem"]["vertical_datum"] == "ellipsoidal"
     assert second["faninsar:dem"]["vertical_datum"] == "egm96"
     assert ellipsoidal.identity != orthometric.identity
+
+
+def test_verify_reports_a_foreign_item_and_keeps_scanning(
+    tmp_path: Path,
+) -> None:
+    """An item.json that is not a FanInSAR product is a problem, not a crash."""
+    import json
+    import shutil
+
+    stack = _stack(tmp_path)
+    stack.prepare_data()
+    stack.coregister_scenes()
+    assert stack.verify() == []
+
+    # An export directory, a vendor layout, or a hand-edited file all look like
+    # this: a valid STAC item that is not a FanInSAR product envelope.
+    foreign = stack.config.work_dir / "exports" / "ts"
+    foreign.mkdir(parents=True)
+    (foreign / "item.json").write_text(
+        json.dumps(
+            {
+                "stac_version": "1.0.0",
+                "type": "Feature",
+                "id": "ts",
+                "properties": {"datetime": None},
+                "assets": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    problems = stack.verify()
+    assert len(problems) == 1
+    assert problems[0].startswith(f"{foreign}: invalid-item")
+
+    # A real damaged product is still reported in the same scan.
+    scene = stack.config.work_dir / "coreg" / "20240113"
+    shutil.rmtree(scene / "f0_IW1_b0.slc.zarr")
+    problems = stack.verify()
+    assert f"{scene}: f0_IW1_b0" in problems
+    assert any(line.startswith(f"{foreign}: invalid-item") for line in problems)

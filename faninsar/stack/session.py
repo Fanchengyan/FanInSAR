@@ -890,8 +890,19 @@ def _load_geocoded_product(
 
     with rasterio.open(product.asset_path("values")) as source:
         values = source.read(1)
-    with rasterio.open(product.asset_path("valid")) as source:
-        valid = source.read(1).astype(bool)
+        # A current product embeds validity as the file's internal mask; an
+        # older product declared it as a separate ``valid`` asset. Both layouts
+        # must read, because a workspace predating the merge is still valid
+        # input. Reading the mask is lossless: it reproduces the exact plane the
+        # writer encoded.
+        embedded = source.read_masks(1).astype(bool) if source.count else None
+    if "valid" in product.assets:
+        with rasterio.open(product.asset_path("valid")) as source:
+            valid = source.read(1).astype(bool)
+    elif embedded is not None:
+        valid = embedded
+    else:
+        valid = np.ones(values.shape, dtype=bool)
     return GeocodedRaster(values=values, valid=valid, grid=grid)
 
 
@@ -911,8 +922,8 @@ def _commit_geocoded_product(
     """
     from affine import Affine
 
+    from faninsar.io.raster import write_cog
     from faninsar.io.storage.product import publish_product
-    from faninsar.network.readers.raster_io import write_cog
     from faninsar.processing.geometry.grids import GeoGrid
 
     values = np.asarray(raster.values)
@@ -931,31 +942,24 @@ def _commit_geocoded_product(
     )
 
     def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
+        # One payload carries both the samples and the support plane: the mask
+        # is an internal GeoTIFF mask, so a reader sees a single self-contained
+        # file. A separate ``valid.tif`` would duplicate what the mask already
+        # says, at no saving (an embedded mask measured smaller than a plain
+        # raster because masked samples compress better).
         values_name = "values.tif"
-        valid_name = "valid.tif"
         write_cog(
             values,
             staging / values_name,
             geogrid,
             nodata=nodata,
             dtype=str(values.dtype),
-            overwrite=True,
-        )
-        write_cog(
-            raster.valid.astype(np.uint8),
-            staging / valid_name,
-            geogrid,
-            nodata=None,
-            dtype="uint8",
+            mask=np.asarray(raster.valid, dtype=bool),
             overwrite=True,
         )
         return {
             "values": {
                 "href": values_name,
-                "type": "image/tiff; application=geotiff; profile=cloud-optimized",
-            },
-            "valid": {
-                "href": valid_name,
                 "type": "image/tiff; application=geotiff; profile=cloud-optimized",
             },
         }
@@ -2047,6 +2051,7 @@ class Stack(NetworkContract, ABC):
 
         """
         from faninsar.io.storage.product import verify_product
+        from faninsar.processing.errors import InvalidProcessingStateError
 
         problems: list[str] = []
         for item_path in sorted(self.config.work_dir.rglob("item.json")):
@@ -2055,10 +2060,20 @@ class Stack(NetworkContract, ABC):
                 part.startswith(".") for part in relative.parts
             ):
                 continue
-            problems.extend(
-                f"{item_path.parent}: {asset}"
-                for asset in verify_product(item_path.parent)
-            )
+            # A directory below the work root can hold an ``item.json`` that is
+            # not a FanInSAR product: an export, a vendor layout, a hand-edited
+            # file. One such item must not stop the scan, so it is reported and
+            # the remaining products are still checked. Failures that are not
+            # product-envelope rejections (for example a malformed declared
+            # dtype) still propagate, so a broken product is never silently
+            # reported as clean.
+            try:
+                problems.extend(
+                    f"{item_path.parent}: {asset}"
+                    for asset in verify_product(item_path.parent)
+                )
+            except InvalidProcessingStateError as error:
+                problems.append(f"{item_path.parent}: invalid-item ({error})")
         return problems
 
     def stac_serve(
@@ -2329,9 +2344,9 @@ class Stack(NetworkContract, ABC):
             return None
         from affine import Affine
 
+        from faninsar.io.raster import write_cog
         from faninsar.network.readers.geometry import NetworkGeometry
         from faninsar.network.readers.metadata import build_geometry_metadata
-        from faninsar.network.readers.raster_io import write_cog
         from faninsar.processing.geometry.grids import GeoGrid
 
         geometry_dir = self.config.work_dir / "geometry"
@@ -2561,7 +2576,7 @@ class Stack(NetworkContract, ABC):
             class.
         path : str or pathlib.Path, optional
             Complete output product directory containing ``item.json``,
-            ``values.tif``, and ``valid.tif``. Relative paths are relative to
+            ``values.tif``. Relative paths are relative to
             the current working directory. Without a path, committed layers
             on the Stack grid save under ``<source>/geocoded/<asset>/``;
             other requests return in memory. A matching committed-layer

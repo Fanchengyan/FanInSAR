@@ -218,8 +218,12 @@ grid through the grid resolver rather than through `geocode`:
 coarser = stack.geocode(ifg.wrapped_phase, grid=stack.resolve_grid(resolution_m=60.0))
 ```
 
-`path` names a complete product directory containing `item.json`, `values.tif`,
-and `valid.tif`; relative paths resolve from the current working directory.
+`path` names a complete product directory containing `item.json` and
+`values.tif`; relative paths resolve from the current working directory. The
+validity plane is the GeoTIFF's internal mask rather than a companion
+`valid.tif`, so one file carries both the samples and their support. Geocoded
+products written by an earlier release still read: their separate `valid`
+asset is honoured when present.
 No input-array content digest is computed. An in-memory product never reuses
 an old output by pathname: an existing directory raises `FileExistsError`
 unless `overwrite=True` requests recomputation and replacement. `stack.verify()`

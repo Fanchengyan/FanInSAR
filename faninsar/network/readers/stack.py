@@ -1105,6 +1105,98 @@ class StackInterferogramCollection(InterferogramCollection):
         data.to_dataset(name=name).to_zarr(str(out), mode="w", consolidated=False)
         return out
 
+    def to_cog(
+        self,
+        assets: tuple[str, ...] | list[str],
+        *,
+        path: str | Path | None = None,
+        mask: bool = True,
+        overwrite: bool = False,
+    ) -> Any:
+        """Export selected assets of every Pair in this view as COGs.
+
+        One target failing does not stop the batch: the returned report records
+        it and the remaining Pairs are still exported.
+
+        Parameters
+        ----------
+        assets : tuple or list of str
+            Asset names to export, for example ``("unwrapped_phase",)``.
+        path : str or pathlib.Path, optional
+            Export root. ``None`` writes under each Pair product's own ``cog/``
+            directory.
+        mask : bool, optional
+            Embed validity as the internal mask.
+        overwrite : bool, optional
+            Replace a destination written by a different export request.
+
+        Returns
+        -------
+        faninsar.io.cog.CogExportReport
+            One item per pair and asset.
+
+        Examples
+        --------
+        >>> report = stack.interferograms.to_cog(("unwrapped_phase",))
+        >>> report.outcome  # doctest: +SKIP
+
+        """
+        from faninsar.io.cog import CogExportItem, CogExportReport
+
+        requested_assets = tuple(assets)
+        if not requested_assets:
+            message = "to_cog requires at least one asset name"
+            raise ValueError(message)
+
+        pair_names = self.pairs.to_names().tolist()
+        items: list[CogExportItem] = []
+        root: Path | None = Path(path) if path is not None else None
+        for pair in pair_names:
+            layers = self[pair]
+            for asset in requested_assets:
+                target_label = f"{pair}/{asset}"
+                try:
+                    layer = getattr(layers, asset)
+                except (AttributeError, FileNotFoundError) as error:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=None,
+                            status="failed",
+                            reason=str(error),
+                        )
+                    )
+                    continue
+                destination = None if root is None else root / str(pair)
+                try:
+                    written = layer.to_cog(
+                        path=destination, mask=mask, overwrite=overwrite
+                    )
+                except Exception as error:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=None,
+                            status="failed",
+                            reason=str(error),
+                        )
+                    )
+                else:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=written,
+                            status="written",
+                        )
+                    )
+        return CogExportReport(
+            requested=tuple(
+                f"{pair}/{asset}" for pair in pair_names for asset in requested_assets
+            ),
+            items=tuple(items),
+            root=root,
+        )
+
     def __str__(self) -> str:
         """Return a one-line summary of this view."""
         return (
@@ -1787,6 +1879,98 @@ class StackSceneCollection(dict):
         if not rows:
             return pd.DataFrame(columns=["date", "role", "units", "shape"])
         return pd.DataFrame(rows).set_index("date")
+
+    def to_cog(
+        self,
+        assets: tuple[str, ...] | list[str],
+        *,
+        path: str | Path | None = None,
+        mask: bool = True,
+        overwrite: bool = False,
+    ) -> Any:
+        """Export selected layers of every committed scene as COGs.
+
+        Each scene contributes one file per asset, taken from its merged read
+        view so the exported samples are what the layer yields.
+
+        Parameters
+        ----------
+        assets : tuple or list of str
+            Layer names to export, for example ``("slc", "amplitude")``.
+        path : str or pathlib.Path, optional
+            Export root. ``None`` writes under each scene product's own
+            ``cog/`` directory.
+        mask : bool, optional
+            Embed persisted support as the internal mask.
+        overwrite : bool, optional
+            Replace a destination written by a different export request.
+
+        Returns
+        -------
+        faninsar.io.cog.CogExportReport
+            One item per scene date and asset.
+
+        Examples
+        --------
+        >>> report = stack.scenes.to_cog(("amplitude",))
+        >>> report.outcome  # doctest: +SKIP
+
+        """
+        from faninsar.io.cog import CogExportItem, CogExportReport
+
+        requested_assets = tuple(assets)
+        if not requested_assets:
+            message = "to_cog requires at least one layer name"
+            raise ValueError(message)
+
+        dates = list(self.dates)
+        items: list[CogExportItem] = []
+        root: Path | None = Path(path) if path is not None else None
+        for date_id in dates:
+            layers = self[date_id].layers
+            for asset in requested_assets:
+                target_label = f"{date_id}/{asset}"
+                try:
+                    layer = getattr(layers, asset)
+                except (AttributeError, FileNotFoundError) as error:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=None,
+                            status="failed",
+                            reason=str(error),
+                        )
+                    )
+                    continue
+                destination = None if root is None else root / str(date_id)
+                try:
+                    written = layer.to_cog(
+                        path=destination, mask=mask, overwrite=overwrite
+                    )
+                except Exception as error:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=None,
+                            status="failed",
+                            reason=str(error),
+                        )
+                    )
+                else:
+                    items.append(
+                        CogExportItem(
+                            target=target_label,
+                            path=written,
+                            status="written",
+                        )
+                    )
+        return CogExportReport(
+            requested=tuple(
+                f"{date_id}/{asset}" for date_id in dates for asset in requested_assets
+            ),
+            items=tuple(items),
+            root=root,
+        )
 
     def __str__(self) -> str:
         """Return a one-line summary of this view."""

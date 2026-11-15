@@ -497,7 +497,9 @@ def test_geocode_complex_product_roundtrip_and_reuse(
     assert raster.grid.crs == UTM
     target = store.root / "geocoded" / "complex"
     assert (target / "values.tif").is_file()
-    assert (target / "valid.tif").is_file()
+    # Validity is the payload's internal mask, not a companion asset: one file
+    # carries both the samples and their support.
+    assert not (target / "valid.tif").exists()
     assert (target / "item.json").is_file()
     assert (stack.config.work_dir / "cache" / "geo-lut").is_dir()
 
@@ -549,7 +551,7 @@ def test_memory_geocode_path_requires_explicit_replacement(stack: Stack) -> None
     np.testing.assert_allclose(first.values[first.valid], 1.5, atol=1e-6)
     np.testing.assert_allclose(replacement.values[replacement.valid], 9.0, atol=1e-6)
     assert (target / "values.tif").is_file()
-    assert (target / "valid.tif").is_file()
+    assert not (target / "valid.tif").exists()
     assert open_product(target).inputs == {}
 
 
@@ -1413,3 +1415,113 @@ def test_bound_layer_geocode_honours_grid_and_overwrite(stack: Stack) -> None:
     raster = ifg.coherence.geocode(alternate)
     assert raster.grid == alternate
     assert not (store.root / "geocoded" / "coherence" / "item.json").exists()
+
+
+def test_geocoded_product_embeds_validity_as_internal_mask(stack: Stack) -> None:
+    """A geocoded product carries support in one file and reads it back exactly."""
+    import rasterio
+
+    store = _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
+    raster = stack.geocode(layer)
+
+    target = store.root / "geocoded" / "wrapped_phase"
+    assert not (target / "valid.tif").exists()
+    with rasterio.open(target / "values.tif") as source:
+        embedded = source.read_masks(1).astype(bool)
+    # The mask the writer embedded is the validity plane the caller received,
+    # so a reader that only opens values.tif still learns the same support.
+    np.testing.assert_array_equal(embedded, np.asarray(raster.valid))
+    assert (target / "values.tif.msk") not in target.iterdir()
+
+
+def test_geocoded_product_still_reads_the_legacy_two_file_layout(stack: Stack) -> None:
+    """A product written before the merge keeps reading through its valid asset."""
+    import json
+
+    import rasterio
+
+    from faninsar.io.raster import write_cog
+    from faninsar.processing.geocoding.geocoder import GeocodedRaster
+
+    store = _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
+    raster = stack.geocode(layer)
+    target = store.root / "geocoded" / "wrapped_phase"
+
+    # Rewrite the child in the older layout: values without a mask plus a
+    # separate boolean plane.
+    values = np.asarray(raster.values)
+    valid = np.asarray(raster.valid)
+    from affine import Affine
+
+    from faninsar.data.datasets.geogrid import GeoGrid
+
+    grid = GeoGrid(
+        shape=raster.grid.shape,
+        transform=Affine(*raster.grid.transform),
+        crs=raster.grid.crs,
+    )
+    write_cog(values, target / "values.tif", grid, mask=None, overwrite=True)
+    write_cog(valid.astype(np.uint8), target / "valid.tif", grid, mask=None, overwrite=True)
+    item_path = target / "item.json"
+    item = json.loads(item_path.read_text(encoding="utf-8"))
+    item["assets"]["valid"] = {
+        "href": "valid.tif",
+        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+    }
+    item_path.write_text(json.dumps(item), encoding="utf-8")
+
+    reused = stack.geocode(layer)
+    assert isinstance(reused, GeocodedRaster)
+    np.testing.assert_array_equal(np.asarray(reused.valid), valid)
+
+
+def test_layer_to_cog_exports_the_read_view_as_a_cog(stack: Stack, tmp_path: Path) -> None:
+    """A committed layer exports to one COG holding the values it reads."""
+    import rasterio
+
+    _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped_phase
+
+    out = tmp_path / "export"
+    written = layer.to_cog(path=out)
+
+    assert written.parent == out
+    assert written.name.endswith(".cog.tif")
+    # A radar-domain product writes an unreferenced COG, which is valid COG.
+    with rasterio.open(written) as dataset:
+        assert dataset.crs is None
+        exported = dataset.read(1)
+    np.testing.assert_allclose(exported, np.asarray(layer.read()), atol=1e-6)
+
+    # A repeated identical request is served from the same file.
+    again = layer.to_cog(path=out)
+    assert again == written
+
+    # Changing the mask policy is a different request, not a silent overwrite.
+    with pytest.raises(RuntimeError, match="different export request"):
+        layer.to_cog(path=out, mask=False)
+
+
+def test_collection_to_cog_reports_every_pair(stack: Stack, tmp_path: Path) -> None:
+    """A collection export writes one file per pair and reports the batch."""
+    store = _write_ifg(stack)
+    assert store.root.parent.name == "ml_1x1"
+
+    report = stack.interferograms.to_cog(("wrapped_phase",), path=tmp_path / "batch")
+
+    assert report.requested == ("20240101_20240113/wrapped_phase",)
+    assert report.outcome == "complete"
+    assert report.complete
+    written = report.items[0].path
+    assert written is not None and written.is_file()
+    # A 1x1 product names no look marker; the domain stays the last token.
+    assert written.name == "wrapped_phase_20240101-20240113_radar.cog.tif"
+
+
+def test_collection_to_cog_requires_an_asset_name(stack: Stack) -> None:
+    """An empty request is a caller error, not an empty success."""
+    _write_ifg(stack)
+    with pytest.raises(ValueError, match="at least one asset name"):
+        stack.interferograms.to_cog(())

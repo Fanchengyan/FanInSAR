@@ -642,6 +642,122 @@ class ProductLayer:
             )
         return session.geocode(self, grid=grid, path=path, overwrite=overwrite)
 
+    def to_cog(
+        self,
+        path: str | Path | None = None,
+        *,
+        mask: bool = True,
+        overwrite: bool = False,
+    ) -> Path:
+        """Export this layer as one Cloud Optimized GeoTIFF.
+
+        Format conversion only: the samples, the grid, and the coordinate
+        domain are unchanged. Use :meth:`geocode` when a different frame is
+        wanted.
+
+        Values come from :attr:`read`, so the exported file holds exactly what
+        this handle yields; the view selection still enters the export identity,
+        so two selections of one source never reuse each other's file.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path, optional
+            Destination. A ``.tif``/``.tiff`` path names the file; anything
+            else is treated as a directory. ``None`` writes to
+            ``<product>/cog/<generated name>``.
+        mask : bool, optional
+            Embed validity as the file's internal mask. The plane comes from
+            the persisted support, not from the sample values, so a supported
+            ``0`` stays valid and an unsupported finite sample stays masked.
+        overwrite : bool, optional
+            Replace an existing destination written by a different export
+            request.
+
+        Returns
+        -------
+        pathlib.Path
+            The written or reused file.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the owning product was replaced.
+        RuntimeError
+            If the export failed; the reason names the destination.
+
+        Examples
+        --------
+        >>> ifg = stack.interferograms["20240101_20240113"]
+        >>> path = ifg.unwrapped_phase.to_cog()  # doctest: +SKIP
+
+        """
+        from faninsar.io.cog import CogExportItem, export_cog, request_from_product
+
+        self.validate_source()
+        product = self._product
+        contributing: list[tuple[str, str]] = [
+            (f"upstream_{index}", upstream.write_id)
+            for index, upstream in enumerate(self._upstream)
+        ]
+        if self._layout_product is not None:
+            contributing.append(("layout", self._layout_product.write_id))
+        for index, burst in enumerate(self._burst_products):
+            contributing.append((f"burst_{index}", burst.write_id))
+        selection: list[tuple[str, str]] = []
+        if self._scene_selection is not None:
+            selection.extend(("unit", unit) for unit in sorted(self._scene_selection))
+        selection.append(("merge_on_read", "true" if self._merge_on_read else "false"))
+        selection.append(("name", self.name))
+
+        request = request_from_product(
+            product=product,
+            asset_key=self.name,
+            composition="merge-on-read" if self._merge_on_read else "identity",
+            selection=selection,
+            contributing=contributing,
+            origin=self.origin,
+            looks=(self.multilook.range, self.multilook.azimuth),
+        )
+
+        values = self.read()
+        grid = None
+        if self.crs is not None:
+            # A geographic layer carries its frame on the product: proj:code,
+            # proj:transform, and the declared shape. Rebuilding the grid from
+            # those is exact, whereas opening one payload would only work for
+            # a layer that happens to have a stored raster.
+            from affine import Affine
+
+            from faninsar.data.datasets.geogrid import GeoGrid
+
+            properties = self._product.properties
+            raw_transform = properties.get("proj:transform")
+            raw_shape = properties.get("faninsar:shape")
+            if raw_transform is None or raw_shape is None:
+                message = (
+                    f"geo layer {self.name!r} cannot be exported: its product "
+                    "records no proj:transform or faninsar:shape"
+                )
+                raise RuntimeError(message)
+            grid = GeoGrid(
+                shape=(int(raw_shape[0]), int(raw_shape[1])),
+                transform=Affine(*[float(value) for value in raw_transform]),
+                crs=self.crs,
+            )
+
+        item: CogExportItem = export_cog(
+            request,
+            values,
+            path=path,
+            grid=grid,
+            mask=mask,
+            overwrite=overwrite,
+        )
+        if item.status == "failed" or item.path is None:
+            message = f"COG export of layer {self.name!r} failed: {item.reason}"
+            raise RuntimeError(message)
+        return item.path
+
     def validate_source(self) -> None:
         """Reject a handle whose owning, layout, or upstream product was replaced."""
         recorded_products = (self._product, *self._upstream, *self._burst_products)
@@ -749,7 +865,6 @@ class ProductLayer:
         from faninsar.io.storage.scene_store import (
             SCENE_KIND,
             CoregisteredSceneStore,
-            valid_samples,
         )
 
         if self._product.kind != SCENE_KIND:
@@ -773,8 +888,11 @@ class ProductLayer:
         if name == "phase":
             return np.angle(mosaic).astype(np.float32)
         if name == "valid_mask":
-            if window is None and not self._merge_on_read:
-                return valid_samples(mosaic)
+            # Persisted support is authoritative. Deriving it from the mosaic
+            # would report a finite-but-invalid sample as valid and a supported
+            # ``0j`` as invalid, the opposite of what the product committed.
+            # The windowed path already reads the committed planes; the full
+            # path takes the same route instead of the mosaic shortcut.
             return self._compose_scene_valid_mask(store, window, mosaic)
         message = f"unknown scene layer: {name!r}"
         raise FileNotFoundError(message)
