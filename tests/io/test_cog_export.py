@@ -297,3 +297,15 @@ def test_collection_path_honours_a_recorded_href(tmp_path: Path) -> None:
     # An item that records nothing still resolves through the table.
     plain = _collection(tmp_path / "plain", None)
     assert plain.path("20240101_20240113", "unw_phase").name == "unw_phase.cog.tif"
+
+
+def test_stable_import_surface() -> None:
+    """The raster primitives are reachable from ``faninsar.io`` and the shim."""
+    from faninsar.io import read_geogrid, validate_cog, write_cog
+    from faninsar.io.raster import RasterGridSpec
+    from faninsar.network.readers import raster_io
+
+    assert raster_io.write_cog is write_cog
+    assert raster_io.validate_cog is validate_cog
+    assert raster_io.read_geogrid is read_geogrid
+    assert RasterGridSpec is not None
